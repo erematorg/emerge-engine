@@ -1,6 +1,6 @@
 use glam::{Mat2, Vec2};
 
-use crate::solver::materials::MaterialModel;
+use crate::solver::materials::{ConstitutiveModel, MaterialModel, MaterialParams};
 use crate::state::particle::Particle;
 
 // --- Newtonian fluid (Tait EOS + viscosity) ---
@@ -40,6 +40,10 @@ impl NewtonianFluidMaterial {
 }
 
 impl MaterialModel for NewtonianFluidMaterial {
+    fn constitutive_model(&self) -> ConstitutiveModel {
+        ConstitutiveModel::Fluid
+    }
+
     fn kirchhoff_stress(&self, particle: &Particle) -> Mat2 {
         let density = particle.density.max(self.min_density);
         let pressure = (self.eos_stiffness
@@ -63,6 +67,17 @@ impl MaterialModel for NewtonianFluidMaterial {
     fn update_particle(&self, particle: &mut Particle, _dt: f32) {
         particle.v *= self.velocity_damping;
         particle.c *= self.affine_damping;
+    }
+
+    fn params(&self) -> MaterialParams {
+        MaterialParams {
+            model: ConstitutiveModel::Fluid as u32,
+            rest_density: self.rest_density,
+            eos_stiffness: self.eos_stiffness,
+            eos_power: self.eos_power,
+            dynamic_viscosity: self.dynamic_viscosity,
+            ..Default::default()
+        }
     }
 
     fn timestep_bound(

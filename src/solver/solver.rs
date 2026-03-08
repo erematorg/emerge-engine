@@ -339,7 +339,7 @@ fn apply_boundary_conditions_to_grid(
 ) {
     for (i, cell) in cells.iter_mut().enumerate() {
         if cell.mass > 0.0 {
-            boundary.apply_to_grid_velocity(i, grid_res, &mut cell.v);
+            boundary.apply_to_grid_velocity(i, grid_res, &mut cell.momentum);
         }
     }
 }

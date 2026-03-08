@@ -2,10 +2,10 @@ use glam::{IVec2, Vec2};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Cell {
+    /// Dual-phase field.
     /// During P2G scatter: accumulated momentum (mass × velocity).
-    /// After `update_velocities`: normalized to true velocity (momentum / mass).
-    /// Never read directly — use the grid's accessor methods which know which phase you're in.
-    pub v: Vec2,
+    /// After `update_velocities`: normalized to true grid velocity (momentum / mass).
+    pub momentum: Vec2,
     pub mass: f32,
 }
 
@@ -56,11 +56,11 @@ impl Grid {
         let idx = self.index(cell_pos);
         let cell = &mut self.cells[idx];
         cell.mass += mass;
-        cell.v += momentum;
+        cell.momentum += momentum;
     }
 
     pub fn velocity_at(&self, cell_pos: IVec2) -> Vec2 {
-        self.cells[self.index(cell_pos)].v
+        self.cells[self.index(cell_pos)].momentum
     }
 
     pub fn mass_at(&self, cell_pos: IVec2) -> f32 {
@@ -68,12 +68,12 @@ impl Grid {
     }
 
     /// Normalize accumulated momentum to velocity (divide by mass), then apply gravity.
-    /// After this call, `cell.v` is a true velocity and can be read by G2P gather.
+    /// After this call, `cell.momentum` holds true grid velocity and can be read by G2P gather.
     pub fn update_velocities(&mut self, dt: f32, gravity: f32) {
         for cell in self.cells.iter_mut() {
             if cell.mass > 0.0 {
-                cell.v /= cell.mass;
-                cell.v += Vec2::new(0.0, gravity) * dt;
+                cell.momentum /= cell.mass;
+                cell.momentum += Vec2::new(0.0, gravity) * dt;
             }
         }
     }

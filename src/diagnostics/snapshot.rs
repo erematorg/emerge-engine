@@ -142,9 +142,9 @@ pub fn collect_mpm_snapshot(
             snapshot.active_grid_cells += 1;
         }
         snapshot.total_grid_mass += cell.mass;
-        snapshot.total_grid_momentum += cell.mass * cell.v;
-        snapshot.max_grid_speed = snapshot.max_grid_speed.max(cell.v.length());
-        snapshot.non_finite_grid_values += count_non_finite_grid_values(cell.mass, cell.v.x, cell.v.y);
+        snapshot.total_grid_momentum += cell.mass * cell.momentum;
+        snapshot.max_grid_speed = snapshot.max_grid_speed.max(cell.momentum.length());
+        snapshot.non_finite_grid_values += count_non_finite_grid_values(cell.mass, cell.momentum.x, cell.momentum.y);
     }
 
     if snapshot.active_grid_cells > 0 {

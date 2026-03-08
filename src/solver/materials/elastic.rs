@@ -1,6 +1,6 @@
 use glam::Mat2;
 
-use crate::solver::materials::MaterialModel;
+use crate::solver::materials::{ConstitutiveModel, MaterialModel, MaterialParams};
 use crate::state::particle::Particle;
 
 // --- Neo-Hookean ---
@@ -25,6 +25,10 @@ impl NeoHookeanMaterial {
 }
 
 impl MaterialModel for NeoHookeanMaterial {
+    fn constitutive_model(&self) -> ConstitutiveModel {
+        ConstitutiveModel::NeoHookean
+    }
+
     fn kirchhoff_stress(&self, particle: &Particle) -> Mat2 {
         let f = particle.deformation_gradient;
         let j = f.determinant();
@@ -52,6 +56,15 @@ impl MaterialModel for NeoHookeanMaterial {
         particle.volume = (particle.initial_volume * j).max(1.0e-6);
         // Density tracks volume: ρ = m/V. Required for correct wave speed in timestep_bound.
         particle.density = particle.mass / particle.volume;
+    }
+
+    fn params(&self) -> MaterialParams {
+        MaterialParams {
+            model: ConstitutiveModel::NeoHookean as u32,
+            lambda: self.elastic_lambda,
+            mu: self.elastic_mu,
+            ..Default::default()
+        }
     }
 
     fn timestep_bound(

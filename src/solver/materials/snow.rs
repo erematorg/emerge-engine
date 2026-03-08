@@ -1,6 +1,6 @@
 use glam::{Mat2, Vec2};
 
-use crate::solver::materials::MaterialModel;
+use crate::solver::materials::{ConstitutiveModel, MaterialModel};
 use crate::solver::svd::svd2;
 use crate::state::particle::Particle;
 
@@ -54,6 +54,10 @@ impl SnowMaterial {
 }
 
 impl MaterialModel for SnowMaterial {
+    fn constitutive_model(&self) -> ConstitutiveModel {
+        ConstitutiveModel::Snow
+    }
+
     fn kirchhoff_stress(&self, particle: &Particle) -> Mat2 {
         let f = particle.deformation_gradient;
         let j = f.determinant();
