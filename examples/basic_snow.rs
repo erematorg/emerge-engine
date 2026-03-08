@@ -120,7 +120,7 @@ impl Default for BasicSnowSettings {
             default_initial_volume: 1.0,
             recompute_density_each_step: false,
             particle_mass: 1.0,
-            mls_d_inverse: 4.0,
+            d_inverse: 4.0,
             max_substeps_per_step: 64, // snow at lambda=38889: c_P≈197 → ~50 substeps per step
         };
         // Spawn box covering full usable grid — filtered to circles in Simulation::new

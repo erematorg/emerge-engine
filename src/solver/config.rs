@@ -22,7 +22,7 @@ pub struct SolverConfig {
     pub recompute_density_each_step: bool,
     pub particle_mass: f32,
     // APIC/MLS quadratic-kernel D^{-1} coefficient. Standard value is 4.0 in grid units.
-    pub mls_d_inverse: f32,
+    pub d_inverse: f32,
     /// Maximum substeps the adaptive loop may run per step() call.
     /// Prevents stiff materials or fast particles from making a single step() unboundedly expensive.
     /// 64 covers snow at lambda=38889 (c_P≈197, ~50 substeps) with headroom.
@@ -50,7 +50,7 @@ impl Default for SolverConfig {
             default_initial_volume: 1.0,
             recompute_density_each_step: false,
             particle_mass: 1.0,
-            mls_d_inverse: 4.0,
+            d_inverse: 4.0,
             max_substeps_per_step: 64,
         }
     }
@@ -89,7 +89,7 @@ impl SolverConfig {
             "projection_min_deformation_j must be positive"
         );
         assert!(self.particle_mass > 0.0, "particle_mass must be positive");
-        assert!(self.mls_d_inverse > 0.0, "mls_d_inverse must be positive");
+        assert!(self.d_inverse > 0.0, "d_inverse must be positive");
         assert!(self.max_substeps_per_step > 0, "max_substeps_per_step must be > 0");
         assert!(
             self.default_initial_volume > 0.0,

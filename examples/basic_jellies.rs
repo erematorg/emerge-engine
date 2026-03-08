@@ -91,7 +91,7 @@ impl Default for BasicJelliesSettings {
             default_initial_volume: 1.0,
             recompute_density_each_step: false,
             particle_mass: 1.0,
-            mls_d_inverse: 4.0,
+            d_inverse: 4.0,
             max_substeps_per_step: 8,
         };
         let spawn_config = SpawnConfig {

@@ -169,7 +169,7 @@ impl MpmSolver {
             &mut self.grid,
             &self.materials,
             sub_dt,
-            self.config.mls_d_inverse,
+            self.config.d_inverse,
         );
 
         // Normalize accumulated momentum to velocity, then apply gravity and wall constraints.
@@ -183,7 +183,7 @@ impl MpmSolver {
             sub_dt,
             self.boundary.as_ref(),
             &self.materials,
-            self.config.mls_d_inverse,
+            self.config.d_inverse,
         );
 
         // Explicit integration drifts under large stresses — reset before NaN propagates.

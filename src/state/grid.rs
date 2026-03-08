@@ -1,5 +1,8 @@
 use glam::{IVec2, Vec2};
 
+/// One grid cell — `repr(C)` for stable GPU buffer layout.
+/// Use `Grid::cells_as_bytes` for wgpu buffer writes.
+#[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Cell {
     /// Dual-phase field.
@@ -75,6 +78,20 @@ impl Grid {
                 cell.momentum /= cell.mass;
                 cell.momentum += Vec2::new(0.0, gravity) * dt;
             }
+        }
+    }
+
+    /// View the cell buffer as raw bytes for wgpu buffer upload.
+    ///
+    /// # Safety
+    /// `Cell` is `repr(C)` with only glam/f32 fields — no pointer fields, no uninit bytes
+    /// in practice. Safe for GPU upload. Do not use to reconstruct `Cell` on CPU.
+    pub fn cells_as_bytes(&self) -> &[u8] {
+        unsafe {
+            core::slice::from_raw_parts(
+                self.cells.as_ptr() as *const u8,
+                self.cells.len() * core::mem::size_of::<Cell>(),
+            )
         }
     }
 }
