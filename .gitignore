@@ -1,0 +1,49 @@
+# Rust build artifacts
+/target/
+**/target/
+Cargo.lock
+
+# IDE and editor settings
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+docs/
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Rust-specific
+**/*.rs.bk
+*.pdb
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+/tmp
+
+# Test logs and debugging outputs
+gpu_*.txt
+debug_*.txt
+build_*.txt
+*_test*.txt
+chatgpt*.md
+explosion_summary*.md
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Application save files
+save.json
+
+# Claude local files
+.claude/

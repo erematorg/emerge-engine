@@ -1,0 +1,42 @@
+[package]
+name = "emerge"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+glam = { version = "0.30", features = ["bytemuck"] }
+nalgebra = { version = "0.34", features = ["glam030"] }
+bytemuck = { version = "1", features = ["derive"] }
+bevy = { version = "0.18", optional = true }
+bevy_egui = { version = "0.39", optional = true }
+
+[features]
+default = []
+mpm_debug = []
+bevy_examples = ["dep:bevy", "dep:bevy_egui"]
+
+[profile.dev]
+opt-level = 1  # Basic optimization for better dev performance
+
+[profile.dev.package."*"]
+opt-level = 3  # Full optimization for dependencies
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[[example]]
+name = "basic_fluids"
+required-features = ["bevy_examples"]
+
+[[example]]
+name = "basic_jellies"
+required-features = ["bevy_examples"]
+
+[[example]]
+name = "basic_mixed"
+required-features = ["bevy_examples"]
+
+[[example]]
+name = "basic_snow"
+required-features = ["bevy_examples"]
