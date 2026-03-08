@@ -25,7 +25,7 @@ pub fn scatter_particles_to_grid(
                 let cell_pos = weights.base_cell + IVec2::new(gx as i32 - 1, gy as i32 - 1);
                 let cell_dist = cell_pos.as_vec2() - p.x + Vec2::splat(0.5);
                 let mass_contrib = weight * p.mass;
-                let velocity_contrib = p.v + p.c * cell_dist;
+                let velocity_contrib = p.v + p.affine * cell_dist;
                 grid.add_mass_momentum(cell_pos, mass_contrib, mass_contrib * velocity_contrib);
                 let stress = material.kirchhoff_stress(&p);
                 let volume = material.stress_volume(&p);
@@ -67,7 +67,7 @@ pub fn gather_grid_to_particles(
             }
         }
 
-        p.c = b * d_inverse;
+        p.affine = b * d_inverse;
         p.x = boundary.clamp_particle_position(p.x + p.v * dt, grid.resolution());
         material.update_particle(p, dt);
         boundary.post_g2p_particle(p, grid.resolution());

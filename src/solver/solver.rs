@@ -233,7 +233,7 @@ fn initialize_particles(
             particles.push(Particle {
                 x: Vec2::new(i, j),
                 v: velocity,
-                c: Mat2::ZERO,
+                affine: Mat2::ZERO,
                 deformation_gradient: spawn.initial_deformation_gradient,
                 mass: config.particle_mass,
                 initial_volume: config.default_initial_volume,
@@ -293,7 +293,7 @@ fn choose_substep_dt(
         .map(|p| {
             let mut effective_speed = p.v.length();
             if config.cfl_include_affine_speed {
-                effective_speed += affine_cfl_speed_contribution(&p.c, config.grid_cell_size);
+                effective_speed += affine_cfl_speed_contribution(&p.affine, config.grid_cell_size);
             }
             effective_speed
         })
@@ -358,8 +358,8 @@ fn project_particle_state_to_admissible(particle: &mut Particle, config: &Solver
     if !particle.v.is_finite() {
         particle.v = Vec2::ZERO;
     }
-    if !particle.c.x_axis.is_finite() || !particle.c.y_axis.is_finite() {
-        particle.c = Mat2::ZERO;
+    if !particle.affine.x_axis.is_finite() || !particle.affine.y_axis.is_finite() {
+        particle.affine = Mat2::ZERO;
     }
 
     if !particle.deformation_gradient.x_axis.is_finite()

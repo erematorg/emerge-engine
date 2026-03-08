@@ -35,7 +35,7 @@ fn collect_and_evaluate_basic_snapshot() {
     let particles = vec![Particle {
         x: Vec2::new(4.0, 4.0),
         v: Vec2::new(1.0, 0.0),
-        c: Mat2::ZERO,
+        affine: Mat2::ZERO,
         deformation_gradient: Mat2::IDENTITY,
         mass: 1.0,
         initial_volume: 1.0,
@@ -85,7 +85,7 @@ fn concentrated_particles_trigger_violation() {
         Particle {
             x: Vec2::new(4.0, 4.0),
             v: Vec2::ZERO,
-            c: Mat2::ZERO,
+            affine: Mat2::ZERO,
             deformation_gradient: Mat2::IDENTITY,
             mass: 1.0,
             initial_volume: 1.0,
@@ -122,7 +122,7 @@ fn mixed_material_ratio_detects_cell_level_blending() {
         Particle {
             x: Vec2::new(4.1, 4.1),
             v: Vec2::ZERO,
-            c: Mat2::ZERO,
+            affine: Mat2::ZERO,
             deformation_gradient: Mat2::IDENTITY,
             mass: 1.0,
             initial_volume: 1.0,
@@ -137,7 +137,7 @@ fn mixed_material_ratio_detects_cell_level_blending() {
         Particle {
             x: Vec2::new(4.3, 4.2),
             v: Vec2::ZERO,
-            c: Mat2::ZERO,
+            affine: Mat2::ZERO,
             deformation_gradient: Mat2::IDENTITY,
             mass: 1.0,
             initial_volume: 1.0,

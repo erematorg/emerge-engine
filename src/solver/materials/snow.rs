@@ -15,8 +15,8 @@ use crate::state::particle::Particle;
 /// Reference: Stomakhin et al. 2013, §4.2. Identical in sparkl, taichi128, Genesis.
 #[derive(Debug, Clone, Copy)]
 pub struct SnowMaterial {
-    pub elastic_lambda: f32,
-    pub elastic_mu: f32,
+    pub lambda: f32,
+    pub mu: f32,
     /// Hardening exponent. Higher = more stiffness gain as snow compacts.
     pub hardening_xi: f32,
     /// Max compression before plastic flow triggers: Δσ < 1 - theta_c → plastic.
@@ -32,8 +32,8 @@ pub struct SnowMaterial {
 
 impl SnowMaterial {
     pub fn new(
-        elastic_lambda: f32,
-        elastic_mu: f32,
+        lambda: f32,
+        mu: f32,
         hardening_xi: f32,
         compression_limit: f32,
         stretch_limit: f32,
@@ -41,8 +41,8 @@ impl SnowMaterial {
         max_plastic_jacobian: f32,
     ) -> Self {
         Self {
-            elastic_lambda,
-            elastic_mu,
+            lambda,
+            mu,
             hardening_xi,
             compression_limit,
             stretch_limit,
@@ -81,8 +81,8 @@ impl MaterialModel for SnowMaterial {
 
         // h = particle.elastic_hardening, updated each step by plasticity
         let h = particle.elastic_hardening;
-        let mu_eff = self.elastic_mu * h;
-        let lambda_eff = self.elastic_lambda * h;
+        let mu_eff = self.mu * h;
+        let lambda_eff = self.lambda * h;
 
         // τ = 2µ·h·(F−R)·Fᵀ + λ·h·(J−1)·J·I
         let f_t = f.transpose();
@@ -95,7 +95,7 @@ impl MaterialModel for SnowMaterial {
 
     fn update_particle(&self, particle: &mut Particle, dt: f32) {
         // 1. Update deformation gradient
-        let f_trial = (Mat2::IDENTITY + dt * particle.c) * particle.deformation_gradient;
+        let f_trial = (Mat2::IDENTITY + dt * particle.affine) * particle.deformation_gradient;
 
         // 2. SVD of trial F
         let (u, sigma, vt) = svd2(f_trial);
@@ -135,7 +135,7 @@ impl MaterialModel for SnowMaterial {
         let density = particle.density.max(1.0e-6);
         // h can increase stiffness significantly when snow is compressed — account for it
         let h = particle.elastic_hardening;
-        let elastic_modulus = ((self.elastic_lambda + 2.0 * self.elastic_mu) * h).max(0.0);
+        let elastic_modulus = ((self.lambda + 2.0 * self.mu) * h).max(0.0);
         if elastic_modulus <= f32::EPSILON {
             return f32::INFINITY;
         }

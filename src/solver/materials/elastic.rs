@@ -7,17 +7,17 @@ use crate::state::particle::Particle;
 
 #[derive(Debug, Clone, Copy)]
 pub struct NeoHookeanMaterial {
-    pub elastic_lambda: f32,
-    pub elastic_mu: f32,
+    pub lambda: f32,
+    pub mu: f32,
     pub min_density: f32,
     pub min_j: f32,
 }
 
 impl NeoHookeanMaterial {
-    pub fn new(elastic_lambda: f32, elastic_mu: f32) -> Self {
+    pub fn new(lambda: f32, mu: f32) -> Self {
         Self {
-            elastic_lambda,
-            elastic_mu,
+            lambda,
+            mu,
             min_density: 1.0e-6,
             min_j: 1.0e-6,
         }
@@ -38,8 +38,8 @@ impl MaterialModel for NeoHookeanMaterial {
 
         let f_t = f.transpose();
         let f_inv_t = f_t.inverse();
-        let p_term_0 = self.elastic_mu * (f - f_inv_t);
-        let p_term_1 = self.elastic_lambda * j.ln() * f_inv_t;
+        let p_term_0 = self.mu * (f - f_inv_t);
+        let p_term_1 = self.lambda * j.ln() * f_inv_t;
         let p = p_term_0 + p_term_1;
         (1.0 / j) * (p * f_t)
     }
@@ -50,7 +50,7 @@ impl MaterialModel for NeoHookeanMaterial {
     }
 
     fn update_particle(&self, particle: &mut Particle, dt: f32) {
-        let fp_new = Mat2::IDENTITY + dt * particle.c;
+        let fp_new = Mat2::IDENTITY + dt * particle.affine;
         particle.deformation_gradient = fp_new * particle.deformation_gradient;
         let j = particle.deformation_gradient.determinant().max(self.min_j);
         particle.volume = (particle.initial_volume * j).max(1.0e-6);
@@ -61,8 +61,8 @@ impl MaterialModel for NeoHookeanMaterial {
     fn params(&self) -> MaterialParams {
         MaterialParams {
             model: ConstitutiveModel::NeoHookean as u32,
-            lambda: self.elastic_lambda,
-            mu: self.elastic_mu,
+            lambda: self.lambda,
+            mu: self.mu,
             ..Default::default()
         }
     }
@@ -76,7 +76,7 @@ impl MaterialModel for NeoHookeanMaterial {
     ) -> f32 {
         // Explicit elasticity update is bounded by elastic wave speed.
         let density = particle.density.max(self.min_density);
-        let elastic_modulus = (self.elastic_lambda + 2.0 * self.elastic_mu).max(0.0);
+        let elastic_modulus = (self.lambda + 2.0 * self.mu).max(0.0);
         if elastic_modulus <= f32::EPSILON {
             return f32::INFINITY;
         }

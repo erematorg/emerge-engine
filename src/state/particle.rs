@@ -4,7 +4,11 @@ use glam::{Mat2, Vec2};
 pub struct Particle {
     pub x: Vec2,
     pub v: Vec2,
-    pub c: Mat2,
+    /// APIC affine velocity gradient (C matrix).
+    /// Accumulated during G2P: C = Σ w_i · v_i ⊗ (x_i − x_p) · D⁻¹
+    /// Encodes the local velocity gradient around the particle.
+    /// Feeds back into P2G to produce a spatially-varying grid velocity field.
+    pub affine: Mat2,
     pub deformation_gradient: Mat2,
     pub mass: f32,
     pub initial_volume: f32,

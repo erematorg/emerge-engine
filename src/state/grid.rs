@@ -51,7 +51,7 @@ impl Grid {
     }
 
     /// Accumulate mass and momentum onto a cell during P2G scatter.
-    /// `v` stores momentum (not velocity) until `update_velocities` normalizes it.
+    /// `cell.momentum` holds accumulated momentum until `update_velocities` normalizes it.
     pub fn add_mass_momentum(&mut self, cell_pos: IVec2, mass: f32, momentum: Vec2) {
         let idx = self.index(cell_pos);
         let cell = &mut self.cells[idx];

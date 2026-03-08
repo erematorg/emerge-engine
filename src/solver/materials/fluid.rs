@@ -54,7 +54,7 @@ impl MaterialModel for NewtonianFluidMaterial {
 
         // Viscous stress acts on deviatoric strain rate only — shear resistance, not bulk.
         // Full strain would add spurious bulk viscosity; real Newtonian fluids have none.
-        let sym_strain = particle.c + particle.c.transpose();
+        let sym_strain = particle.affine + particle.affine.transpose();
         let strain_dev = sym_strain - Mat2::from_diagonal(Vec2::splat(sym_strain.x_axis.x + sym_strain.y_axis.y) * 0.5);
         stress += self.dynamic_viscosity * strain_dev;
         stress
@@ -66,7 +66,7 @@ impl MaterialModel for NewtonianFluidMaterial {
 
     fn update_particle(&self, particle: &mut Particle, _dt: f32) {
         particle.v *= self.velocity_damping;
-        particle.c *= self.affine_damping;
+        particle.affine *= self.affine_damping;
     }
 
     fn params(&self) -> MaterialParams {
