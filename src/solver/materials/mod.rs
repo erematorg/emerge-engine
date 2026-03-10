@@ -2,12 +2,14 @@ pub mod corotated;
 pub mod elastic;
 pub mod fluid;
 pub mod params;
+pub mod sand;
 pub mod snow;
 
 pub use corotated::CorotatedMaterial;
 pub use elastic::NeoHookeanMaterial;
 pub use fluid::NewtonianFluidMaterial;
 pub use params::MaterialParams;
+pub use sand::SandMaterial;
 pub use snow::SnowMaterial;
 
 use glam::Mat2;
@@ -20,11 +22,12 @@ use crate::state::particle::Particle;
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConstitutiveModel {
-    Fallback   = 0,
-    Fluid      = 1, // Weakly-compressible Newtonian fluid, Tait EOS
-    NeoHookean = 2, // Neo-Hookean hyperelastic (jelly, soft solids)
-    Corotated  = 3, // Corotated linear elastic (stiffer baseline)
-    Snow       = 4, // Corotated + SVD plasticity (Stomakhin 2013)
+    Fallback      = 0,
+    Fluid         = 1, // Weakly-compressible Newtonian fluid, Tait EOS
+    NeoHookean    = 2, // Neo-Hookean hyperelastic (jelly, soft solids)
+    Corotated     = 3, // Corotated linear elastic (stiffer baseline)
+    Snow          = 4, // Corotated + SVD plasticity (Stomakhin 2013)
+    DruckerPrager = 5, // Corotated elastic + DP yield surface (sand, soil, rock)
 }
 
 pub trait MaterialModel: Send + Sync + core::fmt::Debug {

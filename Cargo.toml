@@ -9,11 +9,14 @@ nalgebra = { version = "0.34", features = ["glam030"] }
 bytemuck = { version = "1", features = ["derive"] }
 bevy = { version = "0.18", optional = true }
 bevy_egui = { version = "0.39", optional = true }
+wgpu = { version = "27", optional = true }
 
 [features]
 default = []
 mpm_debug = []
 bevy_examples = ["dep:bevy", "dep:bevy_egui"]
+# GPU compute: P2G/G2P via wgpu compute shaders. Plasticity stays CPU-side year 1.
+gpu = ["dep:wgpu"]
 
 [profile.dev]
 opt-level = 1  # Basic optimization for better dev performance
@@ -39,4 +42,8 @@ required-features = ["bevy_examples"]
 
 [[example]]
 name = "basic_snow"
+required-features = ["bevy_examples"]
+
+[[example]]
+name = "basic_sand"
 required-features = ["bevy_examples"]

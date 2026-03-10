@@ -4,9 +4,12 @@ use crate::solver::materials::{ConstitutiveModel, MaterialModel};
 use crate::state::particle::Particle;
 
 /// Corotated linear elasticity.
-/// τ = 2µ·h·(F−R)·Fᵀ + λ·h·(J−1)·J·I
-/// R is the rotation from 2D polar decomposition (no SVD needed).
-/// h = particle.elastic_hardening (1.0 = no hardening; scaled by snow plasticity).
+///
+/// Kirchhoff stress: τ = 2µ·h·(F−R)·Fᵀ + λ·h·(J−1)·J·I
+/// R is the rotation from 2D polar decomposition (analytical — no SVD needed in 2D).
+/// h = particle.elastic_hardening (1.0 baseline; snow plasticity scales this up on compression).
+/// Reference: Stomakhin et al. 2013, eq. (5)–(8). Used as the elastic base for snow.
+/// Also the elastic component of Drucker-Prager (Klar et al. 2016).
 #[derive(Debug, Clone, Copy)]
 pub struct CorotatedMaterial {
     pub lambda: f32,

@@ -3,8 +3,12 @@ use glam::Mat2;
 use crate::solver::materials::{ConstitutiveModel, MaterialModel, MaterialParams};
 use crate::state::particle::Particle;
 
-// --- Neo-Hookean ---
-
+/// Compressible Neo-Hookean hyperelastic solid (jelly, soft tissue).
+///
+/// Free energy: Ψ = µ/2·(tr(FᵀF)−d) − µ·ln(J) + λ/2·ln(J)²
+/// Kirchhoff stress: τ = µ(FFᵀ − I) + λ·ln(J)·I
+///   (derived via P = ∂Ψ/∂F, τ = (1/J)·P·Fᵀ — simplified to avoid F⁻¹)
+/// Reference: standard hyperelasticity; used in Stomakhin et al. 2013 (snow paper) §2.
 #[derive(Debug, Clone, Copy)]
 pub struct NeoHookeanMaterial {
     pub lambda: f32,

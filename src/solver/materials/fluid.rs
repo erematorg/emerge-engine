@@ -3,8 +3,13 @@ use glam::{Mat2, Vec2};
 use crate::solver::materials::{ConstitutiveModel, MaterialModel, MaterialParams};
 use crate::state::particle::Particle;
 
-// --- Newtonian fluid (Tait EOS + viscosity) ---
-
+/// Weakly-compressible Newtonian fluid.
+///
+/// Pressure: Tait equation of state — p = k·((ρ/ρ₀)^γ − 1).
+///   Reference: Monaghan 1994 (SPH), Becker & Teschner 2007 (WCSPH), γ≈7 for water.
+/// Viscosity: deviatoric Newtonian stress — τ_visc = η·dev(Ċ + Ċᵀ).
+///   C (the APIC affine matrix) approximates the local velocity gradient.
+/// Coupled to MLS-MPM transfer: Hu et al. 2018, §4.
 #[derive(Debug, Clone, Copy)]
 pub struct NewtonianFluidMaterial {
     pub rest_density: f32,

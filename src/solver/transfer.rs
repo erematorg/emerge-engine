@@ -5,6 +5,14 @@ use crate::state::{grid::Grid, kernel::quadratic_weights, particle::Particle};
 
 /// P2G: scatter particle mass, momentum, and internal stress forces onto the grid.
 ///
+/// Implements the MLS-MPM transfer operator from Hu et al. 2018
+/// "A Moving Least Squares Material Point Method with Displacement Discontinuity
+/// and Two-Way Rigid Body Coupling" (SIGGRAPH 2018), §4.
+///
+/// Key constants (verified against paper and sparkl):
+///   D_inv = 4.0  (quadratic B-spline: D = h²/4, D_inv = 4/h² with h=1)
+///   force_scale = -D_inv  (negative: force opposes stress gradient)
+///
 /// Stress is pre-integrated as a momentum impulse (`-volume * D_inv * dt * σ * r`)
 /// so the grid needs only one accumulation pass before normalization.
 /// The APIC affine term (`C * cell_dist`) gives the grid a locally-varying velocity field,
@@ -23,6 +31,9 @@ pub fn scatter_particles_to_grid(
             for gy in 0..3 {
                 let weight = weights.wx[gx] * weights.wy[gy];
                 let cell_pos = weights.base_cell + IVec2::new(gx as i32 - 1, gy as i32 - 1);
+                // cell_dist: vector from particle to cell center, in grid coordinates.
+                // +0.5 because cells are centered at (i+0.5, j+0.5) on a collocated grid
+                // (particles live in [0, grid_res], cells cover unit squares around integer nodes).
                 let cell_dist = cell_pos.as_vec2() - p.x + Vec2::splat(0.5);
                 let mass_contrib = weight * p.mass;
                 let velocity_contrib = p.v + p.affine * cell_dist;

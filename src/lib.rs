@@ -1,4 +1,6 @@
 pub mod diagnostics;
+#[cfg(feature = "gpu")]
+pub mod gpu;
 pub mod runtime;
 pub mod solver;
 pub mod state;
@@ -9,7 +11,7 @@ pub use diagnostics::{collect_mpm_snapshot, MpmSnapshot};
 pub use runtime::FixedStepController;
 pub use solver::{
     BoundaryCondition, ConstitutiveModel, MaterialModel, MaterialParams, MaterialRegistry,
-    MpmSolver, NeoHookeanMaterial, NewtonianFluidMaterial, PredictiveBoundary, SlipBoundary,
+    MpmSolver, NeoHookeanMaterial, NewtonianFluidMaterial, PredictiveBoundary, SandMaterial, SlipBoundary,
     SolverConfig, SpawnConfig,
 };
 pub use state::grid::{Cell, Grid};
