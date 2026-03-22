@@ -1,19 +1,23 @@
-/// Two snowballs colliding — CPU MLS-MPM, Stomakhin 2013 snow plasticity.
+/// Two snowballs colliding — GPU MLS-MPM, SVD plasticity in g2p.wgsl.
 ///
 /// Ball A (blue): launched right. Ball B (white): launched left.
 /// Physics constants from MPM2D/constants.h — canonical snowball collision reference.
 ///
-///   cargo run --example basic_snow --features bevy_examples
+///   cargo run --example basic_snow_gpu --features "bevy_examples,gpu"
 use bevy::prelude::*;
+use bevy::tasks::block_on;
 use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
+use emerge::gpu::GpuSolver;
 use emerge::runtime::fixed_step::FixedStepController;
-use emerge::solver::{MpmSolver, SlipBoundary, SnowMaterial, SolverConfig, SpawnConfig};
-use glam::{IVec2, Vec2};
+use emerge::solver::density::estimate_initial_particle_volumes;
+use emerge::solver::{MaterialRegistry, SnowMaterial, SolverConfig, SpawnConfig};
+use emerge::state::{grid::Grid, particle::Particle};
+use glam::{IVec2, Mat2, Vec2};
 
 const GRID: usize = 64;
 const DT: f32 = 0.1;
 const PPC: f32 = 14.0;
-const PDIAM: f32 = 14.0 * 0.5 * 1.6; // solid circles at spacing=0.5
+const PDIAM: f32 = 14.0 * 0.5 * 1.6; // 11.2 — solid circles at spacing=0.5
 const MAX_DT: f32 = 1.0 / 15.0;
 
 const BALL_R: f32 = 10.0;
@@ -45,7 +49,8 @@ const DEFAULTS: Params = Params {
 
 #[derive(Resource)]
 struct Sim {
-    solver: MpmSolver,
+    solver: GpuSolver,
+    particles: Vec<Particle>,
     stepper: FixedStepController,
     prev: Params,
 }
@@ -60,26 +65,16 @@ impl Sim {
             rng_seed: 7,
             ..SpawnConfig::for_solver(&config)
         };
-        let mut solver = MpmSolver::new(config, spawn)
-            .with_default_material(Box::new(make_snow(&p)))
-            .with_boundary(Box::new(SlipBoundary::new(config.boundary_thickness)));
-        {
-            let speed = p.speed;
-            let parts = solver.particles_mut();
-            parts.retain(|pt| {
-                (pt.x - BALL_A).length() <= BALL_R || (pt.x - BALL_B).length() <= BALL_R
-            });
-            for pt in parts.iter_mut() {
-                pt.v = if (pt.x - BALL_A).length() <= BALL_R {
-                    Vec2::new(speed, 0.0)
-                } else {
-                    Vec2::new(-speed, 0.0)
-                };
-            }
-        }
-        solver.recompute_initial_volumes();
+        let mut particles = spawn_balls(&config, &spawn, p.speed);
+        estimate_initial_particle_volumes(&mut particles, &mut Grid::new(GRID));
+        let solver = block_on(GpuSolver::new(
+            config,
+            &particles,
+            MaterialRegistry::with_default(Box::new(make_snow(&p))),
+        ));
         Self {
             solver,
+            particles,
             stepper: FixedStepController::standard(DT, p.hz),
             prev: p,
         }
@@ -97,7 +92,7 @@ fn main() {
         .insert_resource(Sim::new(DEFAULTS))
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
-                title: "MLS-MPM Snow — Snowball Collision".into(),
+                title: "MLS-MPM Snow (GPU) — SVD in WGSL".into(),
                 resolution: (900u32, 900u32).into(),
                 ..default()
             }),
@@ -115,9 +110,9 @@ struct PVis(usize);
 
 fn setup(mut commands: Commands, sim: Res<Sim>) {
     commands.spawn(Camera2d);
-    for (i, p) in sim.solver.particles().iter().enumerate() {
-        let blue = (p.x - BALL_A).length() <= BALL_R + 0.5;
-        let color = if blue {
+    for (i, p) in sim.particles.iter().enumerate() {
+        let ball_a = (p.x - BALL_A).length() <= BALL_R + 0.5;
+        let color = if ball_a {
             Color::srgb(0.40, 0.70, 1.00)
         } else {
             Color::srgb(0.95, 0.97, 1.00)
@@ -165,14 +160,14 @@ fn cursor(
         1.0
     };
     let dt = time.delta_secs().min(MAX_DT);
-    for p in sim.solver.particles_mut() {
+    for p in &mut sim.particles {
         let d = p.x - gp;
         let dist = d.length();
         if dist < 6.0 && dist > 1e-4 {
-            p.v += (d / dist) * sign * 50.0 * (1.0 - dist / 6.0) * dt;
+            p.v += (d / dist) * sign * 200.0 * (1.0 - dist / 6.0) * dt;
             let s = p.v.length();
-            if s > 30.0 {
-                p.v *= 30.0 / s;
+            if s > 60.0 {
+                p.v *= 60.0 / s;
             }
         }
     }
@@ -190,26 +185,29 @@ fn step(time: Res<Time>, mut sim: ResMut<Sim>, params: Res<Params>) {
             .set_default_material(Box::new(make_snow(&params)));
         sim.prev = *params;
     }
-    sim.solver.step_n(n);
+    let sim = sim.as_mut();
+    for _ in 0..n {
+        sim.solver.step_frame(&mut sim.particles);
+    }
 }
 
 fn sync(sim: Res<Sim>, mut q: Query<(&PVis, &mut Transform)>) {
     for (v, mut t) in &mut q {
-        t.translation = p2w(sim.solver.particles()[v.0].x);
+        t.translation = p2w(sim.particles[v.0].x);
     }
 }
 
 fn ui(mut ctx: EguiContexts, mut p: ResMut<Params>, mut sim: ResMut<Sim>, time: Res<Time>) {
     let Ok(ctx) = ctx.ctx_mut() else { return };
-    egui::Window::new("Snow")
+    egui::Window::new("Snow (GPU)")
         .default_pos([10.0, 10.0])
         .default_width(300.0)
         .resizable(false)
         .show(ctx, |ui| {
             ui.label(format!(
-                "fps={:.0}  n={}",
+                "fps={:.0}  n={}  [GPU SVD]",
                 time.delta_secs().recip(),
-                sim.solver.particles().len()
+                sim.particles.len()
             ));
             ui.separator();
             ui.add(egui::Slider::new(&mut p.hz, 1.0..=60.0).text("solver_hz"));
@@ -244,4 +242,53 @@ fn ui(mut ctx: EguiContexts, mut p: ResMut<Params>, mut sim: ResMut<Sim>, time: 
 fn p2w(pos: Vec2) -> Vec3 {
     let c = (pos - Vec2::splat(GRID as f32 * 0.5)) * PPC;
     Vec3::new(c.x.round(), c.y.round(), 0.0)
+}
+
+fn spawn_balls(config: &SolverConfig, spawn: &SpawnConfig, speed: f32) -> Vec<Particle> {
+    let half = spawn.box_size.as_vec2() * 0.5;
+    let (lo, hi) = (spawn.box_center - half, spawn.box_center + half);
+    let mut s = spawn.rng_seed;
+    let mut out = Vec::new();
+    let mut i = lo.x;
+    while i < hi.x {
+        let mut j = lo.y;
+        while j < hi.y {
+            let pos = Vec2::new(i, j);
+            lcg(&mut s);
+            lcg(&mut s); // consume RNG deterministically
+            let in_a = (pos - BALL_A).length() <= BALL_R;
+            let in_b = (pos - BALL_B).length() <= BALL_R;
+            if in_a || in_b {
+                let vel = if in_a {
+                    Vec2::new(speed, 0.0)
+                } else {
+                    Vec2::new(-speed, 0.0)
+                };
+                out.push(Particle {
+                    x: pos,
+                    v: vel,
+                    affine: Mat2::ZERO,
+                    deformation_gradient: Mat2::IDENTITY,
+                    mass: config.particle_mass,
+                    initial_volume: config.default_initial_volume,
+                    volume: config.default_initial_volume,
+                    density: config.particle_mass / config.default_initial_volume,
+                    material_id: 0,
+                    plastic_jacobian: 1.0,
+                    elastic_hardening: 1.0,
+                    plastic_hardening: 0.0,
+                    log_vol_gain: 0.0,
+                    _pad: [0.0; 3],
+                });
+            }
+            j += spawn.spacing;
+        }
+        i += spawn.spacing;
+    }
+    out
+}
+
+fn lcg(s: &mut u32) -> f32 {
+    *s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+    *s as f32 / (u32::MAX as f32 + 1.0)
 }

@@ -1,3 +1,12 @@
+[workspace]
+members = [
+    ".",
+    # forces, energy, utils removed from workspace — Bevy-coupled, kept as reference in crates/.
+    # Port math into emerge/src/ one ForceField at a time when LP needs them.
+    # matter kept: future scope covers quantum/dark matter (may not be MPM-based).
+    "crates/matter",
+]
+
 [package]
 name = "emerge"
 version = "0.1.0"
@@ -17,6 +26,8 @@ mpm_debug = []
 bevy_examples = ["dep:bevy", "dep:bevy_egui"]
 # GPU compute: P2G/G2P via wgpu compute shaders. Plasticity stays CPU-side year 1.
 gpu = ["dep:wgpu"]
+# Standalone debug renderer: instanced particle draw via wgpu. Requires gpu.
+render = ["gpu"]
 
 [profile.dev]
 opt-level = 1  # Basic optimization for better dev performance
@@ -47,3 +58,15 @@ required-features = ["bevy_examples"]
 [[example]]
 name = "basic_sand"
 required-features = ["bevy_examples"]
+
+[[example]]
+name = "basic_jellies_gpu"
+required-features = ["bevy_examples", "gpu"]
+
+[[example]]
+name = "basic_sand_gpu"
+required-features = ["bevy_examples", "gpu"]
+
+[[example]]
+name = "basic_snow_gpu"
+required-features = ["bevy_examples", "gpu"]

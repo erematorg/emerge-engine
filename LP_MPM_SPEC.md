@@ -61,9 +61,27 @@
 
 ### 3.3 Render ownership
 
-**Shared GPU buffer — only viable option at scale.**
-Particles stay in VRAM. LP writes a custom wgpu shader that reads the position buffer directly.
-CPU→GPU upload every frame kills performance at 100K+.
+**Two distinct rendering layers — emerge owns debug, LP owns production.**
+
+**emerge `render` feature (optional, off by default):**
+- A testbed/debug renderer for standalone emerge users and emerge's own examples
+- Adapted from `tmp/wgsparkl/src_testbed/` (Apache v2, game dev allowed)
+- Two GPU passes: compute prep → instanced draw
+  - Prep pass: reads `Particle` buffer, writes `InstanceData[]` (position + deformation + color)
+  - Draw pass: renders instances as deformation-shaped quads (F matrix drives shape, not just circles)
+- Color modes: `DEFAULT` (material palette), `VELOCITY` (heat map), `VOLUME` (SVD of F)
+- No Beer-Lambert, no optical physics — those are LP's semantic concerns
+- emerge exposes: `particle_buffer()`, `particle_count()`, `grid()`, `material_params()`
+
+**LP `systems/render` (LP owns entirely, emerge knows nothing about it):**
+- `OpticalParams { sigma_a: [f32;3], emissivity: f32, n_refract: f32 }` — LP-owned buffer
+- Beer-Lambert per channel: `transmittance = exp(-sigma_a * thickness)`
+- Color emerges from physics: water blue (σ_a[red] high), sand ochre, tissue red
+- Same `material_id` indexes both emerge's `MaterialParams` and LP's `OpticalParams`
+- Reads emerge's `particle_buffer()` directly — zero PCIe copies
+
+**Why split:** optical constants (σ_a for water, chlorophyll, hemoglobin) are LP's semantic domain.
+A different consumer of emerge might render completely differently or not at all.
 
 ### 3.4 Threading model
 

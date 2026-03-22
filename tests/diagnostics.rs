@@ -18,7 +18,7 @@ fn make_config(grid_res: usize) -> SolverConfig {
         projection_min_density: 1.0e-6,
         projection_min_volume: 1.0e-6,
         projection_min_deformation_j: 1.0e-6,
-        gravity: -0.3,
+        gravity: Vec2::new(0.0, -0.3),
         boundary_thickness: 2,
         default_initial_volume: 1.0,
         recompute_density_each_step: false,
@@ -46,6 +46,9 @@ fn collect_and_evaluate_basic_snapshot() {
         elastic_hardening: 1.0,
         plastic_hardening: 0.0,
         log_vol_gain: 0.0,
+        temperature: 0.0,
+        user_tag: 0,
+        _pad: 0.0,
     }];
 
     let mut grid = Grid::new(config.grid_res);
@@ -93,9 +96,12 @@ fn concentrated_particles_trigger_violation() {
             density: 1.0,
             material_id: 0,
             plastic_jacobian: 1.0,
-        elastic_hardening: 1.0,
-        plastic_hardening: 0.0,
-        log_vol_gain: 0.0,
+            elastic_hardening: 1.0,
+            plastic_hardening: 0.0,
+            log_vol_gain: 0.0,
+            temperature: 0.0,
+            user_tag: 0,
+            _pad: 0.0,
         };
         128
     ];
@@ -133,6 +139,9 @@ fn mixed_material_ratio_detects_cell_level_blending() {
             elastic_hardening: 1.0,
             plastic_hardening: 0.0,
             log_vol_gain: 0.0,
+            temperature: 0.0,
+            user_tag: 0,
+            _pad: 0.0,
         },
         Particle {
             x: Vec2::new(4.3, 4.2),
@@ -148,6 +157,9 @@ fn mixed_material_ratio_detects_cell_level_blending() {
             elastic_hardening: 1.0,
             plastic_hardening: 0.0,
             log_vol_gain: 0.0,
+            temperature: 0.0,
+            user_tag: 0,
+            _pad: 0.0,
         },
     ];
 

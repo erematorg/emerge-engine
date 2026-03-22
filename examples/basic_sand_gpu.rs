@@ -1,14 +1,18 @@
-/// Drucker-Prager sand — CPU MLS-MPM, Klar et al. 2016.
-///   cargo run --example basic_sand --features bevy_examples
+/// Drucker-Prager sand — GPU MLS-MPM, plasticity in g2p.wgsl.
+///   cargo run --example basic_sand_gpu --features "bevy_examples,gpu"
 use bevy::prelude::*;
+use bevy::tasks::block_on;
 use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
+use emerge::gpu::GpuSolver;
 use emerge::runtime::fixed_step::FixedStepController;
-use emerge::solver::{MpmSolver, SandMaterial, SlipBoundary, SolverConfig, SpawnConfig};
-use glam::{IVec2, Vec2};
+use emerge::solver::density::estimate_initial_particle_volumes;
+use emerge::solver::{MaterialRegistry, SandMaterial, SolverConfig, SpawnConfig};
+use emerge::state::{grid::Grid, particle::Particle};
+use glam::{IVec2, Mat2, Vec2};
 
 const GRID: usize = 80;
 const DT: f32 = 0.05;
-const PPC: f32 = 8.0;
+const PPC: f32 = 7.0;
 const MAX_DT: f32 = 1.0 / 15.0;
 
 #[derive(Resource, Clone, Copy, PartialEq)]
@@ -29,7 +33,8 @@ const DEFAULTS: Params = Params {
 
 #[derive(Resource)]
 struct Sim {
-    solver: MpmSolver,
+    solver: GpuSolver,
+    particles: Vec<Particle>,
     stepper: FixedStepController,
     prev: Params,
 }
@@ -45,16 +50,20 @@ impl Sim {
             spacing: 0.5,
             box_size: IVec2::new(40, 20),
             box_center: Vec2::new(40.0, 66.0),
-            precompute_initial_volumes: true,
             initial_velocity_scale: 0.0,
             rng_seed: 42,
             ..SpawnConfig::default()
         };
-        let solver = MpmSolver::new(config, spawn)
-            .with_default_material(Box::new(make_sand(&p)))
-            .with_boundary(Box::new(SlipBoundary::new(config.boundary_thickness)));
+        let mut particles = spawn_block(&config, &spawn);
+        estimate_initial_particle_volumes(&mut particles, &mut Grid::new(GRID));
+        let solver = block_on(GpuSolver::new(
+            config,
+            &particles,
+            MaterialRegistry::with_default(Box::new(make_sand(&p))),
+        ));
         Self {
             solver,
+            particles,
             stepper: FixedStepController::standard(DT, p.hz),
             prev: p,
         }
@@ -74,7 +83,7 @@ fn main() {
         .insert_resource(Sim::new(DEFAULTS))
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
-                title: "MLS-MPM Sand — Drucker-Prager".into(),
+                title: "MLS-MPM Sand (GPU) — Drucker-Prager".into(),
                 resolution: (800u32, 800u32).into(),
                 ..default()
             }),
@@ -92,7 +101,7 @@ struct PVis(usize);
 
 fn setup(mut commands: Commands, sim: Res<Sim>) {
     commands.spawn(Camera2d);
-    for (i, p) in sim.solver.particles().iter().enumerate() {
+    for (i, p) in sim.particles.iter().enumerate() {
         commands.spawn((
             Sprite::from_color(sand_color(p.plastic_hardening), Vec2::ONE),
             Transform {
@@ -136,7 +145,7 @@ fn cursor(
         1.0
     };
     let dt = time.delta_secs().min(MAX_DT);
-    for p in sim.solver.particles_mut() {
+    for p in &mut sim.particles {
         let d = p.x - gp;
         let dist = d.length();
         if dist < 6.0 && dist > 1e-4 {
@@ -161,12 +170,15 @@ fn step(time: Res<Time>, mut sim: ResMut<Sim>, params: Res<Params>) {
             .set_default_material(Box::new(make_sand(&params)));
         sim.prev = *params;
     }
-    sim.solver.step_n(n);
+    let sim = sim.as_mut();
+    for _ in 0..n {
+        sim.solver.step_frame(&mut sim.particles);
+    }
 }
 
 fn sync(sim: Res<Sim>, mut q: Query<(&PVis, &mut Transform, &mut Sprite)>) {
     for (v, mut t, mut s) in &mut q {
-        let p = &sim.solver.particles()[v.0];
+        let p = &sim.particles[v.0];
         t.translation = p2w(p.x);
         s.color = sand_color(p.plastic_hardening);
     }
@@ -174,15 +186,15 @@ fn sync(sim: Res<Sim>, mut q: Query<(&PVis, &mut Transform, &mut Sprite)>) {
 
 fn ui(mut ctx: EguiContexts, mut p: ResMut<Params>, mut sim: ResMut<Sim>, time: Res<Time>) {
     let Ok(ctx) = ctx.ctx_mut() else { return };
-    egui::Window::new("Sand")
+    egui::Window::new("Sand (GPU)")
         .default_pos([10.0, 10.0])
         .default_width(280.0)
         .resizable(false)
         .show(ctx, |ui| {
             ui.label(format!(
-                "fps={:.0}  n={}",
+                "fps={:.0}  n={}  [GPU DP]",
                 time.delta_secs().recip(),
-                sim.solver.particles().len()
+                sim.particles.len()
             ));
             ui.separator();
             ui.add(egui::Slider::new(&mut p.hz, 5.0..=60.0).text("solver_hz"));
@@ -214,4 +226,35 @@ fn sand_color(q: f32) -> Color {
 fn p2w(pos: Vec2) -> Vec3 {
     let c = (pos - Vec2::splat(GRID as f32 * 0.5)) * PPC;
     Vec3::new(c.x.round(), c.y.round(), 0.0)
+}
+
+fn spawn_block(config: &SolverConfig, spawn: &SpawnConfig) -> Vec<Particle> {
+    let half = spawn.box_size.as_vec2() * 0.5;
+    let (lo, hi) = (spawn.box_center - half, spawn.box_center + half);
+    let mut out = Vec::new();
+    let mut i = lo.x;
+    while i < hi.x {
+        let mut j = lo.y;
+        while j < hi.y {
+            out.push(Particle {
+                x: Vec2::new(i, j),
+                v: Vec2::ZERO,
+                affine: Mat2::ZERO,
+                deformation_gradient: Mat2::IDENTITY,
+                mass: config.particle_mass,
+                initial_volume: config.default_initial_volume,
+                volume: config.default_initial_volume,
+                density: config.particle_mass / config.default_initial_volume,
+                material_id: 0,
+                plastic_jacobian: 1.0,
+                elastic_hardening: 1.0,
+                plastic_hardening: 0.0,
+                log_vol_gain: 0.0,
+                _pad: [0.0; 3],
+            });
+            j += spawn.spacing;
+        }
+        i += spawn.spacing;
+    }
+    out
 }
