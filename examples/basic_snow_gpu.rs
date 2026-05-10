@@ -1,28 +1,31 @@
-/// Two snowballs colliding — GPU MLS-MPM, SVD plasticity in g2p.wgsl.
+/// Two snowballs colliding — GPU MLS-MPM, Stomakhin 2013 snow plasticity in WGSL.
 ///
-/// Ball A (blue): launched right. Ball B (white): launched left.
-/// Physics constants from MPM2D/constants.h — canonical snowball collision reference.
+/// Ball A (blue)  = soft powder  — low hardening, wide plastic limits.
+/// Ball B (amber) = packed snow  — high hardening, tight limits.
+/// Jp compression shown as red shift on impact.
 ///
 ///   cargo run --example basic_snow_gpu --features "bevy_examples,gpu"
 use bevy::prelude::*;
 use bevy::tasks::block_on;
 use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
-use emerge::gpu::GpuSolver;
+use emerge::gpu::{GpuForceFieldEntry, GpuSolver};
+use emerge::{MaterialRegistry, SnowMaterial, SolverConfig, SpawnConfig, build_particles, log_frame_gpu};
 use emerge::runtime::fixed_step::FixedStepController;
-use emerge::solver::density::estimate_initial_particle_volumes;
-use emerge::solver::{MaterialRegistry, SnowMaterial, SolverConfig, SpawnConfig};
-use emerge::state::{grid::Grid, particle::Particle};
-use glam::{IVec2, Mat2, Vec2};
+use glam::Vec2;
 
 const GRID: usize = 64;
 const DT: f32 = 0.1;
-const PPC: f32 = 14.0;
-const PDIAM: f32 = 14.0 * 0.5 * 1.6; // 11.2 — solid circles at spacing=0.5
-const MAX_DT: f32 = 1.0 / 15.0;
+const PPC: f32 = 10.0;
 
-const BALL_R: f32 = 10.0;
-const BALL_A: Vec2 = Vec2::new(14.0, 36.0);
-const BALL_B: Vec2 = Vec2::new(50.0, 28.0);
+const BALL_R: f32 = 9.0;
+const BALL_A: Vec2 = Vec2::new(16.0, 44.0);
+const BALL_B: Vec2 = Vec2::new(48.0, 44.0);
+const MAT_SOFT:   u32 = 0;
+const MAT_PACKED: u32 = 1;
+const LABELS: &[(u32, &str)] = &[(MAT_SOFT, "soft"), (MAT_PACKED, "packed")];
+
+const COL_A: Color = Color::srgb(0.35, 0.65, 1.00); // blue
+const COL_B: Color = Color::srgb(0.95, 0.80, 0.45); // amber
 
 #[derive(Resource, Clone, Copy, PartialEq)]
 struct Params {
@@ -31,58 +34,74 @@ struct Params {
     speed: f32,
     lambda: f32,
     mu: f32,
-    xi: f32,
-    theta_c: f32,
-    theta_s: f32,
+    xi_a: f32,
+    theta_c_a: f32,
+    theta_s_a: f32,
+    xi_b: f32,
+    theta_c_b: f32,
+    theta_s_b: f32,
+    cursor_strength: f32,
+    cursor_radius: f32,
 }
+
 const DEFAULTS: Params = Params {
-    hz: 5.0,
-    gravity: -9.81,
-    speed: 40.0,
-    // MPM2D: E=1.4e5, nu=0.2 → lambda=38889, mu=58333
-    lambda: 38889.0,
-    mu: 58333.0,
-    xi: 10.0,
-    theta_c: 0.02,
-    theta_s: 0.006,
+    hz: 60.0,
+    gravity: -0.08,
+    speed: 8.0,
+    lambda: 1389.0,
+    mu: 2083.0,
+    xi_a: 7.0,
+    theta_c_a: 0.025,
+    theta_s_a: 0.0075,
+    xi_b: 10.0,
+    theta_c_b: 0.012,
+    theta_s_b: 0.004,
+    cursor_strength: 300.0,
+    cursor_radius: 6.0,
 };
 
 #[derive(Resource)]
 struct Sim {
     solver: GpuSolver,
-    particles: Vec<Particle>,
     stepper: FixedStepController,
     prev: Params,
 }
 
 impl Sim {
     fn new(p: Params) -> Self {
-        let config = SolverConfig::standard(GRID, DT, Vec2::new(0.0, p.gravity));
-        let spawn = SpawnConfig {
-            spacing: 0.5,
-            box_size: IVec2::new(58, 58),
-            initial_velocity_scale: 0.0,
-            rng_seed: 7,
-            ..SpawnConfig::for_solver(&config)
+        let config = SolverConfig {
+            max_substeps_per_step: 20,
+            ..SolverConfig::standard(GRID, DT, Vec2::new(0.0, p.gravity))
         };
-        let mut particles = spawn_balls(&config, &spawn, p.speed);
-        estimate_initial_particle_volumes(&mut particles, &mut Grid::new(GRID));
-        let solver = block_on(GpuSolver::new(
-            config,
-            &particles,
-            MaterialRegistry::with_default(Box::new(make_snow(&p))),
-        ));
+        // Two snowballs: each a disk, given opposing initial velocities post-spawn.
+        let ball_spawn = |center: Vec2, mat: u32| {
+            SpawnConfig::for_solver(&config)
+                .at(center).disk(BALL_R).spacing(0.5).material(mat).rng_seed(7)
+        };
+        let mut ball_a = build_particles(&config, ball_spawn(BALL_A, MAT_SOFT));
+        let mut ball_b = build_particles(&config, ball_spawn(BALL_B, MAT_PACKED));
+        let speed = p.speed;
+        for pt in &mut ball_a { pt.v = Vec2::new(speed, 0.0); }
+        for pt in &mut ball_b { pt.v = Vec2::new(-speed, 0.0); }
+        let mut particles = ball_a;
+        particles.extend(ball_b);
+        let mut registry = MaterialRegistry::with_default(Box::new(make_snow_a(&p)));
+        registry.insert(MAT_PACKED, Box::new(make_snow_b(&p)));
+        let solver = block_on(GpuSolver::new(config, particles, registry));
         Self {
             solver,
-            particles,
             stepper: FixedStepController::standard(DT, p.hz),
             prev: p,
         }
     }
 }
 
-fn make_snow(p: &Params) -> SnowMaterial {
-    SnowMaterial::new(p.lambda, p.mu, p.xi, p.theta_c, p.theta_s, 0.6, 1.05)
+fn make_snow_a(p: &Params) -> SnowMaterial {
+    SnowMaterial::new(p.lambda, p.mu, p.xi_a, p.theta_c_a, p.theta_s_a, 0.6, 20.0)
+}
+fn make_snow_b(p: &Params) -> SnowMaterial {
+    SnowMaterial::new(p.lambda, p.mu, p.xi_b, p.theta_c_b, p.theta_s_b, 0.6, 20.0)
+        .with_cohesion(400.0)
 }
 
 fn main() {
@@ -92,7 +111,7 @@ fn main() {
         .insert_resource(Sim::new(DEFAULTS))
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
-                title: "MLS-MPM Snow (GPU) — SVD in WGSL".into(),
+                title: "MLS-MPM Snow (GPU) — Powder vs Packed".into(),
                 resolution: (900u32, 900u32).into(),
                 ..default()
             }),
@@ -110,28 +129,30 @@ struct PVis(usize);
 
 fn setup(mut commands: Commands, sim: Res<Sim>) {
     commands.spawn(Camera2d);
-    for (i, p) in sim.particles.iter().enumerate() {
-        let ball_a = (p.x - BALL_A).length() <= BALL_R + 0.5;
-        let color = if ball_a {
-            Color::srgb(0.40, 0.70, 1.00)
-        } else {
-            Color::srgb(0.95, 0.97, 1.00)
-        };
+    for (i, p) in sim.solver.particles().iter().enumerate() {
+        let color = if p.material_id == MAT_SOFT { COL_A } else { COL_B };
         commands.spawn((
-            Sprite::from_color(color, Vec2::splat(PDIAM)),
-            Transform {
-                translation: p2w(p.x),
-                ..default()
-            },
             PVis(i),
+            Sprite { color, custom_size: Some(Vec2::ONE), ..default() },
+            Transform::from_translation(p2w(p.x)),
         ));
     }
 }
 
-fn reset(keys: Res<ButtonInput<KeyCode>>, mut sim: ResMut<Sim>, mut p: ResMut<Params>) {
+fn reset(keys: Res<ButtonInput<KeyCode>>, mut sim: ResMut<Sim>, mut p: ResMut<Params>,
+         mut commands: Commands, vis: Query<Entity, With<PVis>>) {
     if keys.just_pressed(KeyCode::KeyR) {
         *p = DEFAULTS;
         *sim = Sim::new(DEFAULTS);
+        for e in &vis { commands.entity(e).despawn(); }
+        for (i, pt) in sim.solver.particles().iter().enumerate() {
+            let color = if pt.material_id == MAT_SOFT { COL_A } else { COL_B };
+            commands.spawn((
+                PVis(i),
+                Sprite { color, custom_size: Some(Vec2::ONE), ..default() },
+                Transform::from_translation(p2w(pt.x)),
+            ));
+        }
     }
 }
 
@@ -140,60 +161,44 @@ fn cursor(
     cam: Query<(&Camera, &GlobalTransform)>,
     mb: Res<ButtonInput<MouseButton>>,
     mut sim: ResMut<Sim>,
-    time: Res<Time>,
+    params: Res<Params>,
 ) {
-    if !mb.pressed(MouseButton::Left) && !mb.pressed(MouseButton::Right) {
-        return;
-    }
+    sim.solver.clear_force_fields_gpu();
+    if !mb.pressed(MouseButton::Left) && !mb.pressed(MouseButton::Right) { return; }
     let Ok(win) = windows.single() else { return };
-    let Some(cp) = win.cursor_position() else {
-        return;
-    };
+    let Some(cp) = win.cursor_position() else { return };
     let Ok((cam, ct)) = cam.single() else { return };
-    let Ok(wp) = cam.viewport_to_world_2d(ct, cp) else {
-        return;
-    };
+    let Ok(wp) = cam.viewport_to_world_2d(ct, cp) else { return };
     let gp = wp / PPC + Vec2::splat(GRID as f32 * 0.5);
-    let sign = if mb.pressed(MouseButton::Right) {
-        -1.0
-    } else {
-        1.0
-    };
-    let dt = time.delta_secs().min(MAX_DT);
-    for p in &mut sim.particles {
-        let d = p.x - gp;
-        let dist = d.length();
-        if dist < 6.0 && dist > 1e-4 {
-            p.v += (d / dist) * sign * 200.0 * (1.0 - dist / 6.0) * dt;
-            let s = p.v.length();
-            if s > 60.0 {
-                p.v *= 60.0 / s;
-            }
-        }
-    }
+    let gm = if mb.pressed(MouseButton::Right) { params.cursor_strength } else { -params.cursor_strength };
+    let r = params.cursor_radius;
+    sim.solver.add_force_field_gpu(GpuForceFieldEntry::gravity_well(gp, gm, 4.0, r, r * 0.4));
 }
 
 fn step(time: Res<Time>, mut sim: ResMut<Sim>, params: Res<Params>) {
     sim.solver.set_gravity(Vec2::new(0.0, params.gravity));
     sim.stepper.set_simulation_speed(params.hz * DT);
     let n = sim.stepper.steps_for_frame(time.delta_secs());
-    if n == 0 {
-        return;
-    }
+    if n == 0 { return; }
     if sim.prev != *params {
-        sim.solver
-            .set_default_material(Box::new(make_snow(&params)));
+        sim.solver.set_default_material(Box::new(make_snow_a(&params)));
+        sim.solver.set_material(MAT_PACKED, Box::new(make_snow_b(&params)));
         sim.prev = *params;
     }
-    let sim = sim.as_mut();
     for _ in 0..n {
-        sim.solver.step_frame(&mut sim.particles);
+        sim.solver.step_frame();
     }
+    sim.solver.sync_particles_blocking();
+    static FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let f = FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    log_frame_gpu(f, DT, sim.solver.particles(), LABELS, 60);
 }
 
-fn sync(sim: Res<Sim>, mut q: Query<(&PVis, &mut Transform)>) {
-    for (v, mut t) in &mut q {
-        t.translation = p2w(sim.particles[v.0].x);
+fn sync(sim: Res<Sim>, mut vis: Query<(&PVis, &mut Transform)>) {
+    for (pv, mut t) in &mut vis {
+        if let Some(p) = sim.solver.particles().get(pv.0) {
+            t.translation = p2w(p.x);
+        }
     }
 }
 
@@ -201,36 +206,35 @@ fn ui(mut ctx: EguiContexts, mut p: ResMut<Params>, mut sim: ResMut<Sim>, time: 
     let Ok(ctx) = ctx.ctx_mut() else { return };
     egui::Window::new("Snow (GPU)")
         .default_pos([10.0, 10.0])
-        .default_width(300.0)
+        .default_width(280.0)
         .resizable(false)
         .show(ctx, |ui| {
             ui.label(format!(
-                "fps={:.0}  n={}  [GPU SVD]",
+                "fps={:.0}  n={}  [GPU]",
                 time.delta_secs().recip(),
-                sim.particles.len()
+                sim.solver.particle_count()
             ));
             ui.separator();
             ui.add(egui::Slider::new(&mut p.hz, 1.0..=60.0).text("solver_hz"));
-            ui.add(egui::Slider::new(&mut p.gravity, -20.0..=0.0).text("gravity"));
-            ui.add(egui::Slider::new(&mut p.speed, 1.0..=80.0).text("launch speed (→ reset)"));
+            ui.add(egui::Slider::new(&mut p.gravity, -2.0..=0.0).text("gravity"));
+            ui.add(egui::Slider::new(&mut p.speed, 1.0..=30.0).text("speed (→ reset)"));
             ui.separator();
-            ui.label("Stiffness (MPM2D: λ=38889 µ=58333)");
-            ui.add(egui::Slider::new(&mut p.lambda, 100.0..=100_000.0).text("λ"));
-            ui.add(egui::Slider::new(&mut p.mu, 100.0..=200_000.0).text("µ"));
+            ui.label("Shared stiffness");
+            ui.add(egui::Slider::new(&mut p.lambda, 50.0..=5_000.0).text("λ"));
+            ui.add(egui::Slider::new(&mut p.mu, 50.0..=10_000.0).text("µ"));
             ui.separator();
-            ui.label("Snow plasticity (Stomakhin 2013)");
-            ui.add(egui::Slider::new(&mut p.xi, 0.0..=20.0).text("xi"));
-            ui.add(
-                egui::Slider::new(&mut p.theta_c, 0.001..=0.5)
-                    .logarithmic(true)
-                    .text("theta_c"),
-            );
-            ui.add(
-                egui::Slider::new(&mut p.theta_s, 0.001..=0.1)
-                    .logarithmic(true)
-                    .text("theta_s"),
-            );
+            ui.colored_label(egui::Color32::from_rgb(90, 165, 255), "Soft powder (blue)");
+            ui.add(egui::Slider::new(&mut p.xi_a, 0.0..=20.0).text("ξ"));
+            ui.add(egui::Slider::new(&mut p.theta_c_a, 0.001..=0.1).logarithmic(true).text("θ_c"));
+            ui.add(egui::Slider::new(&mut p.theta_s_a, 0.001..=0.05).logarithmic(true).text("θ_s"));
             ui.separator();
+            ui.colored_label(egui::Color32::from_rgb(242, 204, 115), "Packed snow (amber)");
+            ui.add(egui::Slider::new(&mut p.xi_b, 0.0..=20.0).text("ξ"));
+            ui.add(egui::Slider::new(&mut p.theta_c_b, 0.001..=0.1).logarithmic(true).text("θ_c"));
+            ui.add(egui::Slider::new(&mut p.theta_s_b, 0.001..=0.05).logarithmic(true).text("θ_s"));
+            ui.separator();
+            ui.add(egui::Slider::new(&mut p.cursor_strength, 10.0..=1000.0).text("cursor force").logarithmic(true));
+            ui.add(egui::Slider::new(&mut p.cursor_radius, 1.0..=15.0).text("cursor radius"));
             ui.label("LMB: push  RMB: pull  R: reset");
             if ui.button("Reset (R)").clicked() {
                 *p = DEFAULTS;
@@ -241,54 +245,5 @@ fn ui(mut ctx: EguiContexts, mut p: ResMut<Params>, mut sim: ResMut<Sim>, time: 
 
 fn p2w(pos: Vec2) -> Vec3 {
     let c = (pos - Vec2::splat(GRID as f32 * 0.5)) * PPC;
-    Vec3::new(c.x.round(), c.y.round(), 0.0)
-}
-
-fn spawn_balls(config: &SolverConfig, spawn: &SpawnConfig, speed: f32) -> Vec<Particle> {
-    let half = spawn.box_size.as_vec2() * 0.5;
-    let (lo, hi) = (spawn.box_center - half, spawn.box_center + half);
-    let mut s = spawn.rng_seed;
-    let mut out = Vec::new();
-    let mut i = lo.x;
-    while i < hi.x {
-        let mut j = lo.y;
-        while j < hi.y {
-            let pos = Vec2::new(i, j);
-            lcg(&mut s);
-            lcg(&mut s); // consume RNG deterministically
-            let in_a = (pos - BALL_A).length() <= BALL_R;
-            let in_b = (pos - BALL_B).length() <= BALL_R;
-            if in_a || in_b {
-                let vel = if in_a {
-                    Vec2::new(speed, 0.0)
-                } else {
-                    Vec2::new(-speed, 0.0)
-                };
-                out.push(Particle {
-                    x: pos,
-                    v: vel,
-                    affine: Mat2::ZERO,
-                    deformation_gradient: Mat2::IDENTITY,
-                    mass: config.particle_mass,
-                    initial_volume: config.default_initial_volume,
-                    volume: config.default_initial_volume,
-                    density: config.particle_mass / config.default_initial_volume,
-                    material_id: 0,
-                    plastic_jacobian: 1.0,
-                    elastic_hardening: 1.0,
-                    plastic_hardening: 0.0,
-                    log_vol_gain: 0.0,
-                    _pad: [0.0; 3],
-                });
-            }
-            j += spawn.spacing;
-        }
-        i += spawn.spacing;
-    }
-    out
-}
-
-fn lcg(s: &mut u32) -> f32 {
-    *s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-    *s as f32 / (u32::MAX as f32 + 1.0)
+    Vec3::new(c.x, c.y, 0.0)
 }

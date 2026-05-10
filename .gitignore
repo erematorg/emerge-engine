@@ -29,6 +29,12 @@ Thumbs.db
 *.log
 /tmp
 
+# Reference repos (physics references, not part of the codebase)
+3x3_SVD_CUDA/
+ChainQueen/
+GeoTaichi/
+claymore/
+
 # Test logs and debugging outputs
 gpu_*.txt
 debug_*.txt

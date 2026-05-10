@@ -1,29 +1,114 @@
-// G2P — Grid to Particle gather
-// MLS-MPM, Hu et al. 2018 SIGGRAPH §4.
-//
-// One thread per particle. Reads 3×3 grid neighborhood.
-// Updates: particle velocity, APIC affine C matrix, deformation gradient F.
-//
-// Steps per particle:
-//   1. Gather: v_p = Σ w_i * v_i  (weighted sum of grid velocities)
-//   2. B-matrix: B += w_i * v_i ⊗ (x_i - x_p)  (outer product, APIC)
-//   3. C = B * D_inverse  (D_inverse = 4.0, quadratic B-spline)
-//   4. F = (I + dt * C) * F  (left-multiply deformation gradient)
-//   5. Constitutive update: kirchhoff stress, volume, density
-//      (plasticity for snow/sand stays CPU year 1 — SVD in WGSL is complex)
-//
-// Material stress dispatch: switch on particle.material_id → ConstitutiveModel discriminant
-//   1 = Fluid      → Tait EOS pressure + deviatoric viscosity
-//   2 = NeoHookean → µ(FFᵀ − I) + λ·ln(J)·I
-//   3 = Corotated  → 2µ(F−R)Fᵀ + λ(J−1)J·I  (analytical 2D polar decomp in WGSL)
-//
-// Reference: Hu et al. 2018, verified constants:
-//   D_inverse = 4.0  (mls-mpm88-explained.cpp: `Dinv = 4 * inv_dx * inv_dx`, dx=1)
-//   F update left-multiply: `F = (I + dt*C) * F`
-//
-// TODO: implement
+// G2P — gather grid velocity/momentum into particle velocity and APIC affine matrix C.
+// One thread per particle. F update, plasticity, position advance: particles_update.wgsl.
 
-// (shared struct definitions with p2g.wgsl — will be unified via wgsl module system)
+struct Particle {
+    x:                    vec2<f32>,
+    v:                    vec2<f32>,
+    velocity_gradient:    mat2x2<f32>,
+    deformation_gradient: mat2x2<f32>,
+    mass:                 f32,
+    initial_volume:       f32,
+    volume:               f32,
+    density:              f32,
+    material_id:          u32,
+    plastic_volume_ratio: f32,
+    hardening_scale:      f32,
+    friction_hardening:   f32,
+    log_volume_strain:    f32,
+    temperature:          f32,
+    user_tag:             u32,
+    activation:           f32,
+    activation_dir:       vec2<f32>,
+    muscle_group_id:      u32,
+    _pad:                 u32,
+}
 
-// TODO: @compute @workgroup_size(64, 1, 1)
-// fn g2p_main(@builtin(global_invocation_id) gid: vec3<u32>) { ... }
+struct Cell {
+    momentum: vec2<f32>, // after grid_update this holds velocity, not momentum
+    mass:     f32,
+    _pad:     f32,
+}
+
+struct StepParams {
+    grid_res:           u32,
+    particle_count:     u32,
+    dt:                 f32,
+    kernel_d_inverse:   f32,
+    gravity:            vec2<f32>,
+    boundary_thickness: u32,
+    vel_limit:          f32,
+}
+
+const BSPLINE_INNER_LIMIT:  f32 = 0.5;
+const BSPLINE_OUTER_LIMIT:  f32 = 1.5;
+const BSPLINE_CENTER_COEFF: f32 = 0.75;
+const BSPLINE_OUTER_SCALE:  f32 = 0.5;
+const CELL_CENTER_OFFSET:   f32 = 0.5;
+const NUM_FLOOR:            f32 = 1e-6;
+
+@group(0) @binding(0) var<storage, read_write> particles:   array<Particle>;
+@group(0) @binding(1) var<storage, read_write> grid:        array<Cell>;
+@group(0) @binding(3) var<uniform>             step_params: StepParams;
+
+fn bspline_w(d: f32) -> f32 {
+    let a = abs(d);
+    if a < BSPLINE_INNER_LIMIT { return BSPLINE_CENTER_COEFF - a * a; }
+    if a < BSPLINE_OUTER_LIMIT { let t = BSPLINE_OUTER_LIMIT - a; return BSPLINE_OUTER_SCALE * t * t; }
+    return 0.0;
+}
+
+@compute @workgroup_size(64, 1, 1)
+fn g2p_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let p_idx = gid.x;
+    if p_idx >= step_params.particle_count { return; }
+
+    let p   = particles[p_idx];
+    let res = step_params.grid_res;
+    let base = vec2<i32>(i32(p.x.x), i32(p.x.y));
+
+    var new_v       = vec2<f32>(0.0);
+    var B_col0      = vec2<f32>(0.0);
+    var B_col1      = vec2<f32>(0.0);
+    var new_density = 0.0; // Σ w_i·m_i — grid-gathered density, avoids F-tracked drift
+
+    for (var di: i32 = -1; di <= 1; di++) {
+        for (var dj: i32 = -1; dj <= 1; dj++) {
+            let cx = base.x + di;
+            let cy = base.y + dj;
+            if cx < 0 || cy < 0 || cx >= i32(res) || cy >= i32(res) { continue; }
+
+            let cell_dist = vec2<f32>(f32(cx), f32(cy)) + vec2<f32>(CELL_CENTER_OFFSET) - p.x;
+            let w = bspline_w(cell_dist.x) * bspline_w(cell_dist.y);
+
+            let cell   = grid[u32(cy) * res + u32(cx)];
+            let cell_v = cell.momentum;
+
+            new_v       += w * cell_v;
+            B_col0      += w * cell_v * cell_dist.x;
+            B_col1      += w * cell_v * cell_dist.y;
+            new_density += w * cell.mass;
+        }
+    }
+
+    // Velocity clamp: !(spd <= limit) also catches NaN (NaN <= x = false).
+    // Inf guard: if spd=Inf, inv=0, then Inf×0=NaN — zero out via select.
+    let spd = length(new_v);
+    if !(spd <= step_params.vel_limit) {
+        let inv = step_params.vel_limit / spd;
+        new_v = select(new_v * inv, vec2<f32>(0.0), !(inv > 0.0));
+    }
+
+    // C = B · D_inverse (APIC affine velocity gradient)
+    // No C-clamp: CPU gather_grid_to_particles has none. Clamping C at 0.5*vel_limit
+    // fires at natural impact velocities (C ~ 6v) and under-deforms F, killing elastic bounce.
+    // The velocity clamp above already bounds the energy; CFL bounds the timestep.
+    let C = mat2x2<f32>(B_col0, B_col1) * step_params.kernel_d_inverse;
+
+    let density = max(new_density, NUM_FLOOR);
+    let volume  = p.mass / density;
+
+    particles[p_idx].v                 = new_v;
+    particles[p_idx].velocity_gradient = C;
+    particles[p_idx].density           = density;
+    particles[p_idx].volume            = volume;
+}

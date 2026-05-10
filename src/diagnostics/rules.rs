@@ -167,7 +167,8 @@ pub fn evaluate_mpm_health(
             && snapshot.particles_per_active_cell > thresholds.max_particles_per_active_cell,
         mixed_material_violation: snapshot.mixed_material_cell_ratio
             > thresholds.max_mixed_material_cell_ratio
-            || snapshot.mixed_material_particle_ratio > thresholds.max_mixed_material_particle_ratio,
+            || snapshot.mixed_material_particle_ratio
+                > thresholds.max_mixed_material_particle_ratio,
         cfl_violation: snapshot.cfl_number > thresholds.max_cfl,
         mass_drift_violation: snapshot.relative_mass_error > thresholds.max_relative_mass_error,
         momentum_drift_violation: snapshot.relative_momentum_error

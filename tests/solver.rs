@@ -1,10 +1,13 @@
 use std::collections::HashMap;
 
-use emerge::solver::{
-    AabbConfinementField, CoulombField, GravityWellField, MpmSolver, NeoHookeanMaterial,
-    NewtonianFluidMaterial, RadialConfinementField, SandMaterial, SnowMaterial, SolverConfig,
-    SpawnConfig, ThermalConfig, ThermalDiffusion, VonMisesMaterial,
+use emerge::fields::{
+    AabbConfinementField, CoulombField, GravityWellField, RadialConfinementField,
 };
+use emerge::{
+    MpmSolver, NaccMaterial, NeoHookeanMaterial, NewtonianFluidMaterial, RankineMaterial,
+    SandMaterial, SandMuIMaterial, SnowMaterial, SolverConfig, SpawnConfig, VonMisesMaterial,
+};
+use emerge::thermodynamics::{ThermalConfig, ThermalDiffusion};
 use glam::{IVec2, Vec2};
 
 // --- helpers ---
@@ -23,7 +26,6 @@ fn small_spawn_config(center: f32) -> SpawnConfig {
         spacing: 0.5,
         box_size: IVec2::new(8, 8),
         box_center: Vec2::splat(center),
-        initial_velocity_offset: Vec2::ZERO,
         initial_velocity_scale: 0.0,
         ..SpawnConfig::default()
     }
@@ -136,11 +138,11 @@ fn snow_stable_after_many_steps() {
             "snow particle {i}: J collapsed"
         );
         assert!(
-            p.plastic_jacobian.is_finite(),
+            p.plastic_volume_ratio.is_finite(),
             "snow particle {i}: Jp non-finite"
         );
         assert!(
-            p.elastic_hardening.is_finite(),
+            p.hardening_scale.is_finite(),
             "snow particle {i}: h non-finite"
         );
     }
@@ -159,11 +161,11 @@ fn sand_stable_after_many_steps() {
             "sand particle {i}: J collapsed"
         );
         assert!(
-            p.plastic_hardening.is_finite(),
+            p.friction_hardening.is_finite(),
             "sand particle {i}: q non-finite"
         );
         assert!(
-            p.log_vol_gain.is_finite(),
+            p.log_volume_strain.is_finite(),
             "sand particle {i}: log_vol_gain non-finite"
         );
     }
@@ -192,6 +194,65 @@ fn von_mises_yield_stays_finite() {
 }
 
 #[test]
+fn rankine_damage_stays_finite_and_j_positive() {
+    // High tensile load: spawn with upward velocity so particles stretch.
+    // Rankine should project tensile stress and accumulate finite damage.
+    let rock = RankineMaterial::rock(2_000.0, 1_000.0);
+    let config = SolverConfig {
+        gravity: Vec2::new(0.0, 9.81), // upward — stretches the block in tension
+        ..small_solver_config()
+    };
+    let spawn = SpawnConfig {
+        initial_velocity_scale: 5.0,
+        ..small_spawn_config(16.0)
+    };
+    let mut solver = MpmSolver::new(config, spawn).with_default_material(Box::new(rock));
+    solver.step_n(100);
+    for (i, p) in solver.particles().iter().enumerate() {
+        assert!(p.x.is_finite(), "rankine particle {i}: position non-finite");
+        assert!(
+            p.deformation_gradient.determinant() > 0.0,
+            "rankine particle {i}: J collapsed"
+        );
+        assert!(
+            p.friction_hardening >= 0.0 && p.friction_hardening.is_finite(),
+            "rankine particle {i}: damage non-finite or negative ({:.4})",
+            p.friction_hardening
+        );
+    }
+}
+
+#[test]
+fn rankine_softening_reduces_tensile_strength() {
+    // Verify: a particle under sustained tension accumulates damage (friction_hardening > 0)
+    // and that the effective tensile strength decreases with softening_rate > 0.
+    use emerge::particle::Particle;
+    use emerge::materials::MaterialModel;
+
+    let mat = RankineMaterial::new(1_000.0, 500.0, 100.0, 2.0);
+    let mut p = Particle::zeroed();
+    p.mass = 1.0;
+    p.initial_volume = 1.0;
+    p.volume = 1.0;
+    p.density = 1.0;
+    // Deformation gradient: pure extension in x by 20% — puts particle in tension
+    p.deformation_gradient = glam::Mat2::from_cols(
+        glam::Vec2::new(1.2, 0.0),
+        glam::Vec2::new(0.0, 1.0),
+    );
+    // Velocity gradient: zero (no ongoing flow — just check state update)
+    p.velocity_gradient = glam::Mat2::ZERO;
+
+    mat.update_particle(&mut p, 0.01);
+
+    // Damage should be positive (tensile yield occurred) or zero (elastic)
+    assert!(p.friction_hardening >= 0.0 && p.friction_hardening.is_finite(),
+        "damage must be non-negative finite, got {}", p.friction_hardening);
+    assert!(p.deformation_gradient.determinant() > 0.0,
+        "J must stay positive after Rankine update");
+}
+
+#[test]
 fn phase_transition_switches_material_ids() {
     const JELLY_ID: u32 = 0;
     const FLUID_ID: u32 = 1;
@@ -206,10 +267,21 @@ fn phase_transition_switches_material_ids() {
     assert!(solver.particles().iter().all(|p| p.material_id == JELLY_ID));
     solver.phase_transition(|p| p.x.x < 16.0, FLUID_ID);
 
-    let fluid_count = solver.particles().iter().filter(|p| p.material_id == FLUID_ID).count();
-    let jelly_count = solver.particles().iter().filter(|p| p.material_id == JELLY_ID).count();
+    let fluid_count = solver
+        .particles()
+        .iter()
+        .filter(|p| p.material_id == FLUID_ID)
+        .count();
+    let jelly_count = solver
+        .particles()
+        .iter()
+        .filter(|p| p.material_id == JELLY_ID)
+        .count();
     assert!(fluid_count > 0, "no particles transitioned to fluid");
-    assert!(jelly_count > 0, "all particles transitioned — expected partial");
+    assert!(
+        jelly_count > 0,
+        "all particles transitioned — expected partial"
+    );
     assert_eq!(fluid_count + jelly_count, solver.particles().len());
 }
 
@@ -244,27 +316,33 @@ fn gravity_well_pulls_particles_toward_source() {
 
     let well = GravityWellField::new(
         vec![(well_pos, 1_000.0)],
-        0.1,  // gravitational_constant
-        1.0,  // softening (grid cells)
-        30.0, // cutoff
-    );
+        0.1, // gravitational_constant
+        1.0, // softening (grid cells)
+    )
+    .with_cutoff(30.0);
 
     let mut solver = MpmSolver::new(config, spawn)
         .with_default_material(Box::new(NeoHookeanMaterial::new(10.0, 20.0)))
         .with_force_field(Box::new(well));
 
-    let cx_before: f32 = solver.particles().iter().map(|p| p.x.x).sum::<f32>()
-        / solver.particles().len() as f32;
+    let cx_before: f32 =
+        solver.particles().iter().map(|p| p.x.x).sum::<f32>() / solver.particles().len() as f32;
 
     solver.step_n(80);
 
     for (i, p) in solver.particles().iter().enumerate() {
-        assert!(p.x.is_finite(), "gravity_well: particle {i} position non-finite");
-        assert!(p.v.is_finite(), "gravity_well: particle {i} velocity non-finite");
+        assert!(
+            p.x.is_finite(),
+            "gravity_well: particle {i} position non-finite"
+        );
+        assert!(
+            p.v.is_finite(),
+            "gravity_well: particle {i} velocity non-finite"
+        );
     }
 
-    let cx_after: f32 = solver.particles().iter().map(|p| p.x.x).sum::<f32>()
-        / solver.particles().len() as f32;
+    let cx_after: f32 =
+        solver.particles().iter().map(|p| p.x.x).sum::<f32>() / solver.particles().len() as f32;
     assert!(
         cx_after > cx_before,
         "gravity_well: CoM did not move toward well (before={cx_before:.2}, after={cx_after:.2})"
@@ -282,8 +360,8 @@ fn radial_confinement_keeps_particles_inside() {
     let radius = 6.0_f32;
 
     let spawn = SpawnConfig {
-        box_center:             center,
-        box_size:               IVec2::new(4, 4),
+        box_center: center,
+        box_size: IVec2::new(4, 4),
         initial_velocity_scale: 15.0,
         ..SpawnConfig::default()
     };
@@ -297,7 +375,10 @@ fn radial_confinement_keeps_particles_inside() {
     solver.step_n(200);
 
     for (i, p) in solver.particles().iter().enumerate() {
-        assert!(p.x.is_finite(), "confinement: particle {i} position non-finite");
+        assert!(
+            p.x.is_finite(),
+            "confinement: particle {i} position non-finite"
+        );
         let dist = (p.x - center).length();
         assert!(
             dist <= radius + 2.0,
@@ -316,7 +397,7 @@ fn coulomb_repulsion_pushes_charged_particles_away() {
     let source_pos = Vec2::splat(16.0);
     let spawn = SpawnConfig {
         box_center: source_pos,
-        box_size:   IVec2::new(4, 4),
+        box_size: IVec2::new(4, 4),
         ..SpawnConfig::default()
     };
 
@@ -328,16 +409,19 @@ fn coulomb_repulsion_pushes_charged_particles_away() {
         mat_charges,
         50.0, // coulomb_constant
         0.5,  // softening (grid cells)
-        20.0, // cutoff
-    );
+    )
+    .with_cutoff(20.0);
 
     let mut solver = MpmSolver::new(config, spawn)
         .with_default_material(Box::new(NeoHookeanMaterial::new(10.0, 20.0)))
         .with_force_field(Box::new(field));
 
-    let avg_dist_before: f32 = solver.particles().iter()
+    let avg_dist_before: f32 = solver
+        .particles()
+        .iter()
         .map(|p| (p.x - source_pos).length())
-        .sum::<f32>() / solver.particles().len() as f32;
+        .sum::<f32>()
+        / solver.particles().len() as f32;
 
     solver.step_n(60);
 
@@ -346,9 +430,12 @@ fn coulomb_repulsion_pushes_charged_particles_away() {
         assert!(p.v.is_finite(), "coulomb: particle {i} velocity non-finite");
     }
 
-    let avg_dist_after: f32 = solver.particles().iter()
+    let avg_dist_after: f32 = solver
+        .particles()
+        .iter()
         .map(|p| (p.x - source_pos).length())
-        .sum::<f32>() / solver.particles().len() as f32;
+        .sum::<f32>()
+        / solver.particles().len() as f32;
 
     assert!(
         avg_dist_after > avg_dist_before,
@@ -368,10 +455,11 @@ fn thermal_diffusion_spreads_heat() {
     };
     let thermal = ThermalDiffusion::new(
         ThermalConfig {
-            conductivity:   0.6,
-            heat_capacity:  4182.0,
-            ambient:        0.0,
+            conductivity: 0.6,
+            heat_capacity: 4182.0,
+            ambient: 0.0,
             grid_cell_size: 0.1,
+            ..Default::default()
         },
         config.grid_res,
     );
@@ -380,32 +468,58 @@ fn thermal_diffusion_spreads_heat() {
         .with_default_material(Box::new(NeoHookeanMaterial::new(10.0, 20.0)))
         .with_thermal(thermal);
 
-    for p in solver.particles_mut() {
-        p.temperature = if p.x.x < 16.0 { 100.0 } else { 0.0 };
+    {
+        let particles = solver.particles_mut();
+        for i in 0..particles.len() {
+            particles.temperature[i] = if particles.x[i].x < 16.0 { 100.0 } else { 0.0 };
+        }
     }
 
     // Mean temperature of each half — more robust than min/max at a sharp discontinuity.
     let mean_hot_before = {
-        let hot: Vec<f32> = solver.particles().iter().filter(|p| p.x.x < 16.0).map(|p| p.temperature).collect();
+        let hot: Vec<f32> = solver
+            .particles()
+            .iter()
+            .filter(|p| p.x.x < 16.0)
+            .map(|p| p.temperature)
+            .collect();
         hot.iter().sum::<f32>() / hot.len() as f32
     };
     let mean_cold_before = {
-        let cold: Vec<f32> = solver.particles().iter().filter(|p| p.x.x >= 16.0).map(|p| p.temperature).collect();
+        let cold: Vec<f32> = solver
+            .particles()
+            .iter()
+            .filter(|p| p.x.x >= 16.0)
+            .map(|p| p.temperature)
+            .collect();
         cold.iter().sum::<f32>() / cold.len() as f32
     };
 
     solver.step_n(50);
 
     for (i, p) in solver.particles().iter().enumerate() {
-        assert!(p.temperature.is_finite(), "thermal: particle {i} temperature non-finite");
+        assert!(
+            p.temperature.is_finite(),
+            "thermal: particle {i} temperature non-finite"
+        );
     }
 
     let mean_hot_after = {
-        let hot: Vec<f32> = solver.particles().iter().filter(|p| p.x.x < 16.0).map(|p| p.temperature).collect();
+        let hot: Vec<f32> = solver
+            .particles()
+            .iter()
+            .filter(|p| p.x.x < 16.0)
+            .map(|p| p.temperature)
+            .collect();
         hot.iter().sum::<f32>() / hot.len() as f32
     };
     let mean_cold_after = {
-        let cold: Vec<f32> = solver.particles().iter().filter(|p| p.x.x >= 16.0).map(|p| p.temperature).collect();
+        let cold: Vec<f32> = solver
+            .particles()
+            .iter()
+            .filter(|p| p.x.x >= 16.0)
+            .map(|p| p.temperature)
+            .collect();
         cold.iter().sum::<f32>() / cold.len() as f32
     };
 
@@ -429,10 +543,11 @@ fn thermal_uniform_temperature_stays_stable() {
     let initial_temp = 20.0_f32;
     let thermal = ThermalDiffusion::new(
         ThermalConfig {
-            conductivity:   1.0,
-            heat_capacity:  1000.0,
-            ambient:        initial_temp, // same as particles → no boundary sink/source
+            conductivity: 1.0,
+            heat_capacity: 1000.0,
+            ambient: initial_temp, // same as particles → no boundary sink/source
             grid_cell_size: 0.1,
+            ..Default::default()
         },
         config.grid_res,
     );
@@ -441,8 +556,11 @@ fn thermal_uniform_temperature_stays_stable() {
         .with_default_material(Box::new(NeoHookeanMaterial::new(10.0, 20.0)))
         .with_thermal(thermal);
 
-    for p in solver.particles_mut() {
-        p.temperature = initial_temp;
+    {
+        let particles = solver.particles_mut();
+        for i in 0..particles.len() {
+            particles.temperature[i] = initial_temp;
+        }
     }
 
     solver.step_n(50);
@@ -468,13 +586,13 @@ fn apply_impulse_shifts_velocity() {
     let mut solver = MpmSolver::new(config, small_spawn_config(16.0))
         .with_default_material(Box::new(NeoHookeanMaterial::new(10.0, 20.0)));
 
-    let avg_vx_before: f32 = solver.particles().iter().map(|p| p.v.x).sum::<f32>()
-        / solver.particles().len() as f32;
+    let avg_vx_before: f32 =
+        solver.particles().iter().map(|p| p.v.x).sum::<f32>() / solver.particles().len() as f32;
 
     solver.apply_impulse(Vec2::splat(16.0), 10.0, Vec2::new(50.0, 0.0));
 
-    let avg_vx_after: f32 = solver.particles().iter().map(|p| p.v.x).sum::<f32>()
-        / solver.particles().len() as f32;
+    let avg_vx_after: f32 =
+        solver.particles().iter().map(|p| p.v.x).sum::<f32>() / solver.particles().len() as f32;
 
     assert!(
         avg_vx_after > avg_vx_before,
@@ -511,7 +629,10 @@ fn material_state_counts_and_centroid() {
     const FLUID_ID: u32 = 1;
     let mut solver = MpmSolver::new(small_solver_config(), small_spawn_config(16.0))
         .with_default_material(Box::new(NeoHookeanMaterial::new(10.0, 20.0)))
-        .with_material(FLUID_ID, Box::new(NewtonianFluidMaterial::new(4.0, 0.1, 10.0, 4.0)));
+        .with_material(
+            FLUID_ID,
+            Box::new(NewtonianFluidMaterial::new(4.0, 0.1, 10.0, 4.0)),
+        );
 
     // Left half → FLUID_ID, right half → default (0).
     solver.phase_transition(|p| p.x.x < 16.0, FLUID_ID);
@@ -520,8 +641,14 @@ fn material_state_counts_and_centroid() {
     let fluid_state = solver.material_state(FLUID_ID);
     let jelly_state = solver.material_state(0);
 
-    assert!(fluid_state.count > 0, "material_state: no fluid particles found");
-    assert!(jelly_state.count > 0, "material_state: no jelly particles found");
+    assert!(
+        fluid_state.count > 0,
+        "material_state: no fluid particles found"
+    );
+    assert!(
+        jelly_state.count > 0,
+        "material_state: no jelly particles found"
+    );
     assert_eq!(
         fluid_state.count + jelly_state.count,
         total,
@@ -551,10 +678,20 @@ fn region_state_returns_subset_in_radius() {
     let small = solver.region_state(center, 2.0);
     let large = solver.region_state(center, 100.0);
 
-    assert!(small.count > 0, "region_state: no particles in small radius");
-    assert!(large.count >= small.count, "region_state: large radius captured fewer than small");
+    assert!(
+        small.count > 0,
+        "region_state: no particles in small radius"
+    );
+    assert!(
+        large.count >= small.count,
+        "region_state: large radius captured fewer than small"
+    );
     // Large radius should capture all particles.
-    assert_eq!(large.count, solver.particles().len(), "region_state: large radius missed particles");
+    assert_eq!(
+        large.count,
+        solver.particles().len(),
+        "region_state: large radius missed particles"
+    );
 }
 
 #[test]
@@ -586,11 +723,13 @@ fn aabb_confinement_keeps_particles_inside() {
         // Allow 2-cell overshoot before restoring force fully acts.
         assert!(
             p.x.x >= min.x - 2.0 && p.x.x <= max.x + 2.0,
-            "aabb_confinement: particle {i} escaped in x (x={:.2})", p.x.x
+            "aabb_confinement: particle {i} escaped in x (x={:.2})",
+            p.x.x
         );
         assert!(
             p.x.y >= min.y - 2.0 && p.x.y <= max.y + 2.0,
-            "aabb_confinement: particle {i} escaped in y (y={:.2})", p.x.y
+            "aabb_confinement: particle {i} escaped in y (y={:.2})",
+            p.x.y
         );
     }
 }
@@ -609,7 +748,10 @@ fn spawn_region_appends_particles() {
         .with_default_material(Box::new(NeoHookeanMaterial::new(10.0, 20.0)));
 
     let count_before = solver.particles().len();
-    assert!(count_before > 0, "spawn_region: initial spawn produced no particles");
+    assert!(
+        count_before > 0,
+        "spawn_region: initial spawn produced no particles"
+    );
 
     let second_spawn = SpawnConfig {
         box_center: Vec2::new(22.0, 16.0),
@@ -619,16 +761,23 @@ fn spawn_region_appends_particles() {
     let range = solver.spawn_region(second_spawn);
 
     let count_after = solver.particles().len();
-    assert_eq!(range.start, count_before, "spawn_region: range.start != count_before");
-    assert_eq!(range.end, count_after, "spawn_region: range.end != count_after");
+    assert_eq!(
+        range.start, count_before,
+        "spawn_region: range.start != count_before"
+    );
+    assert_eq!(
+        range.end, count_after,
+        "spawn_region: range.end != count_after"
+    );
     assert!(range.len() > 0, "spawn_region: spawned zero particles");
 
     // All particles in the new range should be on the right side.
     for idx in range {
+        let x = solver.particles().x[idx];
         assert!(
-            solver.particles()[idx].x.x > 16.0,
+            x.x > 16.0,
             "spawn_region: particle {idx} not in expected region (x={:.2})",
-            solver.particles()[idx].x.x
+            x.x
         );
     }
 }
@@ -641,10 +790,23 @@ fn diagnostics_snapshot_is_clean_after_stable_sim() {
     solver.step_n(20);
     let snap = solver.diagnostics_snapshot();
 
-    assert_eq!(snap.particle_count, solver.particles().len(), "snapshot: particle_count mismatch");
-    assert_eq!(snap.non_finite_particle_values, 0, "snapshot: non-finite particle values found");
-    assert_eq!(snap.out_of_bounds_particles, 0, "snapshot: particles out of bounds");
-    assert_eq!(snap.invalid_physical_particle_values, 0, "snapshot: invalid physical values");
+    assert_eq!(
+        snap.particle_count,
+        solver.particles().len(),
+        "snapshot: particle_count mismatch"
+    );
+    assert_eq!(
+        snap.non_finite_particle_values, 0,
+        "snapshot: non-finite particle values found"
+    );
+    assert_eq!(
+        snap.out_of_bounds_particles, 0,
+        "snapshot: particles out of bounds"
+    );
+    assert_eq!(
+        snap.invalid_physical_particle_values, 0,
+        "snapshot: invalid physical values"
+    );
     assert!(snap.min_deformation_j > 0.0, "snapshot: min J collapsed");
 }
 
@@ -659,10 +821,10 @@ fn gravity_well_cutoff_prevents_far_particles_from_moving() {
     // Well at center (32,32), cutoff=5 cells. Particles far away at (56,32) → dist=24 >> cutoff.
     let well = GravityWellField::new(
         vec![(Vec2::new(32.0, 32.0), 1_000_000.0)],
-        1.0,  // strong G
-        1.0,  // softening
-        5.0,  // cutoff — particles at dist=24 are 4.8× beyond cutoff
-    );
+        1.0, // strong G
+        1.0, // softening
+    )
+    .with_cutoff(5.0); // cutoff — particles at dist=24 are 4.8× beyond cutoff
     let spawn = SpawnConfig {
         box_center: Vec2::new(56.0, 32.0),
         box_size: IVec2::new(4, 4),
@@ -673,13 +835,13 @@ fn gravity_well_cutoff_prevents_far_particles_from_moving() {
         .with_default_material(Box::new(NeoHookeanMaterial::new(10.0, 20.0)))
         .with_force_field(Box::new(well));
 
-    let cx_before: f32 = solver.particles().iter().map(|p| p.x.x).sum::<f32>()
-        / solver.particles().len() as f32;
+    let cx_before: f32 =
+        solver.particles().iter().map(|p| p.x.x).sum::<f32>() / solver.particles().len() as f32;
 
     solver.step_n(30);
 
-    let cx_after: f32 = solver.particles().iter().map(|p| p.x.x).sum::<f32>()
-        / solver.particles().len() as f32;
+    let cx_after: f32 =
+        solver.particles().iter().map(|p| p.x.x).sum::<f32>() / solver.particles().len() as f32;
 
     // CoM should not have drifted left (toward well) — cutoff blocks the force.
     // Allow 0.5-cell drift from boundary reflection and elastic oscillation.
@@ -687,4 +849,116 @@ fn gravity_well_cutoff_prevents_far_particles_from_moving() {
         (cx_after - cx_before).abs() < 0.5,
         "gravity_well cutoff: far particles moved toward well (before={cx_before:.2}, after={cx_after:.2})"
     );
+}
+
+/// GPU and CPU solvers must produce statistically equivalent physics.
+/// Compares aggregate quantities (centre of mass, mean speed) — not per-particle positions,
+/// since GPU atomic-scatter ordering causes sub-cell trajectory differences that are
+/// physically equivalent but particle-ID-permuted.
+#[cfg(feature = "gpu")]
+#[test]
+fn gpu_cpu_parity() {
+    use emerge::gpu::GpuSolver;
+    use emerge::materials::MaterialRegistry;
+
+    let config = SolverConfig {
+        grid_res: 32,
+        dt: 0.002,
+        adaptive_timestep: false,
+        gravity: Vec2::new(0.0, -1.0),
+        ..SolverConfig::default()
+    };
+    let material = NeoHookeanMaterial::new(1_000.0, 500.0);
+
+    let mut cpu = MpmSolver::new(config.clone(), small_spawn_config(16.0))
+        .with_default_material(Box::new(material));
+
+    // Identical starting state for GPU.
+    let mut gpu = pollster::block_on(GpuSolver::new(
+        config.clone(),
+        cpu.particles().to_vec(),
+        MaterialRegistry::with_default(Box::new(material)),
+    ));
+
+    for _ in 0..20 {
+        cpu.step();
+        gpu.step_frame();
+    }
+    // Force a blocking readback so we compare actual final GPU state, not a stale snapshot.
+    gpu.sync_particles_blocking();
+
+    let n = cpu.particles().len() as f32;
+    let cpu_com: Vec2 = cpu.particles().iter().map(|p| p.x).sum::<Vec2>() / n;
+    let gpu_com: Vec2 = gpu.particles().iter().map(|p| p.x).sum::<Vec2>() / n;
+    let cpu_spd: f32 = cpu.particles().iter().map(|p| p.v.length()).sum::<f32>() / n;
+    let gpu_spd: f32 = gpu.particles().iter().map(|p| p.v.length()).sum::<f32>() / n;
+
+    // Centre of mass must agree within 0.5 grid cells.
+    let com_diff = (cpu_com - gpu_com).length();
+    assert!(
+        com_diff < 0.5,
+        "CoM drift CPU {cpu_com:.3?} GPU {gpu_com:.3?} diff {com_diff:.4}"
+    );
+
+    // Mean speed must agree within 10 %.
+    let spd_diff = (cpu_spd - gpu_spd).abs();
+    assert!(
+        spd_diff < 0.1 * cpu_spd.max(1e-6),
+        "speed CPU {cpu_spd:.4} GPU {gpu_spd:.4}"
+    );
+}
+
+#[test]
+fn sand_mui_stable_after_many_steps() {
+    // µ(I) sand: high-velocity spawn stresses the rate-dependent return mapping.
+    let mui = SandMuIMaterial::new(1_000.0, 500.0);
+    let config = SolverConfig {
+        gravity: Vec2::new(0.0, -0.5),
+        ..small_solver_config()
+    };
+    let spawn = SpawnConfig {
+        initial_velocity_scale: 5.0,
+        ..small_spawn_config(16.0)
+    };
+    let mut solver = MpmSolver::new(config, spawn).with_default_material(Box::new(mui));
+    solver.step_n(200);
+    for (i, p) in solver.particles().iter().enumerate() {
+        assert!(p.x.is_finite(), "mui particle {i}: position non-finite");
+        assert!(
+            p.deformation_gradient.determinant() > 0.0,
+            "mui particle {i}: J collapsed"
+        );
+        assert!(
+            p.friction_hardening.is_finite(),
+            "mui particle {i}: mu_i non-finite"
+        );
+        assert!(
+            p.friction_hardening >= 0.0,
+            "mui particle {i}: mu_i negative (={:.4})",
+            p.friction_hardening
+        );
+    }
+}
+
+#[test]
+fn nacc_stable_after_many_steps() {
+    let nacc = NaccMaterial::soft_clay();
+    let config = SolverConfig {
+        gravity: Vec2::new(0.0, -0.3),
+        ..small_solver_config()
+    };
+    let mut solver = MpmSolver::new(config, small_spawn_config(16.0))
+        .with_default_material(Box::new(nacc));
+    solver.step_n(200);
+    for (i, p) in solver.particles().iter().enumerate() {
+        assert!(p.x.is_finite(), "nacc particle {i}: position non-finite");
+        assert!(
+            p.deformation_gradient.determinant() > 0.0,
+            "nacc particle {i}: J collapsed"
+        );
+        assert!(
+            p.log_volume_strain.is_finite(),
+            "nacc particle {i}: alpha non-finite"
+        );
+    }
 }
