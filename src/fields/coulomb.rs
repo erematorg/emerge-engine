@@ -21,9 +21,9 @@ use std::collections::HashMap;
 
 use glam::Vec2;
 
+use crate::fields::{FADE_ONSET_RATIO, ForceField};
+use crate::particle::Particles;
 use crate::solver::cutoff::smooth_cutoff;
-use crate::fields::{ForceField, FADE_ONSET_RATIO};
-use crate::particle::Particle;
 
 /// Electrostatic acceleration from external point charges, affecting particles by material.
 pub struct CoulombField {
@@ -90,25 +90,23 @@ impl CoulombField {
 }
 
 impl ForceField for CoulombField {
-    fn acceleration(&self, particle: &Particle) -> Vec2 {
-        // Look up this particle's charge. Neutral particles skip immediately.
-        let q_particle = match self.material_charges.get(&particle.material_id) {
+    fn acceleration(&self, particles: &Particles, i: usize) -> Vec2 {
+        let q_particle = match self.material_charges.get(&particles.material_id[i]) {
             Some(&q) if q.abs() > f32::EPSILON => q,
             _ => return Vec2::ZERO,
         };
 
         let mut acc = Vec2::ZERO;
         let eps2 = self.softening * self.softening;
-        // Divide by mass to convert force → acceleration.
-        // Avoid division by zero if mass is somehow zero.
-        let inv_mass = if particle.mass > f32::EPSILON {
-            1.0 / particle.mass
+        let inv_mass = if particles.mass[i] > f32::EPSILON {
+            1.0 / particles.mass[i]
         } else {
             0.0
         };
+        let x = particles.x[i];
 
         for &(src_pos, q_src) in &self.sources {
-            let r_vec = particle.x - src_pos; // vector from source to particle
+            let r_vec = x - src_pos; // vector from source to particle
             let r2 = r_vec.length_squared();
             let r = r2.sqrt();
 

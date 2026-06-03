@@ -1,7 +1,7 @@
 use glam::{Mat2, Vec2};
 
 use crate::materials::{ConstitutiveModel, MaterialModel, MaterialParams};
-use crate::particle::Particle;
+use crate::particle::Particles;
 
 /// Bingham viscoplastic fluid.
 ///
@@ -145,19 +145,19 @@ impl MaterialModel for BinghamFluidMaterial {
         ConstitutiveModel::Fluid
     }
 
-    fn kirchhoff_stress(&self, particle: &Particle) -> Mat2 {
+    fn kirchhoff_stress(&self, particles: &Particles, i: usize) -> Mat2 {
         // Pressure from Tait EOS (same as NewtonianFluid)
-        let density = particle.density.max(self.min_density);
+        let density = particles.density[i].max(self.min_density);
         let pressure = (self.eos_stiffness
             * ((density / self.rest_density).powf(self.eos_power) - 1.0))
             .max(self.pressure_floor);
 
         let hydrostatic = Mat2::from_diagonal(Vec2::splat(-pressure));
-        let deviatoric = self.deviatoric_stress(particle.velocity_gradient);
+        let deviatoric = self.deviatoric_stress(particles.velocity_gradient[i]);
 
         // Surface tension: τ += γ·J·I
         let surface = if self.surface_tension_coeff != 0.0 {
-            let f = particle.deformation_gradient;
+            let f = particles.deformation_gradient[i];
             let j = f.x_axis.x * f.y_axis.y - f.x_axis.y * f.y_axis.x;
             Mat2::from_diagonal(Vec2::splat(self.surface_tension_coeff * j))
         } else {
@@ -167,19 +167,19 @@ impl MaterialModel for BinghamFluidMaterial {
         hydrostatic + deviatoric + surface
     }
 
-    fn stress_volume(&self, particle: &Particle) -> f32 {
-        particle.volume.max(self.min_volume)
+    fn stress_volume(&self, particles: &Particles, i: usize) -> f32 {
+        particles.volume[i].max(self.min_volume)
     }
 
-    fn update_particle(&self, particle: &mut Particle, dt: f32) {
-        let j = particle.deformation_gradient.determinant().clamp(0.5, 2.0);
+    fn update_particle(&self, particles: &mut Particles, i: usize, dt: f32) {
+        let j = particles.deformation_gradient[i]
+            .determinant()
+            .clamp(0.5, 2.0);
         let s = j.sqrt();
-        particle.deformation_gradient = glam::Mat2::from_cols(
-            glam::Vec2::new(s, 0.0),
-            glam::Vec2::new(0.0, s),
-        );
+        particles.deformation_gradient[i] =
+            glam::Mat2::from_cols(glam::Vec2::new(s, 0.0), glam::Vec2::new(0.0, s));
         if self.settling_damping > 0.0 {
-            particle.v *= 1.0 - (self.settling_damping * dt).min(0.5);
+            particles.v[i] *= 1.0 - (self.settling_damping * dt).min(0.5);
         }
     }
 
@@ -201,12 +201,13 @@ impl MaterialModel for BinghamFluidMaterial {
 
     fn timestep_bound(
         &self,
-        particle: &Particle,
+        particles: &Particles,
+        i: usize,
         cell_width: f32,
         material_cfl: f32,
         viscous_cfl: f32,
     ) -> f32 {
-        let density = particle.density.max(self.min_density);
+        let density = particles.density[i].max(self.min_density);
         let ratio = (density / self.rest_density.max(self.min_density)).max(1.0e-6);
 
         let mut dt_bound = f32::INFINITY;

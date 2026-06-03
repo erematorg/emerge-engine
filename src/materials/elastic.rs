@@ -2,7 +2,7 @@ use glam::Mat2;
 
 use crate::materials::utils::{MIN_J, elastic_wave_dt, lame_from_young};
 use crate::materials::{ConstitutiveModel, MaterialModel, MaterialParams};
-use crate::particle::Particle;
+use crate::particle::Particles;
 
 /// Compressible Neo-Hookean hyperelastic solid (jelly, soft tissue).
 ///
@@ -50,15 +50,15 @@ impl MaterialModel for NeoHookeanMaterial {
         ConstitutiveModel::NeoHookean
     }
 
-    fn kirchhoff_stress(&self, particle: &Particle) -> Mat2 {
-        let f = particle.deformation_gradient;
+    fn kirchhoff_stress(&self, particles: &Particles, i: usize) -> Mat2 {
+        let f = particles.deformation_gradient[i];
         let j = f.determinant();
         if j <= MIN_J {
             return Mat2::ZERO;
         }
 
         // Thermal modulus scaling: λ_eff = λ·(1 + α·T), same for µ.
-        let t_scale = 1.0 + self.thermal_expansion * particle.temperature;
+        let t_scale = 1.0 + self.thermal_expansion * particles.temperature[i];
         let mu = self.mu * t_scale;
         let lambda = self.lambda * t_scale;
 
@@ -80,16 +80,18 @@ impl MaterialModel for NeoHookeanMaterial {
         dev_stress + vol_stress
     }
 
-    fn stress_volume(&self, particle: &Particle) -> f32 {
+    fn stress_volume(&self, particles: &Particles, i: usize) -> f32 {
         // Kirchhoff stress is returned directly → scatter with V₀, not current volume.
-        particle.initial_volume
+        particles.initial_volume[i]
     }
 
-    fn update_particle(&self, particle: &mut Particle, dt: f32) {
-        let fp_new = Mat2::IDENTITY + dt * particle.velocity_gradient;
-        particle.deformation_gradient = fp_new * particle.deformation_gradient;
-        let j = particle.deformation_gradient.determinant().max(MIN_J);
-        particle.sync_volume_and_density(j);
+    fn update_particle(&self, particles: &mut Particles, i: usize, dt: f32) {
+        let fp_new = Mat2::IDENTITY + dt * particles.velocity_gradient[i];
+        particles.deformation_gradient[i] = fp_new * particles.deformation_gradient[i];
+        let j = particles.deformation_gradient[i].determinant().max(MIN_J);
+        let v = (particles.initial_volume[i] * j).max(1.0e-6);
+        particles.volume[i] = v;
+        particles.density[i] = particles.mass[i] / v;
     }
 
     fn activation_scale(&self) -> f32 {
@@ -107,7 +109,22 @@ impl MaterialModel for NeoHookeanMaterial {
         }
     }
 
-    fn timestep_bound(&self, particle: &Particle, cell_width: f32, material_cfl: f32, _viscous_cfl: f32) -> f32 {
-        elastic_wave_dt(self.lambda, self.mu, 1.0, particle.density, self.min_density, cell_width, material_cfl)
+    fn timestep_bound(
+        &self,
+        particles: &Particles,
+        i: usize,
+        cell_width: f32,
+        material_cfl: f32,
+        _viscous_cfl: f32,
+    ) -> f32 {
+        elastic_wave_dt(
+            self.lambda,
+            self.mu,
+            1.0,
+            particles.density[i],
+            self.min_density,
+            cell_width,
+            material_cfl,
+        )
     }
 }

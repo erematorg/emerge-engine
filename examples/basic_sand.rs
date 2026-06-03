@@ -10,8 +10,8 @@
 use bevy::prelude::*;
 use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
 use emerge::diagnostics::log_frame_full;
-use emerge::{MpmSolver, SandMaterial, SlipBoundary, SolverConfig, SpawnConfig};
 use emerge::runtime::fixed_step::FixedStepController;
+use emerge::{MpmSolver, SandMaterial, SlipBoundary, SolverConfig, SpawnConfig};
 use glam::{IVec2, Vec2};
 
 const GRID: usize = 64;
@@ -58,7 +58,8 @@ impl Sim {
         let config = SolverConfig {
             boundary_thickness: 3,
             max_substeps_per_step: 12,
-            ..SolverConfig::standard(GRID, DT, Vec2::new(0.0, p.gravity))
+            gravity: Vec2::new(0.0, p.gravity),
+            ..SolverConfig::earth(GRID, 0.01, DT)
         };
         // Left pile: loose sand
         let spawn_loose = SpawnConfig {
@@ -86,7 +87,7 @@ impl Sim {
             .with_default_material(Box::new(make_sand(p.lambda, p.mu, p.loose_phi)))
             .with_material(MAT_DENSE, Box::new(make_sand(p.lambda, p.mu, p.dense_phi)))
             .with_boundary(Box::new(SlipBoundary::new(config.boundary_thickness)));
-        let _ = solver.spawn_region(spawn_dense);
+        let _ = solver.spawn_group(spawn_dense);
         Self {
             solver,
             stepper: FixedStepController::standard(DT, p.hz),
@@ -141,7 +142,10 @@ fn setup(mut commands: Commands, sim: Res<Sim>) {
     for (i, p) in sim.solver.particles().iter().enumerate() {
         commands.spawn((
             Sprite::from_color(sand_color(p.material_id, p.friction_hardening), Vec2::ONE),
-            Transform { translation: p2w(p.x), ..default() },
+            Transform {
+                translation: p2w(p.x),
+                ..default()
+            },
             PVis(i),
         ));
     }
@@ -166,11 +170,19 @@ fn cursor(
         return;
     }
     let Ok(win) = windows.single() else { return };
-    let Some(cp) = win.cursor_position() else { return };
+    let Some(cp) = win.cursor_position() else {
+        return;
+    };
     let Ok((cam, ct)) = cam.single() else { return };
-    let Ok(wp) = cam.viewport_to_world_2d(ct, cp) else { return };
+    let Ok(wp) = cam.viewport_to_world_2d(ct, cp) else {
+        return;
+    };
     let gp = wp / PPC + Vec2::splat(GRID as f32 * 0.5);
-    let sign = if mb.pressed(MouseButton::Right) { -1.0 } else { 1.0 };
+    let sign = if mb.pressed(MouseButton::Right) {
+        -1.0
+    } else {
+        1.0
+    };
     let strength = params.cursor_strength;
     let radius = params.cursor_radius;
     let speed_cap = strength * 0.4;
@@ -181,7 +193,9 @@ fn cursor(
         if dist < radius && dist > 1e-4 {
             p.v += (d / dist) * sign * strength * (1.0 - dist / radius) * dt;
             let s = p.v.length();
-            if s > speed_cap { p.v *= speed_cap / s; }
+            if s > speed_cap {
+                p.v *= speed_cap / s;
+            }
         }
     });
 }
@@ -190,14 +204,19 @@ fn step(time: Res<Time>, mut sim: ResMut<Sim>, params: Res<Params>) {
     sim.solver.set_gravity(Vec2::new(0.0, params.gravity));
     sim.stepper.set_simulation_speed(params.hz * DT);
     let n = sim.stepper.steps_for_frame(time.delta_secs());
-    if n == 0 { return; }
+    if n == 0 {
+        return;
+    }
     if sim.prev != *params {
-        sim.solver.set_default_material(Box::new(
-            make_sand(params.lambda, params.mu, params.loose_phi),
-        ));
-        sim.solver.set_material(MAT_DENSE, Box::new(
-            make_sand(params.lambda, params.mu, params.dense_phi),
-        ));
+        sim.solver.set_default_material(Box::new(make_sand(
+            params.lambda,
+            params.mu,
+            params.loose_phi,
+        )));
+        sim.solver.set_material(
+            MAT_DENSE,
+            Box::new(make_sand(params.lambda, params.mu, params.dense_phi)),
+        );
         sim.prev = *params;
     }
     sim.solver.step_n(n);
@@ -245,10 +264,22 @@ fn ui(mut ctx: EguiContexts, mut p: ResMut<Params>, mut sim: ResMut<Sim>, time: 
             ui.label("↑ steeper φ → steeper pile slope");
             ui.separator();
             ui.label("Stiffness (shared)");
-            ui.add(egui::Slider::new(&mut p.lambda, 1000.0..=100000.0).text("λ").logarithmic(true));
-            ui.add(egui::Slider::new(&mut p.mu, 500.0..=80000.0).text("µ").logarithmic(true));
+            ui.add(
+                egui::Slider::new(&mut p.lambda, 1000.0..=100000.0)
+                    .text("λ")
+                    .logarithmic(true),
+            );
+            ui.add(
+                egui::Slider::new(&mut p.mu, 500.0..=80000.0)
+                    .text("µ")
+                    .logarithmic(true),
+            );
             ui.separator();
-            ui.add(egui::Slider::new(&mut p.cursor_strength, 5.0..=500.0).text("cursor force").logarithmic(true));
+            ui.add(
+                egui::Slider::new(&mut p.cursor_strength, 5.0..=500.0)
+                    .text("cursor force")
+                    .logarithmic(true),
+            );
             ui.add(egui::Slider::new(&mut p.cursor_radius, 1.0..=20.0).text("cursor radius"));
             ui.label("LMB: push  RMB: pull  R: reset");
             if ui.button("Reset (R)").clicked() {

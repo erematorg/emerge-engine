@@ -58,11 +58,14 @@ pub struct SolverConfig {
     /// this many times its initial volume without fracturing or flowing first.
     /// Default 50.0. Set higher for extreme-deformation sims (explosions, impacts).
     pub j_max: f32,
+    /// Speed below which a passive (activation == 0) particle becomes eligible for sleep.
+    /// 0.0 = sleep disabled. Typical: 0.01–0.05 grid-cells/s.
+    /// Sleeping particles skip P2G and G2P entirely; woken by neighbouring active cells.
+    pub sleep_threshold: f32,
 
     // ── Physical unit scaling ──────────────────────────────────────────────────
     // Default 1.0 = simulation units (no scaling). Set these to enable SI-calibrated materials.
     // Use `lame_from_si` / `gravity_to_grid` in `materials::utils` to convert SI values.
-
     /// Physical length of one grid cell in meters. Default 1.0 (grid units).
     ///
     /// Example: if the simulation domain is 64 cells representing 0.64 m, set `dx_meters = 0.01`.
@@ -98,6 +101,7 @@ impl Default for SolverConfig {
             max_substeps_per_step: 64,
             apic_blend: 1.0,
             j_max: 50.0,
+            sleep_threshold: 0.0,
             dx_meters: 1.0,
             dt_seconds: 1.0,
         }
@@ -121,6 +125,36 @@ impl SolverConfig {
             // Reference: incremental_mpm two-pass P2G, basic_fluids.rs explicit setting.
             recompute_density_each_step: true,
             ..Self::default()
+        }
+    }
+
+    /// Earth-scale simulation preset.
+    ///
+    /// Derives gravity and unit scaling from real physical constants so that
+    /// material parameters passed via `lame_from_si` produce correct behaviour.
+    ///
+    /// # Arguments
+    /// * `grid_res`    — number of cells per side
+    /// * `cell_m`      — physical size of one grid cell in metres (e.g. `0.01` for 1 cm)
+    /// * `dt`          — frame time step in simulation seconds (e.g. `0.05`)
+    ///
+    /// # Derived values
+    /// `gravity_solver = 9.81 / cell_m` cells/s² (downward, −Y).
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// # use emerge::SolverConfig;
+    /// // 64-cell domain, 1 cm/cell → g = 981 cells/s²
+    /// let config = SolverConfig::earth(64, 0.01, 0.05);
+    /// ```
+    pub fn earth(grid_res: usize, cell_m: f32, dt: f32) -> Self {
+        // g [cells/s²] = 9.81 [m/s²] / cell_m [m/cell]
+        // Derived from v += gravity * sub_dt where sub_dt is in real seconds.
+        let g_solver = 9.81 / cell_m;
+        Self {
+            dx_meters: cell_m,
+            dt_seconds: dt,
+            ..Self::standard(grid_res, dt, Vec2::new(0.0, -g_solver))
         }
     }
 
@@ -165,7 +199,10 @@ impl SolverConfig {
             "default_initial_volume must be positive"
         );
         assert!(self.j_max > 1.0, "j_max must be > 1.0");
-        assert!((0.0..=1.0).contains(&self.apic_blend), "apic_blend must be in [0, 1]");
+        assert!(
+            (0.0..=1.0).contains(&self.apic_blend),
+            "apic_blend must be in [0, 1]"
+        );
         assert!(
             self.boundary_thickness > 0 && self.boundary_thickness < self.grid_res - 1,
             "boundary_thickness must be in [1, grid_res-2]"
@@ -321,7 +358,13 @@ impl SpawnConfig {
                 && max.y <= domain_max,
             "spawn region must stay inside the simulation domain \
              (boundary_thickness={}, grid_res={}): box [{:.1},{:.1}]–[{:.1},{:.1}]",
-            solver.boundary_thickness, solver.grid_res, min.x, min.y, max.x, max.y
+            solver.boundary_thickness,
+            solver.grid_res,
+            min.x,
+            min.y,
+            max.x,
+            max.y
         );
     }
 }
+

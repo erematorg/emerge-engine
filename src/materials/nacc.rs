@@ -1,9 +1,9 @@
 use glam::{Mat2, Vec2};
 
+use crate::materials::svd::svd2;
 use crate::materials::utils::{MIN_J, elastic_wave_dt, lame_from_young};
 use crate::materials::{ConstitutiveModel, MaterialModel, MaterialParams};
-use crate::particle::Particle;
-use crate::materials::svd::svd2;
+use crate::particle::{Particle, Particles};
 
 /// Non-Associated Cam-Clay (NACC) elastoplastic solid.
 ///
@@ -66,7 +66,13 @@ impl NaccMaterial {
 
     /// Construct from Young's modulus E and Poisson's ratio ν.
     /// Friction slope M and cohesion β set separately.
-    pub fn from_young_modulus(young_modulus: f32, poisson_ratio: f32, friction: f32, cohesion: f32, hardening_factor: f32) -> Self {
+    pub fn from_young_modulus(
+        young_modulus: f32,
+        poisson_ratio: f32,
+        friction: f32,
+        cohesion: f32,
+        hardening_factor: f32,
+    ) -> Self {
         let (lambda, mu) = lame_from_young(young_modulus, poisson_ratio);
         let kappa = lambda + (2.0 / 3.0) * mu;
         Self::new(mu, kappa, friction, cohesion, hardening_factor)
@@ -160,7 +166,8 @@ impl NaccMaterial {
         }
 
         // Hardening: move p₀ to reduce y to zero.
-        if self.hardening_enabled && p0 > 1.0e-4 && p_tr < p0 - 1.0e-4 && p_tr > -beta * p0 + 1.0e-4 {
+        if self.hardening_enabled && p0 > 1.0e-4 && p_tr < p0 - 1.0e-4 && p_tr > -beta * p0 + 1.0e-4
+        {
             let p_c = (1.0 - beta) * p0 * 0.5;
             let q_tr = (2.0_f32).sqrt() * s_tr.length();
             let dir = Vec2::new(p_c - p_tr, -q_tr);
@@ -173,7 +180,11 @@ impl NaccMaterial {
             let l2 = (-b - discr) / (2.0 * a);
             let p1 = p_c + l1 * dir.x;
             let p2 = p_c + l2 * dir.x;
-            let p_x = if (p_tr - p_c) * (p1 - p_c) > 0.0 { p1 } else { p2 };
+            let p_x = if (p_tr - p_c) * (p1 - p_c) > 0.0 {
+                p1
+            } else {
+                p2
+            };
             let j_e_x = (-2.0 * p_x / self.kappa + 1.0).abs().max(1.0e-8_f32).sqrt();
             if j_e_x > 1.0e-4 {
                 alpha += (j_e_tr / j_e_x).ln();
@@ -202,12 +213,11 @@ impl MaterialModel for NaccMaterial {
         ConstitutiveModel::Nacc
     }
 
-    fn kirchhoff_stress(&self, particle: &Particle) -> Mat2 {
-        let f = particle.deformation_gradient;
+    fn kirchhoff_stress(&self, particles: &Particles, i: usize) -> Mat2 {
+        let f = particles.deformation_gradient[i];
         let j = f.determinant().max(MIN_J);
 
         // NeoHookean Simo-Pister vol-dev split, with κ = λ + 2µ/3.
-        // Identical to NeoHookeanMaterial but expressed in (κ, µ) terms.
         let b = f * f.transpose();
         let tr_b = b.x_axis.x + b.y_axis.y;
         let dev_b = b - Mat2::from_diagonal(Vec2::splat(tr_b * 0.5));
@@ -218,23 +228,23 @@ impl MaterialModel for NaccMaterial {
         dev_stress + vol_stress
     }
 
-    fn stress_volume(&self, particle: &Particle) -> f32 {
-        particle.volume
+    fn stress_volume(&self, particles: &Particles, i: usize) -> f32 {
+        particles.initial_volume[i]
     }
 
-    fn update_particle(&self, particle: &mut Particle, _dt: f32) {
-        let alpha = particle.log_volume_strain; // nacc_alpha reuses this field
-        let (new_f, new_alpha) = self.project(particle.deformation_gradient, alpha);
-        particle.deformation_gradient = new_f;
-        particle.log_volume_strain = new_alpha;
+    fn update_particle(&self, particles: &mut Particles, i: usize, _dt: f32) {
+        let alpha = particles.log_volume_strain[i];
+        let (new_f, new_alpha) = self.project(particles.deformation_gradient[i], alpha);
+        particles.deformation_gradient[i] = new_f;
+        particles.log_volume_strain[i] = new_alpha;
 
-        // Keep volume/density consistent with updated F.
         let j = new_f.determinant().max(MIN_J);
-        particle.volume = particle.initial_volume * j;
-        particle.density = if particle.volume > MIN_J {
-            particle.mass / particle.volume
+        let vol = particles.initial_volume[i] * j;
+        particles.volume[i] = vol;
+        particles.density[i] = if vol > MIN_J {
+            particles.mass[i] / vol
         } else {
-            particle.density
+            particles.density[i]
         };
     }
 
@@ -246,9 +256,24 @@ impl MaterialModel for NaccMaterial {
         true
     }
 
-    fn timestep_bound(&self, particle: &Particle, cell_width: f32, material_cfl: f32, _viscous_cfl: f32) -> f32 {
+    fn timestep_bound(
+        &self,
+        particles: &Particles,
+        i: usize,
+        cell_width: f32,
+        material_cfl: f32,
+        _viscous_cfl: f32,
+    ) -> f32 {
         let lambda = self.kappa - (2.0 / 3.0) * self.mu;
-        elastic_wave_dt(lambda, self.mu, particle.hardening_scale, particle.density, self.min_density, cell_width, material_cfl)
+        elastic_wave_dt(
+            lambda,
+            self.mu,
+            particles.hardening_scale[i],
+            particles.density[i],
+            self.min_density,
+            cell_width,
+            material_cfl,
+        )
     }
 
     fn params(&self) -> MaterialParams {
@@ -260,8 +285,8 @@ impl MaterialModel for NaccMaterial {
             lambda,
             mu: self.mu,
             hardening_exponent: self.hardening_factor,
-            compression_limit: self.cohesion,  // β
-            stretch_limit: self.friction,       // M
+            compression_limit: self.cohesion, // β
+            stretch_limit: self.friction,     // M
             ..Default::default()
         }
     }

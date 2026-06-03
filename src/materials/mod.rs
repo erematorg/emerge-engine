@@ -1,5 +1,3 @@
-pub(crate) mod svd;
-pub mod registry;
 pub mod bingham;
 pub mod corotated;
 pub mod elastic;
@@ -7,9 +5,11 @@ pub mod fluid;
 pub mod nacc;
 pub mod params;
 pub mod rankine;
+pub mod registry;
 pub mod sand;
 pub mod sand_mui;
 pub mod snow;
+pub(crate) mod svd;
 pub mod utils;
 pub mod viscoelastic;
 pub mod von_mises;
@@ -21,17 +21,19 @@ pub use fluid::NewtonianFluidMaterial;
 pub use nacc::NaccMaterial;
 pub use params::MaterialParams;
 pub use rankine::RankineMaterial;
+pub use registry::{MAX_MATERIAL_SLOTS, MaterialRegistry};
 pub use sand::SandMaterial;
 pub use sand_mui::SandMuIMaterial;
 pub use snow::SnowMaterial;
-pub use utils::{elastic_wave_dt, gravity_to_grid, lame_from_si, lame_from_young, polar_decomposition_2d};
+pub use utils::{
+    elastic_wave_dt, gravity_to_grid, lame_from_si, lame_from_young, polar_decomposition_2d,
+};
 pub use viscoelastic::ViscoelasticMaterial;
 pub use von_mises::VonMisesMaterial;
-pub use registry::{MaterialRegistry, MAX_MATERIAL_SLOTS};
 
 use glam::Mat2;
 
-use crate::particle::Particle;
+use crate::particle::{Particle, Particles};
 
 /// Identifies which constitutive model a material implements.
 /// `repr(u32)` so this discriminant can be stored directly in GPU uniform buffers.
@@ -40,16 +42,16 @@ use crate::particle::Particle;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConstitutiveModel {
     Fallback = 0,
-    Fluid = 1,         // Weakly-compressible Newtonian fluid, Tait EOS
-    NeoHookean = 2,    // Neo-Hookean hyperelastic (jelly, soft solids)
-    Corotated = 3,     // Corotated linear elastic (stiffer baseline)
-    Snow = 4,          // Corotated + SVD plasticity (Stomakhin 2013)
-    DruckerPrager = 5, // Corotated elastic + DP yield surface (sand, soil, rock)
-    VonMises = 6,      // J2 perfect plasticity — ductile flow, no hardening (lava, metal, clay)
-    Rankine = 7,       // Tensile cutoff + exponential softening — brittle rock, bone, ice
+    Fluid = 1,            // Weakly-compressible Newtonian fluid, Tait EOS
+    NeoHookean = 2,       // Neo-Hookean hyperelastic (jelly, soft solids)
+    Corotated = 3,        // Corotated linear elastic (stiffer baseline)
+    Snow = 4,             // Corotated + SVD plasticity (Stomakhin 2013)
+    DruckerPrager = 5,    // Corotated elastic + DP yield surface (sand, soil, rock)
+    VonMises = 6,         // J2 perfect plasticity — ductile flow, no hardening (lava, metal, clay)
+    Rankine = 7,          // Tensile cutoff + exponential softening — brittle rock, bone, ice
     DruckerPragerMuI = 8, // Rate-dependent DP — µ(I) rheology, granular flow
-    Viscoelastic = 9,  // Kelvin-Voigt: NeoHookean elastic + viscous dashpot in parallel
-    Nacc = 10,         // Non-Associated Cam-Clay — wet soil, clay, bio tissue under compression
+    Viscoelastic = 9,     // Kelvin-Voigt: NeoHookean elastic + viscous dashpot in parallel
+    Nacc = 10,            // Non-Associated Cam-Clay — wet soil, clay, bio tissue under compression
 }
 
 pub trait MaterialModel: Send + Sync + core::fmt::Debug {
@@ -60,18 +62,19 @@ pub trait MaterialModel: Send + Sync + core::fmt::Debug {
     }
     // Returns the Kirchhoff-like stress used by the transfer kernel.
     // The kernel applies geometry/time factors (dt, kernel_d_inverse, cell_dist, weight).
-    fn kirchhoff_stress(&self, _particle: &Particle) -> Mat2 {
+    fn kirchhoff_stress(&self, _particles: &Particles, _i: usize) -> Mat2 {
         Mat2::ZERO
     }
 
     // Returns the particle volume used in the stress contribution.
-    fn stress_volume(&self, particle: &Particle) -> f32 {
-        particle.volume
+    fn stress_volume(&self, particles: &Particles, i: usize) -> f32 {
+        particles.initial_volume[i]
     }
 
     fn timestep_bound(
         &self,
-        _particle: &Particle,
+        _particles: &Particles,
+        _i: usize,
         _cell_width: f32,
         _material_cfl: f32,
         _viscous_cfl: f32,
@@ -79,7 +82,7 @@ pub trait MaterialModel: Send + Sync + core::fmt::Debug {
         f32::INFINITY
     }
 
-    fn update_particle(&self, _particle: &mut Particle, _dt: f32) {}
+    fn update_particle(&self, _particles: &mut Particles, _i: usize, _dt: f32) {}
 
     /// Seed per-particle plastic state at spawn time.
     ///

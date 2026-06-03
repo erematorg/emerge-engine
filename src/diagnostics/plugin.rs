@@ -93,7 +93,10 @@ impl DiagnosticsRegistry {
         name: &'static str,
         f: impl Fn(&[Particle], &MpmSnapshot) -> Vec<(String, f32)> + Send + Sync + 'static,
     ) -> Self {
-        self.plugins.push(Box::new(FnPlugin { name, f: Box::new(f) }));
+        self.plugins.push(Box::new(FnPlugin {
+            name,
+            f: Box::new(f),
+        }));
         self
     }
 
@@ -108,7 +111,10 @@ impl DiagnosticsRegistry {
         name: &'static str,
         f: impl Fn(&[Particle], &MpmSnapshot) -> Vec<(String, f32)> + Send + Sync + 'static,
     ) {
-        self.plugins.push(Box::new(FnPlugin { name, f: Box::new(f) }));
+        self.plugins.push(Box::new(FnPlugin {
+            name,
+            f: Box::new(f),
+        }));
     }
 
     /// Collect one frame of diagnostics from all registered plugins.
@@ -201,7 +207,9 @@ impl fmt::Display for DiagnosticsFrame {
 pub struct ActivationStatsPlugin;
 
 impl DiagnosticsPlugin for ActivationStatsPlugin {
-    fn name(&self) -> &'static str { "activation" }
+    fn name(&self) -> &'static str {
+        "activation"
+    }
 
     fn collect(&mut self, particles: &[Particle], _snap: &MpmSnapshot) -> Vec<(String, f32)> {
         if particles.is_empty() {
@@ -211,7 +219,9 @@ impl DiagnosticsPlugin for ActivationStatsPlugin {
         let mut active = 0usize;
         for p in particles {
             sum += p.activation;
-            if p.activation > 0.01 { active += 1; }
+            if p.activation > 0.01 {
+                active += 1;
+            }
         }
         let n = particles.len() as f32;
         vec![
@@ -225,7 +235,9 @@ impl DiagnosticsPlugin for ActivationStatsPlugin {
 pub struct ThermalStatsPlugin;
 
 impl DiagnosticsPlugin for ThermalStatsPlugin {
-    fn name(&self) -> &'static str { "thermal" }
+    fn name(&self) -> &'static str {
+        "thermal"
+    }
 
     fn collect(&mut self, particles: &[Particle], _snap: &MpmSnapshot) -> Vec<(String, f32)> {
         if particles.is_empty() {
@@ -235,7 +247,9 @@ impl DiagnosticsPlugin for ThermalStatsPlugin {
         let mut max = f32::NEG_INFINITY;
         for p in particles {
             sum += p.temperature;
-            if p.temperature > max { max = p.temperature; }
+            if p.temperature > max {
+                max = p.temperature;
+            }
         }
         vec![
             ("T_mean".into(), sum / particles.len() as f32),
@@ -248,14 +262,19 @@ impl DiagnosticsPlugin for ThermalStatsPlugin {
 pub struct MaterialCountPlugin;
 
 impl DiagnosticsPlugin for MaterialCountPlugin {
-    fn name(&self) -> &'static str { "mat_counts" }
+    fn name(&self) -> &'static str {
+        "mat_counts"
+    }
 
     fn collect(&mut self, particles: &[Particle], _snap: &MpmSnapshot) -> Vec<(String, f32)> {
         let mut counts: std::collections::BTreeMap<u32, usize> = std::collections::BTreeMap::new();
         for p in particles {
             *counts.entry(p.material_id).or_default() += 1;
         }
-        counts.into_iter().map(|(id, n)| (format!("mat{id}_n"), n as f32)).collect()
+        counts
+            .into_iter()
+            .map(|(id, n)| (format!("mat{id}_n"), n as f32))
+            .collect()
     }
 }
 
@@ -295,14 +314,17 @@ impl RollingPlugin {
 }
 
 impl DiagnosticsPlugin for RollingPlugin {
-    fn name(&self) -> &'static str { self.inner.name() }
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
 
     fn collect(&mut self, particles: &[Particle], snapshot: &MpmSnapshot) -> Vec<(String, f32)> {
         let raw = self.inner.collect(particles, snapshot);
         let alpha = self.alpha;
         raw.iter()
             .map(|(k, v)| {
-                let smoothed = self.ema
+                let smoothed = self
+                    .ema
                     .entry(k.clone())
                     .and_modify(|ema| *ema = alpha * v + (1.0 - alpha) * *ema)
                     .or_insert(*v);
@@ -320,7 +342,9 @@ struct FnPlugin {
 }
 
 impl DiagnosticsPlugin for FnPlugin {
-    fn name(&self) -> &'static str { self.name }
+    fn name(&self) -> &'static str {
+        self.name
+    }
     fn collect(&mut self, particles: &[Particle], snapshot: &MpmSnapshot) -> Vec<(String, f32)> {
         (self.f)(particles, snapshot)
     }

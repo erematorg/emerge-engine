@@ -13,9 +13,9 @@
 
 use glam::Vec2;
 
+use crate::fields::{FADE_ONSET_RATIO, ForceField};
+use crate::particle::Particles;
 use crate::solver::cutoff::smooth_cutoff;
-use crate::fields::{ForceField, FADE_ONSET_RATIO};
-use crate::particle::Particle;
 
 /// Gravitational acceleration from one or more point-mass sources.
 ///
@@ -77,12 +77,13 @@ impl GravityWellField {
 }
 
 impl ForceField for GravityWellField {
-    fn acceleration(&self, particle: &Particle) -> Vec2 {
+    fn acceleration(&self, particles: &Particles, i: usize) -> Vec2 {
         let mut acc = Vec2::ZERO;
         let eps2 = self.softening * self.softening;
+        let x = particles.x[i];
 
         for &(src_pos, src_mass) in &self.sources {
-            let r_vec = src_pos - particle.x; // vector toward source
+            let r_vec = src_pos - x; // vector toward source
             let r2 = r_vec.length_squared();
             let r = r2.sqrt();
 

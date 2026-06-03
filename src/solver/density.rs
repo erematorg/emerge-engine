@@ -1,4 +1,4 @@
-use glam::IVec2;
+use glam::{IVec2, Vec2};
 
 use crate::transfer::scatter_particle_mass;
 use crate::{grid::Grid, grid::kernel::quadratic_weights, particle::Particles};
@@ -36,23 +36,18 @@ pub fn compute_density_grid(particles: &Particles, grid_res: usize) -> Vec<f32> 
     buf
 }
 
-pub fn estimate_initial_particle_volumes(particles: &mut Particles, grid: &mut Grid) {
-    estimate_density_and_volume_impl(particles, grid, true);
-}
-
-pub fn estimate_particle_density_and_volume(particles: &mut Particles, grid: &mut Grid) {
-    estimate_density_and_volume_impl(particles, grid, false);
-}
-
-fn estimate_density_and_volume_impl(
+/// Compute density and volume for `count` particles (scatter + gather).
+/// Pass `write_initial = true` at spawn time to also set `initial_volume`.
+pub fn estimate_particle_volumes(
     particles: &mut Particles,
     grid: &mut Grid,
-    write_initial_volume: bool,
+    count: usize,
+    write_initial: bool,
 ) {
     grid.clear();
-    scatter_particle_mass(particles, grid);
+    scatter_particle_mass(particles, grid, count);
 
-    for i in 0..particles.len() {
+    for i in 0..count {
         let x = particles.x[i];
         let mass = particles.mass[i];
         let weights = quadratic_weights(x);
@@ -69,7 +64,79 @@ fn estimate_density_and_volume_impl(
         if density > f32::EPSILON {
             particles.density[i] = density;
             particles.volume[i] = mass / density;
-            if write_initial_volume {
+            if write_initial {
+                particles.initial_volume[i] = particles.volume[i];
+            }
+        }
+    }
+}
+
+/// Compute density and volume only for particles in `[new_start..active_count]`.
+///
+/// Scatters only particles whose positions fall within the AABB of the new group
+/// expanded by 3 grid cells (the quadratic B-spline influence radius). All other
+/// active particles are ignored — their density contribution to the new group is zero.
+///
+/// O(active_count) scan but O(local × stencil) grid work — fast for sparse spawns.
+pub fn estimate_particle_volumes_local(
+    particles: &mut Particles,
+    grid: &mut Grid,
+    active_count: usize,
+    new_start: usize,
+    write_initial: bool,
+) {
+    if new_start >= active_count {
+        return;
+    }
+
+    // AABB of new particles in grid coords.
+    let mut lo = Vec2::splat(f32::MAX);
+    let mut hi = Vec2::splat(f32::MIN);
+    for i in new_start..active_count {
+        lo = lo.min(particles.x[i]);
+        hi = hi.max(particles.x[i]);
+    }
+    // Expand by 3 cells: quadratic stencil reaches 1.5 cells per side,
+    // and we need to capture particles that contribute mass to those cells.
+    const MARGIN: f32 = 3.0;
+    lo -= Vec2::splat(MARGIN);
+    hi += Vec2::splat(MARGIN);
+
+    grid.clear();
+    for i in 0..active_count {
+        let x = particles.x[i];
+        if x.x < lo.x || x.y < lo.y || x.x > hi.x || x.y > hi.y {
+            continue;
+        }
+        let mass = particles.mass[i];
+        let weights = quadratic_weights(x);
+        for gx in 0..3 {
+            for gy in 0..3 {
+                let weight = weights.wx[gx] * weights.wy[gy];
+                let cell_pos = weights.base_cell + IVec2::new(gx as i32 - 1, gy as i32 - 1);
+                grid.add_mass_momentum(cell_pos, weight * mass, Vec2::ZERO);
+            }
+        }
+    }
+
+    for i in new_start..active_count {
+        let x = particles.x[i];
+        let mass = particles.mass[i];
+        let weights = quadratic_weights(x);
+        let mut density = 0.0;
+
+        for gx in 0..3 {
+            for gy in 0..3 {
+                let weight = weights.wx[gx] * weights.wy[gy];
+                let cell_pos = weights.base_cell + IVec2::new(gx as i32 - 1, gy as i32 - 1);
+                density += grid.mass_at(cell_pos) * weight;
+            }
+        }
+
+        if density > f32::EPSILON {
+            particles.density[i] = density;
+            particles.volume[i] = mass / density;
+            if write_initial {
                 particles.initial_volume[i] = particles.volume[i];
             }
         }

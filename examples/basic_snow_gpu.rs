@@ -9,8 +9,10 @@ use bevy::prelude::*;
 use bevy::tasks::block_on;
 use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
 use emerge::gpu::{GpuForceFieldEntry, GpuSolver};
-use emerge::{MaterialRegistry, SnowMaterial, SolverConfig, SpawnConfig, build_particles, log_frame_gpu};
 use emerge::runtime::fixed_step::FixedStepController;
+use emerge::{
+    MaterialRegistry, SnowMaterial, SolverConfig, SpawnConfig, build_particles, log_frame_gpu,
+};
 use glam::Vec2;
 
 const GRID: usize = 64;
@@ -20,7 +22,7 @@ const PPC: f32 = 10.0;
 const BALL_R: f32 = 9.0;
 const BALL_A: Vec2 = Vec2::new(16.0, 44.0);
 const BALL_B: Vec2 = Vec2::new(48.0, 44.0);
-const MAT_SOFT:   u32 = 0;
+const MAT_SOFT: u32 = 0;
 const MAT_PACKED: u32 = 1;
 const LABELS: &[(u32, &str)] = &[(MAT_SOFT, "soft"), (MAT_PACKED, "packed")];
 
@@ -71,18 +73,27 @@ impl Sim {
     fn new(p: Params) -> Self {
         let config = SolverConfig {
             max_substeps_per_step: 20,
-            ..SolverConfig::standard(GRID, DT, Vec2::new(0.0, p.gravity))
+            gravity: Vec2::new(0.0, p.gravity),
+            ..SolverConfig::earth(GRID, 0.01, DT)
         };
         // Two snowballs: each a disk, given opposing initial velocities post-spawn.
         let ball_spawn = |center: Vec2, mat: u32| {
             SpawnConfig::for_solver(&config)
-                .at(center).disk(BALL_R).spacing(0.5).material(mat).rng_seed(7)
+                .at(center)
+                .disk(BALL_R)
+                .spacing(0.5)
+                .material(mat)
+                .rng_seed(7)
         };
         let mut ball_a = build_particles(&config, ball_spawn(BALL_A, MAT_SOFT));
         let mut ball_b = build_particles(&config, ball_spawn(BALL_B, MAT_PACKED));
         let speed = p.speed;
-        for pt in &mut ball_a { pt.v = Vec2::new(speed, 0.0); }
-        for pt in &mut ball_b { pt.v = Vec2::new(-speed, 0.0); }
+        for pt in &mut ball_a {
+            pt.v = Vec2::new(speed, 0.0);
+        }
+        for pt in &mut ball_b {
+            pt.v = Vec2::new(-speed, 0.0);
+        }
         let mut particles = ball_a;
         particles.extend(ball_b);
         let mut registry = MaterialRegistry::with_default(Box::new(make_snow_a(&p)));
@@ -130,26 +141,49 @@ struct PVis(usize);
 fn setup(mut commands: Commands, sim: Res<Sim>) {
     commands.spawn(Camera2d);
     for (i, p) in sim.solver.particles().iter().enumerate() {
-        let color = if p.material_id == MAT_SOFT { COL_A } else { COL_B };
+        let color = if p.material_id == MAT_SOFT {
+            COL_A
+        } else {
+            COL_B
+        };
         commands.spawn((
             PVis(i),
-            Sprite { color, custom_size: Some(Vec2::ONE), ..default() },
+            Sprite {
+                color,
+                custom_size: Some(Vec2::ONE),
+                ..default()
+            },
             Transform::from_translation(p2w(p.x)),
         ));
     }
 }
 
-fn reset(keys: Res<ButtonInput<KeyCode>>, mut sim: ResMut<Sim>, mut p: ResMut<Params>,
-         mut commands: Commands, vis: Query<Entity, With<PVis>>) {
+fn reset(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut sim: ResMut<Sim>,
+    mut p: ResMut<Params>,
+    mut commands: Commands,
+    vis: Query<Entity, With<PVis>>,
+) {
     if keys.just_pressed(KeyCode::KeyR) {
         *p = DEFAULTS;
         *sim = Sim::new(DEFAULTS);
-        for e in &vis { commands.entity(e).despawn(); }
+        for e in &vis {
+            commands.entity(e).despawn();
+        }
         for (i, pt) in sim.solver.particles().iter().enumerate() {
-            let color = if pt.material_id == MAT_SOFT { COL_A } else { COL_B };
+            let color = if pt.material_id == MAT_SOFT {
+                COL_A
+            } else {
+                COL_B
+            };
             commands.spawn((
                 PVis(i),
-                Sprite { color, custom_size: Some(Vec2::ONE), ..default() },
+                Sprite {
+                    color,
+                    custom_size: Some(Vec2::ONE),
+                    ..default()
+                },
                 Transform::from_translation(p2w(pt.x)),
             ));
         }
@@ -164,25 +198,40 @@ fn cursor(
     params: Res<Params>,
 ) {
     sim.solver.clear_force_fields_gpu();
-    if !mb.pressed(MouseButton::Left) && !mb.pressed(MouseButton::Right) { return; }
+    if !mb.pressed(MouseButton::Left) && !mb.pressed(MouseButton::Right) {
+        return;
+    }
     let Ok(win) = windows.single() else { return };
-    let Some(cp) = win.cursor_position() else { return };
+    let Some(cp) = win.cursor_position() else {
+        return;
+    };
     let Ok((cam, ct)) = cam.single() else { return };
-    let Ok(wp) = cam.viewport_to_world_2d(ct, cp) else { return };
+    let Ok(wp) = cam.viewport_to_world_2d(ct, cp) else {
+        return;
+    };
     let gp = wp / PPC + Vec2::splat(GRID as f32 * 0.5);
-    let gm = if mb.pressed(MouseButton::Right) { params.cursor_strength } else { -params.cursor_strength };
+    let gm = if mb.pressed(MouseButton::Right) {
+        params.cursor_strength
+    } else {
+        -params.cursor_strength
+    };
     let r = params.cursor_radius;
-    sim.solver.add_force_field_gpu(GpuForceFieldEntry::gravity_well(gp, gm, 4.0, r, r * 0.4));
+    sim.solver
+        .add_force_field_gpu(GpuForceFieldEntry::gravity_well(gp, gm, 4.0, r, r * 0.4));
 }
 
 fn step(time: Res<Time>, mut sim: ResMut<Sim>, params: Res<Params>) {
     sim.solver.set_gravity(Vec2::new(0.0, params.gravity));
     sim.stepper.set_simulation_speed(params.hz * DT);
     let n = sim.stepper.steps_for_frame(time.delta_secs());
-    if n == 0 { return; }
+    if n == 0 {
+        return;
+    }
     if sim.prev != *params {
-        sim.solver.set_default_material(Box::new(make_snow_a(&params)));
-        sim.solver.set_material(MAT_PACKED, Box::new(make_snow_b(&params)));
+        sim.solver
+            .set_default_material(Box::new(make_snow_a(&params)));
+        sim.solver
+            .set_material(MAT_PACKED, Box::new(make_snow_b(&params)));
         sim.prev = *params;
     }
     for _ in 0..n {
@@ -216,7 +265,7 @@ fn ui(mut ctx: EguiContexts, mut p: ResMut<Params>, mut sim: ResMut<Sim>, time: 
             ));
             ui.separator();
             ui.add(egui::Slider::new(&mut p.hz, 1.0..=60.0).text("solver_hz"));
-            ui.add(egui::Slider::new(&mut p.gravity, -2.0..=0.0).text("gravity"));
+            ui.add(egui::Slider::new(&mut p.gravity, -3.0..=0.0).text("gravity"));
             ui.add(egui::Slider::new(&mut p.speed, 1.0..=30.0).text("speed (→ reset)"));
             ui.separator();
             ui.label("Shared stiffness");
@@ -225,15 +274,38 @@ fn ui(mut ctx: EguiContexts, mut p: ResMut<Params>, mut sim: ResMut<Sim>, time: 
             ui.separator();
             ui.colored_label(egui::Color32::from_rgb(90, 165, 255), "Soft powder (blue)");
             ui.add(egui::Slider::new(&mut p.xi_a, 0.0..=20.0).text("ξ"));
-            ui.add(egui::Slider::new(&mut p.theta_c_a, 0.001..=0.1).logarithmic(true).text("θ_c"));
-            ui.add(egui::Slider::new(&mut p.theta_s_a, 0.001..=0.05).logarithmic(true).text("θ_s"));
+            ui.add(
+                egui::Slider::new(&mut p.theta_c_a, 0.001..=0.1)
+                    .logarithmic(true)
+                    .text("θ_c"),
+            );
+            ui.add(
+                egui::Slider::new(&mut p.theta_s_a, 0.001..=0.05)
+                    .logarithmic(true)
+                    .text("θ_s"),
+            );
             ui.separator();
-            ui.colored_label(egui::Color32::from_rgb(242, 204, 115), "Packed snow (amber)");
+            ui.colored_label(
+                egui::Color32::from_rgb(242, 204, 115),
+                "Packed snow (amber)",
+            );
             ui.add(egui::Slider::new(&mut p.xi_b, 0.0..=20.0).text("ξ"));
-            ui.add(egui::Slider::new(&mut p.theta_c_b, 0.001..=0.1).logarithmic(true).text("θ_c"));
-            ui.add(egui::Slider::new(&mut p.theta_s_b, 0.001..=0.05).logarithmic(true).text("θ_s"));
+            ui.add(
+                egui::Slider::new(&mut p.theta_c_b, 0.001..=0.1)
+                    .logarithmic(true)
+                    .text("θ_c"),
+            );
+            ui.add(
+                egui::Slider::new(&mut p.theta_s_b, 0.001..=0.05)
+                    .logarithmic(true)
+                    .text("θ_s"),
+            );
             ui.separator();
-            ui.add(egui::Slider::new(&mut p.cursor_strength, 10.0..=1000.0).text("cursor force").logarithmic(true));
+            ui.add(
+                egui::Slider::new(&mut p.cursor_strength, 10.0..=1000.0)
+                    .text("cursor force")
+                    .logarithmic(true),
+            );
             ui.add(egui::Slider::new(&mut p.cursor_radius, 1.0..=15.0).text("cursor radius"));
             ui.label("LMB: push  RMB: pull  R: reset");
             if ui.button("Reset (R)").clicked() {

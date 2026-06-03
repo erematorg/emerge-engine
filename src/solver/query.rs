@@ -55,7 +55,13 @@ pub fn material_state_of_slice(particles: &[Particle], material_id: u32) -> Mate
     let mut s = MaterialState::default();
     for p in particles {
         if p.material_id == material_id {
-            s.accumulate(p.x, p.v.length(), p.plastic_volume_ratio, p.deformation_gradient.determinant(), p.density);
+            s.accumulate(
+                p.x,
+                p.v.length(),
+                p.plastic_volume_ratio,
+                p.deformation_gradient.determinant(),
+                p.density,
+            );
         }
     }
     s.finalize();
@@ -87,7 +93,13 @@ pub fn region_state_of_slice(particles: &[Particle], center: Vec2, radius: f32) 
     let mut s = MaterialState::default();
     for p in particles {
         if (p.x - center).length_squared() <= r2 {
-            s.accumulate(p.x, p.v.length(), p.plastic_volume_ratio, p.deformation_gradient.determinant(), p.density);
+            s.accumulate(
+                p.x,
+                p.v.length(),
+                p.plastic_volume_ratio,
+                p.deformation_gradient.determinant(),
+                p.density,
+            );
         }
     }
     s.finalize();

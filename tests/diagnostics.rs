@@ -1,6 +1,9 @@
-use emerge::diagnostics::{MpmHealthThresholds, collect_mpm_snapshot, evaluate_mpm_health};
 use emerge::SolverConfig;
-use emerge::{grid::Grid, particle::{Particle, Particles}};
+use emerge::diagnostics::{MpmHealthThresholds, collect_mpm_snapshot, evaluate_mpm_health};
+use emerge::{
+    grid::Grid,
+    particle::{Particle, Particles},
+};
 use glam::{IVec2, Vec2};
 
 fn make_config(grid_res: usize) -> SolverConfig {

@@ -10,11 +10,11 @@
 use bevy::prelude::*;
 use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
 use emerge::diagnostics::log_frame_full;
+use emerge::runtime::fixed_step::FixedStepController;
 use emerge::{
     CorotatedMaterial, MpmSolver, NeoHookeanMaterial, SlipBoundary, SolverConfig, SpawnConfig,
     ViscoelasticMaterial,
 };
-use emerge::runtime::fixed_step::FixedStepController;
 use glam::{IVec2, Vec2};
 
 const GRID: usize = 64;
@@ -71,7 +71,8 @@ impl Sim {
         let config = SolverConfig {
             min_dt: 0.01,
             max_substeps_per_step: 8,
-            ..SolverConfig::standard(GRID, DT, Vec2::new(0.0, p.gravity))
+            gravity: Vec2::new(0.0, p.gravity),
+            ..SolverConfig::earth(GRID, 0.01, DT)
         };
         // Three blobs placed left / centre / right, same height → fall and settle.
         let spawn_neo = SpawnConfig {
@@ -104,11 +105,21 @@ impl Sim {
 
         let mut solver = MpmSolver::new(config, spawn_neo)
             .with_default_material(Box::new(NeoHookeanMaterial::new(p.neo_lambda, p.neo_mu)))
-            .with_material(MAT_COR, Box::new(CorotatedMaterial::new(p.cor_lambda, p.cor_mu)))
-            .with_material(MAT_VIS, Box::new(ViscoelasticMaterial::new(p.vis_lambda, p.vis_mu, p.vis_viscosity)))
+            .with_material(
+                MAT_COR,
+                Box::new(CorotatedMaterial::new(p.cor_lambda, p.cor_mu)),
+            )
+            .with_material(
+                MAT_VIS,
+                Box::new(ViscoelasticMaterial::new(
+                    p.vis_lambda,
+                    p.vis_mu,
+                    p.vis_viscosity,
+                )),
+            )
             .with_boundary(Box::new(SlipBoundary::new(config.boundary_thickness)));
-        let _ = solver.spawn_region(spawn_cor);
-        let _ = solver.spawn_region(spawn_vis);
+        let _ = solver.spawn_group(spawn_cor);
+        let _ = solver.spawn_group(spawn_vis);
 
         Self {
             solver,
@@ -147,7 +158,7 @@ fn mat_color(id: u32) -> Color {
         MAT_NEO => Color::srgb(0.94, 0.52, 0.27), // orange
         MAT_COR => Color::srgb(0.25, 0.78, 0.65), // teal
         MAT_VIS => Color::srgb(0.72, 0.40, 0.90), // purple
-        _       => Color::WHITE,
+        _ => Color::WHITE,
     }
 }
 
@@ -156,7 +167,10 @@ fn setup(mut commands: Commands, sim: Res<Sim>) {
     for (i, p) in sim.solver.particles().iter().enumerate() {
         commands.spawn((
             Sprite::from_color(mat_color(p.material_id), Vec2::ONE),
-            Transform { translation: p2w(p.x), ..default() },
+            Transform {
+                translation: p2w(p.x),
+                ..default()
+            },
             PVis(i),
         ));
     }
@@ -181,33 +195,52 @@ fn cursor(
         return;
     }
     let Ok(win) = windows.single() else { return };
-    let Some(cp) = win.cursor_position() else { return };
+    let Some(cp) = win.cursor_position() else {
+        return;
+    };
     let Ok((cam, ct)) = cam.single() else { return };
-    let Ok(wp) = cam.viewport_to_world_2d(ct, cp) else { return };
+    let Ok(wp) = cam.viewport_to_world_2d(ct, cp) else {
+        return;
+    };
     let gp = wp / PPC + Vec2::splat(GRID as f32 * 0.5);
-    let sign = if mb.pressed(MouseButton::Right) { -1.0 } else { 1.0 };
+    let sign = if mb.pressed(MouseButton::Right) {
+        -1.0
+    } else {
+        1.0
+    };
     let strength = params.cursor_strength;
     let radius = params.cursor_radius;
     let dt = time.delta_secs().min(MAX_DT);
     // apply_radial_impulse clamps to CFL limit — safe under any cursor_strength value.
-    sim.solver.apply_radial_impulse(gp, radius, sign * strength * dt);
+    sim.solver
+        .apply_radial_impulse(gp, radius, sign * strength * dt);
 }
 
 fn step(time: Res<Time>, mut sim: ResMut<Sim>, params: Res<Params>) {
     sim.solver.set_gravity(Vec2::new(0.0, params.gravity));
     sim.stepper.set_simulation_speed(params.hz * DT);
     let n = sim.stepper.steps_for_frame(time.delta_secs());
-    if n == 0 { return; }
+    if n == 0 {
+        return;
+    }
     if sim.prev != *params {
-        sim.solver.set_default_material(Box::new(
-            NeoHookeanMaterial::new(params.neo_lambda, params.neo_mu),
-        ));
-        sim.solver.set_material(MAT_COR, Box::new(
-            CorotatedMaterial::new(params.cor_lambda, params.cor_mu),
-        ));
-        sim.solver.set_material(MAT_VIS, Box::new(
-            ViscoelasticMaterial::new(params.vis_lambda, params.vis_mu, params.vis_viscosity),
-        ));
+        sim.solver
+            .set_default_material(Box::new(NeoHookeanMaterial::new(
+                params.neo_lambda,
+                params.neo_mu,
+            )));
+        sim.solver.set_material(
+            MAT_COR,
+            Box::new(CorotatedMaterial::new(params.cor_lambda, params.cor_mu)),
+        );
+        sim.solver.set_material(
+            MAT_VIS,
+            Box::new(ViscoelasticMaterial::new(
+                params.vis_lambda,
+                params.vis_mu,
+                params.vis_viscosity,
+            )),
+        );
         sim.prev = *params;
     }
     sim.solver.step_n(n);
@@ -237,7 +270,7 @@ fn ui(mut ctx: EguiContexts, mut p: ResMut<Params>, mut sim: ResMut<Sim>, time: 
             ));
             ui.separator();
             ui.add(egui::Slider::new(&mut p.hz, 5.0..=60.0).text("solver_hz"));
-            ui.add(egui::Slider::new(&mut p.gravity, -2.0..=2.0).text("gravity"));
+            ui.add(egui::Slider::new(&mut p.gravity, -3.0..=0.0).text("gravity"));
             ui.separator();
             ui.colored_label(egui::Color32::from_rgb(240, 133, 69), "NeoHookean (orange)");
             ui.add(egui::Slider::new(&mut p.neo_lambda, 1.0..=200.0).text("λ"));
@@ -247,12 +280,19 @@ fn ui(mut ctx: EguiContexts, mut p: ResMut<Params>, mut sim: ResMut<Sim>, time: 
             ui.add(egui::Slider::new(&mut p.cor_lambda, 1.0..=200.0).text("λ"));
             ui.add(egui::Slider::new(&mut p.cor_mu, 1.0..=400.0).text("µ"));
             ui.separator();
-            ui.colored_label(egui::Color32::from_rgb(184, 102, 230), "Viscoelastic (purple)");
+            ui.colored_label(
+                egui::Color32::from_rgb(184, 102, 230),
+                "Viscoelastic (purple)",
+            );
             ui.add(egui::Slider::new(&mut p.vis_lambda, 1.0..=200.0).text("λ"));
             ui.add(egui::Slider::new(&mut p.vis_mu, 1.0..=400.0).text("µ"));
             ui.add(egui::Slider::new(&mut p.vis_viscosity, 0.0..=5.0).text("viscosity"));
             ui.separator();
-            ui.add(egui::Slider::new(&mut p.cursor_strength, 5.0..=200.0).text("cursor force").logarithmic(true));
+            ui.add(
+                egui::Slider::new(&mut p.cursor_strength, 5.0..=200.0)
+                    .text("cursor force")
+                    .logarithmic(true),
+            );
             ui.add(egui::Slider::new(&mut p.cursor_radius, 1.0..=15.0).text("cursor radius"));
             ui.label("LMB: push  RMB: pull  R: reset");
             if ui.button("Reset (R)").clicked() {

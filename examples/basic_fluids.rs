@@ -9,11 +9,11 @@
 use bevy::prelude::*;
 use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
 use emerge::diagnostics::log_frame_full;
+use emerge::runtime::fixed_step::FixedStepController;
 use emerge::{
     BinghamFluidMaterial, MpmSolver, NewtonianFluidMaterial, SlipBoundary, SolverConfig,
     SpawnConfig,
 };
-use emerge::runtime::fixed_step::FixedStepController;
 use glam::{IVec2, Vec2};
 
 const GRID: usize = 64;
@@ -22,15 +22,15 @@ const PPC: f32 = 10.0;
 const MAX_DT: f32 = 1.0 / 15.0;
 
 const MAT_WATER: u32 = 0;
-const MAT_MUD:   u32 = 1;
+const MAT_MUD: u32 = 1;
 
 // Water: tall left column — classic dam break.
 const WATER_CENTER: Vec2 = Vec2::new(11.0, 30.0);
-const WATER_SIZE:   IVec2 = IVec2::new(14, 52);
+const WATER_SIZE: IVec2 = IVec2::new(14, 52);
 
 // Mud: compact blob on the right — falls and barely flows (yield stress).
 const MUD_CENTER: Vec2 = Vec2::new(50.0, 38.0);
-const MUD_SIZE:   IVec2 = IVec2::new(16, 18);
+const MUD_SIZE: IVec2 = IVec2::new(16, 18);
 
 #[derive(Resource, Clone, Copy, PartialEq)]
 struct Params {
@@ -50,7 +50,7 @@ struct Params {
 const DEFAULTS: Params = Params {
     hz: 60.0,
     gravity: -0.3,
-    water_viscosity: 0.5,
+    water_viscosity: 0.1,
     water_stiffness: 10.0,
     water_surface_tension: 0.0,
     mud_viscosity: 8.0,
@@ -74,7 +74,8 @@ impl Sim {
             max_substeps_per_step: 8,
             recompute_density_each_step: true,
             cfl_include_affine_speed: false,
-            ..SolverConfig::standard(GRID, DT, Vec2::new(0.0, p.gravity))
+            gravity: Vec2::new(0.0, p.gravity),
+            ..SolverConfig::earth(GRID, 0.01, DT)
         };
         let spawn_water = SpawnConfig {
             spacing: 0.6,
@@ -96,7 +97,7 @@ impl Sim {
             .with_default_material(Box::new(make_water(&p)))
             .with_material(MAT_MUD, Box::new(make_mud(&p)))
             .with_boundary(Box::new(SlipBoundary::new(config.boundary_thickness)));
-        let _ = solver.spawn_region(spawn_mud);
+        let _ = solver.spawn_group(spawn_mud);
         Self {
             solver,
             stepper: FixedStepController::standard(DT, p.hz),
@@ -113,7 +114,7 @@ fn make_water(p: &Params) -> NewtonianFluidMaterial {
 }
 
 fn make_mud(p: &Params) -> BinghamFluidMaterial {
-    BinghamFluidMaterial::new(6.0, p.mud_viscosity, 5.0, 3.0, p.mud_yield_stress)
+    BinghamFluidMaterial::new(4.0, p.mud_viscosity, 5.0, 3.0, p.mud_yield_stress)
 }
 
 fn main() {
@@ -151,8 +152,15 @@ fn setup(mut commands: Commands, sim: Res<Sim>) {
     commands.spawn(Camera2d);
     for (i, p) in sim.solver.particles().iter().enumerate() {
         commands.spawn((
-            Sprite { color: fluid_color(p.material_id), custom_size: Some(Vec2::splat(8.0)), ..default() },
-            Transform { translation: p2w(p.x), ..default() },
+            Sprite {
+                color: fluid_color(p.material_id),
+                custom_size: Some(Vec2::splat(8.0)),
+                ..default()
+            },
+            Transform {
+                translation: p2w(p.x),
+                ..default()
+            },
             PVis(i),
         ));
     }
@@ -177,26 +185,40 @@ fn cursor(
         return;
     }
     let Ok(win) = windows.single() else { return };
-    let Some(cp) = win.cursor_position() else { return };
+    let Some(cp) = win.cursor_position() else {
+        return;
+    };
     let Ok((cam, ct)) = cam.single() else { return };
-    let Ok(wp) = cam.viewport_to_world_2d(ct, cp) else { return };
+    let Ok(wp) = cam.viewport_to_world_2d(ct, cp) else {
+        return;
+    };
     let gp = wp / PPC + Vec2::splat(GRID as f32 * 0.5);
-    let sign = if mb.pressed(MouseButton::Right) { -1.0 } else { 1.0 };
+    let sign = if mb.pressed(MouseButton::Right) {
+        -1.0
+    } else {
+        1.0
+    };
     let strength = params.cursor_strength;
     let radius = params.cursor_radius;
     let dt = time.delta_secs().min(MAX_DT);
-    sim.solver.apply_radial_impulse(gp, radius, sign * strength * dt);
+    sim.solver
+        .apply_radial_impulse(gp, radius, sign * strength * dt);
 }
 
 fn step(time: Res<Time>, mut sim: ResMut<Sim>, params: Res<Params>) {
     sim.solver.set_gravity(Vec2::new(0.0, params.gravity));
     sim.stepper.set_simulation_speed(params.hz * DT);
     let n = sim.stepper.steps_for_frame(time.delta_secs());
-    if n == 0 { return; }
+    if n == 0 {
+        return;
+    }
     if sim.prev != *params {
-        sim.solver.set_default_material(Box::new(make_water(&params)));
-        sim.solver.set_material(MAT_MUD, Box::new(make_mud(&params)));
-        sim.solver.set_boundary_condition(Box::new(SlipBoundary::new(2)));
+        sim.solver
+            .set_default_material(Box::new(make_water(&params)));
+        sim.solver
+            .set_material(MAT_MUD, Box::new(make_mud(&params)));
+        sim.solver
+            .set_boundary_condition(Box::new(SlipBoundary::new(2)));
         sim.prev = *params;
     }
     sim.solver.step_n(n);
@@ -228,19 +250,28 @@ fn ui(mut ctx: EguiContexts, mut p: ResMut<Params>, mut sim: ResMut<Sim>, time: 
             ));
             ui.separator();
             ui.add(egui::Slider::new(&mut p.hz, 5.0..=60.0).text("solver_hz"));
-            ui.add(egui::Slider::new(&mut p.gravity, -2.0..=0.0).text("gravity"));
+            ui.add(egui::Slider::new(&mut p.gravity, -3.0..=0.0).text("gravity"));
             ui.separator();
-            ui.colored_label(egui::Color32::from_rgb(59, 169, 245), "Newtonian water (blue)");
+            ui.colored_label(
+                egui::Color32::from_rgb(59, 169, 245),
+                "Newtonian water (blue)",
+            );
             ui.add(egui::Slider::new(&mut p.water_viscosity, 0.0..=5.0).text("viscosity"));
             ui.add(egui::Slider::new(&mut p.water_stiffness, 1.0..=100.0).text("eos_k"));
-            ui.add(egui::Slider::new(&mut p.water_surface_tension, 0.0..=2.0).text("surface tension"));
+            ui.add(
+                egui::Slider::new(&mut p.water_surface_tension, 0.0..=2.0).text("surface tension"),
+            );
             ui.separator();
             ui.colored_label(egui::Color32::from_rgb(133, 97, 56), "Bingham mud (brown)");
             ui.add(egui::Slider::new(&mut p.mud_viscosity, 0.5..=30.0).text("viscosity"));
             ui.add(egui::Slider::new(&mut p.mud_yield_stress, 0.0..=20.0).text("yield stress"));
             ui.label("↑ yield stress → mud resists flow until overcome");
             ui.separator();
-            ui.add(egui::Slider::new(&mut p.cursor_strength, 5.0..=200.0).text("cursor force").logarithmic(true));
+            ui.add(
+                egui::Slider::new(&mut p.cursor_strength, 5.0..=200.0)
+                    .text("cursor force")
+                    .logarithmic(true),
+            );
             ui.add(egui::Slider::new(&mut p.cursor_radius, 1.0..=15.0).text("cursor radius"));
             ui.label("LMB: push  RMB: pull  R: reset");
             if ui.button("Reset (R)").clicked() {

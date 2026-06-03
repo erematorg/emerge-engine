@@ -79,4 +79,8 @@ name = "basic_fluids_gpu"
 required-features = ["bevy_examples", "gpu"]
 
 [[example]]
+name = "basic_creature"
+required-features = ["bevy_examples"]
+
+[[example]]
 name = "headless"

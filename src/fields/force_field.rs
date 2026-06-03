@@ -1,6 +1,6 @@
 use glam::Vec2;
 
-use crate::particle::{Particle, Particles};
+use crate::particle::Particles;
 
 /// A body force that produces a per-particle acceleration.
 ///
@@ -19,9 +19,8 @@ pub trait ForceField: Send + Sync {
     /// Use to rebuild internal state that depends on the full particle set —
     /// e.g., a Barnes-Hut quadtree for N-body gravity.
     /// Default implementation does nothing (stateless fields need not override).
-    #[allow(unused_variables)]
-    fn prepare(&mut self, particles: &Particles) {}
+    fn prepare(&mut self, _particles: &Particles) {}
 
-    /// Return the acceleration (in grid-units/s²) applied to `particle` this substep.
-    fn acceleration(&self, particle: &Particle) -> Vec2;
+    /// Return the acceleration (in grid-units/s²) applied to particle `i` this substep.
+    fn acceleration(&self, particles: &Particles, i: usize) -> Vec2;
 }

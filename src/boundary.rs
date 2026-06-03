@@ -1,6 +1,6 @@
 use glam::Vec2;
 
-use crate::particle::Particle;
+use crate::particle::Particles;
 
 pub trait BoundaryCondition: Send + Sync + core::fmt::Debug {
     fn apply_to_grid_velocity(&self, cell_index: usize, grid_res: usize, velocity: &mut Vec2);
@@ -8,7 +8,8 @@ pub trait BoundaryCondition: Send + Sync + core::fmt::Debug {
     /// Not a physical force — last-resort domain enforcement so particles never escape the grid.
     /// Proper no-penetration physics lives in `apply_to_grid_velocity`.
     fn clamp_particle_position(&self, position: Vec2, grid_res: usize) -> Vec2;
-    fn post_g2p_particle(&self, _particle: &mut Particle, _grid_res: usize, _dt: f32) {}
+    fn post_g2p_particle(&self, _particles: &mut Particles, _i: usize, _grid_res: usize, _dt: f32) {
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

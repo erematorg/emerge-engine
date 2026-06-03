@@ -3,11 +3,12 @@ use std::collections::HashMap;
 use emerge::fields::{
     AabbConfinementField, CoulombField, GravityWellField, RadialConfinementField,
 };
+use emerge::thermodynamics::{ThermalConfig, ThermalDiffusion};
 use emerge::{
     MpmSolver, NaccMaterial, NeoHookeanMaterial, NewtonianFluidMaterial, RankineMaterial,
-    SandMaterial, SandMuIMaterial, SnowMaterial, SolverConfig, SpawnConfig, VonMisesMaterial,
+    SandMaterial, SandMuIMaterial, SlipBoundary, SnowMaterial, SolverConfig, SpawnConfig,
+    VonMisesMaterial,
 };
-use emerge::thermodynamics::{ThermalConfig, ThermalDiffusion};
 use glam::{IVec2, Vec2};
 
 // --- helpers ---
@@ -226,8 +227,8 @@ fn rankine_damage_stays_finite_and_j_positive() {
 fn rankine_softening_reduces_tensile_strength() {
     // Verify: a particle under sustained tension accumulates damage (friction_hardening > 0)
     // and that the effective tensile strength decreases with softening_rate > 0.
-    use emerge::particle::Particle;
     use emerge::materials::MaterialModel;
+    use emerge::particle::{Particle, Particles};
 
     let mat = RankineMaterial::new(1_000.0, 500.0, 100.0, 2.0);
     let mut p = Particle::zeroed();
@@ -236,20 +237,25 @@ fn rankine_softening_reduces_tensile_strength() {
     p.volume = 1.0;
     p.density = 1.0;
     // Deformation gradient: pure extension in x by 20% — puts particle in tension
-    p.deformation_gradient = glam::Mat2::from_cols(
-        glam::Vec2::new(1.2, 0.0),
-        glam::Vec2::new(0.0, 1.0),
-    );
+    p.deformation_gradient =
+        glam::Mat2::from_cols(glam::Vec2::new(1.2, 0.0), glam::Vec2::new(0.0, 1.0));
     // Velocity gradient: zero (no ongoing flow — just check state update)
     p.velocity_gradient = glam::Mat2::ZERO;
 
-    mat.update_particle(&mut p, 0.01);
+    let mut soa = Particles::from(vec![p]);
+    mat.update_particle(&mut soa, 0, 0.01);
+    p = soa.get(0);
 
     // Damage should be positive (tensile yield occurred) or zero (elastic)
-    assert!(p.friction_hardening >= 0.0 && p.friction_hardening.is_finite(),
-        "damage must be non-negative finite, got {}", p.friction_hardening);
-    assert!(p.deformation_gradient.determinant() > 0.0,
-        "J must stay positive after Rankine update");
+    assert!(
+        p.friction_hardening >= 0.0 && p.friction_hardening.is_finite(),
+        "damage must be non-negative finite, got {}",
+        p.friction_hardening
+    );
+    assert!(
+        p.deformation_gradient.determinant() > 0.0,
+        "J must stay positive after Rankine update"
+    );
 }
 
 #[test]
@@ -758,26 +764,22 @@ fn spawn_region_appends_particles() {
         box_size: IVec2::new(4, 4),
         ..SpawnConfig::default()
     };
-    let range = solver.spawn_region(second_spawn);
+    let tag = solver.spawn_group(second_spawn);
 
     let count_after = solver.particles().len();
-    assert_eq!(
-        range.start, count_before,
-        "spawn_region: range.start != count_before"
-    );
-    assert_eq!(
-        range.end, count_after,
-        "spawn_region: range.end != count_after"
-    );
-    assert!(range.len() > 0, "spawn_region: spawned zero particles");
+    assert!(count_after > count_before, "spawn_group: spawned zero particles");
 
-    // All particles in the new range should be on the right side.
-    for idx in range {
-        let x = solver.particles().x[idx];
+    let group_count = solver.group_count(tag);
+    assert!(group_count > 0, "spawn_group: tag_index has no entries");
+    assert_eq!(group_count, count_after - count_before, "spawn_group: group_count mismatch");
+
+    // All particles in the new group should be in the right region.
+    let ps = solver.particles();
+    for i in solver.particles_with_tag(tag) {
         assert!(
-            x.x > 16.0,
-            "spawn_region: particle {idx} not in expected region (x={:.2})",
-            x.x
+            ps.x[i].x > 16.0,
+            "spawn_group: particle not in expected region (x={:.2})",
+            ps.x[i].x
         );
     }
 }
@@ -947,8 +949,8 @@ fn nacc_stable_after_many_steps() {
         gravity: Vec2::new(0.0, -0.3),
         ..small_solver_config()
     };
-    let mut solver = MpmSolver::new(config, small_spawn_config(16.0))
-        .with_default_material(Box::new(nacc));
+    let mut solver =
+        MpmSolver::new(config, small_spawn_config(16.0)).with_default_material(Box::new(nacc));
     solver.step_n(200);
     for (i, p) in solver.particles().iter().enumerate() {
         assert!(p.x.is_finite(), "nacc particle {i}: position non-finite");
@@ -960,5 +962,79 @@ fn nacc_stable_after_many_steps() {
             p.log_volume_strain.is_finite(),
             "nacc particle {i}: alpha non-finite"
         );
+    }
+}
+
+#[test]
+fn retain_particles_syncs_active_count_and_steps_cleanly() {
+    // Regression: particles_mut().retain() desynchronised active_count,
+    // causing index-out-of-bounds in scatter_particle_mass on next step.
+    let config = SolverConfig {
+        grid_res: 32,
+        dt: 0.1,
+        ..SolverConfig::standard(32, 0.1, Vec2::new(0.0, -0.1))
+    };
+    let spawn = SpawnConfig {
+        spacing: 0.5,
+        box_size: glam::IVec2::new(16, 16),
+        box_center: Vec2::splat(16.0),
+        initial_velocity_scale: 0.0,
+        ..SpawnConfig::for_solver(&config)
+    };
+    let mut solver = MpmSolver::empty(config)
+        .with_default_material(Box::new(NeoHookeanMaterial::new(100.0, 50.0)))
+        .with_boundary(Box::new(SlipBoundary::new(config.boundary_thickness)));
+    let _ = solver.spawn_group(spawn);
+
+    let before = solver.particles().len();
+    // Keep only particles in the left half.
+    solver.retain_particles(|p| p.x.x < 16.0);
+    let after = solver.particles().len();
+    assert!(after < before, "retain should remove particles");
+
+    // Must not panic — active_count must match particle array length.
+    solver.step_n(5);
+    for p in solver.particles() {
+        assert!(p.x.is_finite(), "position non-finite after retain + step");
+    }
+}
+
+#[test]
+fn split_particles_where_conserves_mass_and_increases_count() {
+    let config = SolverConfig::standard(32, 0.1, Vec2::new(0.0, -0.1));
+    let spawn = SpawnConfig {
+        spacing: 0.5,
+        box_size: glam::IVec2::new(8, 8),
+        box_center: Vec2::splat(16.0),
+        ..SpawnConfig::for_solver(&config)
+    };
+    let mut solver = MpmSolver::empty(config)
+        .with_default_material(Box::new(NeoHookeanMaterial::new(100.0, 50.0)))
+        .with_boundary(Box::new(SlipBoundary::new(config.boundary_thickness)));
+    let _ = solver.spawn_group(spawn);
+
+    // Run a few steps to build up some deformation gradient variation.
+    solver.step_n(5);
+
+    let total_mass_before: f32 = solver.particles().iter().map(|p| p.mass).sum();
+    let count_before = solver.particles().len();
+
+    // Split all active particles (unconditionally for test).
+    solver.split_particles_where(|_| true, 0.2);
+
+    let total_mass_after: f32 = solver.particles().iter().map(|p| p.mass).sum();
+    let count_after = solver.particles().len();
+
+    assert!(count_after > count_before, "particle count must increase after split");
+    assert!(count_after <= count_before * 2, "particle count cannot exceed double");
+    assert!(
+        (total_mass_after - total_mass_before).abs() < 1e-3,
+        "total mass must be conserved: before={total_mass_before:.4} after={total_mass_after:.4}"
+    );
+
+    // Must still simulate without panic.
+    solver.step_n(3);
+    for (i, p) in solver.particles().iter().enumerate() {
+        assert!(p.x.is_finite(), "particle {i} non-finite after split");
     }
 }

@@ -273,11 +273,14 @@ mod step_params {
 mod solver {
     use std::sync::Arc;
 
-    use crate::solver::density::estimate_initial_particle_volumes;
-    use crate::solver::{LcgRng, choose_substep_dt_flat, initialize_particles};
     use crate::materials::{ConstitutiveModel, registry::MaterialRegistry};
     use crate::solver::config::{SolverConfig, SpawnConfig};
-    use crate::{grid::Grid, particle::Particle};
+    use crate::solver::density::estimate_particle_volumes;
+    use crate::solver::{LcgRng, choose_substep_dt_flat, initialize_particles};
+    use crate::{
+        grid::Grid,
+        particle::{Particle, Particles},
+    };
 
     use super::buffers::GpuBuffers;
     use super::pipeline::MpmPipelines;
@@ -324,7 +327,8 @@ mod solver {
         /// Pending async readback — Some while GPU → staging copy + mapping is in flight.
         /// Checked each step_frame; on completion, CPU particles are updated without blocking.
         /// Arc<Mutex<...>> so the wgpu callback (any thread) can signal the main thread.
-        pending_readback: Option<std::sync::Arc<std::sync::Mutex<Option<Result<(), wgpu::BufferAsyncError>>>>>,
+        pending_readback:
+            Option<std::sync::Arc<std::sync::Mutex<Option<Result<(), wgpu::BufferAsyncError>>>>>,
     }
 
     impl GpuSolver {
@@ -483,15 +487,19 @@ mod solver {
                 // Uses pool slot 0 (any valid step_params; particle_count is what matters here).
                 let sort_params =
                     GpuStepParams::new(&self.config, self.config.dt, self.particle_count);
-                self.buffers.upload_step_params_at(&self.queue, 0, &sort_params);
+                self.buffers
+                    .upload_step_params_at(&self.queue, 0, &sort_params);
                 let sort_bg = self.pipelines.make_bind_group(
-                    &self.device, &self.buffers, &self.buffers.step_params_pool[0],
+                    &self.device,
+                    &self.buffers,
+                    &self.buffers.step_params_pool[0],
                 );
                 let particle_wg = div_ceil(self.particle_count as u32, WG_PARTICLES);
                 let mut encoder =
-                    self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("mpm_particle_sort"),
-                    });
+                    self.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("mpm_particle_sort"),
+                        });
                 {
                     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                         label: Some("particle_sort"),
@@ -509,10 +517,15 @@ mod solver {
             let mut sub_dts: Vec<f32> = Vec::with_capacity(self.config.max_substeps_per_step);
             {
                 let mut remaining = self.config.dt;
-                while remaining > f32::EPSILON && sub_dts.len() < self.config.max_substeps_per_step {
+                while remaining > f32::EPSILON && sub_dts.len() < self.config.max_substeps_per_step
+                {
                     let sub_dt = choose_substep_dt_flat(
-                        &self.config, &self.particles, &self.registry, remaining,
-                    ).min(remaining);
+                        &self.config,
+                        &self.particles,
+                        &self.registry,
+                        remaining,
+                    )
+                    .min(remaining);
                     sub_dts.push(sub_dt);
                     remaining -= sub_dt;
                 }
@@ -526,7 +539,8 @@ mod solver {
             for (i, e) in self.force_field_entries.iter().enumerate() {
                 ff_params.entries[i] = *e;
             }
-            self.buffers.upload_force_fields_params(&self.queue, &ff_params);
+            self.buffers
+                .upload_force_fields_params(&self.queue, &ff_params);
 
             // Upload step_params for each substep into its pool slot and build a bind group.
             // All uploads happen before the command buffer executes — pool ensures each substep
@@ -538,7 +552,9 @@ mod solver {
                     let params = GpuStepParams::new(&self.config, sub_dt, self.particle_count);
                     self.buffers.upload_step_params_at(&self.queue, i, &params);
                     self.pipelines.make_bind_group(
-                        &self.device, &self.buffers, &self.buffers.step_params_pool[i],
+                        &self.device,
+                        &self.buffers,
+                        &self.buffers.step_params_pool[i],
                     )
                 })
                 .collect();
@@ -546,9 +562,11 @@ mod solver {
             // Encode all substeps into one command buffer — one GPU submission per frame.
             let grid_wg = div_ceil(self.config.grid_res as u32, WG_GRID);
             let particle_wg = div_ceil(self.particle_count as u32, WG_PARTICLES);
-            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("mpm_frame"),
-            });
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("mpm_frame"),
+                });
             for bg in &bind_groups {
                 self.encode_substep(&mut encoder, bg, grid_wg, particle_wg);
             }
@@ -569,9 +587,10 @@ mod solver {
             self.device.poll(wgpu::PollType::Poll).ok();
 
             // Check if a previous async readback completed.
-            let readback_done = self.pending_readback.as_ref().and_then(|flag| {
-                flag.lock().ok().and_then(|mut g| g.take())
-            });
+            let readback_done = self
+                .pending_readback
+                .as_ref()
+                .and_then(|flag| flag.lock().ok().and_then(|mut g| g.take()));
             if readback_done.map(|r| r.is_ok()).unwrap_or(false) {
                 let gpu_particles = self.buffers.finish_readback(self.particle_count);
                 self.pending_readback = None;
@@ -581,15 +600,34 @@ mod solver {
                 // IMPORTANT: GPU g2p already integrated F via `F_new = (I + dt·C)·F_old`.
                 // Zero affine before update_particle so only the plasticity projection runs.
                 // Restore GPU affine afterwards so next P2G APIC term is correct.
-                for (p_gpu, p_cpu) in gpu_particles.into_iter().zip(self.particles.iter_mut()) {
-                    let gpu_affine = p_gpu.velocity_gradient;
-                    *p_cpu = p_gpu;
-                    if any_cpu {
+                // The new MaterialModel API takes (&mut Particles, usize) — convert AoS to SoA,
+                // run the CPU pass, then scatter results back.
+                if any_cpu {
+                    // Stash GPU affine matrices — we zero affine for the plasticity call then restore.
+                    let gpu_affines: Vec<_> =
+                        gpu_particles.iter().map(|p| p.velocity_gradient).collect();
+                    // Copy readback into AoS cpu mirror (zeroing affine for plasticity).
+                    for (p_gpu, p_cpu) in gpu_particles.iter().zip(self.particles.iter_mut()) {
+                        *p_cpu = *p_gpu;
                         p_cpu.velocity_gradient = glam::Mat2::ZERO;
-                        self.registry
-                            .get(p_cpu.material_id)
-                            .update_particle(p_cpu, self.last_sub_dt);
+                    }
+                    // Build SoA wrapper, run CPU plasticity, scatter plastic state back.
+                    let mut soa = Particles::from(std::mem::take(&mut self.particles));
+                    for i in 0..soa.len() {
+                        self.registry.get(soa.material_id[i]).update_particle(
+                            &mut soa,
+                            i,
+                            self.last_sub_dt,
+                        );
+                    }
+                    self.particles = soa.to_vec();
+                    // Restore GPU affine.
+                    for (p_cpu, gpu_affine) in self.particles.iter_mut().zip(gpu_affines) {
                         p_cpu.velocity_gradient = gpu_affine;
+                    }
+                } else {
+                    for (p_gpu, p_cpu) in gpu_particles.into_iter().zip(self.particles.iter_mut()) {
+                        *p_cpu = p_gpu;
                     }
                 }
                 if any_cpu {
@@ -599,9 +637,11 @@ mod solver {
 
             // Start a new readback if wanted and none is already in flight.
             if want_readback && self.pending_readback.is_none() {
-                self.pending_readback = Some(
-                    self.buffers.begin_readback(&self.device, &self.queue, self.particle_count),
-                );
+                self.pending_readback = Some(self.buffers.begin_readback(
+                    &self.device,
+                    &self.queue,
+                    self.particle_count,
+                ));
             }
         }
 
@@ -688,9 +728,13 @@ mod solver {
         /// Download particles from GPU to CPU synchronously (diagnostics / one-shot use).
         /// Prefer the async readback path in step_frame for per-frame use.
         pub fn download_particles_blocking(&mut self) {
-            let flag = self.buffers.begin_readback(&self.device, &self.queue, self.particle_count);
+            let flag = self
+                .buffers
+                .begin_readback(&self.device, &self.queue, self.particle_count);
             self.device.poll(wgpu::PollType::wait_indefinitely()).ok();
-            if let Ok(mut g) = flag.lock() { g.take(); }
+            if let Ok(mut g) = flag.lock() {
+                g.take();
+            }
             self.particles = self.buffers.finish_readback(self.particle_count);
         }
 
@@ -724,7 +768,8 @@ mod solver {
             debug_assert!(
                 self.registry.is_registered(spawn.material_id),
                 "spawn_region: material_id {} is not registered — call solver.set_material({}, ...) first",
-                spawn.material_id, spawn.material_id
+                spawn.material_id,
+                spawn.material_id
             );
             let mut rng = LcgRng::new(spawn.rng_seed);
             let new_particles = initialize_particles(&self.config, spawn, &mut rng);
@@ -733,8 +778,10 @@ mod solver {
             // Recompute initial volumes for the combined particle set using a temporary grid.
             let mut tmp_grid = Grid::new(self.config.grid_res);
             {
-                let mut tmp_soa = crate::particle::Particles::from(std::mem::take(&mut self.particles));
-                estimate_initial_particle_volumes(&mut tmp_soa, &mut tmp_grid);
+                let mut tmp_soa =
+                    crate::particle::Particles::from(std::mem::take(&mut self.particles));
+                let n = tmp_soa.len();
+                estimate_particle_volumes(&mut tmp_soa, &mut tmp_grid, n, true);
                 self.particles = tmp_soa.to_vec();
             }
 
@@ -787,11 +834,9 @@ mod solver {
                     let _ = self.buffers.finish_readback(self.particle_count);
                 }
             }
-            self.particles = self.buffers.readback_blocking(
-                &self.device,
-                &self.queue,
-                self.particle_count,
-            );
+            self.particles =
+                self.buffers
+                    .readback_blocking(&self.device, &self.queue, self.particle_count);
         }
 
         pub fn set_gravity(&mut self, gravity: glam::Vec2) {
@@ -860,17 +905,19 @@ mod solver {
             radius: f32,
         ) -> impl Iterator<Item = (usize, &Particle)> {
             let r2 = radius * radius;
-            self.particles.iter().enumerate().filter(move |(_, p)| {
-                (p.x - center).length_squared() <= r2
-            })
+            self.particles
+                .iter()
+                .enumerate()
+                .filter(move |(_, p)| (p.x - center).length_squared() <= r2)
         }
 
         /// Count particles of `material_id` within `radius` grid-cells of `center`. O(N).
         pub fn count_near(&self, center: glam::Vec2, radius: f32, material_id: u32) -> usize {
             let r2 = radius * radius;
-            self.particles.iter().filter(|p| {
-                p.material_id == material_id && (p.x - center).length_squared() <= r2
-            }).count()
+            self.particles
+                .iter()
+                .filter(|p| p.material_id == material_id && (p.x - center).length_squared() <= r2)
+                .count()
         }
 
         /// Aggregate state for all particles of the given material.
@@ -916,7 +963,9 @@ mod solver {
                 if d < radius {
                     p.v += force * (1.0 - d / radius);
                     let spd = p.v.length();
-                    if spd > vel_limit { p.v *= vel_limit / spd; }
+                    if spd > vel_limit {
+                        p.v *= vel_limit / spd;
+                    }
                 }
             }
             self.particles_dirty = true;
@@ -932,7 +981,9 @@ mod solver {
                 if d > 0.0 && d < radius {
                     p.v += (delta / d) * strength * (1.0 - d / radius);
                     let spd = p.v.length();
-                    if spd > vel_limit { p.v *= vel_limit / spd; }
+                    if spd > vel_limit {
+                        p.v *= vel_limit / spd;
+                    }
                 }
             }
             self.particles_dirty = true;

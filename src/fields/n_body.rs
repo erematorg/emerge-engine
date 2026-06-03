@@ -19,7 +19,7 @@
 use glam::Vec2;
 
 use crate::fields::ForceField;
-use crate::particle::Particle;
+use crate::particle::Particles;
 
 // ── Quadtree defaults ───────────────────────────────────────────────────────
 // These control tree quality vs. build cost. Both are configurable via the
@@ -172,13 +172,17 @@ impl Node {
         }
     }
 
-    fn acceleration_on(&self, idx: usize, pos: Vec2, mass: f32, gp: GravParams) -> Vec2 {
+    fn acceleration_on(&self, idx: usize, pos: Vec2, gp: GravParams) -> Vec2 {
         if self.is_far_enough(pos, gp.theta, gp.softening) {
             let r_vec = self.mass.center_of_mass - pos;
             let r2 = r_vec.length_squared();
             let norm_s = r2 + gp.eps2;
-            let scale = gp.g * mass * self.mass.total_mass / (norm_s * norm_s.sqrt());
-            return if scale.is_finite() { r_vec * scale } else { Vec2::ZERO };
+            let scale = gp.g * self.mass.total_mass / (norm_s * norm_s.sqrt());
+            return if scale.is_finite() {
+                r_vec * scale
+            } else {
+                Vec2::ZERO
+            };
         }
 
         if self.children.iter().all(|c| c.is_none()) {
@@ -194,7 +198,7 @@ impl Node {
                     continue;
                 }
                 let norm_s = r2 + gp.eps2;
-                let scale = gp.g * mass * bmass / (norm_s * norm_s.sqrt());
+                let scale = gp.g * bmass / (norm_s * norm_s.sqrt());
                 if scale.is_finite() {
                     total += r_vec * scale;
                 }
@@ -204,7 +208,7 @@ impl Node {
 
         let mut total = Vec2::ZERO;
         for child in self.children.iter().flatten() {
-            total += child.acceleration_on(idx, pos, mass, gp);
+            total += child.acceleration_on(idx, pos, gp);
         }
         total
     }
@@ -258,8 +262,8 @@ impl Quadtree {
         tree
     }
 
-    fn acceleration_on(&self, idx: usize, pos: Vec2, mass: f32, gp: GravParams) -> Vec2 {
-        self.root.acceleration_on(idx, pos, mass, gp)
+    fn acceleration_on(&self, idx: usize, pos: Vec2, gp: GravParams) -> Vec2 {
+        self.root.acceleration_on(idx, pos, gp)
     }
 }
 
@@ -325,7 +329,8 @@ impl ForceField for NBodyGravityField {
     fn prepare(&mut self, particles: &crate::particle::Particles) {
         self.snapshot.clear();
         self.snapshot.extend(
-            particles.indices()
+            particles
+                .indices()
                 .filter(|&i| particles.mass[i] > 0.0)
                 .map(|i| (i, particles.x[i], particles.mass[i])),
         );
@@ -336,19 +341,16 @@ impl ForceField for NBodyGravityField {
         ));
     }
 
-    fn acceleration(&self, particle: &Particle) -> Vec2 {
+    fn acceleration(&self, particles: &Particles, i: usize) -> Vec2 {
         let Some(tree) = &self.tree else {
             return Vec2::ZERO;
         };
-        // Self-interaction is suppressed by the r² < ε² guard inside the tree traversal.
-        // Plummer softening requires ε > 0, so self (r=0) is always filtered there.
-        // No O(N) position scan needed.
         let gp = GravParams {
             theta: self.theta,
             eps2: self.softening * self.softening,
             softening: self.softening,
             g: self.gravitational_constant,
         };
-        tree.acceleration_on(usize::MAX, particle.x, particle.mass, gp)
+        tree.acceleration_on(i, particles.x[i], gp)
     }
 }

@@ -1,12 +1,13 @@
 use glam::{Mat2, Vec2};
 
-/// Analytical 2×2 SVD. Returns (U, sigma, Vt) with σ₁ ≥ σ₂ ≥ 0 such that
+/// Analytical 2×2 SVD. Returns (U, sigma, Vt) with σ₁ ≥ |σ₂| and det(U)=det(V)=+1 such that
 /// F = U · diag(sigma) · Vt.
 ///
 /// Algorithm: direct analytical eigendecomposition of C = FᵀF (symmetric 2×2).
 /// 1. Eigenvalues of C via the closed-form trace/discriminant formula
 /// 2. Eigenvectors analytically from (C − λI)v = 0
 /// 3. σᵢ = √λᵢ; U columns = F·vᵢ / σᵢ (fallback to complement for σᵢ ≈ 0)
+/// 4. If F is inverted, encode the reflection in signed σ₂ so U and V stay proper rotations
 ///
 /// No external library or Jacobi iteration needed — fully closed-form.
 /// Reference: standard 2×2 symmetric eigendecomposition; McAdams et al. 2011 §2.
@@ -49,15 +50,27 @@ pub(crate) fn svd2(f: Mat2) -> (Mat2, Vec2, Mat2) {
     let vt = v_sorted.transpose();
 
     // Singular values σᵢ = √λᵢ (clamp negatives from floating-point noise)
-    let sigma = Vec2::new(lambda1.max(0.0).sqrt(), lambda2.max(0.0).sqrt());
+    let mut sigma = Vec2::new(lambda1.max(0.0).sqrt(), lambda2.max(0.0).sqrt());
 
     // U columns: uᵢ = F·vᵢ / σᵢ.  For σᵢ ≈ 0 (rank-deficient F): orthogonal fallback.
     let fv1 = f * v1;
     let fv2 = f * v2;
-    let u1 = if sigma.x > 1e-10 { fv1 / sigma.x } else { orthogonal_complement(fv2) };
-    let u2 = if sigma.y > 1e-10 { fv2 / sigma.y } else { orthogonal_complement(u1) };
+    let u1 = if sigma.x > 1e-10 {
+        fv1 / sigma.x
+    } else {
+        orthogonal_complement(fv2)
+    };
+    let u2 = if sigma.y > 1e-10 {
+        fv2 / sigma.y
+    } else {
+        orthogonal_complement(u1)
+    };
 
-    let u = Mat2::from_cols(u1, u2);
+    let mut u = Mat2::from_cols(u1, u2);
+    if u.determinant() < 0.0 {
+        u.y_axis = -u.y_axis;
+        sigma.y = -sigma.y;
+    }
 
     (u, sigma, vt)
 }
@@ -87,9 +100,22 @@ mod tests {
             assert!((a - b).abs() < 1e-5, "reconstruction {a} vs {b}\nF={f:?}");
         }
 
-        // Singular values non-negative and sorted
-        assert!(sigma.x >= 0.0 && sigma.y >= 0.0, "negative σ: {sigma:?}");
-        assert!(sigma.x >= sigma.y - 1e-6, "σ not sorted: {sigma:?}");
+        // Proper rotations with the reflection, if any, carried by σ₂.
+        assert!(
+            (u.determinant() - 1.0).abs() < 1e-5,
+            "det(U)={}",
+            u.determinant()
+        );
+        assert!(
+            (vt.determinant() - 1.0).abs() < 1e-5,
+            "det(V)={}",
+            vt.determinant()
+        );
+        assert!(sigma.x >= 0.0, "negative σ₁: {sigma:?}");
+        assert!(
+            sigma.x >= sigma.y.abs() - 1e-6,
+            "σ not sorted by magnitude: {sigma:?}"
+        );
 
         // U orthogonal: UᵀU ≈ I
         let utu = u.transpose() * u;
@@ -98,15 +124,61 @@ mod tests {
         assert!(utu.x_axis.y.abs() < 1e-5, "U off-diag={}", utu.x_axis.y);
     }
 
-    #[test] fn identity()            { check_svd(Mat2::IDENTITY); }
-    #[test] fn diagonal()            { check_svd(Mat2::from_cols(Vec2::new(3.0, 0.0), Vec2::new(0.0, 1.5))); }
-    #[test] fn shear()               { check_svd(Mat2::from_cols(Vec2::new(1.0, 0.5), Vec2::new(0.5, 1.0))); }
-    #[test] fn generic_deformation() { check_svd(Mat2::from_cols(Vec2::new(1.2, 0.3), Vec2::new(-0.1, 0.9))); }
-    #[test] fn rank_deficient()      { check_svd(Mat2::from_cols(Vec2::new(1.0, 2.0), Vec2::new(2.0, 4.0))); }
-    #[test] fn negative_det()        { check_svd(Mat2::from_cols(Vec2::new(1.0, 0.0), Vec2::new(0.0, -1.0))); }
-    #[test] fn near_identity()       { check_svd(Mat2::from_cols(Vec2::new(0.99, 0.01), Vec2::new(-0.01, 1.01))); }
-    #[test] fn pure_rotation() {
+    #[test]
+    fn identity() {
+        check_svd(Mat2::IDENTITY);
+    }
+    #[test]
+    fn diagonal() {
+        check_svd(Mat2::from_cols(Vec2::new(3.0, 0.0), Vec2::new(0.0, 1.5)));
+    }
+    #[test]
+    fn shear() {
+        check_svd(Mat2::from_cols(Vec2::new(1.0, 0.5), Vec2::new(0.5, 1.0)));
+    }
+    #[test]
+    fn generic_deformation() {
+        check_svd(Mat2::from_cols(Vec2::new(1.2, 0.3), Vec2::new(-0.1, 0.9)));
+    }
+    #[test]
+    fn rank_deficient() {
+        check_svd(Mat2::from_cols(Vec2::new(1.0, 2.0), Vec2::new(2.0, 4.0)));
+    }
+    #[test]
+    fn negative_det() {
+        check_svd(Mat2::from_cols(Vec2::new(1.0, 0.0), Vec2::new(0.0, -1.0)));
+    }
+    #[test]
+    fn near_identity() {
+        check_svd(Mat2::from_cols(
+            Vec2::new(0.99, 0.01),
+            Vec2::new(-0.01, 1.01),
+        ));
+    }
+    #[test]
+    fn negative_det_uses_signed_sigma() {
+        let (u, sigma, vt) = svd2(Mat2::from_cols(Vec2::new(1.0, 0.0), Vec2::new(0.0, -1.0)));
+        assert!(
+            (u.determinant() - 1.0).abs() < 1e-5,
+            "det(U)={}",
+            u.determinant()
+        );
+        assert!(
+            (vt.determinant() - 1.0).abs() < 1e-5,
+            "det(V)={}",
+            vt.determinant()
+        );
+        assert!(
+            sigma.y <= 0.0,
+            "expected signed σ₂ for inverted F, got {sigma:?}"
+        );
+    }
+    #[test]
+    fn pure_rotation() {
         let a: f32 = 0.7;
-        check_svd(Mat2::from_cols(Vec2::new(a.cos(), a.sin()), Vec2::new(-a.sin(), a.cos())));
+        check_svd(Mat2::from_cols(
+            Vec2::new(a.cos(), a.sin()),
+            Vec2::new(-a.sin(), a.cos()),
+        ));
     }
 }

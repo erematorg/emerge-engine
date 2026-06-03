@@ -1,8 +1,8 @@
 use glam::{Mat2, Vec2};
 
-use crate::materials::{ConstitutiveModel, MaterialModel, MaterialParams};
 use crate::materials::utils::{MIN_J, elastic_wave_dt, lame_from_young};
-use crate::particle::Particle;
+use crate::materials::{ConstitutiveModel, MaterialModel, MaterialParams};
+use crate::particle::Particles;
 
 /// Kelvin-Voigt viscoelastic solid.
 ///
@@ -43,11 +43,21 @@ pub struct ViscoelasticMaterial {
     /// τ_total = τ_elastic + τ_viscous + activation × coeff × I  (isotropic contractile pressure).
     /// 0.0 = passive (default). Tune to order of µ for visible deformation.
     pub active_stress_coeff: f32,
+    /// Thermal softening: λ_eff = λ·(1 + thermal_expansion·T), same for µ.
+    /// Negative = soften on heat (typical). 0.0 = isothermal (default).
+    pub thermal_expansion: f32,
 }
 
 impl ViscoelasticMaterial {
     pub fn new(lambda: f32, mu: f32, viscosity: f32) -> Self {
-        Self { lambda, mu, viscosity, j_min: 0.01, active_stress_coeff: 0.0 }
+        Self {
+            lambda,
+            mu,
+            viscosity,
+            j_min: 0.01,
+            active_stress_coeff: 0.0,
+            thermal_expansion: 0.0,
+        }
     }
 
     pub fn from_young_modulus(young_modulus: f32, poisson_ratio: f32, viscosity: f32) -> Self {
@@ -85,29 +95,33 @@ impl MaterialModel for ViscoelasticMaterial {
         ConstitutiveModel::Viscoelastic
     }
 
-    fn kirchhoff_stress(&self, particle: &Particle) -> Mat2 {
-        let f = particle.deformation_gradient;
+    fn kirchhoff_stress(&self, particles: &Particles, i: usize) -> Mat2 {
+        let f = particles.deformation_gradient[i];
         let j = (f.x_axis.x * f.y_axis.y - f.x_axis.y * f.y_axis.x)
             .max(self.j_min)
             .min(1.0 / self.j_min);
 
+        // Thermal modulus scaling.
+        let t_scale = 1.0 + self.thermal_expansion * particles.temperature[i];
+        let mu = self.mu * t_scale;
+        let lambda = self.lambda * t_scale;
+
         // NeoHookean elastic: τ = µ·(F·Fᵀ − I) + λ·ln(J)·I
-        let b = f * f.transpose(); // Left Cauchy-Green tensor
-        let elastic = self.mu * (b - Mat2::IDENTITY)
-            + Mat2::from_diagonal(Vec2::splat(self.lambda * j.ln()));
+        let b = f * f.transpose();
+        let elastic =
+            mu * (b - Mat2::IDENTITY) + Mat2::from_diagonal(Vec2::splat(lambda * j.ln()));
 
         // Kelvin-Voigt viscous dashpot: τ_v = η · D_dev
-        // D = (C + Cᵀ)/2 (symmetric strain rate from APIC velocity gradient)
-        let c = particle.velocity_gradient;
+        let c = particles.velocity_gradient[i];
         let sym = c + c.transpose();
         let d = sym * 0.5;
         let trace = d.x_axis.x + d.y_axis.y;
         let d_dev = d - Mat2::from_diagonal(Vec2::splat(trace * 0.5));
-        let viscous = self.viscosity * d_dev;
+        let viscous = self.viscosity * t_scale * d_dev;
 
         // Active stress: isotropic contractile pressure proportional to activation.
         let active = if self.active_stress_coeff != 0.0 {
-            particle.activation * self.active_stress_coeff * Mat2::IDENTITY
+            particles.activation[i] * self.active_stress_coeff * Mat2::IDENTITY
         } else {
             Mat2::ZERO
         };
@@ -115,15 +129,17 @@ impl MaterialModel for ViscoelasticMaterial {
         elastic + viscous + active
     }
 
-    fn update_particle(&self, particle: &mut Particle, dt: f32) {
-        let fp_new = Mat2::IDENTITY + dt * particle.velocity_gradient;
-        particle.deformation_gradient = fp_new * particle.deformation_gradient;
-        let j = particle.deformation_gradient.determinant().max(MIN_J);
-        particle.sync_volume_and_density(j);
+    fn update_particle(&self, particles: &mut Particles, i: usize, dt: f32) {
+        let fp_new = Mat2::IDENTITY + dt * particles.velocity_gradient[i];
+        particles.deformation_gradient[i] = fp_new * particles.deformation_gradient[i];
+        let j = particles.deformation_gradient[i].determinant().max(MIN_J);
+        let v = (particles.initial_volume[i] * j).max(1.0e-6);
+        particles.volume[i] = v;
+        particles.density[i] = particles.mass[i] / v;
     }
 
-    fn stress_volume(&self, particle: &Particle) -> f32 {
-        particle.initial_volume
+    fn stress_volume(&self, particles: &Particles, i: usize) -> f32 {
+        particles.initial_volume[i]
     }
 
     fn activation_scale(&self) -> f32 {
@@ -144,17 +160,23 @@ impl MaterialModel for ViscoelasticMaterial {
 
     fn timestep_bound(
         &self,
-        particle: &Particle,
+        particles: &Particles,
+        i: usize,
         cell_width: f32,
         material_cfl: f32,
         viscous_cfl: f32,
     ) -> f32 {
         let elastic_dt = elastic_wave_dt(
-            self.lambda, self.mu, 1.0,
-            particle.density, 1.0e-6, cell_width, material_cfl,
+            self.lambda,
+            self.mu,
+            1.0,
+            particles.density[i],
+            1.0e-6,
+            cell_width,
+            material_cfl,
         );
         let viscous_dt = if self.viscosity > 0.0 {
-            let density = particle.density.max(1.0e-6);
+            let density = particles.density[i].max(1.0e-6);
             let kinematic = self.viscosity / density;
             if kinematic > f32::EPSILON {
                 viscous_cfl * cell_width * cell_width / kinematic

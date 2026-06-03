@@ -8,12 +8,12 @@
 use bevy::prelude::*;
 use bevy::tasks::block_on;
 use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
-use emerge::gpu::{GpuSolver, GpuForceFieldEntry};
-use emerge::{
-    BinghamFluidMaterial, MaterialRegistry, NewtonianFluidMaterial,
-    SolverConfig, SpawnConfig, build_particles, log_frame_gpu,
-};
+use emerge::gpu::{GpuForceFieldEntry, GpuSolver};
 use emerge::runtime::fixed_step::FixedStepController;
+use emerge::{
+    BinghamFluidMaterial, MaterialRegistry, NewtonianFluidMaterial, SolverConfig, SpawnConfig,
+    build_particles, log_frame_gpu,
+};
 use glam::{IVec2, Vec2};
 
 const GRID: usize = 64;
@@ -22,12 +22,12 @@ const PPC: f32 = 10.0;
 const LABELS: &[(u32, &str)] = &[(0, "water"), (1, "mud")];
 
 const MAT_WATER: u32 = 0;
-const MAT_MUD:   u32 = 1;
+const MAT_MUD: u32 = 1;
 
 const WATER_CENTER: Vec2 = Vec2::new(11.0, 30.0);
-const WATER_SIZE:   IVec2 = IVec2::new(14, 52);
-const MUD_CENTER:   Vec2 = Vec2::new(50.0, 38.0);
-const MUD_SIZE:     IVec2 = IVec2::new(16, 18);
+const WATER_SIZE: IVec2 = IVec2::new(14, 52);
+const MUD_CENTER: Vec2 = Vec2::new(50.0, 38.0);
+const MUD_SIZE: IVec2 = IVec2::new(16, 18);
 
 #[derive(Resource, Clone, Copy, PartialEq)]
 struct Params {
@@ -70,7 +70,8 @@ struct Sim {
 impl Sim {
     fn new(p: Params) -> Self {
         let config = SolverConfig {
-            ..SolverConfig::standard(GRID, DT, Vec2::new(0.0, p.gravity))
+            gravity: Vec2::new(0.0, p.gravity),
+            ..SolverConfig::earth(GRID, 0.01, DT)
         };
         let spawn_water = SpawnConfig {
             spacing: 0.5,
@@ -103,7 +104,6 @@ impl Sim {
         }
     }
 }
-
 
 fn make_water(p: &Params) -> NewtonianFluidMaterial {
     let mut m = NewtonianFluidMaterial::new(4.0, p.water_viscosity, p.water_stiffness, 3.0);
@@ -155,22 +155,37 @@ fn setup(mut commands: Commands, sim: Res<Sim>) {
     for (i, p) in sim.solver.particles().iter().enumerate() {
         commands.spawn((
             PVis(i),
-            Sprite { color: fluid_color(p.material_id), custom_size: Some(Vec2::splat(4.0)), ..default() },
+            Sprite {
+                color: fluid_color(p.material_id),
+                custom_size: Some(Vec2::splat(4.0)),
+                ..default()
+            },
             Transform::from_translation(p2w(p.x)),
         ));
     }
 }
 
-fn reset(keys: Res<ButtonInput<KeyCode>>, mut sim: ResMut<Sim>, mut p: ResMut<Params>,
-         mut commands: Commands, vis: Query<Entity, With<PVis>>) {
+fn reset(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut sim: ResMut<Sim>,
+    mut p: ResMut<Params>,
+    mut commands: Commands,
+    vis: Query<Entity, With<PVis>>,
+) {
     if keys.just_pressed(KeyCode::KeyR) {
         *p = DEFAULTS;
         *sim = Sim::new(DEFAULTS);
-        for e in &vis { commands.entity(e).despawn(); }
+        for e in &vis {
+            commands.entity(e).despawn();
+        }
         for (i, pt) in sim.solver.particles().iter().enumerate() {
             commands.spawn((
                 PVis(i),
-                Sprite { color: fluid_color(pt.material_id), custom_size: Some(Vec2::splat(4.0)), ..default() },
+                Sprite {
+                    color: fluid_color(pt.material_id),
+                    custom_size: Some(Vec2::splat(4.0)),
+                    ..default()
+                },
                 Transform::from_translation(p2w(pt.x)),
             ));
         }
@@ -185,25 +200,40 @@ fn cursor(
     params: Res<Params>,
 ) {
     sim.solver.clear_force_fields_gpu();
-    if !mb.pressed(MouseButton::Left) && !mb.pressed(MouseButton::Right) { return; }
+    if !mb.pressed(MouseButton::Left) && !mb.pressed(MouseButton::Right) {
+        return;
+    }
     let Ok(win) = windows.single() else { return };
-    let Some(cp) = win.cursor_position() else { return };
+    let Some(cp) = win.cursor_position() else {
+        return;
+    };
     let Ok((cam, ct)) = cam.single() else { return };
-    let Ok(wp) = cam.viewport_to_world_2d(ct, cp) else { return };
+    let Ok(wp) = cam.viewport_to_world_2d(ct, cp) else {
+        return;
+    };
     let gp = wp / PPC + Vec2::splat(GRID as f32 * 0.5);
-    let gm = if mb.pressed(MouseButton::Right) { params.cursor_strength } else { -params.cursor_strength };
+    let gm = if mb.pressed(MouseButton::Right) {
+        params.cursor_strength
+    } else {
+        -params.cursor_strength
+    };
     let r = params.cursor_radius;
-    sim.solver.add_force_field_gpu(GpuForceFieldEntry::gravity_well(gp, gm, 4.0, r, r * 0.4));
+    sim.solver
+        .add_force_field_gpu(GpuForceFieldEntry::gravity_well(gp, gm, 4.0, r, r * 0.4));
 }
 
 fn step(time: Res<Time>, mut sim: ResMut<Sim>, params: Res<Params>) {
     sim.solver.set_gravity(Vec2::new(0.0, params.gravity));
     sim.stepper.set_simulation_speed(params.hz * DT);
     let n = sim.stepper.steps_for_frame(time.delta_secs());
-    if n == 0 { return; }
+    if n == 0 {
+        return;
+    }
     if sim.prev != *params {
-        sim.solver.set_default_material(Box::new(make_water(&params)));
-        sim.solver.set_material(MAT_MUD, Box::new(make_mud(&params)));
+        sim.solver
+            .set_default_material(Box::new(make_water(&params)));
+        sim.solver
+            .set_material(MAT_MUD, Box::new(make_mud(&params)));
         sim.prev = *params;
     }
     for _ in 0..n {
@@ -239,21 +269,42 @@ fn ui(mut ctx: EguiContexts, mut p: ResMut<Params>, mut sim: ResMut<Sim>, time: 
             ));
             ui.separator();
             ui.add(egui::Slider::new(&mut p.hz, 5.0..=60.0).text("solver_hz"));
-            ui.add(egui::Slider::new(&mut p.gravity, -2.0..=0.0).text("gravity"));
+            ui.add(egui::Slider::new(&mut p.gravity, -3.0..=0.0).text("gravity"));
             ui.separator();
-            ui.colored_label(egui::Color32::from_rgb(59, 169, 245), "Newtonian water (blue)");
-            ui.add(egui::Slider::new(&mut p.water_viscosity, 0.0..=5.0).text("shear µ").logarithmic(true));
-            ui.add(egui::Slider::new(&mut p.water_bulk_viscosity, 0.0..=5.0).text("bulk ζ (wave damp)").logarithmic(true));
+            ui.colored_label(
+                egui::Color32::from_rgb(59, 169, 245),
+                "Newtonian water (blue)",
+            );
+            ui.add(
+                egui::Slider::new(&mut p.water_viscosity, 0.0..=5.0)
+                    .text("shear µ")
+                    .logarithmic(true),
+            );
+            ui.add(
+                egui::Slider::new(&mut p.water_bulk_viscosity, 0.0..=5.0)
+                    .text("bulk ζ (wave damp)")
+                    .logarithmic(true),
+            );
             ui.add(egui::Slider::new(&mut p.water_settling, 0.0..=1.0).text("settling damp"));
-            ui.add(egui::Slider::new(&mut p.water_stiffness, 1.0..=500.0).text("eos_k").logarithmic(true));
-            ui.add(egui::Slider::new(&mut p.water_surface_tension, 0.0..=2.0).text("surface tension"));
+            ui.add(
+                egui::Slider::new(&mut p.water_stiffness, 1.0..=500.0)
+                    .text("eos_k")
+                    .logarithmic(true),
+            );
+            ui.add(
+                egui::Slider::new(&mut p.water_surface_tension, 0.0..=2.0).text("surface tension"),
+            );
             ui.separator();
             ui.colored_label(egui::Color32::from_rgb(133, 97, 56), "Bingham mud (brown)");
             ui.add(egui::Slider::new(&mut p.mud_viscosity, 0.5..=30.0).text("viscosity"));
             ui.add(egui::Slider::new(&mut p.mud_yield_stress, 0.0..=20.0).text("yield stress"));
             ui.add(egui::Slider::new(&mut p.mud_settling, 0.0..=2.0).text("settling damp"));
             ui.separator();
-            ui.add(egui::Slider::new(&mut p.cursor_strength, 5.0..=200.0).text("cursor force").logarithmic(true));
+            ui.add(
+                egui::Slider::new(&mut p.cursor_strength, 5.0..=200.0)
+                    .text("cursor force")
+                    .logarithmic(true),
+            );
             ui.add(egui::Slider::new(&mut p.cursor_radius, 1.0..=15.0).text("cursor radius"));
             ui.label("LMB: push  RMB: pull  R: reset");
             if ui.button("Reset (R)").clicked() {

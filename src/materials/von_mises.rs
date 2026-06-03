@@ -1,11 +1,11 @@
 use glam::{Mat2, Vec2};
 
+use crate::materials::svd::svd2;
 use crate::materials::utils::{
     LOG_CLAMP, MIN_J, elastic_wave_dt, hencky_strains, lame_from_young, reconstruct_f,
 };
 use crate::materials::{ConstitutiveModel, MaterialModel, MaterialParams, polar_decomposition_2d};
-use crate::particle::Particle;
-use crate::materials::svd::svd2;
+use crate::particle::Particles;
 
 /// Von Mises elastoplastic material: J2 plasticity with optional linear isotropic hardening.
 ///
@@ -46,14 +46,24 @@ impl VonMisesMaterial {
 
     /// Perfect plasticity (no hardening).
     pub fn new(lambda: f32, mu: f32, yield_stress: f32) -> Self {
-        Self { lambda, mu, yield_stress, hardening_modulus: 0.0 }
+        Self {
+            lambda,
+            mu,
+            yield_stress,
+            hardening_modulus: 0.0,
+        }
     }
 
     /// Linear isotropic hardening. `hardening_modulus` > 0 makes the material stiffen
     /// as it deforms plastically — yield stress grows as `yield_stress + H·κ`.
     pub fn with_hardening(lambda: f32, mu: f32, yield_stress: f32, hardening_modulus: f32) -> Self {
         assert!(hardening_modulus >= 0.0, "hardening_modulus must be ≥ 0");
-        Self { lambda, mu, yield_stress, hardening_modulus }
+        Self {
+            lambda,
+            mu,
+            yield_stress,
+            hardening_modulus,
+        }
     }
 }
 
@@ -62,20 +72,23 @@ impl MaterialModel for VonMisesMaterial {
         ConstitutiveModel::VonMises
     }
 
-    fn kirchhoff_stress(&self, particle: &Particle) -> Mat2 {
-        let f = particle.deformation_gradient;
+    fn kirchhoff_stress(&self, particles: &Particles, i: usize) -> Mat2 {
+        let f = particles.deformation_gradient[i];
         let j = f.determinant();
-        if j <= MIN_J { return Mat2::ZERO; }
+        if j <= MIN_J {
+            return Mat2::ZERO;
+        }
         let r = polar_decomposition_2d(f);
         2.0 * self.mu * (f - r) * f.transpose() + self.lambda * (j - 1.0) * j * Mat2::IDENTITY
     }
 
-    fn stress_volume(&self, particle: &Particle) -> f32 {
-        particle.initial_volume
+    fn stress_volume(&self, particles: &Particles, i: usize) -> f32 {
+        particles.initial_volume[i]
     }
 
-    fn update_particle(&self, particle: &mut Particle, dt: f32) {
-        let f_trial = (Mat2::IDENTITY + dt * particle.velocity_gradient) * particle.deformation_gradient;
+    fn update_particle(&self, particles: &mut Particles, i: usize, dt: f32) {
+        let f_trial = (Mat2::IDENTITY + dt * particles.velocity_gradient[i])
+            * particles.deformation_gradient[i];
         let (u, sigma, vt) = svd2(f_trial);
 
         let eps = hencky_strains(sigma);
@@ -83,26 +96,29 @@ impl MaterialModel for VonMisesMaterial {
         let dev = eps - Vec2::splat(tr * 0.5);
         let dev_norm = dev.length();
 
-        // J2 yield: 2µ|dev(ε)| ≤ yield_stress + H·κ
-        let kappa = particle.friction_hardening;
+        let kappa = particles.friction_hardening[i];
         let effective_yield = self.yield_stress + self.hardening_modulus * kappa;
         let elastic_dev = 2.0 * self.mu * dev_norm;
 
         let sigma_new = if elastic_dev > effective_yield && dev_norm > LOG_CLAMP {
-            // Return mapping: project deviatoric strain onto yield surface.
-            // γ = (elastic_dev − σ_Y) / (2µ + H)  →  new κ = κ + γ
             let denom = 2.0 * self.mu + self.hardening_modulus;
-            let gamma = if denom > f32::EPSILON { (elastic_dev - effective_yield) / denom } else { 0.0 };
-            particle.friction_hardening = kappa + gamma;
+            let gamma = if denom > f32::EPSILON {
+                (elastic_dev - effective_yield) / denom
+            } else {
+                0.0
+            };
+            particles.friction_hardening[i] = kappa + gamma;
             let eps_proj = dev * (effective_yield / elastic_dev) + Vec2::splat(tr * 0.5);
             Vec2::new(eps_proj.x.exp(), eps_proj.y.exp())
         } else {
             sigma
         };
 
-        particle.deformation_gradient = reconstruct_f(u, sigma_new, vt);
-        let j = particle.deformation_gradient.determinant().max(MIN_J);
-        particle.sync_volume_and_density(j);
+        particles.deformation_gradient[i] = reconstruct_f(u, sigma_new, vt);
+        let j = particles.deformation_gradient[i].determinant().max(MIN_J);
+        let v = (particles.initial_volume[i] * j).max(1.0e-6);
+        particles.volume[i] = v;
+        particles.density[i] = particles.mass[i] / v;
     }
 
     fn params(&self) -> MaterialParams {
@@ -116,7 +132,22 @@ impl MaterialModel for VonMisesMaterial {
         }
     }
 
-    fn timestep_bound(&self, particle: &Particle, cell_width: f32, material_cfl: f32, _viscous_cfl: f32) -> f32 {
-        elastic_wave_dt(self.lambda, self.mu, 1.0, particle.density, MIN_J, cell_width, material_cfl)
+    fn timestep_bound(
+        &self,
+        particles: &Particles,
+        i: usize,
+        cell_width: f32,
+        material_cfl: f32,
+        _viscous_cfl: f32,
+    ) -> f32 {
+        elastic_wave_dt(
+            self.lambda,
+            self.mu,
+            1.0,
+            particles.density[i],
+            MIN_J,
+            cell_width,
+            material_cfl,
+        )
     }
 }

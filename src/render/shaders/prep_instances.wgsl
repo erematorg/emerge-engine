@@ -8,7 +8,7 @@
 //   1 = ByVelocity — |v| * vel_scale → blue→red heat map
 //   2 = ByVolume   — det(F) → blue (compressed) / white (rest) / red (expanded)
 //
-// Particle struct layout (112 bytes) must match src/mechanics/particle.rs exactly.
+// Particle struct layout (112 bytes) must match src/particle.rs exactly.
 
 struct Particle {
     x:                    vec2<f32>,
@@ -32,7 +32,7 @@ struct Particle {
     _pad:                 u32,
 }
 
-// InstanceData layout (48 bytes) — must match DebugRenderer's VertexBufferLayout:
+// InstanceData layout (48 bytes) — must match MpmRenderer's VertexBufferLayout:
 //   deform_col0: vec2<f32> @ offset  0
 //   deform_col1: vec2<f32> @ offset  8
 //   position:    vec2<f32> @ offset 16

@@ -148,10 +148,26 @@ impl ThermalDiffusion {
             for y in 0..self.grid_res {
                 let c = x * self.grid_res + y;
                 let t_c = self.grid_temp[c];
-                let t_xm = if x > 0                 { self.grid_temp[c - self.grid_res] } else { self.config.ambient };
-                let t_xp = if x + 1 < self.grid_res { self.grid_temp[c + self.grid_res] } else { self.config.ambient };
-                let t_ym = if y > 0                 { self.grid_temp[c - 1]             } else { self.config.ambient };
-                let t_yp = if y + 1 < self.grid_res { self.grid_temp[c + 1]             } else { self.config.ambient };
+                let t_xm = if x > 0 {
+                    self.grid_temp[c - self.grid_res]
+                } else {
+                    self.config.ambient
+                };
+                let t_xp = if x + 1 < self.grid_res {
+                    self.grid_temp[c + self.grid_res]
+                } else {
+                    self.config.ambient
+                };
+                let t_ym = if y > 0 {
+                    self.grid_temp[c - 1]
+                } else {
+                    self.config.ambient
+                };
+                let t_yp = if y + 1 < self.grid_res {
+                    self.grid_temp[c + 1]
+                } else {
+                    self.config.ambient
+                };
                 let laplacian = t_xm + t_xp + t_ym + t_yp - 4.0 * t_c;
                 self.grid_work[c] = t_c + alpha_dt * laplacian;
             }

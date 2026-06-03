@@ -1,20 +1,15 @@
 /// GPU elastic solids — NeoHookean + Corotated + Viscoelastic, three-body comparison.
 ///
-/// Three blobs fall and interact on GPU compute:
-///   Mat 0  NeoHookean   (orange) — Simo-Pister vol-dev split
-///   Mat 1  Corotated    (teal)   — linear corotated elastic, stiffer baseline
-///   Mat 2  Viscoelastic (purple) — Kelvin-Voigt damped solid, soft tissue preset
-///
 ///   cargo run --example basic_jellies_gpu --features "bevy_examples,gpu"
 use bevy::prelude::*;
 use bevy::tasks::block_on;
 use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
 use emerge::gpu::{GpuForceFieldEntry, GpuSolver};
-use emerge::{
-    CorotatedMaterial, MaterialRegistry, NeoHookeanMaterial, SolverConfig,
-    SpawnConfig, ViscoelasticMaterial, build_particles, log_frame_gpu,
-};
 use emerge::runtime::fixed_step::FixedStepController;
+use emerge::{
+    CorotatedMaterial, MaterialRegistry, NeoHookeanMaterial, SolverConfig, SpawnConfig,
+    ViscoelasticMaterial, build_particles, log_frame_gpu,
+};
 use glam::Vec2;
 
 const GRID: usize = 64;
@@ -68,9 +63,9 @@ impl Sim {
         let config = SolverConfig {
             min_dt: 0.01,
             max_substeps_per_step: 8,
-            ..SolverConfig::standard(GRID, DT, Vec2::new(0.0, p.gravity))
+            gravity: Vec2::new(0.0, p.gravity),
+            ..SolverConfig::earth(GRID, 0.01, DT)
         };
-
         let spawn = |center: Vec2, mat: u32| {
             SpawnConfig::for_solver(&config)
                 .at(center)
@@ -84,27 +79,21 @@ impl Sim {
         particles.extend(build_particles(&config, spawn(Vec2::new(32.0, 50.0), MAT_COR)));
         particles.extend(build_particles(&config, spawn(Vec2::new(50.0, 50.0), MAT_VIS)));
 
-        let mut registry = MaterialRegistry::with_default(Box::new(
-            NeoHookeanMaterial::new(p.neo_lambda, p.neo_mu),
-        ));
+        let mut registry =
+            MaterialRegistry::with_default(Box::new(NeoHookeanMaterial::new(p.neo_lambda, p.neo_mu)));
         registry.insert(MAT_COR, Box::new(CorotatedMaterial::new(p.cor_lambda, p.cor_mu)));
         registry.insert(MAT_VIS, Box::new(ViscoelasticMaterial::new(p.vis_lambda, p.vis_mu, p.vis_viscosity)));
         let solver = block_on(GpuSolver::new(config, particles, registry));
 
-        Self {
-            solver,
-            stepper: FixedStepController::standard(DT, p.hz),
-            prev: p,
-            physics_frame: 0,
-        }
+        Self { solver, stepper: FixedStepController::standard(DT, p.hz), prev: p, physics_frame: 0 }
     }
 }
 
 fn mat_color(mat: u32) -> Color {
     match mat {
-        0 => Color::srgb(0.94, 0.52, 0.27), // orange — NeoHookean
-        1 => Color::srgb(0.25, 0.78, 0.65), // teal   — Corotated
-        _ => Color::srgb(0.72, 0.40, 0.90), // purple — Viscoelastic
+        0 => Color::srgb(0.94, 0.52, 0.27),
+        1 => Color::srgb(0.25, 0.78, 0.65),
+        _ => Color::srgb(0.72, 0.40, 0.90),
     }
 }
 
@@ -142,8 +131,13 @@ fn setup(mut commands: Commands, sim: Res<Sim>) {
     }
 }
 
-fn reset(keys: Res<ButtonInput<KeyCode>>, mut sim: ResMut<Sim>, mut p: ResMut<Params>,
-         mut commands: Commands, vis: Query<Entity, With<PVis>>) {
+fn reset(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut sim: ResMut<Sim>,
+    mut p: ResMut<Params>,
+    mut commands: Commands,
+    vis: Query<Entity, With<PVis>>,
+) {
     if keys.just_pressed(KeyCode::KeyR) {
         *p = DEFAULTS;
         *sim = Sim::new(DEFAULTS);
@@ -211,14 +205,10 @@ fn ui(mut ctx: EguiContexts, mut p: ResMut<Params>, mut sim: ResMut<Sim>, time: 
         .default_width(300.0)
         .resizable(false)
         .show(ctx, |ui| {
-            ui.label(format!(
-                "fps={:.0}  n={}  [GPU]",
-                time.delta_secs().recip(),
-                sim.solver.particle_count(),
-            ));
+            ui.label(format!("fps={:.0}  n={}  [GPU]", time.delta_secs().recip(), sim.solver.particle_count()));
             ui.separator();
             ui.add(egui::Slider::new(&mut p.hz, 5.0..=60.0).text("solver_hz"));
-            ui.add(egui::Slider::new(&mut p.gravity, -2.0..=2.0).text("gravity"));
+            ui.add(egui::Slider::new(&mut p.gravity, -3.0..=0.0).text("gravity"));
             ui.separator();
             ui.colored_label(egui::Color32::from_rgb(240, 133, 69), "NeoHookean (orange)");
             ui.add(egui::Slider::new(&mut p.neo_lambda, 1.0..=200.0).text("λ"));
@@ -236,10 +226,7 @@ fn ui(mut ctx: EguiContexts, mut p: ResMut<Params>, mut sim: ResMut<Sim>, time: 
             ui.add(egui::Slider::new(&mut p.cursor_strength, 10.0..=1000.0).text("cursor force").logarithmic(true));
             ui.add(egui::Slider::new(&mut p.cursor_radius, 1.0..=15.0).text("cursor radius"));
             ui.label("LMB: push  RMB: pull  R: reset");
-            if ui.button("Reset (R)").clicked() {
-                *p = DEFAULTS;
-                *sim = Sim::new(DEFAULTS);
-            }
+            if ui.button("Reset (R)").clicked() { *p = DEFAULTS; *sim = Sim::new(DEFAULTS); }
         });
 }
 

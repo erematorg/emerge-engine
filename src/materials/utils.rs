@@ -11,11 +11,14 @@ pub(crate) const MIN_J: f32 = 1e-6;
 
 /// Compute Hencky (logarithmic) strains from SVD singular values.
 ///
-/// ε_i = ln(σ_i), clamped above 1e-10 to avoid ln(0).
+/// ε_i = ln(|σ_i|), clamped above 1e-10 to avoid ln(0).
+/// The absolute value preserves Hencky strain magnitudes when `svd2()` encodes
+/// an inversion via a signed second singular value.
 /// Used identically by VonMisesMaterial, SandMaterial, RankineMaterial.
 #[inline(always)]
 pub(crate) fn hencky_strains(sigma: Vec2) -> Vec2 {
-    Vec2::new(sigma.x.max(LOG_CLAMP).ln(), sigma.y.max(LOG_CLAMP).ln())
+    let sigma = sigma.abs().max(Vec2::splat(LOG_CLAMP));
+    Vec2::new(sigma.x.ln(), sigma.y.ln())
 }
 
 /// Reconstruct a 2×2 deformation gradient from SVD factors and (possibly updated) singular values.
@@ -114,16 +117,19 @@ pub fn lame_from_young(young_modulus: f32, poisson_ratio: f32) -> (f32, f32) {
 
 /// Convert SI Young's modulus and Poisson's ratio to emerge grid-unit Lamé parameters.
 ///
-/// Assumes one simulation time unit = `dt_seconds` physical seconds,
-/// one grid cell = `dx_meters` physical meters, and a reference continuum density of
-/// `rest_density_kg_m3` kg/m² (2D, per unit depth). The conversion is:
-///   `λ_grid = λ_SI · dt² / (ρ₀ · dx)`
+/// In the solver, velocity is in cells/s and stress is applied as:
+///   `f_particle = vol_solver * sigma_solver * kernel`
+/// The correct non-dimensionalization gives:
+///   `λ_grid = λ_SI · dt² / (ρ₀ · dx²)`
 ///
-/// # Example — bone (E ≈ 20 GPa, ν = 0.3, ρ ≈ 1900 kg/m³)
+/// Pair with `SolverConfig::earth()` and set `config.particle_mass =
+/// rest_density_kg_m3 * (spacing * dx_meters).powi(2)` for a fully IRL-calibrated sim.
+///
+/// # Example — soft tissue (E ≈ 5 kPa, ν = 0.45, ρ = 1000 kg/m³, 1 cm/cell)
 /// ```rust,no_run
 /// use emerge::lame_from_si;
-/// let (lambda, mu) = lame_from_si(20.0e9, 0.3, 1900.0, 0.01, 0.001);
-/// // lambda ≈ 11.5, mu ≈ 7.7 — ready to plug into RankineMaterial or CorotatedMaterial
+/// let (lambda, mu) = lame_from_si(5_000.0, 0.45, 1000.0, 0.01, 0.1);
+/// // lambda ≈ 1552, mu ≈ 172 — ready for NeoHookeanMaterial or ViscoelasticMaterial
 /// ```
 pub fn lame_from_si(
     young_modulus_pa: f32,
@@ -133,22 +139,24 @@ pub fn lame_from_si(
     dt_seconds: f32,
 ) -> (f32, f32) {
     let (lambda_si, mu_si) = lame_from_young(young_modulus_pa, poisson_ratio);
-    let scale = dt_seconds * dt_seconds / (rest_density_kg_m3 * dx_meters);
+    let scale = dt_seconds * dt_seconds / (rest_density_kg_m3 * dx_meters * dx_meters);
     (lambda_si * scale, mu_si * scale)
 }
 
-/// Convert SI gravity (m/s²) to emerge grid-unit gravity (grid_cells/sim_time²).
+/// Convert SI gravity (m/s²) to solver units (grid cells / s²).
 ///
-/// Physical: `g_grid = g_SI · dt_seconds² / dx_meters`.
-/// Use in `SolverConfig::standard(grid_res, dt, gravity_to_grid(...))`.
+/// In the solver `v += gravity * sub_dt` where sub_dt is in real seconds,
+/// so gravity must be in [cells/s²] = g_SI / dx_meters.
+/// The `dt_seconds` parameter is unused but kept for API compatibility.
 ///
-/// # Example — Earth gravity
+/// # Example — Earth gravity at 1 cm/cell
 /// ```rust,no_run
 /// use emerge::gravity_to_grid;
 /// use glam::Vec2;
-/// let g = gravity_to_grid(Vec2::new(0.0, -9.81), 0.01, 0.001);
-/// // g ≈ Vec2::new(0.0, −0.0000981) grid_cells/sim_time²
+/// let g = gravity_to_grid(Vec2::new(0.0, -9.81), 0.01, 0.1);
+/// // g ≈ Vec2::new(0.0, -981.0) cells/s²
 /// ```
-pub fn gravity_to_grid(g_si: glam::Vec2, dx_meters: f32, dt_seconds: f32) -> glam::Vec2 {
-    g_si * (dt_seconds * dt_seconds / dx_meters)
+pub fn gravity_to_grid(g_si: glam::Vec2, dx_meters: f32, _dt_seconds: f32) -> glam::Vec2 {
+    g_si / dx_meters
 }
+

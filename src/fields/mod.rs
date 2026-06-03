@@ -9,20 +9,20 @@
 /// energy discontinuities without wasting usable interaction radius.
 pub(crate) const FADE_ONSET_RATIO: f32 = 0.85;
 
-mod force_field;
 pub mod buoyancy;
 pub mod chemotaxis;
 pub mod confinement;
 pub mod coulomb;
 pub mod em;
+mod force_field;
 pub mod gravity;
 pub mod n_body;
 
-pub use force_field::ForceField;
 pub use buoyancy::BuoyancyField;
 pub use chemotaxis::ChemotaxisField;
 pub use confinement::{AabbConfinementField, RadialConfinementField};
 pub use coulomb::CoulombField;
 pub use em::UniformElectricField;
+pub use force_field::ForceField;
 pub use gravity::GravityWellField;
 pub use n_body::NBodyGravityField;

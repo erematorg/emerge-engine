@@ -1,9 +1,11 @@
 use glam::{Mat2, Vec2};
 
-use crate::materials::utils::{MIN_J, elastic_wave_dt, hencky_strains, lame_from_young, reconstruct_f};
-use crate::materials::{ConstitutiveModel, MaterialModel, MaterialParams};
-use crate::particle::Particle;
 use crate::materials::svd::svd2;
+use crate::materials::utils::{
+    MIN_J, elastic_wave_dt, hencky_strains, lame_from_young, reconstruct_f,
+};
+use crate::materials::{ConstitutiveModel, MaterialModel, MaterialParams};
+use crate::particle::{Particle, Particles};
 
 /// µ(I)-rheology sand — rate-dependent Drucker-Prager (Blatny / matter "DPMui").
 ///
@@ -55,7 +57,7 @@ impl SandMuIMaterial {
         Self {
             lambda,
             mu,
-            mu_static:  20.9_f32.to_radians().tan(),
+            mu_static: 20.9_f32.to_radians().tan(),
             mu_dynamic: 32.8_f32.to_radians().tan(),
             inertial_q: 5.58,
         }
@@ -69,7 +71,10 @@ impl SandMuIMaterial {
 
     /// Preset for coarse dry sand (d≈5mm, ρₛ=2500) — less rate-sensitive.
     pub fn coarse_sand(lambda: f32, mu: f32) -> Self {
-        Self { inertial_q: 1.12, ..Self::new(lambda, mu) }
+        Self {
+            inertial_q: 1.12,
+            ..Self::new(lambda, mu)
+        }
     }
 
     /// Preset for fine dry sand (d≈1mm, ρₛ=2500) — more rate-sensitive.
@@ -80,7 +85,7 @@ impl SandMuIMaterial {
     /// Preset for dense sand — higher static + dynamic friction, larger µ₂-µ₁ gap.
     pub fn dense_sand(lambda: f32, mu: f32) -> Self {
         Self {
-            mu_static:  30.0_f32.to_radians().tan(),
+            mu_static: 30.0_f32.to_radians().tan(),
             mu_dynamic: 40.0_f32.to_radians().tan(),
             ..Self::new(lambda, mu)
         }
@@ -92,16 +97,18 @@ impl MaterialModel for SandMuIMaterial {
         ConstitutiveModel::DruckerPragerMuI
     }
 
-    fn kirchhoff_stress(&self, particle: &Particle) -> Mat2 {
-        let f = particle.deformation_gradient;
+    fn kirchhoff_stress(&self, particles: &Particles, i: usize) -> Mat2 {
+        let f = particles.deformation_gradient[i];
         let j = f.determinant();
-        if j <= MIN_J { return Mat2::ZERO; }
+        if j <= MIN_J {
+            return Mat2::ZERO;
+        }
         let r = crate::materials::polar_decomposition_2d(f);
         2.0 * self.mu * (f - r) * f.transpose() + self.lambda * (j - 1.0) * j * Mat2::IDENTITY
     }
 
-    fn stress_volume(&self, particle: &Particle) -> f32 {
-        particle.initial_volume
+    fn stress_volume(&self, particles: &Particles, i: usize) -> f32 {
+        particles.initial_volume[i]
     }
 
     fn init_particle(&self, particle: &mut Particle) {
@@ -109,88 +116,72 @@ impl MaterialModel for SandMuIMaterial {
         particle.friction_hardening = self.mu_static;
     }
 
-    fn update_particle(&self, particle: &mut Particle, dt: f32) {
-        // 1. Trial deformation gradient.
-        let f_trial = (Mat2::IDENTITY + dt * particle.velocity_gradient)
-            * particle.deformation_gradient;
+    fn update_particle(&self, particles: &mut Particles, i: usize, dt: f32) {
+        let f_trial = (Mat2::IDENTITY + dt * particles.velocity_gradient[i])
+            * particles.deformation_gradient[i];
         let (u, sigma, vt) = svd2(f_trial);
 
-        // 2. Hencky strains.
         let eps = hencky_strains(sigma);
         let tr = eps.x + eps.y;
 
-        // 3. Trial pressure and deviatoric norm (2D plane-strain).
-        //    K_2d = λ + µ  (bulk modulus for plane-strain 2D).
-        //    p_trial = −K · tr (positive = compression).
         let k_2d = self.lambda + self.mu;
         let p_trial = -k_2d * tr;
 
-        // 4. Tension cutoff: tensile trial state → project to stress-free identity.
         if p_trial <= 0.0 {
-            particle.deformation_gradient = reconstruct_f(u, Vec2::ONE, vt);
-            particle.friction_hardening = self.mu_static;
-            let j = particle.deformation_gradient.determinant().max(MIN_J);
-            particle.sync_volume_and_density(j);
+            particles.deformation_gradient[i] = reconstruct_f(u, Vec2::ONE, vt);
+            particles.friction_hardening[i] = self.mu_static;
+            let j = particles.deformation_gradient[i].determinant().max(MIN_J);
+            let v = (particles.initial_volume[i] * j).max(1.0e-6);
+            particles.volume[i] = v;
+            particles.density[i] = particles.mass[i] / v;
             return;
         }
 
-        // 5. Trial deviatoric norm.
-        //    dev(ε) = ε − (tr/2)·1 → ||dev|| = |ε₁−ε₂| / √2.
-        //    q_trial = √2·µ·||dev|| = µ·|ε₁−ε₂|.
         let dev = eps - Vec2::splat(tr * 0.5);
-        let dev_norm = dev.length(); // |ε₁-ε₂| / √2
+        let dev_norm = dev.length();
         let q_trial = std::f32::consts::SQRT_2 * self.mu * dev_norm;
-
         let q_yield = self.mu_static * p_trial;
 
-        // 6. Elastic: inside yield surface.
         if q_trial <= q_yield || dev_norm < f32::EPSILON {
-            particle.deformation_gradient = reconstruct_f(u, sigma, vt);
-            particle.friction_hardening = self.mu_static;
-            let j = particle.deformation_gradient.determinant().max(MIN_J);
-            particle.sync_volume_and_density(j);
+            particles.deformation_gradient[i] = reconstruct_f(u, sigma, vt);
+            particles.friction_hardening[i] = self.mu_static;
+            let j = particles.deformation_gradient[i].determinant().max(MIN_J);
+            let v = (particles.initial_volume[i] * j).max(1.0e-6);
+            particles.volume[i] = v;
+            particles.density[i] = particles.mass[i] / v;
             return;
         }
 
-        // 7. µ(I) quadratic for shear rate γ̇.
-        //
-        //    Derivation: set q_new = µ(I)·p after projection:
-        //      q_trial − µ·dt·γ̇ = [µ₁ + (µ₂−µ₁)·γ̇/(Q·√p + γ̇)] · p
-        //    Rearranging into aγ̇² + bγ̇ + c = 0 (see matter plasticity.cpp DPMui):
-        let delta_q = q_trial - q_yield; // > 0 by this point
-        let sqrt_p  = p_trial.sqrt();
+        let delta_q = q_trial - q_yield;
+        let sqrt_p = p_trial.sqrt();
 
         let a = self.mu * dt;
-        let b = p_trial * (self.mu_dynamic - self.mu_static)
-              + a * self.inertial_q * sqrt_p
-              - delta_q;
-        let c = -delta_q * self.inertial_q * sqrt_p; // ≤ 0
+        let b =
+            p_trial * (self.mu_dynamic - self.mu_static) + a * self.inertial_q * sqrt_p - delta_q;
+        let c = -delta_q * self.inertial_q * sqrt_p;
 
-        // Discriminant is always ≥ 0: a > 0, c ≤ 0 → 4ac ≤ 0 → b²−4ac ≥ b² ≥ 0.
         let gamma_dot = (-b + (b * b - 4.0 * a * c).sqrt()) / (2.0 * a);
         let gamma_dot = gamma_dot.max(0.0);
 
-        // 8. Effective friction coefficient at this rate.
         let mu_i = if gamma_dot > f32::EPSILON {
-            self.mu_static + (self.mu_dynamic - self.mu_static)
-                / (self.inertial_q * sqrt_p / gamma_dot + 1.0)
+            self.mu_static
+                + (self.mu_dynamic - self.mu_static) / (self.inertial_q * sqrt_p / gamma_dot + 1.0)
         } else {
             self.mu_static
         };
 
-        // 9. Return mapping: project ε along deviatoric direction.
-        //    Δγ = γ̇·dt,  n̂ = dev/dev_norm.
-        //    ε_new = ε − (Δγ/√2) · n̂
         let delta_gamma = gamma_dot * dt;
         let n_hat = dev / dev_norm;
         let eps_new = eps - n_hat * (delta_gamma / std::f32::consts::SQRT_2);
 
         let sigma_new = Vec2::new(eps_new.x.exp(), eps_new.y.exp());
-        particle.deformation_gradient = reconstruct_f(u, sigma_new, vt);
-        particle.friction_hardening = mu_i;
+        particles.deformation_gradient[i] = reconstruct_f(u, sigma_new, vt);
+        particles.friction_hardening[i] = mu_i;
 
-        let j = particle.deformation_gradient.determinant().max(MIN_J);
-        particle.sync_volume_and_density(j);
+        let j = particles.deformation_gradient[i].determinant().max(MIN_J);
+        let v = (particles.initial_volume[i] * j).max(1.0e-6);
+        particles.volume[i] = v;
+        particles.density[i] = particles.mass[i] / v;
     }
 
     fn params(&self) -> MaterialParams {
@@ -206,9 +197,26 @@ impl MaterialModel for SandMuIMaterial {
         }
     }
 
-    fn timestep_bound(&self, particle: &Particle, cell_width: f32, material_cfl: f32, _viscous_cfl: f32) -> f32 {
-        elastic_wave_dt(self.lambda, self.mu, 1.0, particle.density, MIN_J, cell_width, material_cfl)
+    fn timestep_bound(
+        &self,
+        particles: &Particles,
+        i: usize,
+        cell_width: f32,
+        material_cfl: f32,
+        _viscous_cfl: f32,
+    ) -> f32 {
+        elastic_wave_dt(
+            self.lambda,
+            self.mu,
+            1.0,
+            particles.density[i],
+            MIN_J,
+            cell_width,
+            material_cfl,
+        )
     }
 
-    fn needs_cpu_update(&self) -> bool { true }
+    fn needs_cpu_update(&self) -> bool {
+        false
+    }
 }

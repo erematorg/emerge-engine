@@ -8,44 +8,82 @@
 //! diagnostics, and runtime. Does not include experimental or GPU-backend types.
 
 pub use crate::{
-    // Solver
-    MpmSolver, SolverConfig, SpawnConfig, SpawnShape,
-    MaterialHandle, ParticleGroup,
-    Particle, Particles,
-
+    AabbConfinementField,
+    ActivationStatsPlugin,
     // Materials — all eleven
-    BinghamFluidMaterial, CorotatedMaterial, NaccMaterial, NeoHookeanMaterial, NewtonianFluidMaterial,
-    RankineMaterial, SandMaterial, SandMuIMaterial, SnowMaterial, ViscoelasticMaterial,
-    VonMisesMaterial, MaterialModel, MaterialParams, lame_from_young, lame_from_si, gravity_to_grid,
-
+    BinghamFluidMaterial,
     // Boundary conditions
-    BoundaryCondition, SlipBoundary, PredictiveBoundary, FrictionBoundary,
+    BoundaryCondition,
+    BuoyancyField,
+    ChemotaxisField,
+    CorotatedMaterial,
+    CoulombField,
+    DiagnosticsFrame,
+    DiagnosticsPlugin,
+    // Diagnostics
+    DiagnosticsRegistry,
+    // Runtime
+    FixedStepConfig,
+    FixedStepController,
 
     // Force fields
     ForceField,
-    AabbConfinementField, BuoyancyField, ChemotaxisField, CoulombField, GravityWellField,
-    NBodyGravityField, RadialConfinementField, UniformElectricField,
+    FrictionBoundary,
 
-    // Thermodynamics
-    ThermalConfig, ThermalDiffusion,
-    ScalarDiffusionConfig, ScalarDiffusionField,
-
-    // Diagnostics
-    DiagnosticsRegistry, DiagnosticsFrame, DiagnosticsPlugin,
-    ActivationStatsPlugin, ThermalStatsPlugin, MaterialCountPlugin, RollingPlugin,
-    collect_mpm_snapshot, MpmSnapshot,
-
-    // Runtime
-    FixedStepConfig, FixedStepController,
-
-    // Queries + density field export
-    MaterialState, compute_density_grid,
-
-    // Particle construction helpers
-    build_particles, estimate_particle_volumes,
-
+    GravityWellField,
     // Creature locomotion controller
     Lnn,
+    MaterialCountPlugin,
+    MaterialHandle,
+    MaterialModel,
+    MaterialParams,
+    // Queries + density field export
+    MaterialState,
+    MpmSnapshot,
+
+    // Solver
+    MpmSolver,
+    NBodyGravityField,
+    NaccMaterial,
+    NeoHookeanMaterial,
+    NewtonianFluidMaterial,
+    Particle,
+    ParticleGroup,
+    Particles,
+
+    PredictiveBoundary,
+    RadialConfinementField,
+    RankineMaterial,
+    RollingPlugin,
+    SandMaterial,
+    SandMuIMaterial,
+    ScalarDiffusionConfig,
+    ScalarDiffusionField,
+
+    SlipBoundary,
+    SnowMaterial,
+    SolverConfig,
+    SpawnConfig,
+    SpawnShape,
+    // Thermodynamics
+    ThermalConfig,
+    ThermalDiffusion,
+    ThermalStatsPlugin,
+    UniformElectricField,
+
+    ViscoelasticMaterial,
+    VonMisesMaterial,
+    // Particle construction helpers
+    build_particles,
+    collect_mpm_snapshot,
+    compute_density_grid,
+
+    estimate_particle_volumes,
+
+    gravity_to_grid,
+
+    lame_from_si,
+    lame_from_young,
 };
 
 // Math types — re-exported so consumers don't need a separate glam dependency.

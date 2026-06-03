@@ -12,11 +12,11 @@
 use bevy::prelude::*;
 use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
 use emerge::diagnostics::log_frame_full;
-use emerge::{
-    MpmSolver, NeoHookeanMaterial, NewtonianFluidMaterial, SandMaterial, SlipBoundary, SolverConfig,
-    SpawnConfig,
-};
 use emerge::runtime::fixed_step::FixedStepController;
+use emerge::{
+    MpmSolver, NeoHookeanMaterial, NewtonianFluidMaterial, SandMaterial, SlipBoundary,
+    SolverConfig, SpawnConfig,
+};
 use glam::{IVec2, Vec2};
 
 const GRID: usize = 64;
@@ -50,7 +50,7 @@ struct Params {
 
 const DEFAULTS: Params = Params {
     hz: 60.0,
-    gravity: -0.5,
+    gravity: -0.3,
     e_lambda: 40.0,
     e_mu: 80.0,
     // lambda=400, mu=200 → c_P≈24, ~6 CFL substeps (vs ~9 at 1000/500).
@@ -75,7 +75,8 @@ fn make_solver(p: Params) -> MpmSolver {
         min_dt: 0.005,
         max_substeps_per_step: 16,
         recompute_density_each_step: true,
-        ..SolverConfig::standard(GRID, DT, Vec2::new(0.0, p.gravity))
+        gravity: Vec2::new(0.0, p.gravity),
+            ..SolverConfig::earth(GRID, 0.01, DT)
     };
 
     // Spacing 0.7 keeps density realistic (~1500 particles total) while staying
@@ -93,11 +94,13 @@ fn make_solver(p: Params) -> MpmSolver {
         ..SpawnConfig::for_solver(&config)
     };
 
-    let mut solver = MpmSolver::new(config, sand_spawn)
+    let mut solver = MpmSolver::empty(config)
         .with_default_material(Box::new(NeoHookeanMaterial::new(p.e_lambda, p.e_mu)))
         .with_material(SAND_ID, Box::new(make_sand(p)))
         .with_material(FLUID_ID, Box::new(make_fluid(p)))
         .with_boundary(Box::new(SlipBoundary::new(config.boundary_thickness)));
+
+    let _ = solver.spawn_group(sand_spawn);
 
     // Fluid pool — bottom-right
     let fluid_spawn = SpawnConfig {
@@ -109,7 +112,7 @@ fn make_solver(p: Params) -> MpmSolver {
         precompute_initial_volumes: true,
         ..SpawnConfig::for_solver(&config)
     };
-    let _ = solver.spawn_region(fluid_spawn);
+    let _ = solver.spawn_group(fluid_spawn);
 
     // Elastic blob — center, high — falls onto terrain
     let elastic_spawn = SpawnConfig {
@@ -121,12 +124,9 @@ fn make_solver(p: Params) -> MpmSolver {
         precompute_initial_volumes: true,
         ..SpawnConfig::for_solver(&config)
     };
-    let _ = solver.spawn_region(elastic_spawn);
+    let _ = solver.spawn_group(elastic_spawn);
 
-    println!(
-        "[showcase] total particles: {}",
-        solver.particles().len()
-    );
+    println!("[showcase] total particles: {}", solver.particles().len());
     solver
 }
 
@@ -175,7 +175,7 @@ struct PVis(usize);
 
 fn mat_color(id: u32) -> Color {
     match id {
-        SAND_ID => Color::srgb(0.80, 0.64, 0.22), // golden sand
+        SAND_ID => Color::srgb(0.80, 0.64, 0.22),  // golden sand
         FLUID_ID => Color::srgb(0.22, 0.62, 0.95), // blue water
         _ => Color::srgb(0.38, 0.80, 0.48),        // green elastic blob
     }
@@ -213,11 +213,19 @@ fn cursor(
         return;
     }
     let Ok(win) = windows.single() else { return };
-    let Some(cp) = win.cursor_position() else { return };
+    let Some(cp) = win.cursor_position() else {
+        return;
+    };
     let Ok((cam, ct)) = cam.single() else { return };
-    let Ok(wp) = cam.viewport_to_world_2d(ct, cp) else { return };
+    let Ok(wp) = cam.viewport_to_world_2d(ct, cp) else {
+        return;
+    };
     let gp = wp / PPC + Vec2::splat(GRID as f32 * 0.5);
-    let sign = if mb.pressed(MouseButton::Right) { -1.0 } else { 1.0 };
+    let sign = if mb.pressed(MouseButton::Right) {
+        -1.0
+    } else {
+        1.0
+    };
     let dt = time.delta_secs().min(MAX_DT);
     sim.solver.particles_mut().for_each_mut(|p| {
         let d = p.x - gp;
@@ -236,28 +244,44 @@ fn cursor(
 fn drive(keys: Res<ButtonInput<KeyCode>>, mut sim: ResMut<Sim>, time: Res<Time>) {
     let dir = {
         let mut d = Vec2::ZERO;
-        if keys.pressed(KeyCode::ArrowLeft)  { d.x -= 1.0; }
-        if keys.pressed(KeyCode::ArrowRight) { d.x += 1.0; }
-        if keys.pressed(KeyCode::ArrowUp)    { d.y += 1.0; }
-        if keys.pressed(KeyCode::ArrowDown)  { d.y -= 1.0; }
+        if keys.pressed(KeyCode::ArrowLeft) {
+            d.x -= 1.0;
+        }
+        if keys.pressed(KeyCode::ArrowRight) {
+            d.x += 1.0;
+        }
+        if keys.pressed(KeyCode::ArrowUp) {
+            d.y += 1.0;
+        }
+        if keys.pressed(KeyCode::ArrowDown) {
+            d.y -= 1.0;
+        }
         d
     };
-    if dir == Vec2::ZERO { return; }
+    if dir == Vec2::ZERO {
+        return;
+    }
 
-    let centroid = {
+    let (centroid, count) = {
         let particles = sim.solver.particles();
-        let elastic: Vec<Vec2> = particles
-            .iter()
-            .filter(|p| p.material_id == ELASTIC_ID)
-            .map(|p| p.x)
-            .collect();
-        if elastic.is_empty() { return; }
-        elastic.iter().copied().fold(Vec2::ZERO, |a, x| a + x) / elastic.len() as f32
+        let (sum, n) = particles
+            .indices()
+            .filter(|&i| particles.material_id[i] == ELASTIC_ID)
+            .fold((Vec2::ZERO, 0usize), |(s, n), i| {
+                (s + particles.x[i], n + 1)
+            });
+        if n == 0 {
+            return;
+        }
+        (sum / n as f32, n)
     };
+    let _ = count;
 
     let impulse = dir.normalize() * DRIVE_STRENGTH * time.delta_secs().min(MAX_DT);
     sim.solver.particles_mut().for_each_mut(|p| {
-        if p.material_id != ELASTIC_ID { return; }
+        if p.material_id != ELASTIC_ID {
+            return;
+        }
         let dist = (p.x - centroid).length();
         if dist < DRIVE_RADIUS {
             p.v += impulse * (1.0 - dist / DRIVE_RADIUS);
@@ -269,17 +293,29 @@ fn step(time: Res<Time>, mut sim: ResMut<Sim>, params: Res<Params>) {
     sim.solver.set_gravity(Vec2::new(0.0, params.gravity));
     sim.stepper.set_simulation_speed(params.hz * DT);
     let n = sim.stepper.steps_for_frame(time.delta_secs());
-    if n == 0 { return; }
+    if n == 0 {
+        return;
+    }
     if sim.prev != *params {
-        sim.solver.set_default_material(Box::new(NeoHookeanMaterial::new(params.e_lambda, params.e_mu)));
-        sim.solver.set_material(SAND_ID, Box::new(make_sand(*params)));
-        sim.solver.set_material(FLUID_ID, Box::new(make_fluid(*params)));
+        sim.solver
+            .set_default_material(Box::new(NeoHookeanMaterial::new(
+                params.e_lambda,
+                params.e_mu,
+            )));
+        sim.solver
+            .set_material(SAND_ID, Box::new(make_sand(*params)));
+        sim.solver
+            .set_material(FLUID_ID, Box::new(make_fluid(*params)));
         sim.prev = *params;
     }
     sim.solver.step_n(n);
     sim.frame += n as u64;
     let snap = sim.solver.diagnostics_snapshot();
-    const LABELS: &[(u32, &str)] = &[(ELASTIC_ID, "elastic"), (SAND_ID, "sand"), (FLUID_ID, "fluid")];
+    const LABELS: &[(u32, &str)] = &[
+        (ELASTIC_ID, "elastic"),
+        (SAND_ID, "sand"),
+        (FLUID_ID, "fluid"),
+    ];
     log_frame_full(sim.frame, DT, sim.solver.particles(), LABELS, &snap, 60);
 }
 
@@ -293,16 +329,24 @@ fn sync(sim: Res<Sim>, mut q: Query<(&PVis, &mut Transform, &mut Sprite)>) {
 
 fn ui(mut ctx: EguiContexts, mut p: ResMut<Params>, mut sim: ResMut<Sim>, time: Res<Time>) {
     let Ok(ctx) = ctx.ctx_mut() else { return };
-    let n_elastic = sim.solver.particles().iter().filter(|p| p.material_id == ELASTIC_ID).count();
-    let n_sand = sim.solver.particles().iter().filter(|p| p.material_id == SAND_ID).count();
-    let n_fluid = sim.solver.particles().iter().filter(|p| p.material_id == FLUID_ID).count();
+    let (mut n_elastic, mut n_sand, mut n_fluid) = (0usize, 0usize, 0usize);
+    for i in sim.solver.particles().indices() {
+        match sim.solver.particles().material_id[i] {
+            m if m == ELASTIC_ID => n_elastic += 1,
+            m if m == SAND_ID => n_sand += 1,
+            m if m == FLUID_ID => n_fluid += 1,
+            _ => {}
+        }
+    }
     egui::Window::new("Showcase")
         .default_pos([10.0, 10.0])
         .default_width(260.0)
         .resizable(false)
         .show(ctx, |ui| {
             ui.label(format!("fps={:.0}", time.delta_secs().recip()));
-            ui.label(format!("elastic={n_elastic}  sand={n_sand}  fluid={n_fluid}"));
+            ui.label(format!(
+                "elastic={n_elastic}  sand={n_sand}  fluid={n_fluid}"
+            ));
             ui.separator();
             ui.label("↑ ↓ ← →  move blob    R  reset");
             ui.label("LMB push  RMB pull (all materials)");

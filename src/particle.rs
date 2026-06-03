@@ -151,6 +151,11 @@ pub struct Particles {
     pub activation: Vec<f32>,
     pub activation_dir: Vec<Vec2>,
     pub muscle_group_id: Vec<u32>,
+
+    // ── Sleep state — not in the hot path ────────────────────────────────────
+    /// True when the particle is in the sleeping partition and skipped by P2G/G2P.
+    /// Do not write directly — use `MpmSolver::wake` / `MpmSolver::sleep`.
+    pub sleeping: Vec<bool>,
 }
 
 impl Particles {
@@ -175,6 +180,7 @@ impl Particles {
             activation: Vec::new(),
             activation_dir: Vec::new(),
             muscle_group_id: Vec::new(),
+            sleeping: Vec::new(),
         }
     }
 
@@ -199,6 +205,7 @@ impl Particles {
             activation: Vec::with_capacity(cap),
             activation_dir: Vec::with_capacity(cap),
             muscle_group_id: Vec::with_capacity(cap),
+            sleeping: Vec::with_capacity(cap),
         }
     }
 
@@ -284,6 +291,52 @@ impl Particles {
         self.activation.push(p.activation);
         self.activation_dir.push(p.activation_dir);
         self.muscle_group_id.push(p.muscle_group_id);
+        self.sleeping.push(false);
+    }
+
+    /// Swap all SoA fields for indices `a` and `b`. Used by sleep/wake partition logic.
+    #[inline]
+    pub fn swap(&mut self, a: usize, b: usize) {
+        if a == b { return; }
+        self.x.swap(a, b);
+        self.v.swap(a, b);
+        self.velocity_gradient.swap(a, b);
+        self.deformation_gradient.swap(a, b);
+        self.mass.swap(a, b);
+        self.initial_volume.swap(a, b);
+        self.volume.swap(a, b);
+        self.density.swap(a, b);
+        self.material_id.swap(a, b);
+        self.plastic_volume_ratio.swap(a, b);
+        self.hardening_scale.swap(a, b);
+        self.friction_hardening.swap(a, b);
+        self.log_volume_strain.swap(a, b);
+        self.temperature.swap(a, b);
+        self.user_tag.swap(a, b);
+        self.activation.swap(a, b);
+        self.activation_dir.swap(a, b);
+        self.muscle_group_id.swap(a, b);
+        self.sleeping.swap(a, b);
+    }
+
+    /// Rotate `[start..end]` so that `[mid..end]` precedes `[start..mid]`.
+    /// Used by spawn_group to insert new particles before the sleeping zone.
+    /// Standard 3-reversal algorithm — O(end − start) swaps.
+    pub fn rotate_range(&mut self, start: usize, mid: usize, end: usize) {
+        if start >= mid || mid >= end { return; }
+        self.reverse_range(start, mid);
+        self.reverse_range(mid, end);
+        self.reverse_range(start, end);
+    }
+
+    fn reverse_range(&mut self, lo: usize, hi: usize) {
+        let mut l = lo;
+        let mut r = hi;
+        while l < r {
+            r -= 1;
+            self.swap(l, r);
+            l += 1;
+        }
     }
 
     /// Collect all particles into a `Vec<Particle>` (for GPU upload / diagnostics).
@@ -306,6 +359,8 @@ impl Particles {
             if pred(&p) {
                 if write != read {
                     self.set(write, p);
+                    // sleeping is not part of the AoS Particle view — copy explicitly.
+                    self.sleeping[write] = self.sleeping[read];
                 }
                 write += 1;
             }
@@ -328,6 +383,7 @@ impl Particles {
         self.activation.truncate(write);
         self.activation_dir.truncate(write);
         self.muscle_group_id.truncate(write);
+        self.sleeping.truncate(write);
     }
 
     /// Apply `f` to every particle, writing all changes back.
@@ -396,7 +452,10 @@ impl<'a> IntoIterator for &'a Particles {
     type Item = Particle;
     type IntoIter = ParticlesIter;
     fn into_iter(self) -> ParticlesIter {
-        ParticlesIter { particles: self.to_vec(), index: 0 }
+        ParticlesIter {
+            particles: self.to_vec(),
+            index: 0,
+        }
     }
 }
 

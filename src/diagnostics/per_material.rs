@@ -40,28 +40,50 @@ pub struct MaterialStats {
 impl MaterialStats {
     /// Format as a compact single line.
     ///
+    /// Only prints non-zero optional fields to reduce noise.
     /// Example output:
     /// ```text
-    /// [mat 0 snow  ] n=256  cx=(32.1,19.3)  v=0.023/0.041  J=[0.91,1.05]  Jp=0.982 h=1.027  act=0.00/0.00  dmg=0.00  T=0.00
+    /// [mat 0 snow  ] n=256  cx=(32.1,19.3)  v=0.023/0.041  J=[0.91,1.05]  Jp=0.982 h=1.027
+    /// [mat 1 sand  ] n=512  cx=(40.0,12.0)  v=0.010/0.022  J=[0.98,1.01]  q=0.382
+    /// [mat 2 jelly ] n=256  cx=(20.0,30.0)  v=1.200/2.100  J=[0.85,1.20]  act=0.80/1.00  T=36.50
     /// ```
     pub fn format(&self, label: Option<&str>) -> String {
         let tag = match label {
             Some(l) => format!("[mat {} {:<6}]", self.material_id, l),
-            None    => format!("[mat {:<8}]", self.material_id),
+            None => format!("[mat {:<8}]", self.material_id),
         };
-        format!(
-            "{} n={:<5} cx=({:6.1},{:6.1})  v={:.3}/{:.3}  J=[{:.3},{:.3}]  Jp={:.3} h={:.3}  act={:.2}/{:.2}  dmg={:.3}  T={:.2}",
+        let mut s = format!(
+            "{} n={:<5} cx=({:6.1},{:6.1})  v={:.3}/{:.3}  J=[{:.3},{:.3}]",
             tag,
             self.count,
-            self.centroid.x, self.centroid.y,
-            self.mean_speed, self.max_speed,
-            self.j_range[0], self.j_range[1],
-            self.avg_plastic_volume_ratio,
-            self.avg_hardening_scale,
-            self.mean_activation, self.max_activation,
-            self.mean_damage,
-            self.mean_temperature,
-        )
+            self.centroid.x,
+            self.centroid.y,
+            self.mean_speed,
+            self.max_speed,
+            self.j_range[0],
+            self.j_range[1],
+        );
+        // Plastic state — only when deformed.
+        if (self.avg_plastic_volume_ratio - 1.0).abs() > 1e-4 {
+            s.push_str(&format!("  Jp={:.3}", self.avg_plastic_volume_ratio));
+        }
+        if (self.avg_hardening_scale - 1.0).abs() > 1e-4 {
+            s.push_str(&format!("  h={:.3}", self.avg_hardening_scale));
+        }
+        // friction_hardening: DP q, VonMises κ, Rankine damage, SandMuI µ(I).
+        // Only print when non-zero — name it generically as "q" (internal state).
+        if self.mean_damage.abs() > 1e-4 {
+            s.push_str(&format!("  q={:.3}", self.mean_damage));
+        }
+        // Activation — only for creature materials.
+        if self.max_activation > 1e-4 {
+            s.push_str(&format!("  act={:.2}/{:.2}", self.mean_activation, self.max_activation));
+        }
+        // Temperature — only when non-zero.
+        if self.mean_temperature.abs() > 1e-4 {
+            s.push_str(&format!("  T={:.2}", self.mean_temperature));
+        }
+        s
     }
 }
 
@@ -145,7 +167,11 @@ fn per_material_stats_iter(iter: impl Iterator<Item = Particle>) -> Vec<Material
             MaterialStats {
                 material_id: id,
                 count: a.count,
-                centroid: if a.count > 0 { a.centroid_sum / n } else { Vec2::ZERO },
+                centroid: if a.count > 0 {
+                    a.centroid_sum / n
+                } else {
+                    Vec2::ZERO
+                },
                 mean_speed: a.speed_sum / n,
                 max_speed: a.max_speed,
                 j_range: [
@@ -178,12 +204,12 @@ pub fn log_frame(
         return;
     }
     let stats = per_material_stats(particles);
-    println!(
-        "── frame {}  dt={:.4}  n={} ──",
-        frame, dt, particles.len()
-    );
+    println!("── frame {}  dt={:.4}  n={} ──", frame, dt, particles.len());
     for s in &stats {
-        let label = labels.iter().find(|(id, _)| *id == s.material_id).map(|(_, l)| *l);
+        let label = labels
+            .iter()
+            .find(|(id, _)| *id == s.material_id)
+            .map(|(_, l)| *l);
         println!("  {}", s.format(label));
     }
 }
@@ -228,16 +254,40 @@ pub fn log_frame_full(
     if snapshot.sim_time_dropped > 1e-6 {
         extras.push_str(&format!("  time_drop={:.4}", snapshot.sim_time_dropped));
     }
+    // Show active/sleeping only when sleep system is in use.
+    let particle_info = if snapshot.sleeping_count > 0 {
+        format!(
+            "n={}  active={}  sleep={}",
+            particles.len(),
+            snapshot.active_count,
+            snapshot.sleeping_count,
+        )
+    } else {
+        format!("n={}", particles.len())
+    };
+    let substep_info = if snapshot.substeps_last_step > 1 {
+        format!("  sub={}", snapshot.substeps_last_step)
+    } else {
+        String::new()
+    };
     println!(
-        "── frame {}  dt={:.4}  n={}  cfl={:.3}  J=[{:.3},{:.3}]  health={}{} ──",
-        frame, dt, particles.len(),
+        "── frame {}  dt={:.4}  {}  cfl={:.3}  J=[{:.3},{:.3}]{}  health={}{} ──",
+        frame,
+        dt,
+        particle_info,
         snapshot.cfl_number,
-        snapshot.min_deformation_j, snapshot.max_deformation_j,
-        health_tag, extras,
+        snapshot.min_deformation_j,
+        snapshot.max_deformation_j,
+        substep_info,
+        health_tag,
+        extras,
     );
     let stats = per_material_stats(particles);
     for s in &stats {
-        let label = labels.iter().find(|(id, _)| *id == s.material_id).map(|(_, l)| *l);
+        let label = labels
+            .iter()
+            .find(|(id, _)| *id == s.material_id)
+            .map(|(_, l)| *l);
         println!("  {}", s.format(label));
     }
 }
@@ -259,16 +309,29 @@ pub fn log_frame_gpu(
         return;
     }
     let stats = per_material_stats_of(particles);
-    let (j_min, j_max) = stats.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), s| {
-        (lo.min(s.j_range[0]), hi.max(s.j_range[1]))
-    });
-    let (j_min, j_max) = if j_min.is_infinite() { (1.0, 1.0) } else { (j_min, j_max) };
+    let (j_min, j_max) = stats
+        .iter()
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), s| {
+            (lo.min(s.j_range[0]), hi.max(s.j_range[1]))
+        });
+    let (j_min, j_max) = if j_min.is_infinite() {
+        (1.0, 1.0)
+    } else {
+        (j_min, j_max)
+    };
     println!(
         "── frame {}  dt={:.4}  n={}  J=[{:.3},{:.3}]  [GPU] ──",
-        frame, dt, particles.len(), j_min, j_max,
+        frame,
+        dt,
+        particles.len(),
+        j_min,
+        j_max,
     );
     for s in &stats {
-        let label = labels.iter().find(|(id, _)| *id == s.material_id).map(|(_, l)| *l);
+        let label = labels
+            .iter()
+            .find(|(id, _)| *id == s.material_id)
+            .map(|(_, l)| *l);
         println!("  {}", s.format(label));
     }
 }

@@ -1,7 +1,7 @@
 use glam::Vec2;
 
 use crate::fields::ForceField;
-use crate::particle::Particle;
+use crate::particle::Particles;
 
 /// Archimedes buoyancy — lighter particles rise, heavier particles sink.
 ///
@@ -34,7 +34,11 @@ pub struct BuoyancyField {
 
 impl BuoyancyField {
     pub fn new(fluid_density: f32, gravity: Vec2) -> Self {
-        Self { fluid_density, gravity, min_density: 1.0e-4 }
+        Self {
+            fluid_density,
+            gravity,
+            min_density: 1.0e-4,
+        }
     }
 
     /// For a fluid sim: `fluid_density` is your water/mud material's `rest_density`,
@@ -45,10 +49,8 @@ impl BuoyancyField {
 }
 
 impl ForceField for BuoyancyField {
-    fn acceleration(&self, particle: &Particle) -> Vec2 {
-        let rho = particle.density.max(self.min_density);
-        // Buoyancy = −gravity × (ρ_fluid/ρ − 1).
-        // Negative sign: gravity is downward (negative y), so buoyancy is upward for light particles.
+    fn acceleration(&self, particles: &Particles, i: usize) -> Vec2 {
+        let rho = particles.density[i].max(self.min_density);
         -self.gravity * (self.fluid_density / rho - 1.0)
     }
 }

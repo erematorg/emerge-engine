@@ -25,7 +25,10 @@
 
 use glam::IVec2;
 
-use crate::{grid::kernel::quadratic_weights, particle::{Particle, Particles}};
+use crate::{
+    grid::kernel::quadratic_weights,
+    particle::{Particle, Particles},
+};
 
 /// A diffusing, decaying scalar field grid-coupled to MPM particles.
 ///
@@ -60,13 +63,13 @@ pub struct ScalarDiffusionField {
     pub source: Option<fn(&Particle, f32) -> f32>,
 
     grid_res: usize,
-    grid_mass:  Vec<f32>, // Σ(w · mass)          — cleared each step
-    grid_norm:  Vec<f32>, // φ_grid (pre-Laplacian) — needed for G2P delta
-    grid_work:  Vec<f32>, // dual-use: P2G scatter buffer, then Laplacian output
-    // Note: grid_work is reused between P2G and Laplacian to avoid a 4th allocation.
-    // P2G phase:       grid_work = Σ(w · mass · φ)
-    // After normalize: grid_work = post-Laplacian φ  (φ_old data discarded)
-    // G2P reads:       (grid_work − grid_norm) = Δφ
+    grid_mass: Vec<f32>, // Σ(w · mass)          — cleared each step
+    grid_norm: Vec<f32>, // φ_grid (pre-Laplacian) — needed for G2P delta
+    grid_work: Vec<f32>, // dual-use: P2G scatter buffer, then Laplacian output
+                         // Note: grid_work is reused between P2G and Laplacian to avoid a 4th allocation.
+                         // P2G phase:       grid_work = Σ(w · mass · φ)
+                         // After normalize: grid_work = post-Laplacian φ  (φ_old data discarded)
+                         // G2P reads:       (grid_work − grid_norm) = Δφ
 }
 
 /// Configuration for a scalar diffusion field.
@@ -113,9 +116,9 @@ impl ScalarDiffusionField {
             set,
             source: None,
             grid_res,
-            grid_mass:  vec![0.0; n],
-            grid_norm:  vec![0.0; n],
-            grid_work:  vec![0.0; n],
+            grid_mass: vec![0.0; n],
+            grid_norm: vec![0.0; n],
+            grid_work: vec![0.0; n],
         }
     }
 
@@ -208,10 +211,26 @@ impl ScalarDiffusionField {
             for y in 0..self.grid_res {
                 let c = x * self.grid_res + y;
                 let phi_c = self.grid_norm[c];
-                let phi_xm = if x > 0                  { self.grid_norm[c - self.grid_res] } else { self.config.ambient };
-                let phi_xp = if x + 1 < self.grid_res  { self.grid_norm[c + self.grid_res] } else { self.config.ambient };
-                let phi_ym = if y > 0                  { self.grid_norm[c - 1]             } else { self.config.ambient };
-                let phi_yp = if y + 1 < self.grid_res  { self.grid_norm[c + 1]             } else { self.config.ambient };
+                let phi_xm = if x > 0 {
+                    self.grid_norm[c - self.grid_res]
+                } else {
+                    self.config.ambient
+                };
+                let phi_xp = if x + 1 < self.grid_res {
+                    self.grid_norm[c + self.grid_res]
+                } else {
+                    self.config.ambient
+                };
+                let phi_ym = if y > 0 {
+                    self.grid_norm[c - 1]
+                } else {
+                    self.config.ambient
+                };
+                let phi_yp = if y + 1 < self.grid_res {
+                    self.grid_norm[c + 1]
+                } else {
+                    self.config.ambient
+                };
                 let laplacian = phi_xm + phi_xp + phi_ym + phi_yp - 4.0 * phi_c;
                 self.grid_work[c] = (phi_c + d_dt * laplacian) * decay_factor;
             }

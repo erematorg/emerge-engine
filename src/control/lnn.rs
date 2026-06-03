@@ -39,10 +39,18 @@ impl Lnn {
         assert_eq!(amplitude.len(), n, "amplitude length must equal n_neurons");
         assert_eq!(weights.len(), n * n, "weights length must equal n²");
         assert_eq!(bias.len(), n, "bias length must equal n_neurons");
-        Self { state: vec![0.0; n], tau, amplitude, weights, bias }
+        Self {
+            state: vec![0.0; n],
+            tau,
+            amplitude,
+            weights,
+            bias,
+        }
     }
 
-    pub fn n_neurons(&self) -> usize { self.state.len() }
+    pub fn n_neurons(&self) -> usize {
+        self.state.len()
+    }
 
     /// Overwrite neuron states — use to seed the oscillator before running.
     /// Without seeding, all states start at 0 and no wave forms.
@@ -63,9 +71,8 @@ impl Lnn {
                 .sum::<f32>()
                 + self.bias[i];
             let gate = sigmoid(net);
-            dx[i] = (-self.state[i] / self.tau[i]
-                + gate * (self.amplitude[i] - self.state[i]))
-                * dt;
+            dx[i] =
+                (-self.state[i] / self.tau[i] + gate * (self.amplitude[i] - self.state[i])) * dt;
         }
         for i in 0..n {
             self.state[i] += dx[i];
@@ -80,7 +87,9 @@ impl Lnn {
     // ── Genome API ──────────────────────────────────────────────────────────────
 
     /// Expected flat genome length for n neurons: n·(n + 3).
-    pub fn genome_size(n: usize) -> usize { n + n + n * n + n }
+    pub fn genome_size(n: usize) -> usize {
+        n + n + n * n + n
+    }
 
     /// Encode all parameters as a flat genome: [τ₀..τₙ, A₀..Aₙ, W_flat, b₀..bₙ].
     pub fn to_genome(&self) -> Vec<f32> {
@@ -96,7 +105,8 @@ impl Lnn {
     pub fn from_genome(n: usize, genome: &[f32]) -> Self {
         let expected = Self::genome_size(n);
         assert_eq!(
-            genome.len(), expected,
+            genome.len(),
+            expected,
             "genome length mismatch: expected {expected}, got {}",
             genome.len()
         );
@@ -117,7 +127,10 @@ impl Lnn {
     ///
     /// `period`: approximate oscillation period in simulation time units.
     pub fn traveling_wave(n_segments: usize, period: f32) -> Self {
-        assert!(n_segments >= 2, "need at least 2 segments for a traveling wave");
+        assert!(
+            n_segments >= 2,
+            "need at least 2 segments for a traveling wave"
+        );
 
         let tau_val = (period / std::f32::consts::TAU).max(1e-3);
         let tau = vec![tau_val; n_segments];
@@ -127,9 +140,9 @@ impl Lnn {
         let n = n_segments;
         let mut weights = vec![0.0f32; n * n];
         for i in 0..n {
-            weights[i * n + (i + 1) % n]       =  3.0; // excite next → wave propagation
-            weights[i * n + (i + n / 2) % n]   = -2.0; // inhibit opposite → phase separation
-            weights[i * n + i]                  = -0.5; // weak self-inhibition → no saturation
+            weights[i * n + (i + 1) % n] = 3.0; // excite next → wave propagation
+            weights[i * n + (i + n / 2) % n] = -2.0; // inhibit opposite → phase separation
+            weights[i * n + i] = -0.5; // weak self-inhibition → no saturation
         }
 
         let mut lnn = Self::new(tau, amplitude, weights, vec![0.0; n]);
@@ -155,7 +168,9 @@ mod tests {
     fn traveling_wave_oscillates() {
         let mut lnn = Lnn::traveling_wave(4, 1.0);
         let first: Vec<f32> = lnn.activations().collect();
-        for _ in 0..50 { lnn.step(0.01); }
+        for _ in 0..50 {
+            lnn.step(0.01);
+        }
         let later: Vec<f32> = lnn.activations().collect();
         let delta: f32 = first.iter().zip(&later).map(|(a, b)| (a - b).abs()).sum();
         assert!(delta > 0.1, "LNN did not oscillate (delta={delta})");
@@ -174,7 +189,9 @@ mod tests {
     #[test]
     fn activations_in_unit_range() {
         let mut lnn = Lnn::traveling_wave(6, 0.8);
-        for _ in 0..200 { lnn.step(0.005); }
+        for _ in 0..200 {
+            lnn.step(0.005);
+        }
         for a in lnn.activations() {
             assert!(a > 0.0 && a < 1.0, "activation out of (0,1): {a}");
         }

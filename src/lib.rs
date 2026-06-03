@@ -57,19 +57,18 @@ pub mod prelude;
 // `use emerge::MpmSolver` instead of `use emerge::solver::MpmSolver`.
 
 // Solver core
+pub use grid::{Cell, Grid};
+pub use particle::{Particle, Particles};
 pub use solver::MpmSolver;
 pub use solver::config::{SolverConfig, SpawnConfig, SpawnShape};
 pub use solver::handle::{MaterialHandle, ParticleGroup};
-pub use particle::{Particle, Particles};
-pub use grid::{Cell, Grid};
 
 // Materials
 pub use materials::{
-    BinghamFluidMaterial, ConstitutiveModel, MaterialModel, MaterialParams, MaterialRegistry,
-    MAX_MATERIAL_SLOTS, lame_from_young, lame_from_si, gravity_to_grid,
-    CorotatedMaterial, NaccMaterial, NeoHookeanMaterial, NewtonianFluidMaterial,
-    RankineMaterial, SandMaterial, SandMuIMaterial, SnowMaterial,
-    ViscoelasticMaterial, VonMisesMaterial,
+    BinghamFluidMaterial, ConstitutiveModel, CorotatedMaterial, MAX_MATERIAL_SLOTS, MaterialModel,
+    MaterialParams, MaterialRegistry, NaccMaterial, NeoHookeanMaterial, NewtonianFluidMaterial,
+    RankineMaterial, SandMaterial, SandMuIMaterial, SnowMaterial, ViscoelasticMaterial,
+    VonMisesMaterial, gravity_to_grid, lame_from_si, lame_from_young,
 };
 
 // Boundary conditions
@@ -83,9 +82,9 @@ pub use fields::{
 };
 
 // State queries + density export for rendering
-pub use solver::query::MaterialState;
-pub use solver::density::compute_density_grid;
 pub use control::Lnn;
+pub use solver::density::compute_density_grid;
+pub use solver::query::MaterialState;
 
 /// Build a `Vec<Particle>` from a `SpawnConfig` — the primary way to construct
 /// initial particle regions for `GpuSolver::new` or to merge multiple regions.
@@ -121,30 +120,43 @@ pub fn build_particles(config: &SolverConfig, spawn: SpawnConfig) -> Vec<Particl
 /// inside `MpmSolver::spawn_region`. Without it, initial particle density is geometric
 /// (`mass / spacing²`) which can cause a pressure spike on the first substep.
 pub fn estimate_particle_volumes(particles: &mut Vec<Particle>, grid_res: usize) {
-    use crate::solver::density::estimate_initial_particle_volumes;
-    let mut soa = Particles::from(particles.clone());
+    use crate::solver::density::estimate_particle_volumes as density_estimate;
+    let mut soa = Particles::from(std::mem::take(particles));
     let mut grid = Grid::new(grid_res);
-    estimate_initial_particle_volumes(&mut soa, &mut grid);
-    for (i, p) in particles.iter_mut().enumerate() {
-        p.density = soa.density[i];
-        p.volume = soa.volume[i];
-        p.initial_volume = soa.initial_volume[i];
-    }
+    let n = soa.len();
+    density_estimate(&mut soa, &mut grid, n, true);
+    *particles = soa.to_vec();
 }
 
 // Thermodynamics
-pub use thermodynamics::{ThermalConfig, ThermalDiffusion, ScalarDiffusionConfig, ScalarDiffusionField};
+pub use thermodynamics::{
+    ScalarDiffusionConfig, ScalarDiffusionField, ThermalConfig, ThermalDiffusion,
+};
 
 // Diagnostics + plugin system
 pub use diagnostics::{
-    // Snapshot + health
-    collect_mpm_snapshot, MpmSnapshot,
-    MpmHealthThresholds, MpmHealthStatus, evaluate_mpm_health,
-    // Per-material stats + logging
-    MaterialStats, per_material_stats, per_material_stats_of, log_frame, log_frame_full, log_frame_gpu,
+    ActivationStatsPlugin,
+    DiagnosticsFrame,
     // Plugin infrastructure
-    DiagnosticsPlugin, DiagnosticsRegistry, DiagnosticsFrame,
-    ActivationStatsPlugin, ThermalStatsPlugin, MaterialCountPlugin, RollingPlugin,
+    DiagnosticsPlugin,
+    DiagnosticsRegistry,
+    MaterialCountPlugin,
+    // Per-material stats + logging
+    MaterialStats,
+    MpmHealthStatus,
+    MpmHealthThresholds,
+    MpmSnapshot,
+    RollingPlugin,
+    ThermalStatsPlugin,
+    // Snapshot + health
+    FrameLogger,
+    collect_mpm_snapshot,
+    evaluate_mpm_health,
+    log_frame,
+    log_frame_full,
+    log_frame_gpu,
+    per_material_stats,
+    per_material_stats_of,
 };
 
 // Runtime
@@ -152,8 +164,8 @@ pub use runtime::{FixedStepConfig, FixedStepController};
 
 // GPU backend
 #[cfg(feature = "gpu")]
-pub use gpu::{GpuSolver, GpuForceFieldEntry, GpuForceFieldsParams, MAX_FORCE_FIELDS, field_type};
+pub use gpu::{GpuForceFieldEntry, GpuForceFieldsParams, GpuSolver, MAX_FORCE_FIELDS, field_type};
 
 // Render backend
 #[cfg(feature = "render")]
-pub use render::{ColorMode, DebugRenderer};
+pub use render::{ColorMode, MpmRenderer};

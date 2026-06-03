@@ -1,11 +1,11 @@
 use glam::{Mat2, Vec2};
 
+use crate::materials::svd::svd2;
 use crate::materials::utils::{
     MIN_J, elastic_wave_dt, hencky_strains, lame_from_young, reconstruct_f, stress_to_hencky,
 };
 use crate::materials::{ConstitutiveModel, MaterialModel, MaterialParams, polar_decomposition_2d};
-use crate::particle::Particle;
-use crate::materials::svd::svd2;
+use crate::particle::Particles;
 
 /// Rankine (maximum principal stress) elastoplastic material — brittle tensile failure.
 ///
@@ -40,7 +40,12 @@ pub struct RankineMaterial {
 
 impl RankineMaterial {
     pub fn new(lambda: f32, mu: f32, tensile_strength: f32, softening_rate: f32) -> Self {
-        Self { lambda, mu, tensile_strength, softening_rate }
+        Self {
+            lambda,
+            mu,
+            tensile_strength,
+            softening_rate,
+        }
     }
 
     pub fn from_young_modulus(
@@ -90,53 +95,52 @@ impl MaterialModel for RankineMaterial {
         ConstitutiveModel::Rankine
     }
 
-    fn kirchhoff_stress(&self, particle: &Particle) -> Mat2 {
-        let f = particle.deformation_gradient;
+    fn kirchhoff_stress(&self, particles: &Particles, i: usize) -> Mat2 {
+        let f = particles.deformation_gradient[i];
         let j = f.determinant();
-        if j <= MIN_J { return Mat2::ZERO; }
+        if j <= MIN_J {
+            return Mat2::ZERO;
+        }
         let r = polar_decomposition_2d(f);
         2.0 * self.mu * (f - r) * f.transpose() + self.lambda * (j - 1.0) * j * Mat2::IDENTITY
     }
 
-    fn stress_volume(&self, particle: &Particle) -> f32 {
-        particle.initial_volume
+    fn stress_volume(&self, particles: &Particles, i: usize) -> f32 {
+        particles.initial_volume[i]
     }
 
-    fn update_particle(&self, particle: &mut Particle, dt: f32) {
-        let f_trial = (Mat2::IDENTITY + dt * particle.velocity_gradient) * particle.deformation_gradient;
+    fn update_particle(&self, particles: &mut Particles, i: usize, dt: f32) {
+        let f_trial = (Mat2::IDENTITY + dt * particles.velocity_gradient[i])
+            * particles.deformation_gradient[i];
         let (u, sigma, vt) = svd2(f_trial);
 
         let eps = hencky_strains(sigma);
 
-        // Principal Kirchhoff stresses via corotated elastic stiffness tensor.
         let a = 2.0 * self.mu + self.lambda;
         let tau = Vec2::new(
             a * eps.x + self.lambda * eps.y,
             self.lambda * eps.x + a * eps.y,
         );
 
-        let damage = particle.friction_hardening;
+        let damage = particles.friction_hardening[i];
         let t_eff = self.tensile_strength_eff(damage);
 
         let (tau_proj, yielded) = self.project_stress(tau, t_eff);
 
         let sigma_new = if yielded {
-            // Convert both trial and projected stresses to Hencky strain space,
-            // then take the norm of the strain increment as the damage increment.
-            // This gives a dimensionless, ν-independent damage rate — dividing by
-            // (2µ+λ) was wrong (off by det/a² depending on ν). Strain norm is correct.
             let eps_proj = stress_to_hencky(tau_proj, self.lambda, self.mu);
             let eps_trial = stress_to_hencky(tau, self.lambda, self.mu);
-            particle.friction_hardening = damage + (eps_trial - eps_proj).length();
-
+            particles.friction_hardening[i] = damage + (eps_trial - eps_proj).length();
             Vec2::new(eps_proj.x.exp(), eps_proj.y.exp())
         } else {
             sigma
         };
 
-        particle.deformation_gradient = reconstruct_f(u, sigma_new, vt);
-        let j = particle.deformation_gradient.determinant().max(MIN_J);
-        particle.sync_volume_and_density(j);
+        particles.deformation_gradient[i] = reconstruct_f(u, sigma_new, vt);
+        let j = particles.deformation_gradient[i].determinant().max(MIN_J);
+        let v = (particles.initial_volume[i] * j).max(1.0e-6);
+        particles.volume[i] = v;
+        particles.density[i] = particles.mass[i] / v;
     }
 
     fn params(&self) -> MaterialParams {
@@ -152,9 +156,26 @@ impl MaterialModel for RankineMaterial {
         }
     }
 
-    fn timestep_bound(&self, particle: &Particle, cell_width: f32, material_cfl: f32, _viscous_cfl: f32) -> f32 {
-        elastic_wave_dt(self.lambda, self.mu, 1.0, particle.density, MIN_J, cell_width, material_cfl)
+    fn timestep_bound(
+        &self,
+        particles: &Particles,
+        i: usize,
+        cell_width: f32,
+        material_cfl: f32,
+        _viscous_cfl: f32,
+    ) -> f32 {
+        elastic_wave_dt(
+            self.lambda,
+            self.mu,
+            1.0,
+            particles.density[i],
+            MIN_J,
+            cell_width,
+            material_cfl,
+        )
     }
 
-    fn needs_cpu_update(&self) -> bool { true }
+    fn needs_cpu_update(&self) -> bool {
+        false
+    }
 }

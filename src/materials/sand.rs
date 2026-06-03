@@ -1,26 +1,11 @@
 use glam::{Mat2, Vec2};
 
-use crate::materials::utils::{MIN_J, elastic_wave_dt, lame_from_young};
-use crate::materials::{ConstitutiveModel, MaterialModel, MaterialParams, polar_decomposition_2d};
-use crate::particle::Particle;
 use crate::materials::svd::svd2;
+use crate::materials::utils::{LOG_CLAMP, MIN_J, elastic_wave_dt, lame_from_young};
+use crate::materials::{ConstitutiveModel, MaterialModel, MaterialParams, polar_decomposition_2d};
+use crate::particle::{Particle, Particles};
 
-/// Drucker-Prager elastoplastic sand/soil.
-///
-/// Elastic response: corotated linear elasticity (τ = 2µ(F−R)Fᵀ + λ(J−1)J·I).
-/// Plasticity: Drucker-Prager yield surface with friction-angle hardening.
-///
-/// The yield criterion is checked in logarithmic strain space (Hencky strain).
-/// When the trial strain exceeds the cone, singular values of F are projected
-/// back to the yield surface via return mapping.
-///
-/// Reference: Klar et al. 2016 "Drucker-Prager Elastoplasticity for Sand Animation".
-/// Implementation mirrors sparkl's `DruckerPragerPlasticity`, adapted to 2D.
-///
-/// # Visual quality note
-/// Realistic sand piles require ≥4 particles/cell. At 1–2 ppc the elastic regime
-/// is visible between plastic projections. The GPU path enables the ppc needed for
-/// production-quality results; on CPU keep ppc=2 and accept some elastic feel.
+/// Drucker-Prager elastoplastic sand. Ref: Klar et al. 2016.
 #[derive(Debug, Clone, Copy)]
 pub struct SandMaterial {
     pub lambda: f32,
@@ -57,7 +42,6 @@ impl SandMaterial {
             friction_residual: 10.0_f32.to_radians(),
             volume_correction: 1.0,
             dilatancy_angle: 0.0,
-            
         }
     }
 
@@ -114,6 +98,7 @@ impl SandMaterial {
     /// Returns `Some((projected_sigma, delta_q))` if projection occurred (plastic step),
     /// `None` if the trial state is inside the yield surface (elastic step).
     fn project(&self, sigma: Vec2, log_volume_strain: f32, alpha: f32) -> Option<(Vec2, f32)> {
+        let sigma = sigma.abs().max(Vec2::splat(LOG_CLAMP));
         // Hencky (logarithmic) strain, shifted by the accumulated volumetric offset.
         let eps = Vec2::new(
             sigma.x.ln() + log_volume_strain * 0.5,
@@ -154,8 +139,8 @@ impl MaterialModel for SandMaterial {
 
     /// Corotated elastic Kirchhoff stress: τ = 2µ(F−R)Fᵀ + λ(J−1)J·I
     /// R is the rotation from 2D polar decomposition of F.
-    fn kirchhoff_stress(&self, particle: &Particle) -> Mat2 {
-        let f = particle.deformation_gradient;
+    fn kirchhoff_stress(&self, particles: &Particles, i: usize) -> Mat2 {
+        let f = particles.deformation_gradient[i];
         let j = f.determinant();
         if j <= MIN_J {
             return Mat2::ZERO;
@@ -167,8 +152,8 @@ impl MaterialModel for SandMaterial {
         2.0 * self.mu * (f - r) * f_t + self.lambda * (j - 1.0) * j * Mat2::IDENTITY
     }
 
-    fn stress_volume(&self, particle: &Particle) -> f32 {
-        particle.initial_volume
+    fn stress_volume(&self, particles: &Particles, i: usize) -> f32 {
+        particles.initial_volume[i]
     }
 
     fn init_particle(&self, particle: &mut Particle) {
@@ -182,50 +167,43 @@ impl MaterialModel for SandMaterial {
         };
     }
 
-    fn update_particle(&self, particle: &mut Particle, dt: f32) {
-        // 1. Trial elastic deformation gradient.
-        let f_trial =
-            (Mat2::IDENTITY + dt * particle.velocity_gradient) * particle.deformation_gradient;
+    fn update_particle(&self, particles: &mut Particles, i: usize, dt: f32) {
+        let f_trial = (Mat2::IDENTITY + dt * particles.velocity_gradient[i])
+            * particles.deformation_gradient[i];
 
-        // 2. SVD: F_trial = U · diag(σ) · Vt
         let (u, sigma, vt) = svd2(f_trial);
-
-        // 3. Drucker-Prager return mapping.
-        let alpha = self.alpha(particle.friction_hardening);
+        let alpha = self.alpha(particles.friction_hardening[i]);
         let new_sigma = if let Some((proj_sigma, dq)) =
-            self.project(sigma, particle.log_volume_strain, alpha)
+            self.project(sigma, particles.log_volume_strain[i], alpha)
         {
-            let prev_det = sigma.x * sigma.y;
+            let sigma_abs = sigma.abs().max(Vec2::splat(LOG_CLAMP));
+            let prev_det = sigma_abs.x * sigma_abs.y;
             let new_det = proj_sigma.x * proj_sigma.y;
             let diff = new_det - prev_det;
-            // Volume correction: attenuate volume loss from projection.
             let corrected_det = if diff > 0.0 {
                 new_det
             } else {
                 prev_det + diff * self.volume_correction
             };
 
-            particle.log_volume_strain += prev_det.ln() - corrected_det.ln();
-            // phi(q) asymptotes to friction_angle at large q — cap where the
-            // hardening term (h1·q·exp(-h2·q)) is negligible (< 0.01 rad ≈ 0.6°).
-            // Prevents unbounded accumulation in long-settled sims.
+            particles.log_volume_strain[i] += prev_det.ln() - corrected_det.ln();
             let q_max = 5.0 / self.hardening_decay.max(1e-6);
-            particle.friction_hardening = (particle.friction_hardening + dq).min(q_max);
-            // Reynolds dilatancy: dense sand expands under shear.
+            particles.friction_hardening[i] = (particles.friction_hardening[i] + dq).min(q_max);
             if self.dilatancy_angle > 0.0 {
-                particle.log_volume_strain += self.dilatancy_angle.sin() * dq;
+                particles.log_volume_strain[i] += self.dilatancy_angle.sin() * dq;
             }
             proj_sigma
         } else {
             sigma
         };
 
-        // 4. Recompose F from projected singular values: F = U · diag(σ_new) · Vt
         let sigma_mat = Mat2::from_cols(Vec2::new(new_sigma.x, 0.0), Vec2::new(0.0, new_sigma.y));
-        particle.deformation_gradient = u * sigma_mat * vt;
+        particles.deformation_gradient[i] = u * sigma_mat * vt;
 
-        let j = particle.deformation_gradient.determinant().max(MIN_J);
-        particle.sync_volume_and_density(j);
+        let j = particles.deformation_gradient[i].determinant().max(MIN_J);
+        let v = (particles.initial_volume[i] * j).max(1.0e-6);
+        particles.volume[i] = v;
+        particles.density[i] = particles.mass[i] / v;
     }
 
     fn params(&self) -> MaterialParams {
@@ -244,7 +222,22 @@ impl MaterialModel for SandMaterial {
         }
     }
 
-    fn timestep_bound(&self, particle: &Particle, cell_width: f32, material_cfl: f32, _viscous_cfl: f32) -> f32 {
-        elastic_wave_dt(self.lambda, self.mu, 1.0, particle.density, MIN_J, cell_width, material_cfl)
+    fn timestep_bound(
+        &self,
+        particles: &Particles,
+        i: usize,
+        cell_width: f32,
+        material_cfl: f32,
+        _viscous_cfl: f32,
+    ) -> f32 {
+        elastic_wave_dt(
+            self.lambda,
+            self.mu,
+            1.0,
+            particles.density[i],
+            MIN_J,
+            cell_width,
+            material_cfl,
+        )
     }
 }

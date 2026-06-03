@@ -1,9 +1,9 @@
 use glam::{Mat2, Vec2};
 
+use crate::materials::svd::svd2;
 use crate::materials::utils::{MIN_J, elastic_wave_dt, lame_from_young};
 use crate::materials::{ConstitutiveModel, MaterialModel, MaterialParams, polar_decomposition_2d};
-use crate::particle::Particle;
-use crate::materials::svd::svd2;
+use crate::particle::{Particle, Particles};
 
 /// Snow constitutive model: corotated elasticity + SVD-based plasticity.
 ///
@@ -68,13 +68,11 @@ impl SnowMaterial {
     pub fn from_young_modulus(young_modulus: f32, poisson_ratio: f32) -> Self {
         let (lambda, mu) = lame_from_young(young_modulus, poisson_ratio);
         Self::new(
-            lambda,
-            mu,
-            10.0,   // hardening_exponent ξ — Stomakhin 2013 §4
+            lambda, mu, 10.0,   // hardening_exponent ξ — Stomakhin 2013 §4
             0.025,  // compression_limit θ_c — Stomakhin 2013 §4 canonical (was 0.02)
             0.0075, // stretch_limit θ_s — Stomakhin 2013 §4 canonical (was 0.006)
-            0.6,  // min_plastic_jacobian — Jp floor (prevents volume explosion)
-            20.0, // max_plastic_jacobian — Jp ceiling. Matches Taichi MPM88/MPM128.
+            0.6,    // min_plastic_jacobian — Jp floor (prevents volume explosion)
+            20.0,   // max_plastic_jacobian — Jp ceiling. Matches Taichi MPM88/MPM128.
         )
     }
 }
@@ -89,8 +87,8 @@ impl MaterialModel for SnowMaterial {
         particle.hardening_scale = 1.0;
     }
 
-    fn kirchhoff_stress(&self, particle: &Particle) -> Mat2 {
-        let f = particle.deformation_gradient;
+    fn kirchhoff_stress(&self, particles: &Particles, i: usize) -> Mat2 {
+        let f = particles.deformation_gradient[i];
         let j = f.determinant();
         if j <= MIN_J {
             return Mat2::ZERO;
@@ -98,8 +96,8 @@ impl MaterialModel for SnowMaterial {
 
         let r = polar_decomposition_2d(f);
 
-        // h = particle.hardening_scale, updated each step by plasticity
-        let h = particle.hardening_scale;
+        // h = particles.hardening_scale[i], updated each step by plasticity
+        let h = particles.hardening_scale[i];
         let mu_eff = self.mu * h;
         let lambda_eff = self.lambda * h;
 
@@ -108,28 +106,26 @@ impl MaterialModel for SnowMaterial {
         let mut tau = 2.0 * mu_eff * (f - r) * f_t + lambda_eff * (j - 1.0) * j * Mat2::IDENTITY;
 
         // Cohesion: compacted snow (Jp < 1) resists elastic re-expansion (J > 1).
-        // Fires only when J_e > 1 AND Jp < 1 — no feedback loop, stable.
-        // τ_coh = +c · Jp · (J−1) · J · I  →  positive Kirchhoff = inward P2G impulse = attraction.
-        // Modulated by Jp so more-compressed snow is more cohesive.
-        if self.cohesion_coeff > 0.0 && particle.plastic_volume_ratio < 1.0 && j > 1.0 {
-            tau += self.cohesion_coeff * particle.plastic_volume_ratio * (j - 1.0) * j * Mat2::IDENTITY;
+        if self.cohesion_coeff > 0.0 && particles.plastic_volume_ratio[i] < 1.0 && j > 1.0 {
+            tau += self.cohesion_coeff
+                * particles.plastic_volume_ratio[i]
+                * (j - 1.0)
+                * j
+                * Mat2::IDENTITY;
         }
         tau
     }
 
-    fn stress_volume(&self, particle: &Particle) -> f32 {
-        particle.initial_volume
+    fn stress_volume(&self, particles: &Particles, i: usize) -> f32 {
+        particles.initial_volume[i]
     }
 
-    fn update_particle(&self, particle: &mut Particle, dt: f32) {
-        // 1. Update deformation gradient
-        let f_trial =
-            (Mat2::IDENTITY + dt * particle.velocity_gradient) * particle.deformation_gradient;
+    fn update_particle(&self, particles: &mut Particles, i: usize, dt: f32) {
+        let f_trial = (Mat2::IDENTITY + dt * particles.velocity_gradient[i])
+            * particles.deformation_gradient[i];
 
-        // 2. SVD of trial F
         let (u, sigma, vt) = svd2(f_trial);
 
-        // 3. Clamp singular values to elastic range
         let sigma_c = Vec2::new(
             sigma
                 .x
@@ -139,24 +135,23 @@ impl MaterialModel for SnowMaterial {
                 .clamp(1.0 - self.compression_limit, 1.0 + self.stretch_limit),
         );
 
-        // 4. Accumulate plastic Jacobian: Jp *= det(sigma) / det(sigma_c)
-        let jp_new = particle.plastic_volume_ratio * (sigma.x * sigma.y) / (sigma_c.x * sigma_c.y);
-        particle.plastic_volume_ratio =
+        let jp_new =
+            particles.plastic_volume_ratio[i] * (sigma.x * sigma.y) / (sigma_c.x * sigma_c.y);
+        particles.plastic_volume_ratio[i] =
             jp_new.clamp(self.min_plastic_jacobian, self.max_plastic_jacobian);
 
-        // 5. Update elastic hardening: h = exp(ξ(1−Jp)), clamped [0.1, 7.0].
-        //    Upper bound is CFL-driven: at E=5000, h=7 → c_P≈99 cells/s → sub_dt≈0.005 → ~20 substeps.
-        //    Sparkl has no clamp (runs 50 substeps); Taichi MPM128 clamps implicitly via substep budget.
-        //    h=7 gives E_eff_max=35,000 under heavy compression — enough contrast between soft/packed.
-        particle.hardening_scale =
-            (self.hardening_exponent * (1.0 - particle.plastic_volume_ratio)).exp()
-                .clamp(0.1, 7.0);
+        // h clamped [0.1, 7.0]: upper bound is CFL-driven (h=7 → E_eff=35k → ~20 substeps).
+        particles.hardening_scale[i] = (self.hardening_exponent
+            * (1.0 - particles.plastic_volume_ratio[i]))
+            .exp()
+            .clamp(0.1, 7.0);
 
-        // 6. Write back elastic F (plastic part absorbed into Jp + h)
-        particle.deformation_gradient = u * Mat2::from_diagonal(sigma_c) * vt;
+        particles.deformation_gradient[i] = u * Mat2::from_diagonal(sigma_c) * vt;
 
-        let j = particle.deformation_gradient.determinant().max(MIN_J);
-        particle.sync_volume_and_density(j);
+        let j = particles.deformation_gradient[i].determinant().max(MIN_J);
+        let v = (particles.initial_volume[i] * j).max(1.0e-6);
+        particles.volume[i] = v;
+        particles.density[i] = particles.mass[i] / v;
     }
 
     fn params(&self) -> MaterialParams {
@@ -174,8 +169,23 @@ impl MaterialModel for SnowMaterial {
         }
     }
 
-    fn timestep_bound(&self, particle: &Particle, cell_width: f32, material_cfl: f32, _viscous_cfl: f32) -> f32 {
+    fn timestep_bound(
+        &self,
+        particles: &Particles,
+        i: usize,
+        cell_width: f32,
+        material_cfl: f32,
+        _viscous_cfl: f32,
+    ) -> f32 {
         // h grows when snow compresses — accounts for stiffening in CFL bound
-        elastic_wave_dt(self.lambda, self.mu, particle.hardening_scale, particle.density, MIN_J, cell_width, material_cfl)
+        elastic_wave_dt(
+            self.lambda,
+            self.mu,
+            particles.hardening_scale[i],
+            particles.density[i],
+            MIN_J,
+            cell_width,
+            material_cfl,
+        )
     }
 }

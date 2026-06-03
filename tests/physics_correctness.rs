@@ -6,21 +6,34 @@
 //! Each test has a clear physical claim and is comparable to reference MPM implementations
 //! (sparkl, matter, taichi128).
 
-use emerge::{
-    BinghamFluidMaterial, CorotatedMaterial, MpmSolver, NeoHookeanMaterial,
-    NewtonianFluidMaterial, SandMaterial, SandMuIMaterial, SnowMaterial, SolverConfig,
-    SpawnConfig, ViscoelasticMaterial, VonMisesMaterial,
-};
 use emerge::materials::MaterialModel;
 use emerge::particle::{Particle, Particles};
 use emerge::thermodynamics::{ScalarDiffusionConfig, ScalarDiffusionField};
 use emerge::{
-    ActivationStatsPlugin, DiagnosticsFrame, DiagnosticsRegistry,
-    MaterialCountPlugin, ThermalStatsPlugin, collect_mpm_snapshot,
+    ActivationStatsPlugin, DiagnosticsFrame, DiagnosticsRegistry, MaterialCountPlugin,
+    ThermalStatsPlugin, collect_mpm_snapshot,
+};
+use emerge::{
+    BinghamFluidMaterial, CorotatedMaterial, MpmSolver, NeoHookeanMaterial, NewtonianFluidMaterial,
+    SandMaterial, SandMuIMaterial, SnowMaterial, SolverConfig, SpawnConfig, ViscoelasticMaterial,
+    VonMisesMaterial,
 };
 use glam::{IVec2, Mat2, Vec2};
 
 // ─── helpers ────────────────────────────────────────────────────────────────
+
+/// Wrap a single `Particle` in a one-element `Particles` SoA, call `kirchhoff_stress`, return result.
+fn kirchhoff_stress_of(mat: &dyn emerge::materials::MaterialModel, p: &Particle) -> glam::Mat2 {
+    let soa = Particles::from(vec![*p]);
+    mat.kirchhoff_stress(&soa, 0)
+}
+
+/// Wrap a single `Particle` in a one-element `Particles` SoA, call `update_particle`, write back.
+fn update_particle_of(mat: &dyn emerge::materials::MaterialModel, p: &mut Particle, dt: f32) {
+    let mut soa = Particles::from(vec![*p]);
+    mat.update_particle(&mut soa, 0, dt);
+    *p = soa.get(0);
+}
 
 fn zero_gravity_config(grid_res: usize) -> SolverConfig {
     SolverConfig {
@@ -51,7 +64,11 @@ fn linear_momentum(solver: &MpmSolver) -> Vec2 {
 }
 
 fn kinetic_energy(solver: &MpmSolver) -> f32 {
-    solver.particles().iter().map(|p| 0.5 * p.mass * p.v.length_squared()).sum()
+    solver
+        .particles()
+        .iter()
+        .map(|p| 0.5 * p.mass * p.v.length_squared())
+        .sum()
 }
 
 fn min_j(solver: &MpmSolver) -> f32 {
@@ -190,8 +207,8 @@ fn j_stays_positive_neohookean() {
 fn j_stays_positive_snow() {
     let snow = SnowMaterial::from_young_modulus(1.4e5, 0.2);
     let config = SolverConfig::standard(64, 0.05, Vec2::new(0.0, -9.81));
-    let mut solver = MpmSolver::new(config, center_spawn(64, 8))
-        .with_default_material(Box::new(snow));
+    let mut solver =
+        MpmSolver::new(config, center_spawn(64, 8)).with_default_material(Box::new(snow));
 
     solver.step_n(200);
     let jmin = min_j(&solver);
@@ -202,8 +219,8 @@ fn j_stays_positive_snow() {
 fn j_stays_positive_sand() {
     let sand = SandMaterial::dry_sand(5_000.0, 2_000.0);
     let config = SolverConfig::standard(64, 0.05, Vec2::new(0.0, -9.81));
-    let mut solver = MpmSolver::new(config, center_spawn(64, 8))
-        .with_default_material(Box::new(sand));
+    let mut solver =
+        MpmSolver::new(config, center_spawn(64, 8)).with_default_material(Box::new(sand));
 
     solver.step_n(200);
     let jmin = min_j(&solver);
@@ -232,8 +249,8 @@ fn snow_jp_stays_within_bounds() {
     let snow = SnowMaterial::new(38_889.0, 58_333.0, 10.0, 0.025, 0.0075, min_jp, max_jp);
 
     let config = SolverConfig::standard(64, 0.05, Vec2::new(0.0, -9.81));
-    let mut solver = MpmSolver::new(config, center_spawn(64, 8))
-        .with_default_material(Box::new(snow));
+    let mut solver =
+        MpmSolver::new(config, center_spawn(64, 8)).with_default_material(Box::new(snow));
 
     solver.step_n(300);
 
@@ -253,15 +270,16 @@ fn snow_jp_stays_within_bounds() {
 fn snow_hardening_scale_finite() {
     let snow = SnowMaterial::from_young_modulus(1.4e5, 0.2);
     let config = SolverConfig::standard(64, 0.05, Vec2::new(0.0, -9.81));
-    let mut solver = MpmSolver::new(config, center_spawn(64, 8))
-        .with_default_material(Box::new(snow));
+    let mut solver =
+        MpmSolver::new(config, center_spawn(64, 8)).with_default_material(Box::new(snow));
 
     solver.step_n(200);
 
     for (i, p) in solver.particles().iter().enumerate() {
         assert!(
             p.hardening_scale >= 0.0 && p.hardening_scale.is_finite(),
-            "snow particle {i}: hardening_scale={:.4} (must be finite ≥0)", p.hardening_scale
+            "snow particle {i}: hardening_scale={:.4} (must be finite ≥0)",
+            p.hardening_scale
         );
     }
 }
@@ -280,18 +298,15 @@ fn sand_tension_cutoff_removes_tensile_stress() {
     p.volume = 1.0;
     p.density = 1.0;
     // Pure extension: F = diag(1.5, 1.5) — volume 2.25×, tensile state
-    p.deformation_gradient = Mat2::from_cols(
-        Vec2::new(1.5, 0.0),
-        Vec2::new(0.0, 1.5),
-    );
+    p.deformation_gradient = Mat2::from_cols(Vec2::new(1.5, 0.0), Vec2::new(0.0, 1.5));
     p.velocity_gradient = Mat2::ZERO;
 
     // Initialize particle (seeds plastic state)
     sand.init_particle(&mut p);
-    sand.update_particle(&mut p, 0.01);
+    update_particle_of(&sand, &mut p, 0.01);
 
     // After projection, stress should be near zero (tensile → return to identity)
-    let tau = sand.kirchhoff_stress(&p);
+    let tau = kirchhoff_stress_of(&sand, &p);
     let tau_norm = (tau.x_axis.length_squared() + tau.y_axis.length_squared()).sqrt();
     assert!(
         tau_norm < 1.0,
@@ -305,15 +320,16 @@ fn sand_tension_cutoff_removes_tensile_stress() {
 fn sand_log_volume_strain_finite() {
     let sand = SandMaterial::dry_sand(5_000.0, 2_000.0);
     let config = SolverConfig::standard(64, 0.05, Vec2::new(0.0, -9.81));
-    let mut solver = MpmSolver::new(config, center_spawn(64, 8))
-        .with_default_material(Box::new(sand));
+    let mut solver =
+        MpmSolver::new(config, center_spawn(64, 8)).with_default_material(Box::new(sand));
 
     solver.step_n(200);
 
     for (i, p) in solver.particles().iter().enumerate() {
         assert!(
             p.log_volume_strain.is_finite(),
-            "sand particle {i}: log_volume_strain={}", p.log_volume_strain
+            "sand particle {i}: log_volume_strain={}",
+            p.log_volume_strain
         );
     }
 }
@@ -329,13 +345,10 @@ fn check_stress_symmetry(mat: &dyn MaterialModel, label: &str) {
     p.volume = 1.0;
     p.density = 1.0;
     // Small shear deformation: F = [[1.1, 0.1], [0.05, 0.95]]
-    p.deformation_gradient = Mat2::from_cols(
-        Vec2::new(1.1, 0.05),
-        Vec2::new(0.1, 0.95),
-    );
+    p.deformation_gradient = Mat2::from_cols(Vec2::new(1.1, 0.05), Vec2::new(0.1, 0.95));
     mat.init_particle(&mut p);
 
-    let tau = mat.kirchhoff_stress(&p);
+    let tau = kirchhoff_stress_of(mat, &p);
     let asym = (tau.col(0).y - tau.col(1).x).abs();
     assert!(
         asym < 1e-4,
@@ -370,14 +383,11 @@ fn sand_stress_symmetric() {
     p.volume = 1.0;
     p.density = 1.0;
     // Compressive deformation (sand only resists compression)
-    p.deformation_gradient = Mat2::from_cols(
-        Vec2::new(0.9, 0.05),
-        Vec2::new(0.05, 0.9),
-    );
+    p.deformation_gradient = Mat2::from_cols(Vec2::new(0.9, 0.05), Vec2::new(0.05, 0.9));
     sand.init_particle(&mut p);
-    sand.update_particle(&mut p, 0.01);
+    update_particle_of(&sand, &mut p, 0.01);
 
-    let tau = sand.kirchhoff_stress(&p);
+    let tau = kirchhoff_stress_of(&sand, &p);
     let asym = (tau.col(0).y - tau.col(1).x).abs();
     assert!(asym < 1e-4, "Sand: stress asymmetric: {asym:.2e}");
 }
@@ -399,20 +409,20 @@ fn snow_update_preserves_f_decomposition_invariant() {
     p.volume = 1.0;
     p.density = 1.0;
     // Start from slight compression
-    p.deformation_gradient = Mat2::from_cols(
-        Vec2::new(0.95, 0.02),
-        Vec2::new(-0.02, 0.95),
-    );
+    p.deformation_gradient = Mat2::from_cols(Vec2::new(0.95, 0.02), Vec2::new(-0.02, 0.95));
     p.plastic_volume_ratio = 1.0;
     p.hardening_scale = 1.0;
 
     for _ in 0..50 {
         p.velocity_gradient = Mat2::from_cols(Vec2::new(-0.01, 0.005), Vec2::new(0.005, -0.01));
-        snow.update_particle(&mut p, 0.01);
+        update_particle_of(&snow, &mut p, 0.01);
     }
 
     let j = p.deformation_gradient.determinant();
-    assert!(j > 0.0 && j.is_finite(), "Snow: F det invalid after updates: J={j}");
+    assert!(
+        j > 0.0 && j.is_finite(),
+        "Snow: F det invalid after updates: J={j}"
+    );
     assert!(p.deformation_gradient.is_finite(), "Snow: F non-finite");
     assert!(p.hardening_scale > 0.0 && p.hardening_scale.is_finite());
 }
@@ -479,11 +489,13 @@ fn adaptive_substep_keeps_velocities_bounded() {
     for (i, p) in solver.particles().iter().enumerate() {
         assert!(
             p.v.is_finite(),
-            "CFL test: particle {i} velocity non-finite: {:?}", p.v
+            "CFL test: particle {i} velocity non-finite: {:?}",
+            p.v
         );
         assert!(
             p.v.length() < 500.0,
-            "CFL test: particle {i} velocity exploded: |v|={:.1}", p.v.length()
+            "CFL test: particle {i} velocity exploded: |v|={:.1}",
+            p.v.length()
         );
     }
 }
@@ -547,17 +559,29 @@ fn diagnostics_registry_aggregates_plugins() {
 
     // Activation: mean = (0.8 + 0.0)/2 = 0.4, frac = 1/2 = 0.5
     let act_mean = frame.get("act_mean").expect("act_mean missing");
-    assert!((act_mean - 0.4).abs() < 1e-5, "act_mean={act_mean:.4} expected 0.4");
+    assert!(
+        (act_mean - 0.4).abs() < 1e-5,
+        "act_mean={act_mean:.4} expected 0.4"
+    );
 
     let act_frac = frame.get("act_frac").expect("act_frac missing");
-    assert!((act_frac - 0.5).abs() < 1e-5, "act_frac={act_frac:.4} expected 0.5");
+    assert!(
+        (act_frac - 0.5).abs() < 1e-5,
+        "act_frac={act_frac:.4} expected 0.5"
+    );
 
     // Temperature: mean = (300+320)/2=310, max=320
     let t_mean = frame.get("T_mean").expect("T_mean missing");
-    assert!((t_mean - 310.0).abs() < 1e-3, "T_mean={t_mean:.2} expected 310");
+    assert!(
+        (t_mean - 310.0).abs() < 1e-3,
+        "T_mean={t_mean:.2} expected 310"
+    );
 
     let t_max = frame.get("T_max").expect("T_max missing");
-    assert!((t_max - 320.0).abs() < 1e-3, "T_max={t_max:.2} expected 320");
+    assert!(
+        (t_max - 320.0).abs() < 1e-3,
+        "T_max={t_max:.2} expected 320"
+    );
 
     // Material counts: mat0_n=1, mat1_n=1
     let mat0 = frame.get("mat0_n").expect("mat0_n missing");
@@ -584,7 +608,10 @@ fn diagnostics_frame_format_line_is_compact() {
     let line = frame.format_line();
     assert!(line.contains("n=256"), "missing n=256 in: {line}");
     assert!(line.contains("ke=1.2345"), "missing ke in: {line}");
-    assert!(line.contains("act_mean=0.5000"), "missing act_mean in: {line}");
+    assert!(
+        line.contains("act_mean=0.5000"),
+        "missing act_mean in: {line}"
+    );
 }
 
 /// Empty registry produces empty DiagnosticsFrame.
@@ -592,10 +619,20 @@ fn diagnostics_frame_format_line_is_compact() {
 fn empty_registry_produces_empty_frame() {
     let mut registry = DiagnosticsRegistry::new();
     let p: Vec<Particle> = vec![];
-    let config = SolverConfig { grid_res: 8, ..SolverConfig::default() };
+    let config = SolverConfig {
+        grid_res: 8,
+        ..SolverConfig::default()
+    };
     use emerge::grid::Grid;
     let grid = Grid::new(8);
-    let snap = collect_mpm_snapshot(0, &emerge::particle::Particles::new(), &grid, &config, 0.1, 1);
+    let snap = collect_mpm_snapshot(
+        0,
+        &emerge::particle::Particles::new(),
+        &grid,
+        &config,
+        0.1,
+        1,
+    );
     let frame = registry.collect(&p, &snap);
     assert!(frame.stats.is_empty(), "expected empty frame");
     assert!(frame.format_line().is_empty(), "expected empty format");
@@ -655,13 +692,15 @@ fn scalar_diffusion_spreads_and_conserves() {
     // Cold particle should have warmed
     assert!(
         particles.temperature[1] > 0.1,
-        "cold particle didn't warm: T={:.4}", particles.temperature[1]
+        "cold particle didn't warm: T={:.4}",
+        particles.temperature[1]
     );
 
     // Hot particle should have cooled
     assert!(
         particles.temperature[0] < 100.0,
-        "hot particle didn't cool: T={:.4}", particles.temperature[0]
+        "hot particle didn't cool: T={:.4}",
+        particles.temperature[0]
     );
 
     // Conservation: total T should be roughly conserved (±20% tolerance — boundary effects)
@@ -706,11 +745,13 @@ fn scalar_diffusion_decay_reduces_total() {
     // Allow ±50% — grid average discretization makes this noisy with one particle
     assert!(
         particles.temperature[0] < 70.0,
-        "decay: temperature not decreasing: T={:.2}", particles.temperature[0]
+        "decay: temperature not decreasing: T={:.2}",
+        particles.temperature[0]
     );
     assert!(
         particles.temperature[0] > 0.0,
-        "decay: temperature went negative: T={:.2}", particles.temperature[0]
+        "decay: temperature went negative: T={:.2}",
+        particles.temperature[0]
     );
 }
 
@@ -736,12 +777,12 @@ fn snow_half_step_consistency() {
 
     // Full step
     let mut p_full = base_particle;
-    snow.update_particle(&mut p_full, 0.02);
+    update_particle_of(&snow, &mut p_full, 0.02);
 
     // Two half-steps
     let mut p_half = base_particle;
-    snow.update_particle(&mut p_half, 0.01);
-    snow.update_particle(&mut p_half, 0.01);
+    update_particle_of(&snow, &mut p_half, 0.01);
+    update_particle_of(&snow, &mut p_half, 0.01);
 
     let j_full = p_full.deformation_gradient.determinant();
     let j_half = p_half.deformation_gradient.determinant();
@@ -764,19 +805,18 @@ fn von_mises_stress_bounded_by_yield() {
         initial_velocity_scale: 5.0,
         ..center_spawn(64, 6)
     };
-    let mut solver = MpmSolver::new(config, spawn)
-        .with_default_material(Box::new(vm));
+    let mut solver = MpmSolver::new(config, spawn).with_default_material(Box::new(vm));
 
     solver.step_n(100);
 
     for (i, p) in solver.particles().iter().enumerate() {
-        let tau = vm.kirchhoff_stress(&p);
+        let tau = kirchhoff_stress_of(&vm, &p);
         // von Mises equivalent stress: sqrt(3/2 * s:s) where s = dev(τ)
         let tr = (tau.col(0).x + tau.col(1).y) * 0.5;
         let s00 = tau.col(0).x - tr;
         let s11 = tau.col(1).y - tr;
         let s01 = tau.col(1).x; // off-diagonal
-        let vm_stress = (1.5 * (s00*s00 + s11*s11 + 2.0*s01*s01)).sqrt();
+        let vm_stress = (1.5 * (s00 * s00 + s11 * s11 + 2.0 * s01 * s01)).sqrt();
         // Allow 40% overshoot: initial_velocity_scale=5.0 creates violent collisions where
         // discrete return-mapping can't fully project to the yield surface in a single step.
         // Key invariant: stress stays finite and bounded, not that it's exactly at yield.
@@ -815,13 +855,17 @@ fn two_material_solver_both_j_positive() {
         material_id: 1,
         ..SpawnConfig::default()
     };
-    let _range = solver.spawn_region(spawn1);
+    let _tag = solver.spawn_group(spawn1);
 
     solver.step_n(100);
 
     for (i, p) in solver.particles().iter().enumerate() {
         let j = p.deformation_gradient.determinant();
-        assert!(j > 0.0, "two-material: particle {i} mat={} J={j:.2e}", p.material_id);
+        assert!(
+            j > 0.0,
+            "two-material: particle {i} mat={} J={j:.2e}",
+            p.material_id
+        );
     }
 }
 
@@ -831,12 +875,12 @@ fn two_material_solver_both_j_positive() {
 #[test]
 fn sand_mui_friction_stays_in_range() {
     let mat = SandMuIMaterial::fine_sand(5_000.0, 2_000.0);
-    let mu_static  = 20.9f32.to_radians().tan();
+    let mu_static = 20.9f32.to_radians().tan();
     let mu_dynamic = 32.8f32.to_radians().tan();
 
     let config = SolverConfig::standard(64, 0.05, Vec2::new(0.0, -9.81));
-    let mut solver = MpmSolver::new(config, center_spawn(64, 8))
-        .with_default_material(Box::new(mat));
+    let mut solver =
+        MpmSolver::new(config, center_spawn(64, 8)).with_default_material(Box::new(mat));
 
     solver.step_n(100);
 
@@ -859,7 +903,11 @@ fn bingham_mud_stable_under_gravity() {
         .with_default_material(Box::new(BinghamFluidMaterial::mud()));
     solver.step_n(60);
     for p in solver.particles() {
-        assert!(p.x.y > 1.0, "mud particle fell through floor: y={:.3}", p.x.y);
+        assert!(
+            p.x.y > 1.0,
+            "mud particle fell through floor: y={:.3}",
+            p.x.y
+        );
         assert!(p.x.is_finite(), "mud particle position NaN");
         assert!(p.v.is_finite(), "mud particle velocity NaN");
     }
@@ -926,8 +974,6 @@ fn viscoelastic_cell_body_stable() {
 /// Tests that the dashpot term activates when velocity_gradient is non-zero.
 #[test]
 fn viscoelastic_viscous_term_activates() {
-    use emerge::materials::MaterialModel;
-
     let e = 5.0e4f32;
     let nu = 0.40f32;
     let eta = 500.0f32;
@@ -941,18 +987,21 @@ fn viscoelastic_viscous_term_activates() {
     p.density = 1.0;
     p.mass = 1.0;
 
-    let tau_elastic_rest = elastic.kirchhoff_stress(&p);
-    let tau_visco_rest = visco.kirchhoff_stress(&p);
+    let tau_elastic_rest = kirchhoff_stress_of(&elastic, &p);
+    let tau_visco_rest = kirchhoff_stress_of(&visco, &p);
     // At rest (C=0, F=I) both give same stress (NeoHookean base is identical).
     let diff_rest = (tau_visco_rest - tau_elastic_rest).x_axis.length()
         + (tau_visco_rest - tau_elastic_rest).y_axis.length();
-    assert!(diff_rest < 1.0, "at rest KV and elastic should agree: diff={diff_rest}");
+    assert!(
+        diff_rest < 1.0,
+        "at rest KV and elastic should agree: diff={diff_rest}"
+    );
 
     // Now give particle a shear strain rate via velocity_gradient.
     p.velocity_gradient = Mat2::from_cols(Vec2::new(0.0, 1.0), Vec2::new(0.0, 0.0));
 
-    let tau_elastic_shear = elastic.kirchhoff_stress(&p);
-    let tau_visco_shear = visco.kirchhoff_stress(&p);
+    let tau_elastic_shear = kirchhoff_stress_of(&elastic, &p);
+    let tau_visco_shear = kirchhoff_stress_of(&visco, &p);
 
     // KV adds η·D_dev — stress norms must differ.
     let norm_e = tau_elastic_shear.x_axis.length() + tau_elastic_shear.y_axis.length();
@@ -974,7 +1023,10 @@ fn phase_rule_transitions_hot_particles() {
 
     let config = SolverConfig::standard(64, 0.05, Vec2::ZERO);
     let mut solver = MpmSolver::new(config, center_spawn(64, 8))
-        .with_material(HOT_ID, Box::new(NeoHookeanMaterial::from_young_modulus(1.0e5, 0.3)))
+        .with_material(
+            HOT_ID,
+            Box::new(NeoHookeanMaterial::from_young_modulus(1.0e5, 0.3)),
+        )
         .with_phase_rule(move |p| {
             if p.material_id == COLD_ID && p.temperature > hot_threshold {
                 Some(HOT_ID)
@@ -991,8 +1043,16 @@ fn phase_rule_transitions_hot_particles() {
 
     solver.step();
 
-    let hot_count = solver.particles().iter().filter(|p| p.material_id == HOT_ID).count();
-    assert!(hot_count >= n / 2, "expected ≥{} hot particles, got {hot_count}", n / 2);
+    let hot_count = solver
+        .particles()
+        .iter()
+        .filter(|p| p.material_id == HOT_ID)
+        .count();
+    assert!(
+        hot_count >= n / 2,
+        "expected ≥{} hot particles, got {hot_count}",
+        n / 2
+    );
 }
 
 /// Phase rule: no transitions when condition not met.
@@ -1002,15 +1062,26 @@ fn phase_rule_no_spurious_transitions() {
 
     let config = SolverConfig::standard(64, 0.05, Vec2::ZERO);
     let mut solver = MpmSolver::new(config, center_spawn(64, 8))
-        .with_material(MAT_B, Box::new(NeoHookeanMaterial::from_young_modulus(1.0e5, 0.3)))
+        .with_material(
+            MAT_B,
+            Box::new(NeoHookeanMaterial::from_young_modulus(1.0e5, 0.3)),
+        )
         .with_phase_rule(|p| {
-            if p.temperature > 999.0 { Some(MAT_B) } else { None }
+            if p.temperature > 999.0 {
+                Some(MAT_B)
+            } else {
+                None
+            }
         });
 
     // No particles have temperature > 999
     solver.step_n(10);
 
-    let b_count = solver.particles().iter().filter(|p| p.material_id == MAT_B).count();
+    let b_count = solver
+        .particles()
+        .iter()
+        .filter(|p| p.material_id == MAT_B)
+        .count();
     assert_eq!(b_count, 0, "spurious transitions to MAT_B: {b_count}");
 }
 
@@ -1025,9 +1096,13 @@ fn particles_near_radius_correct() {
     let center = Vec2::splat(32.0);
     let radius = 2.0;
 
-    for (_, p) in solver.particles_near(center, radius) {
-        let dist = (p.x - center).length();
-        assert!(dist <= radius + f32::EPSILON, "particle at dist={dist:.3} outside radius={radius}");
+    let ps = solver.particles();
+    for i in solver.particles_near(center, radius) {
+        let dist = (ps.x[i] - center).length();
+        assert!(
+            dist <= radius + f32::EPSILON,
+            "particle at dist={dist:.3} outside radius={radius}"
+        );
     }
 }
 
@@ -1042,7 +1117,9 @@ fn count_near_matches_manual() {
     let mat_id = 0u32;
 
     let api_count = solver.count_near(center, radius, mat_id);
-    let manual_count = solver.particles().iter()
+    let manual_count = solver
+        .particles()
+        .iter()
         .filter(|p| p.material_id == mat_id && (p.x - center).length() <= radius)
         .count();
 

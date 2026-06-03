@@ -1,0 +1,144 @@
+pub mod conservation;
+pub mod electromagnetism;
+pub(crate) mod pairwise;
+pub mod thermodynamics;
+pub mod waves;
+
+use bevy::prelude::*;
+
+// FROZEN: no new features. Thermodynamics will wire to emerge::Particle::temperature.
+//
+// Portability split (target state):
+//   Portable / pure Rust (target: emerge migration)
+//     thermodynamics — Fourier conduction math, entropy calculations
+//     waves          — WaveGrid finite-difference solver, oscillation math
+//     electromagnetism — field/force math functions
+//     conservation   — ledger accounting (stays in LP, not emerge)
+//   Bevy ECS layer (stays in LP)
+//     Component/Resource derives, Plugin impls, system wiring
+//     WaveEquationComponent, ThermalConductivity, ElectricCharge, etc.
+//
+// To make portable: separate math structs into plain Rust, keep #[derive(Component)] only
+// in a thin ECS wrapper file. Math structs then become candidates for emerge migration.
+
+pub use conservation::EnergyConservationPlugin;
+pub use electromagnetism::ElectromagnetismPlugin;
+pub use pairwise::DeterminismConfig;
+pub use thermodynamics::ThermodynamicsPlugin;
+pub use waves::WavesPlugin;
+
+// Re-export EnergyType from conservation module
+pub use conservation::EnergyType;
+
+#[derive(Debug)]
+pub enum EnergyTransferError {
+    Overflow,
+    Underflow,
+    InsufficientCapacity,
+    ThermodynamicConstraint,
+}
+
+/// Core trait for all energy-based systems in the simulation
+/// This complements the existing EnergyQuantity component
+pub trait EnergySystem {
+    // Core energy tracking
+    fn total_energy(&self) -> f32;
+
+    // Energy transfer with entropy consideration
+    fn transfer_energy(&mut self, energy: f32) -> Result<f32, EnergyTransferError> {
+        // Default implementation could track basic conservation
+        Ok(energy)
+    }
+
+    // Transformation efficiency
+    fn transformation_efficiency(&self) -> f32 {
+        1.0 // Default full efficiency
+    }
+
+    // Entropy generation during energy transfer
+    fn entropy_generation(&self, _energy_transfer: f32) -> f32 {
+        0.0 // Default no entropy generation
+    }
+
+    // Energy type for this system
+    fn energy_type(&self) -> EnergyType {
+        EnergyType::Generic
+    }
+
+    // Create an EnergyTransaction for the ledger (optional)
+    fn create_transaction(
+        &self,
+        amount: f32,
+        source: Option<Entity>,
+        destination: Option<Entity>,
+    ) -> conservation::EnergyTransaction {
+        conservation::EnergyTransaction {
+            transaction_type: if amount > 0.0 {
+                conservation::TransactionType::Input
+            } else {
+                conservation::TransactionType::Output
+            },
+            amount: amount.abs(),
+            source,
+            destination,
+            timestamp: 0.0, // Current time should be passed in a real implementation
+            transfer_rate: 0.0, // Default to instantaneous transfer
+            duration: 0.0,  // Default to instantaneous transfer
+        }
+    }
+
+    // Create a flux transaction for sustained energy flow
+    fn create_flux_transaction(
+        &self,
+        rate: f32,
+        duration: f32,
+        source: Option<Entity>,
+        destination: Option<Entity>,
+        timestamp: f32,
+    ) -> conservation::EnergyTransaction {
+        conservation::EnergyTransaction {
+            transaction_type: if rate > 0.0 {
+                conservation::TransactionType::Input
+            } else {
+                conservation::TransactionType::Output
+            },
+            amount: rate.abs() * duration, // Total energy = rate × time
+            source,
+            destination,
+            timestamp,
+            transfer_rate: rate.abs(),
+            duration,
+        }
+    }
+}
+
+/// Main plugin for all energy-related systems
+#[derive(Default)]
+pub struct EnergyPlugin;
+
+impl Plugin for EnergyPlugin {
+    fn build(&self, app: &mut App) {
+        app.register_type::<EnergyType>()
+            .init_resource::<DeterminismConfig>()
+            .register_type::<DeterminismConfig>()
+            .add_plugins(EnergyConservationPlugin)
+            .add_plugins(ThermodynamicsPlugin)
+            .add_plugins(ElectromagnetismPlugin)
+            .add_plugins(WavesPlugin);
+    }
+}
+
+pub mod prelude {
+    pub use super::{EnergySystem, EnergyTransferError};
+    pub use crate::DeterminismConfig;
+
+    pub use crate::conservation::{
+        EnergyConservationMonitor, EnergyConservationPlugin, EnergyConservationTracker,
+        EnergyLedger, EnergyQuantity, EnergyTransaction, EnergyTransferEvent, EnergyType,
+        TransactionType, conversion_efficiency, verify_conservation,
+    };
+
+    pub use crate::electromagnetism::prelude::*;
+    pub use crate::thermodynamics::prelude::*;
+    pub use crate::waves::prelude::*;
+}

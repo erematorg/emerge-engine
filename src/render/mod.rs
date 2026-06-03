@@ -1,42 +1,31 @@
-/// Standalone wgpu debug renderer for emerge MPM particles.
+/// emerge particle renderer — physics-driven, no assets, no Bevy.
 ///
-/// # What this is
+/// # Architecture
 ///
-/// A zero-dependency (no Bevy) instanced particle renderer intended for two use cases:
-///   - **LP's production render pipeline**: LP owns the wgpu surface; it hands `DebugRenderer`
-///     a `TextureView` each frame and composites particles on top of its own scene.
-///   - **Headless / custom wgpu apps**: any app that manages its own wgpu device.
-///
-/// The Bevy examples (`basic_sand`, `basic_fluids`, etc.) deliberately do NOT use this renderer.
-/// They use plain Bevy sprites so the example code stays readable and Bevy-idiomatic.
-/// This renderer is for LP, not for the demo examples.
-///
-/// # Feature gate
-///
-/// Enabled via `features = ["render"]` (which implies `"gpu"`). No Bevy dependency.
-///
-/// # Two-pass pipeline (per frame)
-///
+/// Two-pass GPU pipeline (zero CPU↔GPU roundtrip):
 ///   1. **Compute** — `prep_instances.wgsl`: reads `Particle[]` from VRAM, writes
-///      `InstanceData[]` (deformed quad transform + color). Zero CPU↔GPU roundtrip.
-///   2. **Render** — `render_particles.wgsl`: instanced draw of a unit quad per particle,
-///      deformed by F (so compression/shear is visible). Optional disc clipping.
+///      `InstanceData[]` (F-deformed quad + color). One thread per particle.
+///   2. **Render** — `render_particles.wgsl`: instanced draw, optional disc clip.
 ///
-/// Color modes: `ByMaterial` (palette by `material_id`), `ByVelocity` (heat map),
-/// `ByVolume` (det(F) — blue compressed / white rest / red expanded).
+/// LP owns the wgpu surface and calls `render_raw` each frame with emerge's
+/// `particle_buffer()`. The renderer composites onto whatever LP has already drawn.
+///
+/// # Extending
+///
+/// - `set_color_mode(ColorMode::ByPhysics)` — Beer-Lambert + thermal (wire σ_a via `set_optical_params`)
+/// - `set_optical_params(slot, sigma_a)` — LP registers per-material absorption (placeholder, no-op until ByPhysics lands)
+/// - Future passes (curvature flow, SS-SSS) added as separate structs, same `render_raw` entry point
 ///
 /// # Usage
 ///
 /// ```no_run
 /// # #[cfg(feature = "render")]
 /// # {
-/// use emerge::render::{ColorMode, DebugRenderer};
-/// // device/queue/surface_format come from your wgpu setup (LP's renderer, winit app, etc.)
+/// use emerge::render::{ColorMode, MpmRenderer};
 /// # let (device, queue, solver, surface_format, output_view) = unimplemented!();
-/// let mut renderer = DebugRenderer::new(&device, &solver, surface_format);
+/// let mut renderer = MpmRenderer::new(&device, &solver, surface_format);
 /// renderer.set_camera(&queue, solver.config().grid_res as u32, 1.0, true);
 /// renderer.set_color_mode(ColorMode::ByMaterial);
-/// // Each frame — composites on top of existing content (LoadOp::Load):
 /// renderer.render_raw(&device, &queue, &solver.particle_buffer(), solver.particle_count(), &output_view, false);
 /// # }
 /// ```
@@ -61,6 +50,13 @@ pub enum ColorMode {
     ByVelocity = 1,
     /// Color by det(F) — blue (compressed) / white (rest) / red (expanded).
     ByVolume = 2,
+    /// Physics-derived: Beer-Lambert absorption + blackbody thermal glow.
+    /// Requires `set_optical_params` per material slot. LP's production mode.
+    ByPhysics = 3,
+    /// Blackbody thermal emission only — diagnostic for temperature field.
+    ByThermal = 4,
+    /// Muscle activation [0,1] → cool→warm gradient. Creature diagnostic.
+    ByActivation = 5,
 }
 
 // ── GPU-side structs (repr(C), bytemuck) ─────────────────────────────────────
@@ -101,13 +97,13 @@ struct CameraParams {
 }
 const _: () = assert!(mem::size_of::<CameraParams>() == 80);
 
-// ── DebugRenderer ────────────────────────────────────────────────────────────
+// ── MpmRenderer ────────────────────────────────────────────────────────────
 
 /// Standalone wgpu debug renderer — draws MPM particles as deformed ellipses.
 ///
 /// Particles are rendered using the particle's deformation gradient F, so
 /// compression, shear, and volume change are visually apparent.
-pub struct DebugRenderer {
+pub struct MpmRenderer {
     prep_pipeline: wgpu::ComputePipeline,
     prep_layout: wgpu::BindGroupLayout,
     render_pipeline: wgpu::RenderPipeline,
@@ -122,7 +118,7 @@ pub struct DebugRenderer {
     vel_scale: f32,
 }
 
-impl DebugRenderer {
+impl MpmRenderer {
     /// Create a renderer compatible with `output_format` (match your swapchain surface format).
     pub fn new(
         device: &wgpu::Device,
@@ -412,6 +408,14 @@ impl DebugRenderer {
         self.vel_scale = vel_scale;
     }
 
+    /// Register per-material optical absorption coefficients for `ByPhysics` mode.
+    ///
+    /// `slot`: material_id % 16. `sigma_a`: [r, g, b] absorption per grid-cell.
+    /// Real optics values (LP year-1): water=[0.06,0.014,0.007], sand=[1.2,0.96,0.80].
+    ///
+    /// No-op until `ByPhysics` shader support lands. Call now to future-proof LP startup.
+    pub fn set_optical_params(&mut self, _slot: usize, _sigma_a: [f32; 3]) {}
+
     // ── Rendering ─────────────────────────────────────────────────────────────
 
     /// Render all particles from `solver` into `output_view`.
@@ -425,7 +429,14 @@ impl DebugRenderer {
         solver: &GpuSolver,
         output_view: &wgpu::TextureView,
     ) {
-        self.render_raw(device, queue, &solver.particle_buffer(), solver.particle_count(), output_view, true);
+        self.render_raw(
+            device,
+            queue,
+            &solver.particle_buffer(),
+            solver.particle_count(),
+            output_view,
+            true,
+        );
     }
 
     /// Render particles directly from a GPU buffer into `output_view`.
@@ -499,7 +510,12 @@ impl DebugRenderer {
         // Pass 2: render — instanced draw of deformed quads.
         {
             let load_op = if clear {
-                wgpu::LoadOp::Clear(wgpu::Color { r: 0.05, g: 0.05, b: 0.08, a: 1.0 })
+                wgpu::LoadOp::Clear(wgpu::Color {
+                    r: 0.05,
+                    g: 0.05,
+                    b: 0.08,
+                    a: 1.0,
+                })
             } else {
                 wgpu::LoadOp::Load
             };
@@ -509,7 +525,10 @@ impl DebugRenderer {
                     view: output_view,
                     resolve_target: None,
                     depth_slice: None,
-                    ops: wgpu::Operations { load: load_op, store: wgpu::StoreOp::Store },
+                    ops: wgpu::Operations {
+                        load: load_op,
+                        store: wgpu::StoreOp::Store,
+                    },
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,

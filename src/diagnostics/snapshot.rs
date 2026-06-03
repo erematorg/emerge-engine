@@ -2,7 +2,7 @@ use glam::Vec2;
 use std::collections::HashMap;
 
 use crate::solver::config::SolverConfig;
-use crate::{grid::Grid, particle::{Particle, Particles}};
+use crate::{grid::Grid, particle::Particles};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MpmSnapshot {
@@ -44,6 +44,10 @@ pub struct MpmSnapshot {
     /// Average elastic hardening multiplier h = exp(ξ*(1−Jp)). 1.0 = no hardening.
     /// Rises above 1.0 when snow is compacted (compressed snow is stiffer).
     pub avg_elastic_hardening: f32,
+    /// Active particles (not sleeping). Sleeping particles are excluded from P2G/G2P.
+    pub active_count: usize,
+    /// Sleeping particles (excluded from this step's physics).
+    pub sleeping_count: usize,
     /// Particles whose velocity was clamped to the CFL limit during G2P this step.
     /// Nonzero = CFL was violated; substep budget or material stiffness needs attention.
     pub vel_clamp_count: usize,
@@ -135,15 +139,13 @@ pub fn collect_mpm_snapshot(
             h_sum += h;
         }
 
-        // Assemble a temporary Particle view for the non-finite / invalid checkers.
-        let particle = particles.get(i);
-        let non_finite_values = count_non_finite_particle_values(&particle);
+        let non_finite_values = count_non_finite_particle_values(particles, i);
         snapshot.non_finite_particle_values += non_finite_values;
         if non_finite_values == 0 {
             snapshot.valid_particle_count += 1;
         }
         snapshot.invalid_physical_particle_values +=
-            count_invalid_particle_values(&particle, deformation_j);
+            count_invalid_particle_values(particles, i, deformation_j);
     }
 
     if !particles.is_empty() {
@@ -227,27 +229,29 @@ fn particle_cell_index(position: Vec2, grid_res: usize) -> Option<usize> {
     Some(ux * grid_res + uy)
 }
 
-fn count_non_finite_particle_values(particle: &Particle) -> usize {
+fn count_non_finite_particle_values(particles: &Particles, i: usize) -> usize {
+    let c = particles.velocity_gradient[i];
+    let f = particles.deformation_gradient[i];
     let values = [
-        particle.x.x,
-        particle.x.y,
-        particle.v.x,
-        particle.v.y,
-        particle.velocity_gradient.x_axis.x,
-        particle.velocity_gradient.x_axis.y,
-        particle.velocity_gradient.y_axis.x,
-        particle.velocity_gradient.y_axis.y,
-        particle.deformation_gradient.x_axis.x,
-        particle.deformation_gradient.x_axis.y,
-        particle.deformation_gradient.y_axis.x,
-        particle.deformation_gradient.y_axis.y,
-        particle.mass,
-        particle.initial_volume,
-        particle.volume,
-        particle.density,
-        particle.plastic_volume_ratio,
+        particles.x[i].x,
+        particles.x[i].y,
+        particles.v[i].x,
+        particles.v[i].y,
+        c.x_axis.x,
+        c.x_axis.y,
+        c.y_axis.x,
+        c.y_axis.y,
+        f.x_axis.x,
+        f.x_axis.y,
+        f.y_axis.x,
+        f.y_axis.y,
+        particles.mass[i],
+        particles.initial_volume[i],
+        particles.volume[i],
+        particles.density[i],
+        particles.plastic_volume_ratio[i],
     ];
-    values.iter().filter(|value| !value.is_finite()).count()
+    values.iter().filter(|v| !v.is_finite()).count()
 }
 
 fn count_non_finite_grid_values(mass: f32, vx: f32, vy: f32) -> usize {
@@ -257,24 +261,24 @@ fn count_non_finite_grid_values(mass: f32, vx: f32, vy: f32) -> usize {
         .count()
 }
 
-fn count_invalid_particle_values(particle: &Particle, deformation_j: f32) -> usize {
+fn count_invalid_particle_values(particles: &Particles, i: usize, deformation_j: f32) -> usize {
     let mut invalid = 0usize;
-    if particle.mass <= 0.0 {
+    if particles.mass[i] <= 0.0 {
         invalid += 1;
     }
-    if particle.volume <= 0.0 {
+    if particles.volume[i] <= 0.0 {
         invalid += 1;
     }
-    if particle.initial_volume <= 0.0 {
+    if particles.initial_volume[i] <= 0.0 {
         invalid += 1;
     }
-    if particle.density <= 0.0 {
+    if particles.density[i] <= 0.0 {
         invalid += 1;
     }
     if deformation_j <= 0.0 {
         invalid += 1;
     }
-    if particle.plastic_volume_ratio <= 0.0 {
+    if particles.plastic_volume_ratio[i] <= 0.0 {
         invalid += 1;
     }
     invalid

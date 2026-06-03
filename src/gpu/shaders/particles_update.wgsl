@@ -205,6 +205,98 @@ fn dp_plasticity(sigma_in: vec2<f32>, log_volume_strain: f32, q: f32, mat: Mater
     return DpReturn(sigma_new, gamma, lvg_delta);
 }
 
+// ── Rankine plasticity ────────────────────────────────────────────────────────
+// Tensile cutoff with exponential damage softening (Wolper et al. 2019).
+// Uses Hencky strains, same corotated-elastic basis as VonMises and DP.
+// tensile_strength → mat.hardening_exponent, softening_rate → mat.hardening_modulus.
+// Damage accumulates in friction_hardening.
+
+// Convert Kirchhoff principal stresses τ to Hencky strain eigenvectors ε.
+// Inverse of: τ = (2µ+λ)·εᵢ + λ·εⱼ.
+fn hencky_from_stress(tau: vec2<f32>, lambda: f32, mu: f32) -> vec2<f32> {
+    let a  = 2.0 * mu + lambda;
+    let det = a * a - lambda * lambda;
+    let x  = (a * tau.x - lambda * tau.y) / det;
+    let y  = (a * tau.y - lambda * tau.x) / det;
+    return vec2<f32>(x, y);
+}
+
+struct RankineReturn { f_e: mat2x2<f32>, damage_delta: f32 }
+
+fn rankine_plasticity(f_trial: mat2x2<f32>, damage: f32, mat: MaterialParams) -> RankineReturn {
+    let svd    = svd2(f_trial);
+    let sigma  = max(svd.s, vec2<f32>(NUM_FLOOR_TIGHT));
+    let eps    = log(sigma);
+    let a      = 2.0 * mat.mu + mat.lambda;
+    let tau    = vec2<f32>(a * eps.x + mat.lambda * eps.y, mat.lambda * eps.x + a * eps.y);
+    let t_eff  = mat.hardening_exponent * exp(-mat.hardening_modulus * damage);
+
+    let t1 = tau.x > t_eff;
+    let t2 = tau.y > t_eff;
+    if !t1 && !t2 {
+        return RankineReturn(f_trial, 0.0);
+    }
+
+    let tau_proj = vec2<f32>(select(tau.x, t_eff, t1), select(tau.y, t_eff, t2));
+    let eps_proj = hencky_from_stress(tau_proj, mat.lambda, mat.mu);
+    let eps_prev = eps;
+    let ddmg     = length(eps_prev - eps_proj);
+    let sigma_new = exp(eps_proj);
+    let diag = mat2x2<f32>(vec2<f32>(sigma_new.x, 0.0), vec2<f32>(0.0, sigma_new.y));
+    return RankineReturn(svd.u * diag * transpose(svd.v), ddmg);
+}
+
+// ── SandMuI plasticity ────────────────────────────────────────────────────────
+// µ(I)-rheology Drucker-Prager (Blatny 2022). Rate-dependent friction.
+// dp_h0=mu_static, dp_h1=mu_dynamic, dp_h2=inertial_q.
+// mu_i stored in friction_hardening.
+
+struct MuIReturn { f_e: mat2x2<f32>, mu_i: f32 }
+
+fn sand_mui_plasticity(f_trial: mat2x2<f32>, mu_i_in: f32, mat: MaterialParams, dt: f32) -> MuIReturn {
+    let svd   = svd2(f_trial);
+    let sigma = max(svd.s, vec2<f32>(NUM_FLOOR_TIGHT));
+    let eps   = log(sigma);
+    let tr    = eps.x + eps.y;
+    let k_2d  = mat.lambda + mat.mu;
+    let p_tri = -k_2d * tr;
+
+    if p_tri <= 0.0 {
+        let diag = mat2x2<f32>(vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 1.0));
+        return MuIReturn(svd.u * diag * transpose(svd.v), mat.dp_h0);
+    }
+
+    let dev    = eps - vec2<f32>(tr * 0.5);
+    let dn     = length(dev);
+    let SQRT2: f32 = 1.41421356;
+    let q_tri  = SQRT2 * mat.mu * dn;
+    let q_yld  = mat.dp_h0 * p_tri;
+
+    if q_tri <= q_yld || dn < NUM_FLOOR_TIGHT {
+        let diag = mat2x2<f32>(vec2<f32>(sigma.x, 0.0), vec2<f32>(0.0, sigma.y));
+        return MuIReturn(svd.u * diag * transpose(svd.v), mat.dp_h0);
+    }
+
+    let delta_q   = q_tri - q_yld;
+    let sqrt_p    = sqrt(p_tri);
+    let a_coef    = mat.mu * dt;
+    let b_coef    = p_tri * (mat.dp_h1 - mat.dp_h0) + a_coef * mat.dp_h2 * sqrt_p - delta_q;
+    let c_coef    = -delta_q * mat.dp_h2 * sqrt_p;
+    let disc      = b_coef * b_coef - 4.0 * a_coef * c_coef;
+    let gd        = max((-b_coef + sqrt(max(disc, 0.0))) / (2.0 * a_coef), 0.0);
+
+    let mu_i = select(mat.dp_h0,
+        mat.dp_h0 + (mat.dp_h1 - mat.dp_h0) / (mat.dp_h2 * sqrt_p / gd + 1.0),
+        gd > NUM_FLOOR_TIGHT);
+
+    let delta_gamma = gd * dt;
+    let n_hat       = dev / dn;
+    let eps_new     = eps - n_hat * (delta_gamma / SQRT2);
+    let sigma_new   = exp(eps_new);
+    let diag = mat2x2<f32>(vec2<f32>(sigma_new.x, 0.0), vec2<f32>(0.0, sigma_new.y));
+    return MuIReturn(svd.u * diag * transpose(svd.v), mu_i);
+}
+
 // ── Von Mises plasticity ──────────────────────────────────────────────────────
 // J2 plasticity with linear isotropic hardening in Hencky strain space.
 // yield_stress stored in mat.hardening_exponent (union layout).
@@ -305,6 +397,16 @@ fn particles_update_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let vm_res           = vm_plasticity(new_F, p.friction_hardening, mat);
         new_F                = vm_res.f_e;
         p.friction_hardening += vm_res.dkappa;
+    } else if mat.model == 7u {
+        // Rankine: tensile cutoff with exponential damage softening.
+        let rk_res           = rankine_plasticity(new_F, p.friction_hardening, mat);
+        new_F                = rk_res.f_e;
+        p.friction_hardening += rk_res.damage_delta;
+    } else if mat.model == 8u {
+        // SandMuI: µ(I)-rheology rate-dependent Drucker-Prager.
+        let mi_res           = sand_mui_plasticity(new_F, p.friction_hardening, mat, dt);
+        new_F                = mi_res.f_e;
+        p.friction_hardening = mi_res.mu_i;
     }
 
     // Fluid F reset: extract J = det(F), reset to isotropic F = sqrt(J)·I.

@@ -5,14 +5,14 @@
 ///   phase rules · particles_near · apply_impulse · material_state · diagnostics
 ///
 ///   cargo run --example headless
-use emerge::diagnostics::log_frame_full;
+use emerge::diagnostics::{FrameLogger, log_frame_full, per_material_stats};
 use emerge::{
     MpmSolver, NeoHookeanMaterial, SandMaterial, SlipBoundary, SolverConfig, SpawnConfig,
 };
 use glam::{IVec2, Vec2};
 
 const JELLY_ID: u32 = 0;
-const SAND_ID:  u32 = 1;
+const SAND_ID: u32 = 1;
 const LABELS: &[(u32, &str)] = &[(JELLY_ID, "jelly"), (SAND_ID, "sand")];
 
 fn main() {
@@ -53,20 +53,32 @@ fn main() {
             }
         });
 
-    let _ = solver.spawn_region(sand_spawn);
+    let _ = solver.spawn_group(sand_spawn);
 
     println!(
         "Spawned {} particles ({} jelly, {} sand)\n",
         solver.particles().len(),
-        solver.particles().iter().filter(|p| p.material_id == JELLY_ID).count(),
-        solver.particles().iter().filter(|p| p.material_id == SAND_ID).count(),
+        solver
+            .particles()
+            .iter()
+            .filter(|p| p.material_id == JELLY_ID)
+            .count(),
+        solver
+            .particles()
+            .iter()
+            .filter(|p| p.material_id == SAND_ID)
+            .count(),
     );
+
+    let mut logger = FrameLogger::open("headless_run.ndjson").expect("failed to open log file");
 
     // Step 100 frames, log every 60.
     for step in 1..=100u64 {
         solver.step_n(1);
         let snap = solver.diagnostics_snapshot();
+        let stats = per_material_stats(solver.particles());
         log_frame_full(step, config.dt, solver.particles(), LABELS, &snap, 60);
+        logger.log(step, config.dt, &stats, &snap, LABELS);
     }
 
     // LP sensor demo: count how many sand particles are near the jelly centroid.
@@ -74,7 +86,10 @@ fn main() {
     let jelly_state = solver.material_state(JELLY_ID);
     let center = jelly_state.centroid;
     let sand_nearby = solver.count_near(center, 8.0, SAND_ID);
-    println!("\nSand particles within r=8 of jelly centroid ({:.1?}): {}", center, sand_nearby);
+    println!(
+        "\nSand particles within r=8 of jelly centroid ({:.1?}): {}",
+        center, sand_nearby
+    );
 
     // LP impulse demo: apply a radial push at the jelly centroid (models creature locomotion).
     solver.apply_radial_impulse(center, 6.0, 5.0);
@@ -82,19 +97,38 @@ fn main() {
 
     // Final physics summary.
     let jelly = solver.material_state(JELLY_ID);
-    let sand  = solver.material_state(SAND_ID);
-    let snap  = solver.diagnostics_snapshot();
+    let sand = solver.material_state(SAND_ID);
+    let snap = solver.diagnostics_snapshot();
 
     println!("\n── Final physics summary ──");
     println!("  total_particle_mass  : {:.6}", snap.total_particle_mass);
-    println!("  mass_error           : {:.2e}  (P2G conservation)", snap.relative_mass_error);
-    println!("  momentum_error       : {:.2e}  (P2G conservation)", snap.relative_momentum_error);
-    println!("  global_J_range       : [{:.4}, {:.4}]", snap.min_deformation_j, snap.max_deformation_j);
-    println!("  cfl_number           : {:.4}  (< 1.0 = stable)", snap.cfl_number);
+    println!(
+        "  mass_error           : {:.2e}  (P2G conservation)",
+        snap.relative_mass_error
+    );
+    println!(
+        "  momentum_error       : {:.2e}  (P2G conservation)",
+        snap.relative_momentum_error
+    );
+    println!(
+        "  global_J_range       : [{:.4}, {:.4}]",
+        snap.min_deformation_j, snap.max_deformation_j
+    );
+    println!(
+        "  cfl_number           : {:.4}  (< 1.0 = stable)",
+        snap.cfl_number
+    );
     println!("  substeps_last_step   : {}", snap.substeps_last_step);
-    println!("  non_finite_particles : {}", snap.non_finite_particle_values);
-    println!("  jelly  centroid={:.2?}  avg_speed={:.4}  avg_J={:.4}",
-        jelly.centroid, jelly.avg_speed, jelly.avg_det_f);
-    println!("  sand   centroid={:.2?}  avg_speed={:.4}  avg_Jp={:.4}",
-        sand.centroid, sand.avg_speed, sand.avg_volume_ratio);
+    println!(
+        "  non_finite_particles : {}",
+        snap.non_finite_particle_values
+    );
+    println!(
+        "  jelly  centroid={:.2?}  avg_speed={:.4}  avg_J={:.4}",
+        jelly.centroid, jelly.avg_speed, jelly.avg_det_f
+    );
+    println!(
+        "  sand   centroid={:.2?}  avg_speed={:.4}  avg_Jp={:.4}",
+        sand.centroid, sand.avg_speed, sand.avg_volume_ratio
+    );
 }

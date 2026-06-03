@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use glam::Vec2;
 
 use crate::fields::ForceField;
-use crate::particle::Particle;
+use crate::particle::Particles;
 
 /// Uniform external electric field E applied to charged particles.
 ///
@@ -50,17 +50,16 @@ impl UniformElectricField {
 }
 
 impl ForceField for UniformElectricField {
-    fn acceleration(&self, particle: &Particle) -> Vec2 {
-        let q = match self.material_charges.get(&particle.material_id) {
+    fn acceleration(&self, particles: &Particles, i: usize) -> Vec2 {
+        let q = match self.material_charges.get(&particles.material_id[i]) {
             Some(&q) if q.abs() > f32::EPSILON => q,
             _ => return Vec2::ZERO,
         };
-        let inv_mass = if particle.mass > f32::EPSILON {
-            1.0 / particle.mass
+        let inv_mass = if particles.mass[i] > f32::EPSILON {
+            1.0 / particles.mass[i]
         } else {
             0.0
         };
-        // a = q · E / m
         self.field * (q * inv_mass)
     }
 }

@@ -3,6 +3,7 @@ pub mod cutoff;
 pub mod density;
 pub mod handle;
 pub mod query;
+pub mod spatial_hash;
 
 pub use config::{SolverConfig, SpawnConfig};
 pub use cutoff::smooth_cutoff;
@@ -10,29 +11,38 @@ pub use density::compute_density_grid;
 pub use handle::{MaterialHandle, ParticleGroup};
 pub use query::{MaterialState, material_state_of, region_state_of};
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
+
+use spatial_hash::SpatialHash;
 
 use glam::{Mat2, Vec2};
 
-
 use crate::diagnostics::{MpmSnapshot, collect_mpm_snapshot};
+use crate::thermodynamics::{ScalarDiffusionField, ThermalDiffusion};
 use crate::{
     boundary::{BoundaryCondition, SlipBoundary},
     fields::ForceField,
-    materials::{MaterialModel, FallbackMaterial},
     materials::registry::MaterialRegistry,
-    solver::density::{estimate_initial_particle_volumes, estimate_particle_density_and_volume},
+    materials::{FallbackMaterial, MaterialModel},
+    solver::density::estimate_particle_volumes,
     transfer::{gather_grid_to_particles, scatter_particles_to_grid},
 };
 use crate::{
     grid::Grid,
     particle::{Particle, Particles},
 };
-use crate::thermodynamics::{ScalarDiffusionField, ThermalDiffusion};
 
 pub struct MpmSolver {
     config: SolverConfig,
     particles: Particles,
+    /// Partition boundary: particles[0..active_count] are active, [active_count..N] sleeping.
+    /// P2G / G2P only visit [0..active_count]. Maintained by sleep_particle / wake_particle.
+    active_count: usize,
+    /// Maps user_tag → physical indices of all particles with that tag.
+    /// HashSet gives O(1) insert/remove on every sleep/wake swap.
+    tag_index: HashMap<u32, HashSet<usize>>,
+    /// Monotonically increasing counter — next tag issued by spawn_group.
+    next_tag: u32,
     grid: Grid,
     materials: MaterialRegistry,
     boundaries: Vec<Box<dyn BoundaryCondition>>,
@@ -48,26 +58,67 @@ pub struct MpmSolver {
     last_sim_time_dropped: f32,
     /// Automatic phase transition rules, evaluated every substep.
     phase_rules: Vec<Box<dyn Fn(&Particle) -> Option<u32> + Send + Sync>>,
+    /// Spatial hash over active particles — rebuilt each substep after G2P.
+    /// Turns O(N) radius queries into O(candidates_in_neighborhood).
+    spatial_hash: SpatialHash,
 }
 
 impl MpmSolver {
-    pub fn new(config: SolverConfig, spawn: SpawnConfig) -> Self {
+    /// Create an empty solver with no particles. Use `spawn_region` to add particles.
+    pub fn empty(config: SolverConfig) -> Self {
         config.validate();
-        spawn.validate_for_solver(&config);
-
-
-        let mut rng = LcgRng::new(spawn.rng_seed);
-        let mut particles = Particles::from(initialize_particles(&config, spawn, &mut rng));
-        let mut grid = Grid::new(config.grid_res);
-        if spawn.precompute_initial_volumes {
-            estimate_initial_particle_volumes(&mut particles, &mut grid);
-        }
         let materials = MaterialRegistry::with_default(Box::new(FallbackMaterial));
         let default_boundary: Box<dyn BoundaryCondition> =
             Box::new(SlipBoundary::new(config.boundary_thickness));
         Self {
             config,
+            particles: Particles::default(),
+            active_count: 0,
+            tag_index: HashMap::new(),
+            next_tag: 1,
+            grid: Grid::new(config.grid_res),
+            materials,
+            boundaries: vec![default_boundary],
+            force_fields: Vec::new(),
+            thermal: None,
+            scalar_fields: Vec::new(),
+            frame_index: 0,
+            last_step_dt: config.dt,
+            last_substeps: 0,
+            last_vel_clamp_count: 0,
+            last_j_projection_count: 0,
+            last_sim_time_dropped: 0.0,
+            phase_rules: Vec::new(),
+            spatial_hash: SpatialHash::new(config.grid_cell_size),
+        }
+    }
+
+    pub fn new(config: SolverConfig, spawn: SpawnConfig) -> Self {
+        config.validate();
+        spawn.validate_for_solver(&config);
+
+        let mut rng = LcgRng::new(spawn.rng_seed);
+        let mut particles = Particles::from(initialize_particles(&config, spawn, &mut rng));
+        let mut grid = Grid::new(config.grid_res);
+        if spawn.precompute_initial_volumes {
+            let n = particles.len();
+            estimate_particle_volumes(&mut particles, &mut grid, n, true);
+        }
+        let materials = MaterialRegistry::with_default(Box::new(FallbackMaterial));
+        let default_boundary: Box<dyn BoundaryCondition> =
+            Box::new(SlipBoundary::new(config.boundary_thickness));
+        let active_count = particles.len();
+        let mut tag_index: HashMap<u32, HashSet<usize>> = HashMap::new();
+        if active_count > 0 {
+            // Initial particles carry user_tag=0; register them so group ops work.
+            tag_index.insert(0, (0..active_count).collect());
+        }
+        let mut solver = Self {
+            config,
             particles,
+            active_count,
+            tag_index,
+            next_tag: 1,
             grid,
             materials,
             boundaries: vec![default_boundary],
@@ -81,7 +132,10 @@ impl MpmSolver {
             last_j_projection_count: 0,
             last_sim_time_dropped: 0.0,
             phase_rules: Vec::new(),
-        }
+            spatial_hash: SpatialHash::new(config.grid_cell_size),
+        };
+        solver.spatial_hash.rebuild(&solver.particles.x, solver.active_count);
+        solver
     }
 
     pub fn with_default_material(mut self, material: Box<dyn MaterialModel>) -> Self {
@@ -178,6 +232,151 @@ impl MpmSolver {
     /// Safe uses: writing non-velocity fields (temperature, activation, user_tag, material_id).
     pub fn particles_mut(&mut self) -> &mut Particles {
         &mut self.particles
+    }
+
+    /// Remove particles where `pred` returns `false`, keeping `active_count` and
+    /// tag index in sync. Use instead of `particles_mut().retain()` directly.
+    pub fn retain_particles<F: Fn(&Particle) -> bool>(&mut self, pred: F) {
+        self.particles.retain(pred);
+        let new_len = self.particles.len();
+        self.active_count = new_len;
+        // Rebuild tag index from scratch — indices shift after retain.
+        self.tag_index.clear();
+        for i in 0..new_len {
+            self.tag_index
+                .entry(self.particles.user_tag[i])
+                .or_default()
+                .insert(i);
+        }
+        self.spatial_hash.rebuild(
+            &self.particles.x,
+            self.active_count,
+        );
+    }
+
+    /// Split particles where `pred` returns `true` into two daughter particles.
+    ///
+    /// Each daughter gets half the mass and half the volume of the parent, with all
+    /// other fields (v, F, C, damage, tag, material_id, temperature…) copied identically.
+    /// Daughters are offset ±`offset_cells` cells along the principal stretch direction
+    /// of the deformation gradient (eigenvector of FᵀF corresponding to max eigenvalue).
+    ///
+    /// Conservation: total mass and volume are preserved (halved per daughter × 2).
+    ///
+    /// # LP usage
+    /// ```rust,ignore
+    /// // Split Rankine particles whose damage exceeds 0.8:
+    /// solver.split_particles_where(|p| p.friction_hardening > 0.8, 0.3);
+    /// // Split snow particles compressed past 60% volume:
+    /// solver.split_particles_where(|p| p.plastic_volume_ratio < 0.6, 0.3);
+    /// ```
+    pub fn split_particles_where<F: Fn(&Particle) -> bool>(
+        &mut self,
+        pred: F,
+        offset_cells: f32,
+    ) {
+        // max 200 new particles per call — prevents exponential blow-up if condition
+        // stays true across multiple frames. Caller should make condition one-shot
+        // (e.g. check a damage field that gets set after split).
+        const MAX_NEW: usize = 200;
+        let active = self.active_count;
+        let mut new_particles: Vec<Particle> = Vec::new();
+
+        for i in 0..active {
+            if new_particles.len() >= MAX_NEW {
+                break;
+            }
+            let p = self.particles.get(i);
+            if !pred(&p) {
+                continue;
+            }
+
+            // Principal stretch direction from FᵀF.
+            let ftf = p.deformation_gradient.transpose() * p.deformation_gradient;
+            let trace = ftf.x_axis.x + ftf.y_axis.y;
+            let diff = ftf.x_axis.x - ftf.y_axis.y;
+            let disc = (diff * diff * 0.25 + ftf.x_axis.y * ftf.y_axis.x).max(0.0);
+            let lambda_max = trace * 0.5 + disc.sqrt();
+            let dir = if disc > 1e-8 {
+                let v = Vec2::new(lambda_max - ftf.x_axis.x, -ftf.x_axis.y);
+                let n = v.length();
+                if n > 1e-6 { v / n } else { Vec2::X }
+            } else {
+                Vec2::X
+            };
+
+            // Halve mass and volume on parent in-place.
+            self.particles.mass[i] *= 0.5;
+            self.particles.initial_volume[i] *= 0.5;
+            self.particles.volume[i] *= 0.5;
+            self.particles.x[i] -= dir * offset_cells;
+            // Mark as split so pred can exclude it on future calls.
+            self.particles.friction_hardening[i] = f32::MAX;
+
+            // Daughter: clone parent state, offset in opposite direction.
+            // Give parent/child diverging velocities so fragments visibly separate.
+            let speed = self.particles.v[i].length().min(20.0);
+            self.particles.v[i] -= dir * speed * 0.3;
+            let mut child = self.particles.get(i);
+            child.x = p.x + dir * offset_cells;
+            child.v = p.v + dir * speed * 0.3;
+            child.friction_hardening = 0.0;
+            new_particles.push(child);
+        }
+
+        // Append daughters as active particles.
+        for child in new_particles {
+            let idx = self.particles.len();
+            self.particles.push(child);
+            self.tag_index
+                .entry(child.user_tag)
+                .or_default()
+                .insert(idx);
+        }
+        self.active_count = self.particles.len();
+        self.spatial_hash
+            .rebuild(&self.particles.x, self.active_count);
+    }
+
+    /// Apply pairwise adhesion between particles of the same `tag`.
+    ///
+    /// For each active particle with the given tag, neighboring same-tag particles
+    /// within `radius` cells exert an attraction that nudges velocities toward each other.
+    /// `strength` is a velocity correction per cell of separation per call — tune to taste.
+    ///
+    /// Call once per frame after `step_n()`. Does not add energy to the system when
+    /// particles are already touching (force fades to zero at contact).
+    ///
+    /// # LP usage
+    /// ```rust,ignore
+    /// // Keep creature body particles together (tag = creature id).
+    /// solver.apply_particle_adhesion(creature_tag, 2.0, 0.05);
+    /// ```
+    pub fn apply_particle_adhesion(&mut self, tag: u32, radius: f32, strength: f32) {
+        // Collect positions of all same-tag active particles.
+        let positions: Vec<(usize, glam::Vec2)> = (0..self.active_count)
+            .filter(|&i| self.particles.user_tag[i] == tag)
+            .map(|i| (i, self.particles.x[i]))
+            .collect();
+
+        for &(i, xi) in &positions {
+            let mut delta_v = glam::Vec2::ZERO;
+            for &idx in self.spatial_hash.query(xi, radius).collect::<Vec<_>>().iter() {
+                if idx == i || self.particles.user_tag[idx] != tag {
+                    continue;
+                }
+                let xj = self.particles.x[idx];
+                let diff = xj - xi;
+                let dist = diff.length();
+                if dist < 1e-4 || dist > radius {
+                    continue;
+                }
+                // Linear fade: full at contact, zero at radius.
+                let fade = 1.0 - dist / radius;
+                delta_v += diff / dist * strength * fade;
+            }
+            self.particles.v[i] += delta_v;
+        }
     }
 
     pub fn assign_particle_materials_by_position<F>(&mut self, mut material_for: F)
@@ -287,7 +486,86 @@ impl MpmSolver {
         snap.vel_clamp_count = self.last_vel_clamp_count;
         snap.j_projection_count = self.last_j_projection_count;
         snap.sim_time_dropped = self.last_sim_time_dropped;
+        snap.active_count = self.active_count;
+        snap.sleeping_count = self.particles.len().saturating_sub(self.active_count);
         snap
+    }
+
+    // ── Tag-based group API ───────────────────────────────────────────────────
+
+    /// Aggregate physics state for all particles with `tag`. O(group_size).
+    pub fn group_state(&self, tag: u32) -> MaterialState {
+        let mut s = MaterialState::default();
+        if let Some(indices) = self.tag_index.get(&tag) {
+            for &i in indices {
+                s.accumulate(
+                    self.particles.x[i],
+                    self.particles.v[i].length(),
+                    self.particles.plastic_volume_ratio[i],
+                    self.particles.deformation_gradient[i].determinant(),
+                    self.particles.density[i],
+                );
+            }
+        }
+        s.finalize();
+        s
+    }
+
+    /// Center of mass for all particles with `tag`. O(group_size).
+    pub fn group_centroid(&self, tag: u32) -> glam::Vec2 {
+        let indices = match self.tag_index.get(&tag) {
+            Some(s) if !s.is_empty() => s,
+            _ => return glam::Vec2::ZERO,
+        };
+        let sum: glam::Vec2 = indices.iter().map(|&i| self.particles.x[i]).sum();
+        sum / indices.len() as f32
+    }
+
+    /// Number of particles with `tag`. O(1).
+    pub fn group_count(&self, tag: u32) -> usize {
+        self.tag_index.get(&tag).map_or(0, |v| v.len())
+    }
+
+    /// Set `activation` uniformly on all particles with `tag`. O(group_size).
+    pub fn set_group_activation(&mut self, tag: u32, value: f32) {
+        if let Some(indices) = self.tag_index.get(&tag) {
+            for &i in indices {
+                self.particles.activation[i] = value.clamp(0.0, 1.0);
+            }
+        }
+    }
+
+    /// Set `activation` per particle using a spatial function. O(group_size).
+    pub fn set_group_activation_fn(&mut self, tag: u32, f: impl Fn(glam::Vec2) -> f32) {
+        if let Some(indices) = self.tag_index.get(&tag) {
+            for &i in indices {
+                self.particles.activation[i] = f(self.particles.x[i]).clamp(0.0, 1.0);
+            }
+        }
+    }
+
+    /// Set `temperature` uniformly on all particles with `tag`. O(group_size).
+    pub fn set_group_temperature(&mut self, tag: u32, value: f32) {
+        if let Some(indices) = self.tag_index.get(&tag) {
+            for &i in indices {
+                self.particles.temperature[i] = value;
+            }
+        }
+    }
+
+    /// Apply a velocity impulse to all particles with `tag`, with optional distance falloff. O(group_size).
+    pub fn apply_group_impulse(&mut self, tag: u32, impulse: glam::Vec2, falloff_center: Option<glam::Vec2>) {
+        let indices: Vec<usize> = match self.tag_index.get(&tag) {
+            Some(s) => s.iter().copied().collect(),
+            None => return,
+        };
+        for i in indices {
+            let scale = match falloff_center {
+                None => 1.0,
+                Some(c) => (1.0 - (self.particles.x[i] - c).length() * 0.1).max(0.0),
+            };
+            self.particles.v[i] += impulse * scale;
+        }
     }
 
     // ── Query & Transition API ────────────────────────────────────────────────
@@ -299,47 +577,49 @@ impl MpmSolver {
 
     /// Aggregate state for all particles within `radius` grid-cells of `center`.
     pub fn region_state(&self, center: Vec2, radius: f32) -> MaterialState {
-        region_state_of(&self.particles, center, radius)
+        let r2 = radius * radius;
+        let mut s = query::MaterialState::default();
+        for i in self.spatial_hash.query(center, radius) {
+            if (self.particles.x[i] - center).length_squared() <= r2 {
+                s.accumulate(
+                    self.particles.x[i],
+                    self.particles.v[i].length(),
+                    self.particles.plastic_volume_ratio[i],
+                    self.particles.deformation_gradient[i].determinant(),
+                    self.particles.density[i],
+                );
+            }
+        }
+        s.finalize();
+        s
     }
 
-    /// Iterate over particles within `radius` grid-cells of `center`.
+    /// Iterate indices of active particles within `radius` grid-cells of `center`.
     ///
-    /// Yields `(index, &Particle)` so LP can read state and use the index
-    /// to apply targeted impulses or phase transitions by index.
-    ///
-    /// O(N) — fine for organism-scale queries (hundreds to low thousands of particles).
-    /// For planetary-scale queries, use `region_state` aggregates instead.
-    ///
-    /// # Example — cell adhesion sensing
-    /// ```rust,ignore
-    /// for (idx, neighbor) in solver.particles_near(cell.x, sensing_radius) {
-    ///     if neighbor.material_id == FOOD_ID {
-    ///         solver.particles_mut()[idx].user_tag = CONSUMED;
-    ///     }
-    /// }
-    /// ```
+    /// Returns indices only — read particle data via `solver.particles().x[i]` etc.
+    /// O(candidates) via spatial hash, not O(N).
     pub fn particles_near(
         &self,
         center: Vec2,
         radius: f32,
-    ) -> impl Iterator<Item = (usize, Particle)> + '_ {
+    ) -> impl Iterator<Item = usize> + '_ {
         let r2 = radius * radius;
-        self.particles.indices().filter_map(move |i| {
-            if (self.particles.x[i] - center).length_squared() <= r2 {
-                Some((i, self.particles.get(i)))
-            } else {
-                None
-            }
-        })
+        self.spatial_hash
+            .query(center, radius)
+            .filter(move |&i| (self.particles.x[i] - center).length_squared() <= r2)
     }
 
-    /// Count particles of a given material within `radius` of `center`. O(N).
+    /// Count active particles of a given material within `radius` of `center`.
+    /// O(candidates) via spatial hash, not O(N).
     pub fn count_near(&self, center: Vec2, radius: f32, material_id: u32) -> usize {
         let r2 = radius * radius;
-        self.particles.indices().filter(|&i| {
-            self.particles.material_id[i] == material_id
-                && (self.particles.x[i] - center).length_squared() <= r2
-        }).count()
+        self.spatial_hash
+            .query(center, radius)
+            .filter(|&i| {
+                self.particles.material_id[i] == material_id
+                    && (self.particles.x[i] - center).length_squared() <= r2
+            })
+            .count()
     }
 
     /// Switch material for every particle where `predicate` returns true.
@@ -416,10 +696,14 @@ impl MpmSolver {
     pub fn apply_impulse(&mut self, center: Vec2, radius: f32, force: Vec2) {
         let vel_limit = self.config.grid_cell_size / self.config.min_dt;
         let r2 = radius * radius;
+        let mut to_wake = Vec::new();
         for i in 0..self.particles.len() {
             let d = self.particles.x[i] - center;
             let dist2 = d.length_squared();
             if dist2 <= r2 && dist2 > 1e-8 {
+                if self.particles.sleeping[i] {
+                    to_wake.push(i);
+                }
                 let falloff = 1.0 - (dist2 / r2).sqrt();
                 self.particles.v[i] += force * falloff;
                 let spd = self.particles.v[i].length();
@@ -428,6 +712,9 @@ impl MpmSolver {
                 }
             }
         }
+        for i in to_wake {
+            self.wake_particle(i);
+        }
     }
 
     /// Apply an outward radial velocity delta to particles within `radius`, with linear falloff.
@@ -435,10 +722,14 @@ impl MpmSolver {
     pub fn apply_radial_impulse(&mut self, center: Vec2, radius: f32, strength: f32) {
         let vel_limit = self.config.grid_cell_size / self.config.min_dt;
         let r2 = radius * radius;
+        let mut to_wake = Vec::new();
         for i in 0..self.particles.len() {
             let d = self.particles.x[i] - center;
             let dist2 = d.length_squared();
             if dist2 <= r2 && dist2 > 1e-8 {
+                if self.particles.sleeping[i] {
+                    to_wake.push(i);
+                }
                 let dist = dist2.sqrt();
                 let falloff = 1.0 - dist / radius;
                 self.particles.v[i] += (d / dist) * strength * falloff;
@@ -447,6 +738,9 @@ impl MpmSolver {
                     self.particles.v[i] *= vel_limit / spd;
                 }
             }
+        }
+        for i in to_wake {
+            self.wake_particle(i);
         }
     }
 
@@ -464,7 +758,7 @@ impl MpmSolver {
         while remaining > f32::EPSILON && substeps_taken < self.config.max_substeps_per_step {
             // Cap sub-step at remaining time so we don't overshoot the configured frame dt.
             let sub_dt =
-                choose_substep_dt(&self.config, &self.particles, &self.materials, remaining);
+                choose_substep_dt(&self.config, &self.particles, self.active_count, &self.materials, remaining);
             self.do_substep(sub_dt);
             remaining -= sub_dt;
             self.last_step_dt = sub_dt;
@@ -480,12 +774,10 @@ impl MpmSolver {
         // Running pre-P2G (not post) means a bad particle from a previous substep is
         // fixed before its momentum enters the grid — no NaN cascade possible.
         if self.config.project_invalid_state {
-            for i in 0..self.particles.len() {
-                let mut p = self.particles.get(i);
-                if project_particle_state_to_admissible(&mut p, &self.config) {
+            for i in 0..self.active_count {
+                if project_particle_state_to_admissible(&mut self.particles, i, &self.config) {
                     self.last_j_projection_count += 1;
                 }
-                self.particles.set(i, p);
             }
         }
 
@@ -493,16 +785,35 @@ impl MpmSolver {
         // Auto-enabled when any registered material declares needs_density_recompute=true.
         // Manual override via config.recompute_density_each_step for edge cases.
         if self.config.recompute_density_each_step || self.materials.any_needs_density_recompute() {
-            estimate_particle_density_and_volume(&mut self.particles, &mut self.grid);
+            estimate_particle_volumes(&mut self.particles, &mut self.grid, self.active_count, false);
         }
 
         self.grid.clear();
-        scatter_particles_to_grid(
-            &self.particles,
-            &mut self.grid,
-            &self.materials,
-            sub_dt,
-        );
+        scatter_particles_to_grid(&self.particles, &mut self.grid, &self.materials, sub_dt, self.active_count);
+
+        // Wake any sleeping particle whose kernel overlaps an active grid cell.
+        // This propagates activity from moving regions into neighbouring sleeping ones
+        // without a separate O(N) scan — we only visit the sleeping partition.
+        if self.active_count < self.particles.len() {
+            let total = self.particles.len();
+            let mut to_wake = Vec::new();
+            for i in self.active_count..total {
+                let x = self.particles.x[i];
+                let base = crate::grid::kernel::quadratic_weights(x).base_cell;
+                'outer: for gx in 0i32..3 {
+                    for gy in 0i32..3 {
+                        let cell = base + glam::IVec2::new(gx - 1, gy - 1);
+                        if self.grid.cell_is_active(cell) {
+                            to_wake.push(i);
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+            for i in to_wake {
+                self.wake_particle(i);
+            }
+        }
 
         // Normalize accumulated momentum to velocity, then apply gravity and wall constraints.
         self.grid.update_velocities(sub_dt, self.config.gravity);
@@ -511,21 +822,8 @@ impl MpmSolver {
             apply_boundary_conditions_to_grid(&mut self.grid, grid_res, boundary.as_ref());
         }
 
-        // Grid velocity projection — clamp every cell to CFL-safe speed before G2P.
-        //
-        // This is the root fix for large-force instability. G2P gathers both v_p and the
-        // APIC affine matrix C_p from grid velocities. The post-G2P particle velocity clamp
-        // only covers v_p — C_p is unclamped. Large C_p → F = (I + dt·C)·F blows up → J→0.
-        // Clamping here bounds both v_p and C_p at the source, regardless of how the velocity
-        // got there (gravity, force fields applied previous step, or impulses between steps).
-        //
-        // Trade-off: cells with zero mass have no physical velocity — skip them (momentum=0).
-        // Only mass-bearing cells can produce valid C_p contributions anyway.
-        //
-        // This is Tier 1 of the large-force stability plan (see apply_impulse doc).
-        // Tier 2 (force-triggered substepping) will further reduce energy loss for large
-        // one-shot impulses. Tier 3 (affine projection stabilizer, 2025) would make this
-        // unnecessary, but is deferred until LP stress-tests demand it.
+        // Clamp grid velocity before G2P — bounds both v_p and C_p at the source.
+        // Post-G2P clamping misses C_p: large C_p → F = (I + dt·C)·F blows up → J→0.
         {
             let vel_limit = self.config.grid_cell_size / sub_dt;
             for cell in self.grid.active_cells_mut() {
@@ -546,6 +844,7 @@ impl MpmSolver {
             &self.materials,
             self.config.grid_cell_size / sub_dt,
             self.config.apic_blend,
+            self.active_count,
         );
 
         // External body force fields: v += dt × acceleration(p) per particle.
@@ -560,11 +859,10 @@ impl MpmSolver {
             for (_, field) in &mut fields {
                 field.prepare(&self.particles);
             }
-            for i in 0..self.particles.len() {
-                let p = self.particles.get(i);
+            for i in 0..self.active_count {
                 let mut dv = Vec2::ZERO;
                 for (_, field) in &fields {
-                    dv += field.acceleration(&p);
+                    dv += field.acceleration(&self.particles, i);
                 }
                 self.particles.v[i] += sub_dt * dv;
             }
@@ -573,7 +871,7 @@ impl MpmSolver {
             // Re-clamp velocity after force fields — large external impulses (explosions,
             // creature bursts, planetary impacts) must not enter P2G with >1 cell/substep.
             let vel_limit = self.config.grid_cell_size / sub_dt;
-            for i in 0..self.particles.len() {
+            for i in 0..self.active_count {
                 let spd = self.particles.v[i].length();
                 if spd > vel_limit {
                     self.particles.v[i] *= vel_limit / spd;
@@ -594,7 +892,7 @@ impl MpmSolver {
         // Automatic phase transitions — evaluate registered rules, first match wins.
         if !self.phase_rules.is_empty() {
             let rules = std::mem::take(&mut self.phase_rules);
-            for i in 0..self.particles.len() {
+            for i in 0..self.active_count {
                 let p = self.particles.get(i);
                 for rule in &rules {
                     if let Some(new_id) = rule(&p) {
@@ -606,6 +904,30 @@ impl MpmSolver {
             self.phase_rules = rules;
         }
 
+        // Rebuild spatial hash over the active partition after all position updates.
+        // O(active_count). Subsequent particles_near / count_near / region_state calls
+        // within this frame use the hash rather than a full scan.
+        self.spatial_hash.rebuild(&self.particles.x, self.active_count);
+
+        // Sleep evaluation: put slow, passive active particles to sleep.
+        // Creatures (activation > 0) are never slept — they drive locomotion.
+        let threshold = self.config.sleep_threshold;
+        if threshold > 0.0 {
+            let threshold_sq = threshold * threshold;
+            let mut to_sleep: Vec<usize> = (0..self.active_count)
+                .filter(|&i| {
+                    self.particles.activation[i] == 0.0
+                        && self.particles.v[i].length_squared() < threshold_sq
+                })
+                .collect();
+            // Descending order: sleep_particle swaps i↔last_active (high end of active zone).
+            // Processing high-to-low ensures each displacement lands in already-processed
+            // positions, so no sleeping candidate is accidentally skipped.
+            to_sleep.sort_unstable_by(|a, b| b.cmp(a));
+            for i in to_sleep {
+                self.sleep_particle(i);
+            }
+        }
     }
 
     pub fn effective_dt(&self) -> f32 {
@@ -623,35 +945,155 @@ impl MpmSolver {
     }
 
     pub fn recompute_initial_volumes(&mut self) {
-        estimate_initial_particle_volumes(&mut self.particles, &mut self.grid);
+        estimate_particle_volumes(&mut self.particles, &mut self.grid, self.active_count, true);
     }
 
     /// Remove all particles where `predicate` returns true. Returns count removed.
     ///
     /// Uses stable retain (preserves order). O(N).
     ///
-    /// **Important:** any `ParticleGroup` index ranges are invalidated after removal —
-    /// rebuild groups via `spawn_group` or `particles_with_tag` afterward.
-    /// LP pattern: tag particles to remove with a sentinel `user_tag`, then call
-    /// `solver.remove_particles(|p| p.user_tag == DEAD)`.
+    /// LP pattern: tag particles with a sentinel before the step, then call
+    /// `solver.remove_particles(|p| p.user_tag == DEAD)`. The tag-based group API
+    /// remains valid after removal — tag_index is rebuilt internally.
     pub fn remove_particles<F: Fn(&Particle) -> bool>(&mut self, predicate: F) -> usize {
         let before = self.particles.len();
         self.particles.retain(|p| !predicate(p));
-        before - self.particles.len()
+        let removed = before - self.particles.len();
+        if removed > 0 {
+            // retain() compacted the array — all physical indices in tag_index are stale.
+            // Rebuild from scratch and re-establish the sleep partition.
+            self.tag_index.clear();
+            // Re-partition: move all sleeping particles to the back.
+            let n = self.particles.len();
+            let mut write = 0usize;
+            for read in 0..n {
+                if !self.particles.sleeping[read] {
+                    if write != read {
+                        self.particles.swap(write, read);
+                    }
+                    write += 1;
+                }
+            }
+            self.active_count = write;
+            // Rebuild tag_index over the freshly-partitioned array.
+            for i in 0..n {
+                self.tag_index
+                    .entry(self.particles.user_tag[i])
+                    .or_default()
+                    .insert(i);
+            }
+        }
+        removed
     }
 
-    /// Iterate all particles with the given `user_tag`. O(N).
+    /// Iterate physical indices of all particles with `tag`. O(group_size) via tag_index.
     ///
-    /// Use this to rebuild a `ParticleGroup` after `remove_particles` shifts indices,
-    /// or to query all particles belonging to a creature / region by ownership tag.
-    pub fn particles_with_tag(&self, tag: u32) -> impl Iterator<Item = (usize, Particle)> + '_ {
-        self.particles.indices().filter_map(move |i| {
-            if self.particles.user_tag[i] == tag {
-                Some((i, self.particles.get(i)))
-            } else {
-                None
+    /// Returns indices only — read particle data via `solver.particles().x[i]` etc.
+    /// This avoids cloning 112B per particle on every call.
+    pub fn particles_with_tag(&self, tag: u32) -> impl Iterator<Item = usize> + '_ {
+        self.tag_index
+            .get(&tag)
+            .into_iter()
+            .flat_map(|s| s.iter())
+            .copied()
+    }
+
+    // ── Sleep / wake ─────────────────────────────────────────────────────────
+
+    /// Put particle at physical index `i` to sleep.
+    ///
+    /// Swaps it with the last active particle, decrementing `active_count`.
+    /// Updates `tag_index` for both affected particles.
+    /// No-op if already sleeping.
+    fn sleep_particle(&mut self, i: usize) {
+        if self.particles.sleeping[i] || self.active_count == 0 {
+            return;
+        }
+        self.particles.sleeping[i] = true;
+        let last_active = self.active_count - 1;
+        if i != last_active {
+            let tag_i = self.particles.user_tag[i];
+            let tag_j = self.particles.user_tag[last_active];
+            // Same-tag swap: both indices stay in the same set — no update needed.
+            // Different-tag swap: each particle moves to the other's former position.
+            if tag_i != tag_j {
+                Self::tag_index_replace(&mut self.tag_index, tag_i, i, last_active);
+                Self::tag_index_replace(&mut self.tag_index, tag_j, last_active, i);
             }
-        })
+            self.particles.swap(i, last_active);
+        }
+        self.active_count -= 1;
+    }
+
+    /// Wake particle at physical index `i`.
+    ///
+    /// Swaps it with the first sleeping particle, incrementing `active_count`.
+    /// Updates `tag_index` for both affected particles.
+    /// No-op if already awake.
+    fn wake_particle(&mut self, i: usize) {
+        if !self.particles.sleeping[i] {
+            return;
+        }
+        self.particles.sleeping[i] = false;
+        let first_sleeping = self.active_count;
+        if i != first_sleeping {
+            let tag_i = self.particles.user_tag[i];
+            let tag_j = self.particles.user_tag[first_sleeping];
+            if tag_i != tag_j {
+                Self::tag_index_replace(&mut self.tag_index, tag_i, i, first_sleeping);
+                Self::tag_index_replace(&mut self.tag_index, tag_j, first_sleeping, i);
+            }
+            self.particles.swap(i, first_sleeping);
+        }
+        self.active_count += 1;
+    }
+
+    /// Wake all particles belonging to `tag`. O(group_size · log group_size).
+    pub fn wake_tag(&mut self, tag: u32) {
+        // Snapshot sleeping indices, then wake ascending.
+        // wake_particle(i) swaps i↔first_sleeping (low end of sleeping zone).
+        // Ascending order: each displacement lands at an already-processed lower position,
+        // so no sleeping tag particle is silently displaced to an unvisited index.
+        let mut to_wake: Vec<usize> = self.tag_index
+            .get(&tag)
+            .map(|s| s.iter().filter(|&&i| self.particles.sleeping[i]).copied().collect())
+            .unwrap_or_default();
+        to_wake.sort_unstable();
+        for i in to_wake {
+            self.wake_particle(i);
+        }
+    }
+
+    /// Sleep all particles belonging to `tag`. O(group_size · log group_size).
+    pub fn sleep_tag(&mut self, tag: u32) {
+        // Snapshot active indices, then sleep descending.
+        // sleep_particle(i) swaps i↔last_active (high end of active zone).
+        // Descending order: each displacement lands at an already-processed higher position.
+        let mut to_sleep: Vec<usize> = self.tag_index
+            .get(&tag)
+            .map(|s| s.iter().filter(|&&i| !self.particles.sleeping[i]).copied().collect())
+            .unwrap_or_default();
+        to_sleep.sort_unstable_by(|a, b| b.cmp(a));
+        for i in to_sleep {
+            self.sleep_particle(i);
+        }
+    }
+
+    /// Number of currently active (non-sleeping) particles.
+    pub fn active_count(&self) -> usize {
+        self.active_count
+    }
+
+    fn tag_index_replace(
+        tag_index: &mut HashMap<u32, HashSet<usize>>,
+        tag: u32,
+        old_idx: usize,
+        new_idx: usize,
+    ) {
+        if let Some(s) = tag_index.get_mut(&tag) {
+            s.remove(&old_idx);
+            s.insert(new_idx);
+        }
     }
 
     /// Collect all particles into a `Vec<Particle>` (for diagnostics or GPU upload).
@@ -659,72 +1101,92 @@ impl MpmSolver {
         self.particles.to_vec()
     }
 
-    /// Spawn an additional region of particles and append them to the existing simulation.
+    /// Spawn particles, tag them, and return the stable tag.
     ///
-    /// Returns the index range `start..end` into `self.particles()` for the newly added
-    /// particles. Store this range to track ownership (e.g. map a body ID → particle slice).
+    /// The returned `u32` tag is the only stable identity for this group — physical
+    /// indices change whenever particles sleep or wake. Pass it to `group_state`,
+    /// `set_group_activation`, `group_centroid`, etc.
     ///
-    /// Recomputes initial volumes for the full particle set after spawning — new particles'
-    /// densities depend on existing neighbours, so this is O(N_total) per call.
-    /// Avoid calling `spawn_region` in a hot loop at large N.
+    /// All particles in the region are stamped with `user_tag = tag` (overrides
+    /// any `user_tag` set in the SpawnConfig).
     ///
-    /// ```ignore
-    /// let fluid_range = solver.spawn_region(SpawnConfig { box_center: fluid_center, .. });
-    /// let sand_range  = solver.spawn_region(SpawnConfig { box_center: sand_center,  .. });
+    /// ```rust,no_run
+    /// # use emerge::solver::MpmSolver;
+    /// # use emerge::{SolverConfig, SpawnConfig};
+    /// # let config = SolverConfig::standard(64, 0.05, glam::Vec2::NEG_Y);
+    /// # let mut solver = MpmSolver::empty(config);
+    /// let creature = solver.spawn_group(SpawnConfig::for_solver(&config));
+    /// solver.set_group_activation(creature, 1.0);
+    /// let centroid = solver.group_centroid(creature);
     /// ```
-    #[must_use = "returns the particle index range for the spawned region — store it to track ownership"]
-    pub fn spawn_region(&mut self, spawn: SpawnConfig) -> std::ops::Range<usize> {
-        let start = self.particles.len();
+    #[must_use = "store the tag — it is the only stable identity for this group"]
+    pub fn spawn_group(&mut self, spawn: SpawnConfig) -> u32 {
+        let tag = self.next_tag;
+        self.next_tag += 1;
+
+        let old_active = self.active_count;
+        let old_len = self.particles.len();
+        // sleeping zone is [old_active..old_len] — new particles must land before it.
+
         spawn.validate_for_solver(&self.config);
         debug_assert!(
             self.materials.is_registered(spawn.material_id),
-            "spawn_region: material_id {} is not registered — call solver.with_material({}, ...) first",
-            spawn.material_id, spawn.material_id
+            "spawn_group: material_id {} is not registered",
+            spawn.material_id,
         );
         let mut rng = LcgRng::new(spawn.rng_seed);
         let new_particles = initialize_particles(&self.config, spawn, &mut rng);
         for p in new_particles {
             self.particles.push(p);
         }
-        // Let the material seed its own per-particle plastic state (e.g. sand friction accumulator).
+        let new_len = self.particles.len();
+        let new_count = new_len - old_len;
+        let sleeping_count = old_len - old_active;
+
+        // Stamp tag and init material plastic state (new particles still at [old_len..new_len]).
         let mat_id = spawn.material_id;
-        if self.materials.is_registered(mat_id) {
-            for i in start..self.particles.len() {
+        for i in old_len..new_len {
+            self.particles.user_tag[i] = tag;
+            if self.materials.is_registered(mat_id) {
                 let mut p = self.particles.get(i);
                 self.materials.get(mat_id).init_particle(&mut p);
                 self.particles.set(i, p);
             }
         }
-        // Volume estimation is neighbour-weighted (P2G mass scatter → per-particle density),
-        // so it must run over all particles — new particles' densities depend on existing neighbours.
-        // This is O(N_total) per call; avoid calling spawn_region in a hot loop at large N.
-        estimate_initial_particle_volumes(&mut self.particles, &mut self.grid);
-        start..self.particles.len()
-    }
 
-    /// Spawn particles and return a typed `ParticleGroup` handle.
-    ///
-    /// Preferred ergonomic API over `spawn_region` — the group tracks the index
-    /// range and provides bulk operations (set_activation, apply_impulse, state).
-    ///
-    /// ```rust,no_run
-    /// # use emerge::solver::MpmSolver;
-    /// # use emerge::{SolverConfig, SpawnConfig};
-    /// # let config = SolverConfig::standard(64, 0.05, glam::Vec2::NEG_Y);
-    /// # let mut solver = MpmSolver::new(config, SpawnConfig::default());
-    /// let creature = solver.spawn_group(SpawnConfig { ..Default::default() });
-    /// creature.set_activation(&mut solver.particles_mut(), 1.0);
-    /// let centroid = creature.centroid(solver.particles());
-    /// ```
-    #[must_use = "store the ParticleGroup to track this region's particles"]
-    pub fn spawn_group(&mut self, spawn: SpawnConfig) -> ParticleGroup {
-        ParticleGroup::new(self.spawn_region(spawn))
-    }
+        // If sleeping particles sit between the active zone and the new particles, rotate new
+        // particles before the sleeping zone so the partition invariant is maintained:
+        //   before: [0..old_active] active | [old_active..old_len] sleeping | [old_len..new_len] new
+        //   after:  [0..old_active] active | [old_active..old_active+new_count] new | [...] sleeping
+        if sleeping_count > 0 {
+            self.particles.rotate_range(old_active, old_len, new_len);
+            // Sleeping particles moved from [old_active+k] → [old_active+new_count+k].
+            // Update tag_index for each displaced sleeping particle.
+            for k in 0..sleeping_count {
+                let old_pos = old_active + k;
+                let new_pos = old_active + new_count + k;
+                let t = self.particles.user_tag[new_pos];
+                Self::tag_index_replace(&mut self.tag_index, t, old_pos, new_pos);
+            }
+        }
 
-    /// Spawn a named group — label appears in diagnostics output.
-    #[must_use = "store the ParticleGroup to track this region's particles"]
-    pub fn spawn_named_group(&mut self, spawn: SpawnConfig, label: impl Into<String>) -> ParticleGroup {
-        ParticleGroup::named(self.spawn_region(spawn), label)
+        // New particles are at [old_active..old_active+new_count].
+        let group_start = old_active;
+        let group_end = old_active + new_count;
+        self.tag_index.insert(tag, (group_start..group_end).collect::<HashSet<usize>>());
+        self.active_count = group_end;
+
+        // Scatter only particles in the spawn region + 3-cell margin.
+        // O(active_count) scan but O(local × stencil) grid work — fast for sparse spawns.
+        density::estimate_particle_volumes_local(
+            &mut self.particles,
+            &mut self.grid,
+            self.active_count,
+            group_start,
+            true,
+        );
+        self.spatial_hash.rebuild(&self.particles.x, self.active_count);
+        tag
     }
 
     /// Attach a scalar diffusion field (pheromone, nutrients, morphogen).
@@ -847,27 +1309,35 @@ impl LcgRng {
 pub(crate) fn choose_substep_dt(
     config: &SolverConfig,
     particles: &Particles,
+    active_count: usize,
     materials: &MaterialRegistry,
     max_dt: f32,
 ) -> f32 {
     if !config.adaptive_timestep {
         return max_dt.min(config.dt);
     }
+    // Single pass for both velocity CFL and material timestep bound.
     let mut max_speed = 0.0f32;
-    for i in 0..particles.len() {
+    let mut min_mat_dt = max_dt;
+    for i in 0..active_count {
         let mut s = particles.v[i].length();
         if config.cfl_include_affine_speed {
-            s += affine_cfl_speed_contribution(&particles.velocity_gradient[i], config.grid_cell_size);
+            s += affine_cfl_speed_contribution(
+                &particles.velocity_gradient[i],
+                config.grid_cell_size,
+            );
         }
         max_speed = max_speed.max(s);
-    }
-    let mut min_mat_dt = max_dt;
-    for i in 0..particles.len() {
-        let p = particles.get(i);
-        let mdt = materials.get(p.material_id).timestep_bound(
-            &p, config.grid_cell_size, config.material_cfl_coefficient, config.viscous_timestep_coefficient,
+        let mdt = materials.get(particles.material_id[i]).timestep_bound(
+            particles,
+            i,
+            config.grid_cell_size,
+            config.material_cfl_coefficient,
+            config.viscous_timestep_coefficient,
         );
-        if mdt.is_finite() && mdt > 0.0 { min_mat_dt = min_mat_dt.min(mdt); }
+        if mdt.is_finite() && mdt > 0.0 {
+            min_mat_dt = min_mat_dt.min(mdt);
+        }
     }
     cfl_bound(config, max_speed, min_mat_dt, max_dt)
 }
@@ -892,12 +1362,19 @@ pub(crate) fn choose_substep_dt_flat(
         }
         max_speed = max_speed.max(s);
     }
+    let soa = Particles::from(particles.to_vec());
     let mut min_mat_dt = max_dt;
-    for p in particles {
-        let mdt = materials.get(p.material_id).timestep_bound(
-            p, config.grid_cell_size, config.material_cfl_coefficient, config.viscous_timestep_coefficient,
+    for i in 0..soa.len() {
+        let mdt = materials.get(soa.material_id[i]).timestep_bound(
+            &soa,
+            i,
+            config.grid_cell_size,
+            config.material_cfl_coefficient,
+            config.viscous_timestep_coefficient,
         );
-        if mdt.is_finite() && mdt > 0.0 { min_mat_dt = min_mat_dt.min(mdt); }
+        if mdt.is_finite() && mdt > 0.0 {
+            min_mat_dt = min_mat_dt.min(mdt);
+        }
     }
     cfl_bound(config, max_speed, min_mat_dt, max_dt)
 }
@@ -935,80 +1412,86 @@ fn apply_boundary_conditions_to_grid(
 }
 
 /// Returns `true` if any field was corrected (state was invalid/non-finite).
-fn project_particle_state_to_admissible(particle: &mut Particle, config: &SolverConfig) -> bool {
+fn project_particle_state_to_admissible(
+    particles: &mut Particles,
+    i: usize,
+    config: &SolverConfig,
+) -> bool {
     let mut projected = false;
     let min = config.boundary_thickness.saturating_sub(1) as f32;
     let max = config.grid_res.saturating_sub(config.boundary_thickness) as f32;
     let domain_center = Vec2::splat((min + max) * 0.5);
 
-    if !particle.x.is_finite() {
-        particle.x = domain_center;
+    if !particles.x[i].is_finite() {
+        particles.x[i] = domain_center;
         projected = true;
     } else {
-        particle.x = particle.x.clamp(Vec2::splat(min), Vec2::splat(max));
+        particles.x[i] = particles.x[i].clamp(Vec2::splat(min), Vec2::splat(max));
     }
 
-    if !particle.v.is_finite() {
-        particle.v = Vec2::ZERO;
+    if !particles.v[i].is_finite() {
+        particles.v[i] = Vec2::ZERO;
         projected = true;
     }
-    if !particle.velocity_gradient.x_axis.is_finite()
-        || !particle.velocity_gradient.y_axis.is_finite()
+    if !particles.velocity_gradient[i].x_axis.is_finite()
+        || !particles.velocity_gradient[i].y_axis.is_finite()
     {
-        particle.velocity_gradient = Mat2::ZERO;
+        particles.velocity_gradient[i] = Mat2::ZERO;
         projected = true;
     }
 
-    if !particle.deformation_gradient.x_axis.is_finite()
-        || !particle.deformation_gradient.y_axis.is_finite()
-        || particle.deformation_gradient.determinant() <= config.projection_min_deformation_j
+    let f = particles.deformation_gradient[i];
+    if !f.x_axis.is_finite()
+        || !f.y_axis.is_finite()
+        || f.determinant() <= config.projection_min_deformation_j
     {
-        particle.deformation_gradient = Mat2::IDENTITY;
+        particles.deformation_gradient[i] = Mat2::IDENTITY;
         projected = true;
     } else {
-        let j = particle.deformation_gradient.determinant();
+        let j = f.determinant();
         if j > config.j_max {
-            particle.deformation_gradient *= (config.j_max / j).sqrt();
+            particles.deformation_gradient[i] *= (config.j_max / j).sqrt();
             projected = true;
         }
     }
 
-    if !particle.plastic_volume_ratio.is_finite() || particle.plastic_volume_ratio <= 0.0 {
-        particle.plastic_volume_ratio = 1.0;
+    if !particles.plastic_volume_ratio[i].is_finite() || particles.plastic_volume_ratio[i] <= 0.0 {
+        particles.plastic_volume_ratio[i] = 1.0;
         projected = true;
     }
-    if !particle.hardening_scale.is_finite() || particle.hardening_scale <= 0.0 {
-        particle.hardening_scale = 1.0;
+    if !particles.hardening_scale[i].is_finite() || particles.hardening_scale[i] <= 0.0 {
+        particles.hardening_scale[i] = 1.0;
         projected = true;
     }
-    if !particle.friction_hardening.is_finite() {
-        particle.friction_hardening = 0.0;
+    if !particles.friction_hardening[i].is_finite() {
+        particles.friction_hardening[i] = 0.0;
         projected = true;
     }
-    if !particle.log_volume_strain.is_finite() {
-        particle.log_volume_strain = 0.0;
+    if !particles.log_volume_strain[i].is_finite() {
+        particles.log_volume_strain[i] = 0.0;
         projected = true;
     }
 
-    if !particle.mass.is_finite() || particle.mass <= 0.0 {
-        particle.mass = config.particle_mass;
+    if !particles.mass[i].is_finite() || particles.mass[i] <= 0.0 {
+        particles.mass[i] = config.particle_mass;
         projected = true;
     }
-    if !particle.initial_volume.is_finite() || particle.initial_volume <= 0.0 {
-        particle.initial_volume = config
+    if !particles.initial_volume[i].is_finite() || particles.initial_volume[i] <= 0.0 {
+        particles.initial_volume[i] = config
             .default_initial_volume
             .max(config.projection_min_volume);
         projected = true;
     }
-    if !particle.volume.is_finite() || particle.volume <= 0.0 {
-        particle.volume = particle.initial_volume.max(config.projection_min_volume);
+    if !particles.volume[i].is_finite() || particles.volume[i] <= 0.0 {
+        particles.volume[i] = particles.initial_volume[i].max(config.projection_min_volume);
         projected = true;
     }
-    if !particle.density.is_finite() || particle.density <= 0.0 {
-        particle.density = (particle.mass / particle.volume).max(config.projection_min_density);
+    if !particles.density[i].is_finite() || particles.density[i] <= 0.0 {
+        particles.density[i] =
+            (particles.mass[i] / particles.volume[i]).max(config.projection_min_density);
         projected = true;
     } else {
-        particle.density = particle.density.max(config.projection_min_density);
+        particles.density[i] = particles.density[i].max(config.projection_min_density);
     }
     projected
 }

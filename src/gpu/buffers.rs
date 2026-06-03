@@ -94,12 +94,14 @@ impl GpuBuffers {
         });
 
         let step_params_pool: Vec<wgpu::Buffer> = (0..max_substeps)
-            .map(|i| device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(&format!("mpm_step_params_{i}")),
-                size: step_bytes,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }))
+            .map(|i| {
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(&format!("mpm_step_params_{i}")),
+                    size: step_bytes,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            })
             .collect();
 
         let force_fields_params = device.create_buffer(&wgpu::BufferDescriptor {
@@ -163,9 +165,9 @@ impl GpuBuffers {
         let byte_count = (particle_count * mem::size_of::<Particle>()) as u64;
 
         // Submit copy GPU → staging (non-blocking GPU command).
-        let mut encoder = device.create_command_encoder(
-            &wgpu::CommandEncoderDescriptor { label: Some("mpm_readback_copy") },
-        );
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("mpm_readback_copy"),
+        });
         encoder.copy_buffer_to_buffer(&self.particles, 0, &self.readback_staging, 0, byte_count);
         queue.submit(std::iter::once(encoder.finish()));
 
@@ -191,9 +193,9 @@ impl GpuBuffers {
         particle_count: usize,
     ) -> Vec<Particle> {
         let byte_count = (particle_count * mem::size_of::<Particle>()) as u64;
-        let mut encoder = device.create_command_encoder(
-            &wgpu::CommandEncoderDescriptor { label: Some("mpm_readback_blocking") },
-        );
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("mpm_readback_blocking"),
+        });
         encoder.copy_buffer_to_buffer(&self.particles, 0, &self.readback_staging, 0, byte_count);
         queue.submit(std::iter::once(encoder.finish()));
         device.poll(wgpu::PollType::wait_indefinitely()).ok();

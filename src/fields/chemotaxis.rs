@@ -41,7 +41,7 @@
 use glam::Vec2;
 
 use crate::fields::ForceField;
-use crate::particle::{Particle, Particles};
+use crate::particle::Particles;
 use crate::thermodynamics::ScalarDiffusionField;
 
 /// Gradient-following force derived from a scalar concentration field (Keller-Segel).
@@ -114,14 +114,14 @@ impl ForceField for ChemotaxisField {
         // Gradient is computed on-demand from the snapshot; no pre-computation needed.
     }
 
-    fn acceleration(&self, particle: &Particle) -> Vec2 {
+    fn acceleration(&self, particles: &Particles, i: usize) -> Vec2 {
         if let Some(id) = self.material_filter {
-            if particle.material_id != id {
+            if particles.material_id[i] != id {
                 return Vec2::ZERO;
             }
         }
-        let ix = particle.x.x.floor() as i32;
-        let iy = particle.x.y.floor() as i32;
+        let ix = particles.x[i].x.floor() as i32;
+        let iy = particles.x[i].y.floor() as i32;
         self.sensitivity * self.gradient_at(ix, iy)
     }
 }

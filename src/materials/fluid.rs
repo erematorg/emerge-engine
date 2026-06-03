@@ -1,15 +1,10 @@
 use glam::{Mat2, Vec2};
 
 use crate::materials::{ConstitutiveModel, MaterialModel, MaterialParams};
-use crate::particle::Particle;
+use crate::particle::Particles;
 
-/// Weakly-compressible Newtonian fluid.
-///
-/// Pressure: Tait equation of state — p = k·((ρ/ρ₀)^γ − 1).
-///   Reference: Monaghan 1994 (SPH), Becker & Teschner 2007 (WCSPH), γ≈7 for water.
-/// Viscosity: deviatoric Newtonian stress — τ_visc = η·dev(Ċ + Ċᵀ).
-///   C (the APIC affine matrix) approximates the local velocity gradient.
-/// Coupled to MLS-MPM transfer: Hu et al. 2018, §4.
+/// Weakly-compressible Newtonian fluid (Tait EOS + deviatoric viscosity).
+/// Refs: Becker & Teschner 2007 (WCSPH), Hu et al. 2018 (MLS-MPM).
 #[derive(Debug, Clone, Copy)]
 pub struct NewtonianFluidMaterial {
     pub rest_density: f32,
@@ -85,10 +80,10 @@ impl MaterialModel for NewtonianFluidMaterial {
         ConstitutiveModel::Fluid
     }
 
-    fn kirchhoff_stress(&self, particle: &Particle) -> Mat2 {
+    fn kirchhoff_stress(&self, particles: &Particles, i: usize) -> Mat2 {
         // Clamp density both ways: min prevents div-by-zero at low PPC,
         // max (2×ρ₀) prevents pressure spikes when particles are over-compressed on impact.
-        let density = particle.density
+        let density = particles.density[i]
             .max(self.min_density)
             .min(self.rest_density * 2.0);
         let pressure = (self.eos_stiffness
@@ -97,17 +92,16 @@ impl MaterialModel for NewtonianFluidMaterial {
 
         let mut stress = Mat2::from_diagonal(Vec2::splat(-pressure));
 
-        // Viscous stress: deviatoric shear + optional bulk term.
-        // Thermal thinning: µ_eff = µ₀·exp(−k·T) (Arrhenius-like; k=0 → isothermal).
         let eff_viscosity = if self.thermal_viscosity_coeff > 0.0 {
-            self.dynamic_viscosity * (-self.thermal_viscosity_coeff * particle.temperature).exp()
+            self.dynamic_viscosity
+                * (-self.thermal_viscosity_coeff * particles.temperature[i]).exp()
         } else {
             self.dynamic_viscosity
         };
-        let sym_strain = particle.velocity_gradient + particle.velocity_gradient.transpose();
+        let c = particles.velocity_gradient[i];
+        let sym_strain = c + c.transpose();
         let div_v = sym_strain.x_axis.x + sym_strain.y_axis.y; // = 2·tr(D) = 2·∇·v
-        let strain_dev = sym_strain
-            - Mat2::from_diagonal(Vec2::splat(div_v * 0.5));
+        let strain_dev = sym_strain - Mat2::from_diagonal(Vec2::splat(div_v * 0.5));
         stress += eff_viscosity * strain_dev;
 
         // Bulk viscosity ζ: τ += ζ·(∇·v)·I — damps longitudinal/acoustic waves.
@@ -116,10 +110,8 @@ impl MaterialModel for NewtonianFluidMaterial {
             stress += Mat2::from_diagonal(Vec2::splat(self.bulk_viscosity * div_v * 0.5));
         }
 
-        // Surface tension: τ += γ·J·I  (continuum surface energy ψ = γ·J)
-        // J = det(F) — resists compression isotropically, models surface cohesion.
         if self.surface_tension_coeff != 0.0 {
-            let f = particle.deformation_gradient;
+            let f = particles.deformation_gradient[i];
             let j = f.x_axis.x * f.y_axis.y - f.x_axis.y * f.y_axis.x;
             stress += Mat2::from_diagonal(Vec2::splat(self.surface_tension_coeff * j));
         }
@@ -127,19 +119,19 @@ impl MaterialModel for NewtonianFluidMaterial {
         stress
     }
 
-    fn stress_volume(&self, particle: &Particle) -> f32 {
-        particle.volume.max(self.min_volume)
+    fn stress_volume(&self, particles: &Particles, i: usize) -> f32 {
+        particles.volume[i].max(self.min_volume)
     }
 
-    fn update_particle(&self, particle: &mut Particle, dt: f32) {
-        let j = particle.deformation_gradient.determinant().clamp(0.5, 2.0);
+    fn update_particle(&self, particles: &mut Particles, i: usize, dt: f32) {
+        let j = particles.deformation_gradient[i]
+            .determinant()
+            .clamp(0.5, 2.0);
         let s = j.sqrt();
-        particle.deformation_gradient = glam::Mat2::from_cols(
-            glam::Vec2::new(s, 0.0),
-            glam::Vec2::new(0.0, s),
-        );
+        particles.deformation_gradient[i] =
+            glam::Mat2::from_cols(glam::Vec2::new(s, 0.0), glam::Vec2::new(0.0, s));
         if self.settling_damping > 0.0 {
-            particle.v *= 1.0 - (self.settling_damping * dt).min(0.5);
+            particles.v[i] *= 1.0 - (self.settling_damping * dt).min(0.5);
         }
     }
 
@@ -164,13 +156,14 @@ impl MaterialModel for NewtonianFluidMaterial {
 
     fn timestep_bound(
         &self,
-        particle: &Particle,
+        particles: &Particles,
+        i: usize,
         cell_width: f32,
         material_cfl: f32,
         viscous_cfl: f32,
     ) -> f32 {
         const MIN_DENSITY_RATIO: f32 = 1.0e-6;
-        let density = particle.density.max(self.min_density);
+        let density = particles.density[i].max(self.min_density);
         let ratio = (density / self.rest_density.max(self.min_density)).max(MIN_DENSITY_RATIO);
 
         let mut dt_bound = f32::INFINITY;

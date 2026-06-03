@@ -1,5 +1,7 @@
 pub mod kernel;
 
+use std::collections::HashMap;
+
 use glam::{IVec2, Vec2};
 
 /// One grid cell — `repr(C)` for stable GPU buffer layout.
@@ -13,35 +15,31 @@ pub struct Cell {
     pub mass: f32,
 }
 
-/// Sparse-ready grid — dense `Vec<Cell>` backing with dirty-index tracking.
+/// Sparse grid — HashMap-backed, only touched cells allocated.
 ///
-/// `clear()` / `update_velocities()` / iteration operate only on cells touched this
-/// frame — O(active particles × stencil) instead of O(grid_res²). For a 1000×1000
-/// domain with 10k particles this is ~90k operations vs 1M, enabling large open-world
-/// domains without the full HashMap step.
+/// `resolution` defines the simulation domain (soft boundary enforcement).
+/// Memory cost is O(active particles × stencil) not O(resolution²).
+/// A 4096-cell domain with 50k particles uses ~4 MB instead of 192 MB.
 ///
-/// Upgrade path: swap `Vec<Cell>` for `HashMap<u32, Cell>` when grid_res > ~512.
-/// All callers go through the public API — none touch the backing store directly.
+/// All P2G/G2P callers go through the public API. The HashMap key is the flat
+/// index `x * resolution + y`, matching the boundary condition convention.
 #[derive(Debug)]
 pub struct Grid {
     resolution: usize,
-    cells: Vec<Cell>,
-    /// Whether each cell was touched this frame. Parallel to `cells`.
-    /// Used to dedup dirty_indices — guarantees each cell appears exactly once.
-    touched: Vec<bool>,
-    /// Flat indices of touched cells, each appearing exactly once.
+    /// Sparse cell storage. Only contains cells touched this frame.
+    cells: HashMap<u32, Cell>,
+    /// Flat indices of cells touched this frame, in insertion order.
+    /// Separate from `cells` to enable O(touched) clear without iterating HashMap buckets.
     dirty: Vec<u32>,
 }
 
 impl Grid {
     pub fn new(resolution: usize) -> Self {
         assert!(resolution >= 4, "grid resolution must be >= 4");
-        let n = resolution * resolution;
         Self {
             resolution,
-            cells: vec![Cell::default(); n],
-            touched: vec![false; n],
-            dirty: Vec::with_capacity(n.min(1 << 16)),
+            cells: HashMap::new(),
+            dirty: Vec::new(),
         }
     }
 
@@ -49,12 +47,10 @@ impl Grid {
         self.resolution
     }
 
-    /// Zero only cells touched since last `clear()`. O(active cells), not O(grid_res²).
+    /// Remove only touched cells. O(touched), not O(resolution²).
     pub fn clear(&mut self) {
         for &idx in &self.dirty {
-            let i = idx as usize;
-            self.cells[i] = Cell::default();
-            self.touched[i] = false;
+            self.cells.remove(&idx);
         }
         self.dirty.clear();
     }
@@ -69,17 +65,17 @@ impl Grid {
         if x >= self.resolution || y >= self.resolution {
             return;
         }
-        let idx = x * self.resolution + y;
-        let cell = &mut self.cells[idx];
+        let idx = (x * self.resolution + y) as u32;
+        if !self.cells.contains_key(&idx) {
+            self.cells.insert(idx, Cell::default());
+            self.dirty.push(idx);
+        }
+        let cell = self.cells.get_mut(&idx).unwrap();
         cell.mass += mass;
         cell.momentum += momentum;
-        if !self.touched[idx] {
-            self.touched[idx] = true;
-            self.dirty.push(idx as u32);
-        }
     }
 
-    /// Grid velocity at `cell_pos` — valid after `update_velocities()`. Zero for OOB.
+    /// Grid velocity at `cell_pos` — valid after `update_velocities()`. Zero for OOB/untouched.
     pub fn velocity_at(&self, cell_pos: IVec2) -> Vec2 {
         if cell_pos.x < 0 || cell_pos.y < 0 {
             return Vec2::ZERO;
@@ -89,7 +85,23 @@ impl Grid {
         if x >= self.resolution || y >= self.resolution {
             return Vec2::ZERO;
         }
-        self.cells[x * self.resolution + y].momentum
+        self.cells
+            .get(&((x * self.resolution + y) as u32))
+            .map_or(Vec2::ZERO, |c| c.momentum)
+    }
+
+    /// True if `cell_pos` was touched by P2G this frame.
+    #[inline]
+    pub fn cell_is_active(&self, cell_pos: IVec2) -> bool {
+        if cell_pos.x < 0 || cell_pos.y < 0 {
+            return false;
+        }
+        let x = cell_pos.x as usize;
+        let y = cell_pos.y as usize;
+        if x >= self.resolution || y >= self.resolution {
+            return false;
+        }
+        self.cells.contains_key(&((x * self.resolution + y) as u32))
     }
 
     pub fn mass_at(&self, cell_pos: IVec2) -> f32 {
@@ -101,42 +113,51 @@ impl Grid {
         if x >= self.resolution || y >= self.resolution {
             return 0.0;
         }
-        self.cells[x * self.resolution + y].mass
+        self.cells
+            .get(&((x * self.resolution + y) as u32))
+            .map_or(0.0, |c| c.mass)
     }
 
     /// Normalize momentum → velocity and apply gravity. Operates only on active cells.
     pub fn update_velocities(&mut self, dt: f32, gravity: Vec2) {
-        for &idx in &self.dirty {
-            let cell = &mut self.cells[idx as usize];
-            if cell.mass > 0.0 {
-                cell.momentum /= cell.mass;
-                cell.momentum += gravity * dt;
+        let (dirty, cells) = (&self.dirty, &mut self.cells);
+        for &idx in dirty {
+            if let Some(cell) = cells.get_mut(&idx) {
+                if cell.mass > 0.0 {
+                    cell.momentum /= cell.mass;
+                    cell.momentum += gravity * dt;
+                }
             }
         }
     }
 
     /// Iterate active cells (read-only). For diagnostics.
     pub fn active_cells(&self) -> impl Iterator<Item = &Cell> {
-        self.dirty.iter().map(move |&idx| &self.cells[idx as usize])
+        let cells = &self.cells;
+        self.dirty.iter().filter_map(move |idx| cells.get(idx))
     }
 
     /// Iterate active cells (mutable). For CFL clamping.
     pub fn active_cells_mut(&mut self) -> impl Iterator<Item = &mut Cell> {
-        let ptr = self.cells.as_mut_ptr();
-        self.dirty.iter().map(move |&idx| {
-            // SAFETY: dirty contains unique in-bounds indices (enforced at insertion).
-            unsafe { &mut *ptr.add(idx as usize) }
+        let (dirty, cells) = (&self.dirty, &mut self.cells);
+        // SAFETY: dirty contains unique indices (enforced at insertion), each yielding
+        // a distinct &mut Cell. HashMap does not reallocate during iteration here since
+        // no inserts occur between clear() and the next add_mass_momentum() call.
+        let ptr = cells as *mut HashMap<u32, Cell>;
+        dirty.iter().filter_map(move |idx| {
+            // SAFETY: each idx is unique in dirty, so no two iterations alias.
+            unsafe { (*ptr).get_mut(idx) }
         })
     }
 
     /// Iterate active cells with flat index: `(flat_idx, &mut Cell)`.
-    /// `flat_idx = x * resolution + y` — same formula used by boundary conditions.
+    /// `flat_idx = x * resolution + y` — same convention used by boundary conditions.
     pub fn active_cells_with_index_mut(&mut self) -> impl Iterator<Item = (usize, &mut Cell)> {
-        let ptr = self.cells.as_mut_ptr();
-        self.dirty.iter().map(move |&idx| {
-            let i = idx as usize;
-            // SAFETY: dirty contains unique in-bounds indices (enforced at insertion).
-            (i, unsafe { &mut *ptr.add(i) })
+        let (dirty, cells) = (&self.dirty, &mut self.cells);
+        let ptr = cells as *mut HashMap<u32, Cell>;
+        dirty.iter().filter_map(move |&idx| {
+            // SAFETY: same as active_cells_mut — unique indices, no concurrent inserts.
+            unsafe { (*ptr).get_mut(&idx).map(|cell| (idx as usize, cell)) }
         })
     }
 
