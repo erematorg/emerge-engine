@@ -15,8 +15,9 @@
 ///   GRID=64, DT=0.1, GRAVITY=-0.3 cell/step². Fall from y=48 to floor ≈46 cells in ~55 steps.
 use emerge::{
     BinghamFluidMaterial, FrictionBoundary, MpmSolver, NeoHookeanMaterial,
-    NewtonianFluidMaterial, RankineMaterial, SandMaterial, SlipBoundary, SnowMaterial,
-    SolverConfig, SpawnConfig, VonMisesMaterial, ViscoelasticMaterial, lame_from_young,
+    NewtonianFluidMaterial, RankineMaterial, SandMaterial, SandMuIMaterial, SlipBoundary,
+    SnowMaterial, SolverConfig, SpawnConfig, VonMisesMaterial, ViscoelasticMaterial,
+    lame_from_young,
 };
 use glam::{IVec2, Vec2};
 use std::time::Instant;
@@ -165,6 +166,11 @@ fn run_basic() {
         ("viscoelastic",        Box::new(|| {
             let m = ViscoelasticMaterial::soft_tissue();
             MpmSolver::new(config(), center_spawn(0)).with_default_material(Box::new(m)).with_boundary(Box::new(SlipBoundary::new(2)))
+        })),
+        ("sand µ(I)",           Box::new(|| {
+            let (l, u) = lame_from_young(1e5, 0.2);
+            let m = SandMuIMaterial::fine_sand(l, u);
+            MpmSolver::new(config(), center_spawn(0)).with_default_material(Box::new(m)).with_boundary(Box::new(FrictionBoundary::new(2, 0.6)))
         })),
     ];
 

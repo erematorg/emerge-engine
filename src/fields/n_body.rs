@@ -354,3 +354,95 @@ impl ForceField for NBodyGravityField {
         tree.acceleration_on(i, particles.x[i], gp)
     }
 }
+
+/// Orbital-mechanics helpers for placing bodies in stable orbits under
+/// [`NBodyGravityField`]. All take `g` explicitly — pass the same `gravitational_constant`
+/// you gave the field. Units are simulation units (grid cells, cells/s).
+///
+/// Use these to seed initial velocities so spawned bodies orbit rather than fall in.
+pub mod orbit {
+    /// Circular orbital speed for pure Newtonian gravity: `v = √(G·M / r)`.
+    ///
+    /// Valid when softening ε ≪ r. For softened gravity at small r use
+    /// [`circular_velocity_softened`].
+    pub fn circular_velocity(g: f32, central_mass: f32, orbit_radius: f32) -> f32 {
+        if orbit_radius <= f32::EPSILON {
+            return 0.0;
+        }
+        (g * central_mass / orbit_radius).sqrt()
+    }
+
+    /// Circular orbital speed for Plummer-softened gravity.
+    ///
+    /// Matches the force law used by [`super::NBodyGravityField`]:
+    /// `m·v²/r = G·M·m·r / (r²+ε²)^{3/2}` → `v = r·√(G·M / (r²+ε²)^{3/2})`.
+    pub fn circular_velocity_softened(
+        g: f32,
+        central_mass: f32,
+        orbit_radius: f32,
+        softening: f32,
+    ) -> f32 {
+        let norm_s = orbit_radius * orbit_radius + softening * softening;
+        if norm_s <= f32::EPSILON {
+            return 0.0;
+        }
+        orbit_radius * (g * central_mass / (norm_s * norm_s.sqrt())).sqrt()
+    }
+
+    /// Escape speed: `v = √(2·G·M / r)`. Below this a body stays bound.
+    pub fn escape_velocity(g: f32, central_mass: f32, distance: f32) -> f32 {
+        if distance <= f32::EPSILON {
+            return 0.0;
+        }
+        (2.0 * g * central_mass / distance).sqrt()
+    }
+
+    /// Vis-viva speed at `distance` on an elliptical orbit of given `eccentricity`.
+    ///
+    /// `at_periapsis = true` evaluates at closest approach, `false` at apoapsis.
+    /// `v = √(μ·(2/r − 1/a))` with `μ = G·M` and `a` the semi-major axis.
+    pub fn elliptical_velocity(
+        g: f32,
+        central_mass: f32,
+        distance: f32,
+        eccentricity: f32,
+        at_periapsis: bool,
+    ) -> f32 {
+        if distance <= f32::EPSILON {
+            return 0.0;
+        }
+        let mu = g * central_mass;
+        let sign = if at_periapsis { 1.0 } else { -1.0 };
+        let semimajor = distance / (1.0 - eccentricity * sign);
+        (mu * (2.0 / distance - 1.0 / semimajor)).max(0.0).sqrt()
+    }
+}
+
+#[cfg(test)]
+mod orbit_tests {
+    use super::orbit::*;
+
+    #[test]
+    fn escape_is_sqrt2_times_circular() {
+        // v_escape = √2 · v_circular for the same G, M, r (unsoftened).
+        let (g, m, r) = (1.0, 100.0, 10.0);
+        let vc = circular_velocity(g, m, r);
+        let ve = escape_velocity(g, m, r);
+        assert!((ve / vc - 2.0_f32.sqrt()).abs() < 1e-5, "ve/vc = {}", ve / vc);
+    }
+
+    #[test]
+    fn circular_orbit_is_zero_eccentricity_ellipse() {
+        // A circular orbit is an ellipse with e=0: vis-viva must match circular_velocity.
+        let (g, m, r) = (0.5, 200.0, 25.0);
+        let vc = circular_velocity(g, m, r);
+        let ve = elliptical_velocity(g, m, r, 0.0, true);
+        assert!((vc - ve).abs() < 1e-4, "vc={vc} ve={ve}");
+    }
+
+    #[test]
+    fn zero_radius_is_safe() {
+        assert_eq!(circular_velocity(1.0, 1.0, 0.0), 0.0);
+        assert_eq!(escape_velocity(1.0, 1.0, 0.0), 0.0);
+    }
+}

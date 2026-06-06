@@ -13,6 +13,13 @@ pub struct MpmHealthThresholds {
     pub max_out_of_bounds_particles: usize,
     pub max_invalid_physical_particle_values: usize,
     pub max_non_finite_values: usize,
+    /// Max simulation time (seconds) that may be dropped per frame before flagging.
+    /// Nonzero drop means the substep budget was exhausted — sim runs in slow motion.
+    pub max_sim_time_dropped: f32,
+    /// Max velocity clamps per frame. Each clamp = G2P produced over-CFL velocity.
+    pub max_vel_clamp_count: usize,
+    /// Max J projections per frame. Each projection = explicit integration diverged.
+    pub max_j_projection_count: usize,
 }
 
 impl MpmHealthThresholds {
@@ -50,6 +57,9 @@ impl Default for MpmHealthThresholds {
             max_out_of_bounds_particles: 0,
             max_invalid_physical_particle_values: 0,
             max_non_finite_values: 0,
+            max_sim_time_dropped: 1e-6,
+            max_vel_clamp_count: 0,
+            max_j_projection_count: 0,
         }
     }
 }
@@ -66,6 +76,12 @@ pub struct MpmHealthStatus {
     pub out_of_bounds_violation: bool,
     pub invalid_physical_state_violation: bool,
     pub non_finite_violation: bool,
+    /// Substep budget was exhausted — sim dropped time, may be running in slow motion.
+    pub sim_time_dropped_violation: bool,
+    /// G2P produced over-CFL velocities that were clamped — integration under stress.
+    pub vel_clamp_violation: bool,
+    /// J went negative and was projected back — explicit integration diverged.
+    pub j_projection_violation: bool,
 }
 
 impl MpmHealthStatus {
@@ -80,6 +96,9 @@ impl MpmHealthStatus {
             && !self.out_of_bounds_violation
             && !self.invalid_physical_state_violation
             && !self.non_finite_violation
+            && !self.sim_time_dropped_violation
+            && !self.vel_clamp_violation
+            && !self.j_projection_violation
     }
 
     pub fn issue_labels(self) -> Vec<&'static str> {
@@ -113,6 +132,15 @@ impl MpmHealthStatus {
         }
         if self.non_finite_violation {
             labels.push("non_finite");
+        }
+        if self.sim_time_dropped_violation {
+            labels.push("time_dropped");
+        }
+        if self.vel_clamp_violation {
+            labels.push("vel_clamp");
+        }
+        if self.j_projection_violation {
+            labels.push("j_proj");
         }
         labels
     }
@@ -178,5 +206,8 @@ pub fn evaluate_mpm_health(
         invalid_physical_state_violation: snapshot.invalid_physical_particle_values
             > thresholds.max_invalid_physical_particle_values,
         non_finite_violation: non_finite_total > thresholds.max_non_finite_values,
+        sim_time_dropped_violation: snapshot.sim_time_dropped > thresholds.max_sim_time_dropped,
+        vel_clamp_violation: snapshot.vel_clamp_count > thresholds.max_vel_clamp_count,
+        j_projection_violation: snapshot.j_projection_count > thresholds.max_j_projection_count,
     }
 }

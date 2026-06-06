@@ -22,7 +22,8 @@
 //
 //   Extended physics (experimental, not part of LP-stable API)
 //   ├── acoustics/       WaveEquation2D                  [feature = "experimental"]
-//   └── electromagnetics/ EM field math                  [feature = "experimental"]
+//   ├── electromagnetics/ EM field math                  [feature = "experimental"]
+//   └── measures/        O(N) entropy (spatial · kinetic · phase) · local MI · KL divergence
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ── Core ─────────────────────────────────────────────────────────────────────
@@ -49,6 +50,8 @@ pub mod render;
 pub mod acoustics;
 #[cfg(feature = "experimental")]
 pub mod electromagnetics;
+#[cfg(feature = "experimental")]
+pub mod measures;
 
 // ── Prelude — common imports for LP/game consumers ───────────────────────────
 pub mod prelude;

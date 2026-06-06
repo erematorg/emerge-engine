@@ -42,6 +42,10 @@ build_*.txt
 *_test*.txt
 chatgpt*.md
 explosion_summary*.md
+diag_out*.txt
+val_out.txt
+val_err.txt
+*.ndjson
 
 # Environment files
 .env

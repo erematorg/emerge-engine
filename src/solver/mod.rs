@@ -315,11 +315,14 @@ impl MpmSolver {
 
             // Daughter: clone parent state, offset in opposite direction.
             // Give parent/child diverging velocities so fragments visibly separate.
+            // 30% of speed transferred to separation — empirical, keeps fragments
+            // from immediately re-merging while conserving approximate momentum.
+            const SPLIT_VEL_FRACTION: f32 = 0.3;
             let speed = self.particles.v[i].length().min(20.0);
-            self.particles.v[i] -= dir * speed * 0.3;
+            self.particles.v[i] -= dir * speed * SPLIT_VEL_FRACTION;
             let mut child = self.particles.get(i);
             child.x = p.x + dir * offset_cells;
-            child.v = p.v + dir * speed * 0.3;
+            child.v = p.v + dir * speed * SPLIT_VEL_FRACTION;
             child.friction_hardening = 0.0;
             new_particles.push(child);
         }
