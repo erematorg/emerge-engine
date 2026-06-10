@@ -30,6 +30,11 @@ experimental = []
 
 [dev-dependencies]
 pollster = "0.3"
+criterion = "0.5"
+
+[[bench]]
+name = "scaling"
+harness = false
 
 [profile.dev]
 opt-level = 1  # Basic optimization for better dev performance
