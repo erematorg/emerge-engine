@@ -12,7 +12,7 @@
 ///   CPU downloads particles once per frame only if plasticity is needed
 ///   LP renders: reads the particle buffer directly via shared wgpu Device
 ///
-/// Physics constants: KERNEL_D_INVERSE=4.0 is a fixed B-spline constant; other params come from SolverConfig.
+/// Physics constants: KERNEL_D_INVERSE=4.0 is a fixed B-spline constant; other params come from SimConfig.
 /// GPU-side constants (MAX_MATERIALS, workgroup sizes) are named here
 /// and must match their WGSL counterparts exactly.
 ///
@@ -33,19 +33,21 @@ pub mod shaders {
     pub const G2P: &str = include_str!("shaders/g2p.wgsl");
     pub const PARTICLES_UPDATE: &str = include_str!("shaders/particles_update.wgsl");
     pub const FORCE_FIELDS: &str = include_str!("shaders/force_fields.wgsl");
+    pub const APPLY_IMPULSES: &str = include_str!("shaders/apply_impulses.wgsl");
 }
 
 #[cfg(feature = "gpu")]
-pub use solver::GpuSolver;
+pub use solver::GpuSimulation;
 
 #[cfg(feature = "gpu")]
 pub use step_params::{
-    GpuForceFieldEntry, GpuForceFieldsParams, GpuStepParams, MAX_FORCE_FIELDS, field_type,
+    GpuFieldEntry, GpuFieldsParams, GpuImpulseEntry, GpuImpulseParams, GpuStepParams,
+    MAX_FORCE_FIELDS, MAX_GPU_IMPULSES, field_type,
 };
 
 #[cfg(feature = "gpu")]
 mod step_params {
-    use crate::solver::config::SolverConfig;
+    use crate::solver::config::SimConfig;
 
     /// Re-export so GPU code reads the same limit as the registry.
     /// Injected into WGSL shaders at pipeline creation — change only in `materials/registry.rs`.
@@ -56,7 +58,7 @@ mod step_params {
     /// 32 bytes, 16-byte aligned — satisfies WGSL uniform binding requirements.
     /// Fields mirror `struct StepParams` in every WGSL shader exactly (same offsets, same types).
     ///
-    /// All values come from `SolverConfig` or are computed from it — no hardcoded physics here.
+    /// All values come from `SimConfig` or are computed from it — no hardcoded physics here.
     /// Uniform data uploaded once per GPU substep.
     ///
     /// Layout (32 bytes, 16-byte aligned — WGSL uniform binding requirement):
@@ -78,13 +80,13 @@ mod step_params {
         pub particle_count: u32,
         pub dt: f32,
         pub kernel_d_inverse: f32,
-        pub gravity: glam::Vec2, // SolverConfig::gravity — supports angled/planetary gravity
+        pub gravity: glam::Vec2, // SimConfig::gravity — supports angled/planetary gravity
         pub boundary_thickness: u32,
         pub vel_limit: f32, // grid_cell_size / sub_dt
     }
 
     impl GpuStepParams {
-        pub fn new(config: &SolverConfig, sub_dt: f32, particle_count: usize) -> Self {
+        pub fn new(config: &SimConfig, sub_dt: f32, particle_count: usize) -> Self {
             Self {
                 grid_res: config.grid_res as u32,
                 particle_count: particle_count as u32,
@@ -111,23 +113,24 @@ mod step_params {
         pub const AABB_CONFINEMENT: u32 = 3;
         pub const RADIAL_CONFINEMENT: u32 = 4;
         pub const UNIFORM_ELECTRIC: u32 = 5;
+        pub const BUOYANCY: u32 = 6;
     }
 
     /// One GPU force-field entry — 48 bytes, 16-byte aligned.
-    /// Matches `struct ForceFieldEntry` in `force_fields.wgsl` exactly (size-asserted).
+    /// Matches `struct FieldEntry` in `force_fields.wgsl` exactly (size-asserted).
     /// Use the named constructors instead of filling `params` manually.
     #[repr(C)]
     #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-    pub struct GpuForceFieldEntry {
+    pub struct GpuFieldEntry {
         pub field_type: u32,
         pub material_mask: u32,
         pub _pad: [u32; 2],
         pub params: [f32; 8],
     }
 
-    const _: () = assert!(core::mem::size_of::<GpuForceFieldEntry>() == 48);
+    const _: () = assert!(core::mem::size_of::<GpuFieldEntry>() == 48);
 
-    impl GpuForceFieldEntry {
+    impl GpuFieldEntry {
         /// material_mask value for a field that affects all materials.
         pub const ALL_MATERIALS: u32 = 0xFFFF_FFFF;
 
@@ -254,43 +257,107 @@ mod step_params {
                 params: p,
             }
         }
+
+        /// Archimedes buoyancy for particles of `material_id` floating in a denser fluid.
+        ///
+        /// - `gravity`: must match `SimConfig::gravity` (solver gravity, including sign)
+        /// - `fluid_density_grid`: surrounding fluid's rest_density in grid units
+        ///   (`ρ_SI · dx_m² / dt_s²` — same value as `NewtonianFluidMaterial::rest_density`)
+        /// - `material_id`: only particles of this material receive the buoyancy force
+        ///
+        /// Uses particle rest density (`mass / initial_volume`) not instantaneous density,
+        /// preventing the expansion-buoyancy runaway where expanded fluid appears falsely light.
+        /// Applies `Δv = −gravity · (fluid_density / ρ₀_particle − 1) · dt` each substep.
+        pub fn buoyancy(gravity: glam::Vec2, fluid_density_grid: f32, material_id: u32) -> Self {
+            let mut p = [0f32; 8];
+            p[0] = gravity.x;
+            p[1] = gravity.y;
+            p[2] = fluid_density_grid;
+            p[3] = 1.0e-4; // min_density floor — mirrors BuoyancyField::new default
+            Self {
+                field_type: field_type::BUOYANCY,
+                material_mask: 1 << material_id,
+                _pad: [0; 2],
+                params: p,
+            }
+        }
     }
 
     /// Uniform buffer containing all active GPU force-field entries — 784 bytes.
-    /// Matches `struct ForceFieldsParams` in `force_fields.wgsl` exactly (size-asserted).
+    /// Matches `struct FieldsParams` in `force_fields.wgsl` exactly (size-asserted).
     #[repr(C)]
     #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-    pub struct GpuForceFieldsParams {
+    pub struct GpuFieldsParams {
         pub count: u32,
         pub _pad: [u32; 3],
-        pub entries: [GpuForceFieldEntry; MAX_FORCE_FIELDS],
+        pub entries: [GpuFieldEntry; MAX_FORCE_FIELDS],
     }
 
-    const _: () = assert!(core::mem::size_of::<GpuForceFieldsParams>() == 784);
+    const _: () = assert!(core::mem::size_of::<GpuFieldsParams>() == 784);
+
+    /// Max impulses per frame submitted via `apply_impulse` / `apply_radial_impulse`.
+    /// Must match `array<ImpulseEntry, 16>` in `apply_impulses.wgsl`.
+    pub const MAX_GPU_IMPULSES: usize = 16;
+
+    /// One impulse descriptor — 32 bytes, matches `struct ImpulseEntry` in WGSL.
+    ///
+    /// mode 0 = radial: `v += normalize(p - center) * strength * falloff`
+    /// mode 1 = directional: `v += force * falloff`
+    #[repr(C)]
+    #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+    pub struct GpuImpulseEntry {
+        pub center: [f32; 2], // grid-space origin
+        pub radius: f32,
+        pub strength: f32,   // radial only (signed)
+        pub force: [f32; 2], // directional only
+        pub mode: u32,       // 0 = radial, 1 = directional
+        pub _pad: u32,
+    }
+
+    const _: () = assert!(core::mem::size_of::<GpuImpulseEntry>() == 32);
+
+    /// Uniform data for the apply_impulses compute pass — 528 bytes.
+    /// Matches `struct ImpulseParams` in `apply_impulses.wgsl`.
+    #[repr(C)]
+    #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+    pub struct GpuImpulseParams {
+        pub count: u32,
+        pub vel_limit: f32,
+        pub particle_count: u32,
+        pub _pad: u32,
+        pub entries: [GpuImpulseEntry; MAX_GPU_IMPULSES],
+    }
+
+    const _: () = assert!(core::mem::size_of::<GpuImpulseParams>() == 528);
 }
 
 #[cfg(feature = "gpu")]
 mod solver {
     use std::sync::Arc;
 
-    use crate::materials::{ConstitutiveModel, registry::MaterialRegistry};
-    use crate::solver::config::{SolverConfig, SpawnConfig};
+    use crate::materials::registry::MaterialRegistry;
+    use crate::solver::config::{SimConfig, SpawnRegion};
     use crate::solver::density::estimate_particle_volumes;
-    use crate::solver::{LcgRng, choose_substep_dt_flat, initialize_particles};
+    use crate::solver::{LcgRng, choose_substep_dt, initialize_particles};
     use crate::{
         grid::Grid,
         particle::{Particle, Particles},
     };
 
     use super::buffers::GpuBuffers;
-    use super::pipeline::MpmPipelines;
+    use super::pipeline::SimPipelines;
     use super::step_params::{
-        GpuForceFieldEntry, GpuForceFieldsParams, GpuStepParams, MAX_FORCE_FIELDS, MAX_MATERIALS,
+        GpuFieldEntry, GpuFieldsParams, GpuImpulseEntry, GpuImpulseParams, GpuStepParams,
+        MAX_FORCE_FIELDS, MAX_GPU_IMPULSES, MAX_MATERIALS,
     };
 
     /// Workgroup sizes — must match `@workgroup_size(...)` in the WGSL shaders.
     const WG_GRID: u32 = 8; // grid_clear and grid_update: 8×8 2D workgroups
     const WG_PARTICLES: u32 = 64; // p2g and g2p: 64-wide 1D workgroups
+
+    /// Shared between the wgpu map_async callback (any thread) and step_frame's poll.
+    type ReadbackResult =
+        std::sync::Arc<std::sync::Mutex<Option<Result<(), wgpu::BufferAsyncError>>>>;
 
     /// GPU-backed MLS-MPM solver.
     ///
@@ -300,12 +367,12 @@ mod solver {
     ///
     /// Particles live in VRAM between frames; the CPU only touches them at spawn and for
     /// plasticity readback (currently: none — all plasticity runs in particles_update.wgsl).
-    pub struct GpuSolver {
+    pub struct GpuSimulation {
         device: Arc<wgpu::Device>,
         queue: Arc<wgpu::Queue>,
         buffers: GpuBuffers,
-        pipelines: MpmPipelines,
-        config: SolverConfig,
+        pipelines: SimPipelines,
+        config: SimConfig,
         registry: MaterialRegistry,
         /// CPU-side particle mirror. One frame behind the GPU when readback is strided.
         /// Access via `particles()` / `particles_mut()`. Do not replace the Vec directly.
@@ -313,31 +380,35 @@ mod solver {
         particle_count: usize,
         last_sub_dt: f32,
         last_substeps: usize,
+        frame_index: u64,
         /// GPU force-field entries — uploaded to the force_fields_params uniform each substep.
-        force_field_entries: Vec<GpuForceFieldEntry>,
+        force_field_entries: Vec<GpuFieldEntry>,
         /// Frame counter used to stride CPU readbacks when all materials are GPU-resident.
         readback_frame: usize,
         /// Download CPU particle state every N step_frame calls when no CPU plasticity is needed.
         /// 1 = every frame (default, always accurate). 2+ = skip frames, reducing GPU stall cost.
         /// One-frame lag on sprite positions is invisible at 60fps.
         pub readback_stride: usize,
-        /// True when CPU particles have been modified externally (cursor, user forces, etc.)
-        /// and must be re-uploaded before the next GPU pass. Set via mark_particles_dirty().
-        particles_dirty: bool,
+        /// Particle positions/materials changed — sort + upload required before next GPU pass.
+        /// Set by spawn, phase_transition, mark_particles_dirty().
+        layout_dirty: bool,
+        /// Pending impulses to apply on GPU at the start of the next step_frame.
+        /// Applied via a dedicated compute pass that reads LIVE GPU particle positions,
+        /// avoiding the stale-CPU-mirror artifacts from the old upload approach.
+        pending_impulses: Vec<GpuImpulseEntry>,
         /// Pending async readback — Some while GPU → staging copy + mapping is in flight.
         /// Checked each step_frame; on completion, CPU particles are updated without blocking.
         /// Arc<Mutex<...>> so the wgpu callback (any thread) can signal the main thread.
-        pending_readback:
-            Option<std::sync::Arc<std::sync::Mutex<Option<Result<(), wgpu::BufferAsyncError>>>>>,
+        pending_readback: Option<ReadbackResult>,
     }
 
-    impl GpuSolver {
-        /// Create a GpuSolver, initialize wgpu, upload initial particle and material data.
+    impl GpuSimulation {
+        /// Create a GpuSimulation, initialize wgpu, upload initial particle and material data.
         ///
         /// `async` because wgpu adapter/device requests are async.
-        /// In examples, wrap with `pollster::block_on(GpuSolver::new(...))`.
+        /// In examples, wrap with `pollster::block_on(GpuSimulation::new(...))`.
         pub async fn new(
-            config: SolverConfig,
+            config: SimConfig,
             particles: Vec<Particle>,
             registry: MaterialRegistry,
         ) -> Self {
@@ -364,28 +435,24 @@ mod solver {
 
             let device = Arc::new(device);
             let queue = Arc::new(queue);
+            Self::with_device(device, queue, config, particles, registry)
+        }
 
-            // Warn for materials whose constitutive model has no GPU stress implementation.
-            // Rankine and DruckerPragerMuI both fall to the default zero-stress branch in
-            // p2g.wgsl — particles will be pressureless on GPU. Use MpmSolver (CPU) instead.
-            const GPU_UNSUPPORTED: &[ConstitutiveModel] = &[
-                ConstitutiveModel::Rankine,
-                ConstitutiveModel::DruckerPragerMuI,
-            ];
-            for id in 0..registry.len() as u32 {
-                let cm = registry.constitutive_model_of(id);
-                if GPU_UNSUPPORTED.contains(&cm) {
-                    eprintln!(
-                        "[emerge] WARNING: material {} ({:?}) has no GPU stress implementation \
-                         — particles will have zero stress. Use MpmSolver (CPU) for this material.",
-                        id, cm
-                    );
-                }
-            }
-
+        /// Build a `GpuSimulation` on an existing device/queue so its GPU buffers can be
+        /// shared with a renderer or surface on the same device — required for the
+        /// zero-readback [`crate::render::Renderer::render_gpu`] path. `new()` creates its
+        /// own headless device instead, which is correct for compute-only or CPU-readback
+        /// workflows but cannot share GPU buffers with another device.
+        pub fn with_device(
+            device: Arc<wgpu::Device>,
+            queue: Arc<wgpu::Queue>,
+            config: SimConfig,
+            particles: Vec<Particle>,
+            registry: MaterialRegistry,
+        ) -> Self {
             let material_params = registry.all_params();
 
-            // Run init_particle before uploading. Mirrors MpmSolver::spawn_region().
+            // Run init_particle before uploading. Mirrors Simulation::spawn_region().
             // Materials that seed plastic state (Snow: Jp=1, Sand: q=neutral) start wrong
             // without this.
             let mut initialized = particles;
@@ -405,7 +472,7 @@ mod solver {
             buffers.upload_particles(&queue, &initialized);
             buffers.upload_materials(&queue, &material_params);
 
-            let pipelines = MpmPipelines::new(&device);
+            let pipelines = SimPipelines::new(&device);
 
             Self {
                 device,
@@ -418,18 +485,19 @@ mod solver {
                 particle_count,
                 last_sub_dt: config.dt,
                 last_substeps: 0,
+                frame_index: 0,
                 force_field_entries: Vec::new(),
                 readback_frame: 0,
                 readback_stride: 1,
-                particles_dirty: true, // seed particle_sort on first step_frame
+                layout_dirty: true, // seed particle_sort on first step_frame
+                pending_impulses: Vec::new(),
                 pending_readback: None,
             }
         }
 
-        /// Mark CPU particles as modified — step_frame will upload them to GPU before next physics pass.
-        /// Call after any external modification (cursor forces, user impulses, spawn).
+        /// Mark CPU particles as layout-changed (positions/materials) — triggers sort + upload.
         pub fn mark_particles_dirty(&mut self) {
-            self.particles_dirty = true;
+            self.layout_dirty = true;
         }
 
         /// Upload revised material params (e.g., if interactive sliders change them).
@@ -470,10 +538,12 @@ mod solver {
         pub fn step_frame(&mut self) {
             let any_cpu = self.registry.any_needs_cpu_update();
 
-            // Upload CPU → GPU only when CPU state was externally modified (cursor, impulses,
-            // CPU plasticity correction). On pure-GPU frames this is skipped entirely.
-            if self.particles_dirty || any_cpu {
-                // Sort by grid cell so neighbouring particles are adjacent in upload order.
+            // Upload CPU → GPU only when positions/materials actually changed.
+            // Impulses are now applied by a dedicated GPU compute pass (apply_impulses) that
+            // reads LIVE GPU positions — no CPU mirror upload needed for impulse-only frames.
+            let needs_upload = self.layout_dirty || any_cpu;
+            let needs_particle_sort = needs_upload;
+            if needs_upload {
                 let res = self.config.grid_res as u32;
                 self.particles.sort_unstable_by_key(|p| {
                     let cx = (p.x.x as u32).min(res.saturating_sub(1));
@@ -481,60 +551,38 @@ mod solver {
                     cy * res + cx
                 });
                 self.buffers.upload_particles(&self.queue, &self.particles);
-                self.particles_dirty = false;
-
-                // particle_sort — re-seed sorted_particle_ids to identity [0..N).
-                // Uses pool slot 0 (any valid step_params; particle_count is what matters here).
-                let sort_params =
-                    GpuStepParams::new(&self.config, self.config.dt, self.particle_count);
-                self.buffers
-                    .upload_step_params_at(&self.queue, 0, &sort_params);
-                let sort_bg = self.pipelines.make_bind_group(
-                    &self.device,
-                    &self.buffers,
-                    &self.buffers.step_params_pool[0],
-                );
-                let particle_wg = div_ceil(self.particle_count as u32, WG_PARTICLES);
-                let mut encoder =
-                    self.device
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("mpm_particle_sort"),
-                        });
-                {
-                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("particle_sort"),
-                        timestamp_writes: None,
-                    });
-                    pass.set_pipeline(&self.pipelines.particle_sort);
-                    pass.set_bind_group(0, &sort_bg, &[]);
-                    pass.dispatch_workgroups(particle_wg, 1, 1);
-                }
-                self.queue.submit(std::iter::once(encoder.finish()));
+                self.layout_dirty = false;
             }
 
             // Pre-compute all sub_dts from CPU mirror (same one-frame lag as before).
-            // Allows all substeps to be encoded in one command buffer → one GPU submit.
+            // CFL scan is O(N) — run it ONCE and reuse the result to fill the sub_dts array.
+            // The CPU mirror is static within a frame so every repeated call would return the
+            // same value anyway. Previously this called choose_substep_dt up to 16×/frame
+            // (once per substep), which in debug mode caused measurable cursor slowdown.
+            let particles_soa = crate::particle::Particles::from(self.particles.clone());
+            let sub_dt_cfl = choose_substep_dt(
+                &self.config,
+                &particles_soa,
+                particles_soa.len(),
+                &self.registry,
+                self.config.dt,
+            );
             let mut sub_dts: Vec<f32> = Vec::with_capacity(self.config.max_substeps_per_step);
             {
                 let mut remaining = self.config.dt;
                 while remaining > f32::EPSILON && sub_dts.len() < self.config.max_substeps_per_step
                 {
-                    let sub_dt = choose_substep_dt_flat(
-                        &self.config,
-                        &self.particles,
-                        &self.registry,
-                        remaining,
-                    )
-                    .min(remaining);
+                    let sub_dt = sub_dt_cfl.min(remaining);
                     sub_dts.push(sub_dt);
                     remaining -= sub_dt;
                 }
             }
             self.last_substeps = sub_dts.len();
             self.last_sub_dt = sub_dts.last().copied().unwrap_or(self.config.dt);
+            self.frame_index += 1;
 
             // Build force fields uniform (same every substep).
-            let mut ff_params: GpuForceFieldsParams = bytemuck::Zeroable::zeroed();
+            let mut ff_params: GpuFieldsParams = bytemuck::Zeroable::zeroed();
             ff_params.count = self.force_field_entries.len() as u32;
             for (i, e) in self.force_field_entries.iter().enumerate() {
                 ff_params.entries[i] = *e;
@@ -559,14 +607,68 @@ mod solver {
                 })
                 .collect();
 
-            // Encode all substeps into one command buffer — one GPU submission per frame.
-            let grid_wg = div_ceil(self.config.grid_res as u32, WG_GRID);
-            let particle_wg = div_ceil(self.particle_count as u32, WG_PARTICLES);
+            // Encode everything into one command buffer — one GPU submit per frame.
+            // Order: [apply_impulses?] → [particle_sort?] → substep_0 → … → substep_N
+            //
+            // apply_impulses runs first so physics sees the freshly-applied velocities.
+            // particle_sort re-seeds sorted_particle_ids after a CPU upload (layout_dirty).
+            // Both use dedicated buffer slots so they never alias substep params.
+            let grid_wg = (self.config.grid_res as u32).div_ceil(WG_GRID);
+            let particle_wg = (self.particle_count as u32).div_ceil(WG_PARTICLES);
             let mut encoder = self
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("mpm_frame"),
                 });
+
+            // — apply_impulses pass (GPU-native, no stale CPU mirror) —
+            if !self.pending_impulses.is_empty() {
+                let vel_limit = self.config.grid_cell_size / self.config.min_dt;
+                let mut params = GpuImpulseParams {
+                    count: self.pending_impulses.len() as u32,
+                    vel_limit,
+                    particle_count: self.particle_count as u32,
+                    _pad: 0,
+                    entries: bytemuck::Zeroable::zeroed(),
+                };
+                for (i, e) in self.pending_impulses.iter().enumerate() {
+                    params.entries[i] = *e;
+                }
+                self.buffers.upload_impulse_params(&self.queue, &params);
+                let impulse_bg = self
+                    .pipelines
+                    .make_impulse_bind_group(&self.device, &self.buffers);
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("apply_impulses"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.pipelines.apply_impulses);
+                pass.set_bind_group(0, &impulse_bg, &[]);
+                pass.dispatch_workgroups(particle_wg, 1, 1);
+                drop(pass);
+                self.pending_impulses.clear();
+            }
+
+            // — particle_sort pass (after layout upload, before physics) —
+            if needs_particle_sort {
+                let sort_slot = self.buffers.step_params_pool.len() - 1;
+                let sort_params =
+                    GpuStepParams::new(&self.config, self.config.dt, self.particle_count);
+                self.buffers
+                    .upload_step_params_at(&self.queue, sort_slot, &sort_params);
+                let sort_bg = self.pipelines.make_bind_group(
+                    &self.device,
+                    &self.buffers,
+                    &self.buffers.step_params_pool[sort_slot],
+                );
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("particle_sort"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.pipelines.particle_sort);
+                pass.set_bind_group(0, &sort_bg, &[]);
+                pass.dispatch_workgroups(particle_wg, 1, 1);
+            }
             for bg in &bind_groups {
                 self.encode_substep(&mut encoder, bg, grid_wg, particle_wg);
             }
@@ -581,7 +683,7 @@ mod solver {
             // If any_cpu: readback every frame (CPU plasticity needs current state).
             // Otherwise: stride-gated to reduce overhead.
             self.readback_frame = self.readback_frame.wrapping_add(1);
-            let want_readback = any_cpu || (self.readback_frame % self.readback_stride == 0);
+            let want_readback = any_cpu || self.readback_frame.is_multiple_of(self.readback_stride);
 
             // Pump wgpu callbacks so any in-flight mapping can complete.
             self.device.poll(wgpu::PollType::Poll).ok();
@@ -631,7 +733,7 @@ mod solver {
                     }
                 }
                 if any_cpu {
-                    self.particles_dirty = true;
+                    self.layout_dirty = true; // CPU plasticity touched positions/F
                 }
             }
 
@@ -648,7 +750,7 @@ mod solver {
         /// Add a non-uniform body force field for the GPU path.
         /// Entries are uploaded and dispatched every substep until cleared.
         /// Panics if `MAX_FORCE_FIELDS` is exceeded.
-        pub fn add_force_field_gpu(&mut self, entry: GpuForceFieldEntry) {
+        pub fn add_force_field_gpu(&mut self, entry: GpuFieldEntry) {
             assert!(
                 self.force_field_entries.len() < MAX_FORCE_FIELDS,
                 "add_force_field_gpu: MAX_FORCE_FIELDS ({MAX_FORCE_FIELDS}) exceeded"
@@ -762,9 +864,9 @@ mod solver {
         /// LP uses this as `creature_id → particle_range` for ownership tracking.
         ///
         /// Call before `step_frame` — mid-frame spawning is not supported.
-        pub fn spawn_region(&mut self, spawn: SpawnConfig) -> std::ops::Range<usize> {
+        pub fn spawn_region(&mut self, spawn: SpawnRegion) -> std::ops::Range<usize> {
             let start = self.particles.len();
-            spawn.validate_for_solver(&self.config);
+            spawn.validate_for_sim(&self.config);
             debug_assert!(
                 self.registry.is_registered(spawn.material_id),
                 "spawn_region: material_id {} is not registered — call solver.set_material({}, ...) first",
@@ -815,7 +917,7 @@ mod solver {
             start..n
         }
 
-        pub fn config(&self) -> &SolverConfig {
+        pub fn config(&self) -> &SimConfig {
             &self.config
         }
         pub fn particle_count(&self) -> usize {
@@ -862,11 +964,11 @@ mod solver {
 
         /// Register a material, auto-assigning the next available ID.
         ///
-        /// Mirrors `MpmSolver::register_material` — use this instead of `set_material`
+        /// Mirrors `Simulation::register_material` — use this instead of `set_material`
         /// when you don't want to track IDs manually. Returns a typed handle.
         ///
         /// LP pattern: call at world-init time to build a material palette, then
-        /// use `handle.id()` in `SpawnConfig::for_solver(...).material(handle.id())`.
+        /// use `handle.id()` in `SpawnRegion::for_sim(...).material(handle.id())`.
         pub fn register_material(
             &mut self,
             material: Box<dyn crate::materials::MaterialModel>,
@@ -897,6 +999,24 @@ mod solver {
             self.last_substeps
         }
 
+        /// Total frames stepped since creation.
+        pub fn frame_index(&self) -> u64 {
+            self.frame_index
+        }
+
+        /// Physics snapshot from the CPU particle mirror (one frame behind GPU when strided).
+        /// Grid-side fields (mass error, momentum error, active cells) are zero — GPU grid is
+        /// not readable on CPU. All particle-side fields are exact.
+        pub fn diagnostics_snapshot(&self) -> crate::diagnostics::SimSnapshot {
+            crate::diagnostics::collect_snapshot_particles_only(
+                self.frame_index,
+                &self.particles,
+                &self.config,
+                self.last_sub_dt,
+                self.last_substeps,
+            )
+        }
+
         /// Iterate over (index, &Particle) pairs within `radius` grid-cells of `center`.
         /// Reads the internal CPU particle mirror — one frame behind GPU when strided.
         pub fn particles_near(
@@ -921,8 +1041,8 @@ mod solver {
         }
 
         /// Aggregate state for all particles of the given material.
-        pub fn material_state(&self, material_id: u32) -> crate::solver::query::MaterialState {
-            crate::solver::query::material_state_of_slice(&self.particles, material_id)
+        pub fn material_state(&self, material_id: u32) -> crate::solver::query::BodyState {
+            crate::solver::query::body_state_of_slice(&self.particles, material_id)
         }
 
         /// Aggregate state for all particles within `radius` grid-cells of `center`.
@@ -930,8 +1050,8 @@ mod solver {
             &self,
             center: glam::Vec2,
             radius: f32,
-        ) -> crate::solver::query::MaterialState {
-            crate::solver::query::region_state_of_slice(&self.particles, center, radius)
+        ) -> crate::solver::query::BodyState {
+            crate::solver::query::region_body_state_of_slice(&self.particles, center, radius)
         }
 
         /// Reassign material for all particles matching `predicate`. Marks dirty so GPU
@@ -950,47 +1070,47 @@ mod solver {
                     p.material_id = new_material_id;
                 }
             }
-            self.particles_dirty = true;
+            self.layout_dirty = true; // material_id changed — sort order may differ
         }
 
-        /// Add `force` to every particle within `radius` cells of `center`, scaled linearly by
-        /// proximity. GPU sees the change on the next `step_frame` upload.
-        /// Velocity is clamped to the CFL limit so LP impulses can't break GPU stability.
+        /// Add `force` to every particle within `radius` cells of `center`, scaled by proximity.
+        /// Applied on the GPU at the start of the next step_frame — reads LIVE GPU positions,
+        /// avoiding any stale-CPU-mirror artifacts. No CPU particle scan.
         pub fn apply_impulse(&mut self, center: glam::Vec2, radius: f32, force: glam::Vec2) {
-            let vel_limit = self.config.grid_cell_size / self.config.min_dt;
-            for p in self.particles.iter_mut() {
-                let d = (p.x - center).length();
-                if d < radius {
-                    p.v += force * (1.0 - d / radius);
-                    let spd = p.v.length();
-                    if spd > vel_limit {
-                        p.v *= vel_limit / spd;
-                    }
-                }
+            if self.pending_impulses.len() < MAX_GPU_IMPULSES {
+                self.pending_impulses.push(GpuImpulseEntry {
+                    center: center.to_array(),
+                    radius,
+                    strength: 0.0,
+                    force: force.to_array(),
+                    mode: 1,
+                    _pad: 0,
+                });
+            } else {
+                eprintln!(
+                    "emerge: GPU impulse queue full ({MAX_GPU_IMPULSES}/frame max) — impulse dropped"
+                );
             }
-            self.particles_dirty = true;
         }
 
-        /// Push every particle within `radius` cells outward from `center` with `strength` falloff.
-        /// GPU sees the change on the next `step_frame` upload. Velocity is clamped to CFL limit.
+        /// Push every particle within `radius` cells outward from `center`.
+        /// Applied on the GPU at the start of the next step_frame — reads LIVE GPU positions.
+        /// `strength` may be negative to pull. No CPU particle scan.
         pub fn apply_radial_impulse(&mut self, center: glam::Vec2, radius: f32, strength: f32) {
-            let vel_limit = self.config.grid_cell_size / self.config.min_dt;
-            for p in self.particles.iter_mut() {
-                let delta = p.x - center;
-                let d = delta.length();
-                if d > 0.0 && d < radius {
-                    p.v += (delta / d) * strength * (1.0 - d / radius);
-                    let spd = p.v.length();
-                    if spd > vel_limit {
-                        p.v *= vel_limit / spd;
-                    }
-                }
+            if self.pending_impulses.len() < MAX_GPU_IMPULSES {
+                self.pending_impulses.push(GpuImpulseEntry {
+                    center: center.to_array(),
+                    radius,
+                    strength,
+                    force: [0.0; 2],
+                    mode: 0,
+                    _pad: 0,
+                });
+            } else {
+                eprintln!(
+                    "emerge: GPU impulse queue full ({MAX_GPU_IMPULSES}/frame max) — impulse dropped"
+                );
             }
-            self.particles_dirty = true;
         }
-    }
-
-    fn div_ceil(a: u32, b: u32) -> u32 {
-        (a + b - 1) / b
     }
 }

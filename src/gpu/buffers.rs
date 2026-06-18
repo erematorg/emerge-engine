@@ -5,7 +5,7 @@
 ///   - `grid`:               array<Cell>              — 16 bytes each, repr(C)
 ///   - `materials`:          array<MaterialParams, N> — 96 bytes each, 16-byte aligned
 ///   - `step_params`:        GpuStepParams            — 32 bytes, uploaded once per substep
-///   - `force_fields_params: GpuForceFieldsParams     — 784 bytes, uploaded when fields change
+///   - `force_fields_params: GpuFieldsParams     — 784 bytes, uploaded when fields change
 ///
 /// Upload path (CPU → GPU, via write_buffer):
 ///   particles:          initial spawn, then only when CPU plasticity corrects state
@@ -19,7 +19,7 @@
 ///   grid:        never downloaded
 use std::mem;
 
-use super::step_params::{GpuForceFieldsParams, GpuStepParams};
+use super::step_params::{GpuFieldsParams, GpuImpulseParams, GpuStepParams};
 use crate::materials::MaterialParams;
 use crate::particle::Particle;
 
@@ -35,7 +35,7 @@ struct GpuCell {
 
 const _: () = assert!(mem::size_of::<GpuCell>() == 16);
 
-/// All persistent GPU buffers for one GpuSolver instance.
+/// All persistent GPU buffers for one GpuSimulation instance.
 pub struct GpuBuffers {
     /// Particle data — STORAGE | COPY_DST | COPY_SRC.
     pub particles: wgpu::Buffer,
@@ -48,6 +48,8 @@ pub struct GpuBuffers {
     pub step_params_pool: Vec<wgpu::Buffer>,
     /// Non-uniform force-field entries for the force_fields pass — UNIFORM | COPY_DST
     pub force_fields_params: wgpu::Buffer,
+    /// Impulse descriptors for the apply_impulses pass — UNIFORM | COPY_DST
+    pub impulse_params: wgpu::Buffer,
     /// Sorted particle index permutation — STORAGE.
     /// Written once per frame by particle_sort pass (identity for now).
     /// Read by p2g and particles_update for cache-coherent particle access.
@@ -93,7 +95,9 @@ impl GpuBuffers {
             mapped_at_creation: false,
         });
 
-        let step_params_pool: Vec<wgpu::Buffer> = (0..max_substeps)
+        // Allocate max_substeps + 1 slots: 0..max_substeps for physics substeps,
+        // slot max_substeps is a dedicated particle_sort slot so it never aliases substep 0.
+        let step_params_pool: Vec<wgpu::Buffer> = (0..max_substeps + 1)
             .map(|i| {
                 device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some(&format!("mpm_step_params_{i}")),
@@ -106,7 +110,14 @@ impl GpuBuffers {
 
         let force_fields_params = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mpm_force_fields_params"),
-            size: mem::size_of::<GpuForceFieldsParams>() as u64,
+            size: mem::size_of::<GpuFieldsParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let impulse_params = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mpm_impulse_params"),
+            size: mem::size_of::<GpuImpulseParams>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -131,6 +142,7 @@ impl GpuBuffers {
             materials,
             step_params_pool,
             force_fields_params,
+            impulse_params,
             sorted_particle_ids,
             readback_staging,
         }
@@ -149,8 +161,12 @@ impl GpuBuffers {
         queue.write_buffer(&self.step_params_pool[index], 0, bytemuck::bytes_of(params));
     }
 
-    pub fn upload_force_fields_params(&self, queue: &wgpu::Queue, params: &GpuForceFieldsParams) {
+    pub fn upload_force_fields_params(&self, queue: &wgpu::Queue, params: &GpuFieldsParams) {
         queue.write_buffer(&self.force_fields_params, 0, bytemuck::bytes_of(params));
+    }
+
+    pub fn upload_impulse_params(&self, queue: &wgpu::Queue, params: &GpuImpulseParams) {
+        queue.write_buffer(&self.impulse_params, 0, bytemuck::bytes_of(params));
     }
 
     /// Begin an async GPU → CPU readback. Non-blocking — returns a shared flag set when done.

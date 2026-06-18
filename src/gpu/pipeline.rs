@@ -16,7 +16,7 @@
 ///   binding 1: grid                 — storage read_write
 ///   binding 2: materials            — uniform (array<MaterialParams, MAX_MATERIALS>)
 ///   binding 3: step_params          — uniform (GpuStepParams, 32 bytes)
-///   binding 4: force_fields_params  — uniform (GpuForceFieldsParams, 784 bytes)
+///   binding 4: force_fields_params  — uniform (GpuFieldsParams, 784 bytes)
 ///   binding 5: sorted_particle_ids  — storage read_write (u32 per particle)
 ///
 /// Passes that don't use a binding still share the same layout — avoids rebinding.
@@ -24,8 +24,8 @@ use super::buffers::GpuBuffers;
 use super::shaders;
 use super::step_params::{MAX_FORCE_FIELDS, MAX_MATERIALS};
 
-/// All compiled compute pipelines for one GpuSolver instance.
-pub struct MpmPipelines {
+/// All compiled compute pipelines for one GpuSimulation instance.
+pub struct SimPipelines {
     /// Once per frame: initializes sorted_particle_ids to identity permutation.
     pub particle_sort: wgpu::ComputePipeline,
     pub grid_clear: wgpu::ComputePipeline,
@@ -37,10 +37,14 @@ pub struct MpmPipelines {
     pub particles_update: wgpu::ComputePipeline,
     /// Post-particles_update: applies non-uniform body forces (gravity wells, Coulomb, etc.).
     pub force_fields: wgpu::ComputePipeline,
+    /// Apply velocity impulses directly on GPU particle buffer — no CPU upload needed.
+    pub apply_impulses: wgpu::ComputePipeline,
     pub bind_group_layout: wgpu::BindGroupLayout,
+    /// Separate layout for apply_impulses — only needs particles + impulse_params.
+    pub impulse_bind_group_layout: wgpu::BindGroupLayout,
 }
 
-impl MpmPipelines {
+impl SimPipelines {
     pub fn new(device: &wgpu::Device) -> Self {
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("mpm_bind_group_layout"),
@@ -89,7 +93,7 @@ impl MpmPipelines {
                     },
                     count: None,
                 },
-                // binding 4: force_fields_params — uniform (GpuForceFieldsParams, 784 bytes)
+                // binding 4: force_fields_params — uniform (GpuFieldsParams, 784 bytes)
                 wgpu::BindGroupLayoutEntry {
                     binding: 4,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -121,12 +125,13 @@ impl MpmPipelines {
             push_constant_ranges: &[],
         });
 
-        // Patch shader sources: inject Rust-side constants so WGSL never has its own copies.
-        // Any change to MAX_MATERIAL_SLOTS or MAX_FORCE_FIELDS propagates here automatically.
+        // MAX_MATERIALS: array-size constant — must be injected via string template
+        // (naga requires CREATION_RESOLVED; WGSL `override` doesn't apply to array sizes).
         let p2g_src = patch_shader(shaders::P2G);
         let particles_update_src = patch_shader(shaders::PARTICLES_UPDATE);
-        let force_fields_src = patch_shader(shaders::FORCE_FIELDS);
-        let grid_update_src = patch_shader(shaders::GRID_UPDATE);
+
+        // MAX_FORCE_FIELDS: loop-bound constant — uses WGSL `override` (proper pipeline specialization).
+        let ff_consts: &[(&str, f64)] = &[("MAX_FORCE_FIELDS", MAX_FORCE_FIELDS as f64)];
 
         let particle_sort = make_pipeline(
             device,
@@ -134,6 +139,7 @@ impl MpmPipelines {
             shaders::PARTICLE_SORT,
             "particle_sort_main",
             "particle_sort",
+            &[],
         );
         let grid_clear = make_pipeline(
             device,
@@ -141,29 +147,75 @@ impl MpmPipelines {
             shaders::GRID_CLEAR,
             "grid_clear_main",
             "grid_clear",
+            &[],
         );
-        let p2g = make_pipeline(device, &pipeline_layout, &p2g_src, "p2g_main", "p2g");
+        let p2g = make_pipeline(device, &pipeline_layout, &p2g_src, "p2g_main", "p2g", &[]);
         let grid_update = make_pipeline(
             device,
             &pipeline_layout,
-            &grid_update_src,
+            shaders::GRID_UPDATE,
             "grid_update_main",
             "grid_update",
+            ff_consts,
         );
-        let g2p = make_pipeline(device, &pipeline_layout, shaders::G2P, "g2p_main", "g2p");
+        let g2p = make_pipeline(device, &pipeline_layout, shaders::G2P, "g2p_main", "g2p", &[]);
         let particles_update = make_pipeline(
             device,
             &pipeline_layout,
             &particles_update_src,
             "particles_update_main",
             "particles_update",
+            &[],
         );
         let force_fields = make_pipeline(
             device,
             &pipeline_layout,
-            &force_fields_src,
+            shaders::FORCE_FIELDS,
             "force_fields_main",
             "force_fields",
+            ff_consts,
+        );
+
+        // Impulse pass has a minimal 2-binding layout: particles + impulse_params.
+        let impulse_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("mpm_impulse_bind_group_layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        let impulse_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("mpm_impulse_pipeline_layout"),
+                bind_group_layouts: &[&impulse_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+        let apply_impulses = make_pipeline(
+            device,
+            &impulse_pipeline_layout,
+            shaders::APPLY_IMPULSES,
+            "apply_impulses_main",
+            "apply_impulses",
+            &[],
         );
 
         Self {
@@ -174,8 +226,33 @@ impl MpmPipelines {
             g2p,
             particles_update,
             force_fields,
+            apply_impulses,
             bind_group_layout,
+            impulse_bind_group_layout,
         }
+    }
+
+    /// Build a bind group for the apply_impulses pass (particles + impulse_params).
+    /// Created on-demand each cursor frame — cheap, no GPU work.
+    pub fn make_impulse_bind_group(
+        &self,
+        device: &wgpu::Device,
+        buffers: &GpuBuffers,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mpm_impulse_bind_group"),
+            layout: &self.impulse_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buffers.particles.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: buffers.impulse_params.as_entire_binding(),
+                },
+            ],
+        })
     }
 
     /// Build a bind group for one substep using the given step_params buffer slot.
@@ -219,12 +296,12 @@ impl MpmPipelines {
     }
 }
 
-/// Inject Rust-side constants into a WGSL shader source.
-/// Replaces `{{MAX_MATERIALS}}` and `{{MAX_FORCE_FIELDS}}` placeholders.
+/// Replaces `{{MAX_MATERIALS}}` with the Rust-side value.
+/// Needed because naga requires array-size constants to be CREATION_RESOLVED (known at
+/// shader-module creation time), so WGSL `override` constants cannot be used there.
+/// MAX_FORCE_FIELDS is a loop bound only — it uses `override` and is handled via constants.
 fn patch_shader(source: &str) -> String {
-    source
-        .replace("{{MAX_MATERIALS}}", &MAX_MATERIALS.to_string())
-        .replace("{{MAX_FORCE_FIELDS}}", &MAX_FORCE_FIELDS.to_string())
+    source.replace("{{MAX_MATERIALS}}", &MAX_MATERIALS.to_string())
 }
 
 fn make_pipeline(
@@ -233,6 +310,7 @@ fn make_pipeline(
     source: &str,
     entry_point: &str,
     label: &str,
+    constants: &[(&str, f64)],
 ) -> wgpu::ComputePipeline {
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(label),
@@ -243,7 +321,10 @@ fn make_pipeline(
         layout: Some(layout),
         module: &module,
         entry_point: Some(entry_point),
-        compilation_options: wgpu::PipelineCompilationOptions::default(),
+        compilation_options: wgpu::PipelineCompilationOptions {
+            constants,
+            ..Default::default()
+        },
         cache: None,
     })
 }

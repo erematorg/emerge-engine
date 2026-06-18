@@ -1,11 +1,11 @@
 // Force fields — non-uniform body forces applied after G2P. One thread per particle.
 //
 // Field types: 0=disabled, 1=GravityWell, 2=Coulomb, 3=AabbConfinement,
-//              4=RadialConfinement, 5=UniformElectric.
+//              4=RadialConfinement, 5=UniformElectric, 6=Buoyancy.
 // params layout per type is documented in GpuForceFieldEntry constructors (src/gpu/mod.rs).
 // All positions in grid coordinates. material_mask bit i = material i affected.
 //
-// WG_PARTICLES (= 64) and MAX_FORCE_FIELDS (= 16) MUST match src/gpu/mod.rs.
+// MAX_FORCE_FIELDS is a pipeline-overridable constant set from src/gpu/mod.rs at pipeline creation.
 
 // ── Particle struct — 112 bytes, matches repr(C) in src/mechanics/particle.rs ────────────────
 struct Particle {
@@ -60,13 +60,14 @@ struct ForceFieldsParams {
 }
 
 // ── Named constants ───────────────────────────────────────────────────────────
-const MAX_FORCE_FIELDS:          u32 = {{MAX_FORCE_FIELDS}}u;
+override MAX_FORCE_FIELDS:       u32;
 const FIELD_DISABLED:            u32 = 0u;
 const FIELD_GRAVITY_WELL:        u32 = 1u;
 const FIELD_COULOMB:             u32 = 2u;
 const FIELD_AABB_CONFINEMENT:    u32 = 3u;
 const FIELD_RADIAL_CONFINEMENT:  u32 = 4u;
 const FIELD_UNIFORM_ELECTRIC:    u32 = 5u;
+const FIELD_BUOYANCY:            u32 = 6u;
 // Prevent divide-by-near-zero in softened potentials.
 const FF_NUM_FLOOR:              f32 = 1e-10;
 // Prevent a = F/m overflow when mass is negligible.
@@ -214,6 +215,17 @@ fn force_fields_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let inv_mass = select(0.0, 1.0 / p.mass, p.mass > FF_MASS_FLOOR);
                 if inv_mass == 0.0 { continue; }
                 p.v += (charge * inv_mass) * e_field * dt;
+            }
+            case FIELD_BUOYANCY: {
+                // True Archimedes buoyancy: net a = g·(ρ_fluid/ρ₀_particle − 1) upward.
+                // Formula: Δv = −g · (ρ_fluid/ρ₀) · dt. Solver already applies −g, so
+                // net = −g + g·(ρ_fluid/ρ₀) = g·(ρ_fluid/ρ₀ − 1) — upward for lighter particles.
+                // Uses rest density (m/V₀) not instantaneous density — prevents expansion runaway.
+                // params01 = (gravity_x, gravity_y, fluid_density, _unused)
+                let gravity_vec  = vec2<f32>(entry.params01.x, entry.params01.y);
+                let fluid_rho    = entry.params01.z;
+                let rest_rho     = p.mass / max(p.initial_volume, 1e-10);
+                p.v += -gravity_vec * (fluid_rho / max(rest_rho, 1e-10)) * dt;
             }
             default: {}
         }

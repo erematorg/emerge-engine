@@ -34,7 +34,7 @@ const MOM_ATOMIC_SCALE:   f32 = 100000.0;
 const CELL_CENTER_OFFSET: f32 = 0.5;
 const FIELD_GRAVITY_WELL: u32 = 1u;
 const FIELD_COULOMB:      u32 = 2u;
-const MAX_FORCE_FIELDS:   u32 = {{MAX_FORCE_FIELDS}}u;
+override MAX_FORCE_FIELDS: u32;
 const FF_NUM_FLOOR:       f32 = 1e-10;
 
 @group(0) @binding(1) var<storage, read_write> grid_int:    array<i32>;
