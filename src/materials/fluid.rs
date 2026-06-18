@@ -1,5 +1,6 @@
 use glam::{Mat2, Vec2};
 
+use crate::materials::physical_props::{FromSI, NewtonianFluid, scale_stress, scale_visc};
 use crate::materials::{ConstitutiveModel, MaterialModel, MaterialParams};
 use crate::particle::Particles;
 
@@ -65,13 +66,46 @@ impl NewtonianFluidMaterial {
         }
     }
 
-    /// Preset: water-like fluid at the given rest density.
+    /// Low-viscosity preset: γ=7, µ=1e-3 Pa·s. Corresponds to water at 20°C.
     ///
-    /// Parameters: γ=7 (Tait EOS exponent for water), µ≈1e-3 Pa·s (physical water viscosity
-    /// at 20°C). `eos_stiffness` controls incompressibility — higher = stiffer; 1e4 works
+    /// `eos_stiffness` controls incompressibility — higher = stiffer; 1e4 works
     /// well at emerge's default grid scale. Reference: Becker & Teschner 2007 §4.
-    pub fn water(rest_density: f32, eos_stiffness: f32) -> Self {
+    pub fn low_viscosity(rest_density: f32, eos_stiffness: f32) -> Self {
         Self::new(rest_density, 1.0e-3, eos_stiffness, 7.0)
+    }
+
+    /// Weakly-compressible variant: caps sound speed at `c_ref_m_s`.
+    ///
+    /// Use `c_ref_m_s = 10 * v_max_m_s` (WCSPH rule) to limit compressibility to ~1%.
+    /// Weakly-compressible variant: caps sound speed at `c_ref_m_s`.
+    /// Use `c_ref_m_s = 10 * v_max_m_s` (WCSPH rule) to limit compressibility to ~1%.
+    /// `rho_kg_m3` and `eta_pa_s` are the fluid's SI density and viscosity.
+    pub fn weakly_compressible(
+        rho_kg_m3: f32,
+        eta_pa_s: f32,
+        c_ref_m_s: f32,
+        config: &crate::SimConfig,
+    ) -> Self {
+        const GAMMA: f32 = 7.0;
+        let visc = scale_visc(eta_pa_s, rho_kg_m3, config);
+        let k_si = rho_kg_m3 * c_ref_m_s * c_ref_m_s / GAMMA;
+        let eos = scale_stress(k_si, rho_kg_m3, config);
+        Self::new(rho_kg_m3, visc, eos, GAMMA)
+    }
+}
+
+impl FromSI<NewtonianFluid> for NewtonianFluidMaterial {
+    /// `rest_density` defaults to `props.rho_kg_m3`. Caller should adjust if
+    /// particle mass/volume don't match the SI density.
+    fn from_physical(props: &NewtonianFluid, config: &crate::SimConfig) -> Self {
+        const GAMMA: f32 = 7.0;
+        let visc = scale_visc(props.eta_pa_s, props.rho_kg_m3, config);
+        let eos = scale_stress(props.bulk_modulus_pa / GAMMA, props.rho_kg_m3, config);
+        // rest_density must be in grid units so EOS ratio = ρ_grid / ρ₀_grid stays near 1.
+        // ρ_grid = ρ_SI · dx² / dt²
+        let rho_grid = props.rho_kg_m3 * config.dx_meters * config.dx_meters
+            / (config.dt_seconds * config.dt_seconds);
+        Self::new(rho_grid, visc, eos, GAMMA)
     }
 }
 

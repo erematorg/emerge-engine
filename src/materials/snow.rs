@@ -1,5 +1,6 @@
 use glam::{Mat2, Vec2};
 
+use crate::materials::physical_props::{FromSI, SnowProps, scale_lame};
 use crate::materials::svd::svd2;
 use crate::materials::utils::{MIN_J, elastic_wave_dt, lame_from_young};
 use crate::materials::{ConstitutiveModel, MaterialModel, MaterialParams, polar_decomposition_2d};
@@ -15,7 +16,7 @@ use crate::particle::{Particle, Particles};
 ///
 /// Reference: Stomakhin et al. 2013, §4.2. Identical in sparkl, taichi128, Genesis.
 #[derive(Debug, Clone, Copy)]
-pub struct SnowMaterial {
+pub struct StomakhinMaterial {
     pub lambda: f32,
     pub mu: f32,
     /// Hardening exponent. Higher = more stiffness gain as snow compacts.
@@ -35,7 +36,7 @@ pub struct SnowMaterial {
     pub cohesion_coeff: f32,
 }
 
-impl SnowMaterial {
+impl StomakhinMaterial {
     pub fn new(
         lambda: f32,
         mu: f32,
@@ -62,22 +63,40 @@ impl SnowMaterial {
         self
     }
 
-    /// Construct with Stomakhin 2013 default plasticity params and E/ν inputs.
-    ///
+    /// Stomakhin 2013 canonical plasticity: ξ=10, θ_c=0.025, θ_s=0.0075.
     /// Canonical: E = 1.4e5, ν = 0.2 — matches MPM2D reference and sparkl snow demos.
     pub fn from_young_modulus(young_modulus: f32, poisson_ratio: f32) -> Self {
         let (lambda, mu) = lame_from_young(young_modulus, poisson_ratio);
-        Self::new(
-            lambda, mu, 10.0,   // hardening_exponent ξ — Stomakhin 2013 §4
-            0.025,  // compression_limit θ_c — Stomakhin 2013 §4 canonical (was 0.02)
-            0.0075, // stretch_limit θ_s — Stomakhin 2013 §4 canonical (was 0.006)
-            0.6,    // min_plastic_jacobian — Jp floor (prevents volume explosion)
-            20.0,   // max_plastic_jacobian — Jp ceiling. Matches Taichi MPM88/MPM128.
-        )
+        Self::new(lambda, mu, 10.0, 0.025, 0.0075, 0.6, 20.0)
+    }
+
+    /// Low cohesion: ξ=5, tight compression (θ_c=0.01), tight stretch (θ_s=0.003). Loose powder regime.
+    pub fn low_cohesion(young_modulus: f32, poisson_ratio: f32) -> Self {
+        let (lambda, mu) = lame_from_young(young_modulus, poisson_ratio);
+        Self::new(lambda, mu, 5.0, 0.01, 0.003, 0.5, 20.0)
+    }
+
+    /// High cohesion: ξ=15, relaxed compression (θ_c=0.04), minimal stretch (θ_s=0.005). Packed/wet regime.
+    pub fn high_cohesion(young_modulus: f32, poisson_ratio: f32) -> Self {
+        let (lambda, mu) = lame_from_young(young_modulus, poisson_ratio);
+        Self::new(lambda, mu, 15.0, 0.04, 0.005, 0.6, 20.0).with_cohesion(800.0)
     }
 }
 
-impl MaterialModel for SnowMaterial {
+impl FromSI<SnowProps> for StomakhinMaterial {
+    /// Plasticity params fixed to Stomakhin 2013: ξ=10, θ_c=0.025, θ_s=0.0075.
+    fn from_physical(props: &SnowProps, config: &crate::SimConfig) -> Self {
+        let (lambda, mu) = scale_lame(
+            props.elastic.e_pa,
+            props.elastic.nu,
+            props.elastic.rho_kg_m3,
+            config,
+        );
+        Self::new(lambda, mu, 10.0, 0.025, 0.0075, 0.6, 20.0)
+    }
+}
+
+impl MaterialModel for StomakhinMaterial {
     fn constitutive_model(&self) -> ConstitutiveModel {
         ConstitutiveModel::Snow
     }
@@ -137,6 +156,8 @@ impl MaterialModel for SnowMaterial {
 
         let jp_new =
             particles.plastic_volume_ratio[i] * (sigma.x * sigma.y) / (sigma_c.x * sigma_c.y);
+        // Known: Jp drifts slowly over thousands of substeps due to cumulative SVD rounding.
+        // Clamp prevents blow-up but doesn't eliminate drift. Acceptable for LP timescales.
         particles.plastic_volume_ratio[i] =
             jp_new.clamp(self.min_plastic_jacobian, self.max_plastic_jacobian);
 

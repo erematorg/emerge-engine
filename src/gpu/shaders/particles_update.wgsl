@@ -407,6 +407,12 @@ fn particles_update_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let mi_res           = sand_mui_plasticity(new_F, p.friction_hardening, mat, dt);
         new_F                = mi_res.f_e;
         p.friction_hardening = mi_res.mu_i;
+    } else if mat.model == 11u && mat.compression_limit > 0.0 {
+        // GranularFluid: snow-style SVD plasticity — clamp singular values, accumulate Jp and h.
+        let sr               = snow_plasticity(new_F, p.plastic_volume_ratio, mat);
+        new_F                = sr.f_e;
+        p.plastic_volume_ratio = sr.jp;
+        p.hardening_scale      = sr.h;
     }
 
     // Fluid F reset: extract J = det(F), reset to isotropic F = sqrt(J)·I.

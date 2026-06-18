@@ -1,5 +1,6 @@
 use glam::{Mat2, Vec2};
 
+use crate::materials::physical_props::{FromSI, Viscoelastic, scale_lame, scale_visc};
 use crate::materials::utils::{MIN_J, elastic_wave_dt, lame_from_young};
 use crate::materials::{ConstitutiveModel, MaterialModel, MaterialParams};
 use crate::particle::Particles;
@@ -65,28 +66,32 @@ impl ViscoelasticMaterial {
         Self::new(lambda, mu, viscosity)
     }
 
-    /// Biological soft tissue (tendon, cartilage): stiff, nearly incompressible, highly damped.
-    /// E=50 kPa, ν=0.45, η=10 Pa·s.
-    pub fn soft_tissue() -> Self {
-        Self::from_young_modulus(5.0e4, 0.45, 10.0)
+    /// Nearly incompressible viscoelastic: ν=0.45. Soft tissue regime (tendon, cartilage).
+    pub fn near_incompressible(young_modulus: f32, viscosity: f32) -> Self {
+        Self::from_young_modulus(young_modulus, 0.45, viscosity)
     }
 
-    /// Cell body / cytoskeleton: very soft, moderate damping.
-    /// E=5 kPa, ν=0.40, η=0.05 Pa·s.
-    pub fn cell_body() -> Self {
-        Self::from_young_modulus(5.0e3, 0.40, 0.05)
+    /// Moderately compressible viscoelastic: ν=0.40. Cytoskeletal network regime.
+    pub fn moderately_compressible(young_modulus: f32, viscosity: f32) -> Self {
+        Self::from_young_modulus(young_modulus, 0.40, viscosity)
     }
 
-    /// Hydrogel / biological scaffold: soft, lightly damped.
-    /// E=1 kPa, ν=0.45, η=0.01 Pa·s.
-    pub fn hydrogel() -> Self {
-        Self::from_young_modulus(1.0e3, 0.45, 0.01)
+    /// Dense rubber-like material (e.g. intervertebral disc): ν=0.45.
+    pub fn rubber_damper(young_modulus: f32, viscosity: f32) -> Self {
+        Self::from_young_modulus(young_modulus, 0.45, viscosity)
     }
+}
 
-    /// Dense rubber-like material (e.g. intervertebral disc): stiff, highly damped.
-    /// E=5 MPa, ν=0.45, η=1000 Pa·s.
-    pub fn rubber_damper() -> Self {
-        Self::from_young_modulus(5.0e6, 0.45, 1000.0)
+impl FromSI<Viscoelastic> for ViscoelasticMaterial {
+    fn from_physical(props: &Viscoelastic, config: &crate::SimConfig) -> Self {
+        let (lambda, mu) = scale_lame(
+            props.elastic.e_pa,
+            props.elastic.nu,
+            props.elastic.rho_kg_m3,
+            config,
+        );
+        let visc = scale_visc(props.eta_pa_s, props.elastic.rho_kg_m3, config);
+        Self::new(lambda, mu, visc)
     }
 }
 
@@ -108,8 +113,7 @@ impl MaterialModel for ViscoelasticMaterial {
 
         // NeoHookean elastic: τ = µ·(F·Fᵀ − I) + λ·ln(J)·I
         let b = f * f.transpose();
-        let elastic =
-            mu * (b - Mat2::IDENTITY) + Mat2::from_diagonal(Vec2::splat(lambda * j.ln()));
+        let elastic = mu * (b - Mat2::IDENTITY) + Mat2::from_diagonal(Vec2::splat(lambda * j.ln()));
 
         // Kelvin-Voigt viscous dashpot: τ_v = η · D_dev
         let c = particles.velocity_gradient[i];

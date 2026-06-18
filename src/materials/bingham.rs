@@ -1,5 +1,6 @@
 use glam::{Mat2, Vec2};
 
+use crate::materials::physical_props::{BinghamProps, FromSI, scale_stress, scale_visc};
 use crate::materials::{ConstitutiveModel, MaterialModel, MaterialParams};
 use crate::particle::Particles;
 
@@ -70,28 +71,24 @@ impl BinghamFluidMaterial {
         }
     }
 
-    /// Wet mud: flows under sustained stress, holds shape under small loads.
-    /// ρ = 1500 kg/m³, η = 0.5 Pa·s, τ₀ = 100 Pa.
-    pub fn mud() -> Self {
-        Self::new(1500.0, 0.5, 1.0e4, 7.0, 100.0)
+    /// High yield stress, low viscosity: τ₀=100 Pa, η=0.5 Pa·s. Wet mud regime.
+    pub fn high_yield(rest_density: f32, eos_stiffness: f32) -> Self {
+        Self::new(rest_density, 0.5, eos_stiffness, 7.0, 100.0)
     }
 
-    /// Basaltic lava: extremely viscous, high yield stress.
-    /// ρ = 2700 kg/m³, η = 500 Pa·s, τ₀ = 1000 Pa.
-    pub fn lava() -> Self {
-        Self::new(2700.0, 500.0, 1.0e5, 7.0, 1000.0)
+    /// High yield stress, high viscosity: τ₀=1000 Pa, η=500 Pa·s. Basaltic lava regime.
+    pub fn viscous_high_yield(rest_density: f32, eos_stiffness: f32) -> Self {
+        Self::new(rest_density, 500.0, eos_stiffness, 7.0, 1000.0)
     }
 
-    /// Biological cytoplasm: very low yield, near-Newtonian.
-    /// ρ = 1050 kg/m³, η = 0.01 Pa·s, τ₀ = 1 Pa.
-    pub fn cytoplasm() -> Self {
-        Self::new(1050.0, 0.01, 5.0e2, 7.0, 1.0)
+    /// Low yield stress, low viscosity: τ₀=1 Pa, η=0.01 Pa·s. Biological cytoplasm regime.
+    pub fn low_yield(rest_density: f32, eos_stiffness: f32) -> Self {
+        Self::new(rest_density, 0.01, eos_stiffness, 7.0, 1.0)
     }
 
-    /// Dense biological fluid (mucus, blood clot).
-    /// ρ = 1060 kg/m³, η = 0.1 Pa·s, τ₀ = 10 Pa.
-    pub fn mucus() -> Self {
-        Self::new(1060.0, 0.1, 1.0e3, 7.0, 10.0)
+    /// Medium yield stress, medium viscosity: τ₀=10 Pa, η=0.1 Pa·s. Dense biological fluid regime.
+    pub fn medium_yield(rest_density: f32, eos_stiffness: f32) -> Self {
+        Self::new(rest_density, 0.1, eos_stiffness, 7.0, 10.0)
     }
 
     /// Compute deviatoric Bingham stress from the APIC velocity gradient C.
@@ -137,6 +134,18 @@ impl BinghamFluidMaterial {
         }
 
         tau
+    }
+}
+
+impl FromSI<BinghamProps> for BinghamFluidMaterial {
+    fn from_physical(props: &BinghamProps, config: &crate::SimConfig) -> Self {
+        const GAMMA: f32 = 7.0;
+        let visc = scale_visc(props.eta_pa_s, props.rho_kg_m3, config);
+        let tau0 = scale_stress(props.yield_stress_pa, props.rho_kg_m3, config);
+        let eos = scale_stress(props.bulk_modulus_pa / GAMMA, props.rho_kg_m3, config);
+        let rho_grid = props.rho_kg_m3 * config.dx_meters * config.dx_meters
+            / (config.dt_seconds * config.dt_seconds);
+        Self::new(rho_grid, visc, eos, GAMMA, tau0)
     }
 }
 

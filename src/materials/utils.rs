@@ -14,7 +14,7 @@ pub(crate) const MIN_J: f32 = 1e-6;
 /// ε_i = ln(|σ_i|), clamped above 1e-10 to avoid ln(0).
 /// The absolute value preserves Hencky strain magnitudes when `svd2()` encodes
 /// an inversion via a signed second singular value.
-/// Used identically by VonMisesMaterial, SandMaterial, RankineMaterial.
+/// Used identically by VonMisesMaterial, DruckerPragerMaterial, RankineMaterial.
 #[inline(always)]
 pub(crate) fn hencky_strains(sigma: Vec2) -> Vec2 {
     let sigma = sigma.abs().max(Vec2::splat(LOG_CLAMP));
@@ -48,7 +48,7 @@ pub(crate) fn stress_to_hencky(tau: Vec2, lambda: f32, mu: f32) -> Vec2 {
 /// Uses the analytical formula for 2×2 matrices (no SVD needed):
 ///   x = F₀₀+F₁₁, y = F₁₀−F₀₁, norm = √(x²+y²), R = [[x,−y],[y,x]]/norm
 /// Returns Mat2::IDENTITY when F is near-singular (norm ≤ ε).
-/// Used identically by CorotatedMaterial, SnowMaterial, VonMisesMaterial, SandMaterial.
+/// Used identically by CorotatedMaterial, StomakhinMaterial, VonMisesMaterial, DruckerPragerMaterial.
 pub fn polar_decomposition_2d(f: Mat2) -> Mat2 {
     let x = f.x_axis.x + f.y_axis.y;
     let y = f.x_axis.y - f.y_axis.x;
@@ -122,11 +122,12 @@ pub fn lame_from_young(young_modulus: f32, poisson_ratio: f32) -> (f32, f32) {
 /// The correct non-dimensionalization gives:
 ///   `λ_grid = λ_SI · dt² / (ρ₀ · dx²)`
 ///
-/// Pair with `SolverConfig::earth()` and set `config.particle_mass =
+/// Pair with `SimConfig::earth()` and set `config.particle_mass =
 /// rest_density_kg_m3 * (spacing * dx_meters).powi(2)` for a fully IRL-calibrated sim.
 ///
 /// # Example — soft tissue (E ≈ 5 kPa, ν = 0.45, ρ = 1000 kg/m³, 1 cm/cell)
 /// ```rust,no_run
+/// # extern crate emerge_engine as emerge;
 /// use emerge::lame_from_si;
 /// let (lambda, mu) = lame_from_si(5_000.0, 0.45, 1000.0, 0.01, 0.1);
 /// // lambda ≈ 1552, mu ≈ 172 — ready for NeoHookeanMaterial or ViscoelasticMaterial
@@ -151,6 +152,7 @@ pub fn lame_from_si(
 ///
 /// # Example — Earth gravity at 1 cm/cell
 /// ```rust,no_run
+/// # extern crate emerge_engine as emerge;
 /// use emerge::gravity_to_grid;
 /// use glam::Vec2;
 /// let g = gravity_to_grid(Vec2::new(0.0, -9.81), 0.01, 0.1);
@@ -159,4 +161,3 @@ pub fn lame_from_si(
 pub fn gravity_to_grid(g_si: glam::Vec2, dx_meters: f32, _dt_seconds: f32) -> glam::Vec2 {
     g_si / dx_meters
 }
-

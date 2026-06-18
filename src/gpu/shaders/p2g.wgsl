@@ -167,12 +167,29 @@ fn kirchhoff(p: Particle, mat: MaterialParams) -> mat2x2<f32> {
             let k     = (2.0 / 3.0) * mu_e + lam_e;
             tau = (mu_e / J) * dev_B + (k * 0.5 * (J * J - 1.0)) * I;
         }
-        case 3u, 4u, 5u, 6u: { // Corotated / Snow / DP / VonMises
+        case 3u, 4u, 5u, 6u, 7u, 8u: { // Corotated / Snow / DP / VonMises / Rankine / SandMuI
             let t_scale = 1.0 + mat.thermal_expansion * p.temperature;
             let R     = polar_r(F);
             let mu_e  = mat.mu * h * t_scale;
             let lam_e = mat.lambda * h * t_scale;
             tau = 2.0 * mu_e * (F - R) * transpose(F) + lam_e * (J - 1.0) * J * I;
+        }
+        case 11u: { // GranularFluid — Tait EOS pressure + corotated elastic deviatoric + SVD plasticity
+            // EOS pressure: −k·((ρ/ρ₀)^γ − 1)·I
+            let rho   = clamp(mat.rest_density / max(J, NUM_FLOOR), NUM_FLOOR, mat.rest_density * 4.0);
+            let ratio = rho / max(mat.rest_density, NUM_FLOOR);
+            let press = max(mat.eos_stiffness * (pow(ratio, mat.eos_power) - 1.0), mat.pressure_floor);
+            // Corotated elastic deviatoric: 2µ·h·dev[(F−R)·Fᵀ]
+            let h      = p.hardening_scale;
+            let R      = polar_r(F);
+            let mu_eff = mat.mu * h;
+            let coro   = 2.0 * mu_eff * (F - R) * transpose(F);
+            let tr_c   = coro[0][0] + coro[1][1];
+            let dev_c  = coro - (tr_c * 0.5) * I;
+            // Small elastic volumetric term from λ — prevents total collapse under EOS alone
+            let lam_e  = mat.lambda * h;
+            let lam_vol = lam_e * (J - 1.0) * J * I;
+            tau = -press * I + dev_c + lam_vol;
         }
         case 9u: { // Viscoelastic (Kelvin-Voigt) — elastic NeoHookean + viscous dashpot
             let j_min   = max(mat.volume_ratio_min, NUM_FLOOR);
@@ -226,6 +243,10 @@ fn sv(p: Particle, mat: MaterialParams) -> f32 {
             // J = det(F); F is reset to sqrt(J)·I in particles_update.
             let J = max(det2(p.deformation_gradient), NUM_FLOOR);
             return max(p.initial_volume * J, NUM_FLOOR);
+        }
+        case 11u: {
+            // GranularFluid: EOS is density-based — use current volume (tracks J each substep).
+            return max(p.volume, NUM_FLOOR);
         }
         default: { return p.initial_volume; }
     }

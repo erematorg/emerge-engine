@@ -1,5 +1,6 @@
 use glam::{Mat2, Vec2};
 
+use crate::materials::physical_props::{BrittleProps, FromSI, scale_lame, scale_stress};
 use crate::materials::svd::svd2;
 use crate::materials::utils::{
     MIN_J, elastic_wave_dt, hencky_strains, lame_from_young, reconstruct_f, stress_to_hencky,
@@ -9,7 +10,7 @@ use crate::particle::Particles;
 
 /// Rankine (maximum principal stress) elastoplastic material — brittle tensile failure.
 ///
-/// Elastic response: corotated linear elastic (same as SandMaterial / VonMisesMaterial).
+/// Elastic response: corotated linear elastic (same as DruckerPragerMaterial / VonMisesMaterial).
 /// Yield criterion: max(τ₁, τ₂) ≤ σ_t_eff, where τᵢ are principal Kirchhoff stresses and
 ///   σ_t_eff = tensile_strength · exp(−softening_rate · damage)  (exponential softening).
 ///
@@ -58,14 +59,14 @@ impl RankineMaterial {
         Self::new(lambda, mu, tensile_strength, softening_rate)
     }
 
-    /// Brittle rock preset: high stiffness, low tensile strength, fast softening.
-    pub fn rock(lambda: f32, mu: f32) -> Self {
-        Self::new(lambda, mu, 500.0, 2.0)
+    /// Low tensile strength, fast softening: tensile=500, softening_rate=2.0. Brittle rock regime.
+    pub fn stiff_brittle(young_modulus: f32, poisson_ratio: f32) -> Self {
+        Self::from_young_modulus(young_modulus, poisson_ratio, 500.0, 2.0)
     }
 
-    /// Bone preset: stiff, moderate tensile strength, moderate softening.
-    pub fn bone(lambda: f32, mu: f32) -> Self {
-        Self::new(lambda, mu, 2000.0, 1.0)
+    /// High tensile strength, slow softening: tensile=2000, softening_rate=1.0. Bone regime.
+    pub fn high_tensile(young_modulus: f32, poisson_ratio: f32) -> Self {
+        Self::from_young_modulus(young_modulus, poisson_ratio, 2000.0, 1.0)
     }
 
     /// Effective tensile strength after damage softening.
@@ -73,7 +74,22 @@ impl RankineMaterial {
     fn tensile_strength_eff(&self, damage: f32) -> f32 {
         self.tensile_strength * (-self.softening_rate * damage).exp()
     }
+}
 
+impl FromSI<BrittleProps> for RankineMaterial {
+    fn from_physical(props: &BrittleProps, config: &crate::SimConfig) -> Self {
+        let (lambda, mu) = scale_lame(
+            props.elastic.e_pa,
+            props.elastic.nu,
+            props.elastic.rho_kg_m3,
+            config,
+        );
+        let ts = scale_stress(props.tensile_strength_pa, props.elastic.rho_kg_m3, config);
+        Self::new(lambda, mu, ts, props.softening_rate)
+    }
+}
+
+impl RankineMaterial {
     /// Rankine return mapping in 2D principal stress space.
     ///
     /// Returns (projected_tau, yielded) — `yielded` is true if any projection occurred.

@@ -1,5 +1,6 @@
 use glam::Mat2;
 
+use crate::materials::physical_props::{Elastic, FromSI, scale_lame};
 use crate::materials::utils::{MIN_J, elastic_wave_dt, lame_from_young};
 use crate::materials::{ConstitutiveModel, MaterialModel, MaterialParams};
 use crate::particle::Particles;
@@ -41,6 +42,13 @@ impl NeoHookeanMaterial {
     /// Canonical values: E = 5e6, ν = 0.2 (wgsparkl elasticity2 — stiff soft solid).
     pub fn from_young_modulus(young_modulus: f32, poisson_ratio: f32) -> Self {
         let (lambda, mu) = lame_from_young(young_modulus, poisson_ratio);
+        Self::new(lambda, mu)
+    }
+}
+
+impl FromSI<Elastic> for NeoHookeanMaterial {
+    fn from_physical(props: &Elastic, config: &crate::SimConfig) -> Self {
+        let (lambda, mu) = scale_lame(props.e_pa, props.nu, props.rho_kg_m3, config);
         Self::new(lambda, mu)
     }
 }

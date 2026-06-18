@@ -1,5 +1,6 @@
 use glam::{Mat2, Vec2};
 
+use crate::materials::physical_props::{DuctileProps, FromSI, scale_lame, scale_stress};
 use crate::materials::svd::svd2;
 use crate::materials::utils::{
     LOG_CLAMP, MIN_J, elastic_wave_dt, hencky_strains, lame_from_young, reconstruct_f,
@@ -64,6 +65,24 @@ impl VonMisesMaterial {
             yield_stress,
             hardening_modulus,
         }
+    }
+
+    /// Soft ductile: yield_stress = E/200. Low yield-to-stiffness ratio. Remoulded clay regime.
+    pub fn soft_ductile(young_modulus: f32, poisson_ratio: f32) -> Self {
+        Self::from_young_modulus(young_modulus, poisson_ratio, young_modulus * 0.005)
+    }
+}
+
+impl FromSI<DuctileProps> for VonMisesMaterial {
+    fn from_physical(props: &DuctileProps, config: &crate::SimConfig) -> Self {
+        let (lambda, mu) = scale_lame(
+            props.elastic.e_pa,
+            props.elastic.nu,
+            props.elastic.rho_kg_m3,
+            config,
+        );
+        let yield_stress = scale_stress(props.yield_stress_pa, props.elastic.rho_kg_m3, config);
+        Self::new(lambda, mu, yield_stress)
     }
 }
 

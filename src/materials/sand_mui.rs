@@ -1,5 +1,6 @@
 use glam::{Mat2, Vec2};
 
+use crate::materials::physical_props::{FromSI, GranularProps, scale_lame};
 use crate::materials::svd::svd2;
 use crate::materials::utils::{
     MIN_J, elastic_wave_dt, hencky_strains, lame_from_young, reconstruct_f,
@@ -35,7 +36,7 @@ use crate::particle::{Particle, Particles};
 /// Canonical parameters: µ₁=tan(20.9°), µ₂=tan(32.8°), I₀=0.279, d=1mm, ρₛ=2500 kg/m³
 /// → Q = 0.279 / (0.001 · √2500) ≈ 5.58.
 #[derive(Debug, Clone, Copy)]
-pub struct SandMuIMaterial {
+pub struct MuIRheologyMaterial {
     pub lambda: f32,
     pub mu: f32,
     /// µ₁ = tan(φ_static). Quasi-static friction at vanishing shear rate.
@@ -50,7 +51,7 @@ pub struct SandMuIMaterial {
     pub inertial_q: f32,
 }
 
-impl SandMuIMaterial {
+impl MuIRheologyMaterial {
     /// Construct with Lamé parameters. Defaults to matter's canonical µ(I) parameters
     /// (µ₁=tan20.9°, µ₂=tan32.8°, Q=5.58 for 1mm sand grains).
     pub fn new(lambda: f32, mu: f32) -> Self {
@@ -63,27 +64,29 @@ impl SandMuIMaterial {
         }
     }
 
-    /// Construct from Young's modulus E and Poisson's ratio ν (same API as SandMaterial).
+    /// Construct from Young's modulus E and Poisson's ratio ν (same API as DruckerPragerMaterial).
     pub fn from_young_modulus(young_modulus: f32, poisson_ratio: f32) -> Self {
         let (lambda, mu) = lame_from_young(young_modulus, poisson_ratio);
         Self::new(lambda, mu)
     }
 
-    /// Preset for coarse dry sand (d≈5mm, ρₛ=2500) — less rate-sensitive.
-    pub fn coarse_sand(lambda: f32, mu: f32) -> Self {
+    /// Large-grain: inertial_q=1.12, less rate-sensitive. Coarse sand regime (d≈5mm).
+    pub fn large_grain(young_modulus: f32, poisson_ratio: f32) -> Self {
+        let (lambda, mu) = lame_from_young(young_modulus, poisson_ratio);
         Self {
             inertial_q: 1.12,
             ..Self::new(lambda, mu)
         }
     }
 
-    /// Preset for fine dry sand (d≈1mm, ρₛ=2500) — more rate-sensitive.
-    pub fn fine_sand(lambda: f32, mu: f32) -> Self {
-        Self::new(lambda, mu) // default is already fine sand
+    /// Small-grain: default inertial_q, more rate-sensitive. Fine sand regime (d≈1mm).
+    pub fn small_grain(young_modulus: f32, poisson_ratio: f32) -> Self {
+        Self::from_young_modulus(young_modulus, poisson_ratio)
     }
 
-    /// Preset for dense sand — higher static + dynamic friction, larger µ₂-µ₁ gap.
-    pub fn dense_sand(lambda: f32, mu: f32) -> Self {
+    /// Dense-packed: higher static + dynamic friction, larger µ₂-µ₁ gap.
+    pub fn dense_packed(young_modulus: f32, poisson_ratio: f32) -> Self {
+        let (lambda, mu) = lame_from_young(young_modulus, poisson_ratio);
         Self {
             mu_static: 30.0_f32.to_radians().tan(),
             mu_dynamic: 40.0_f32.to_radians().tan(),
@@ -92,7 +95,25 @@ impl SandMuIMaterial {
     }
 }
 
-impl MaterialModel for SandMuIMaterial {
+impl FromSI<GranularProps> for MuIRheologyMaterial {
+    /// µ(I) friction params (µ₁, µ₂, I₀) fixed to canonical fine-sand values.
+    /// Use `irl::DRY_SAND`, `irl::LOOSE_SAND`, or `irl::DENSE_SAND` as props.
+    fn from_physical(props: &GranularProps, config: &crate::SimConfig) -> Self {
+        let (lambda, mu) = scale_lame(
+            props.elastic.e_pa,
+            props.elastic.nu,
+            props.elastic.rho_kg_m3,
+            config,
+        );
+        Self {
+            mu_static: props.friction_angle_deg.to_radians().tan(),
+            mu_dynamic: (props.friction_angle_deg + 12.0).to_radians().tan(),
+            ..Self::new(lambda, mu)
+        }
+    }
+}
+
+impl MaterialModel for MuIRheologyMaterial {
     fn constitutive_model(&self) -> ConstitutiveModel {
         ConstitutiveModel::DruckerPragerMuI
     }

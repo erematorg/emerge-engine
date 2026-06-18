@@ -1,5 +1,6 @@
 use glam::{Mat2, Vec2};
 
+use crate::materials::physical_props::{FromSI, GranularProps, scale_lame};
 use crate::materials::svd::svd2;
 use crate::materials::utils::{LOG_CLAMP, MIN_J, elastic_wave_dt, lame_from_young};
 use crate::materials::{ConstitutiveModel, MaterialModel, MaterialParams, polar_decomposition_2d};
@@ -7,7 +8,7 @@ use crate::particle::{Particle, Particles};
 
 /// Drucker-Prager elastoplastic sand. Ref: Klar et al. 2016.
 #[derive(Debug, Clone, Copy)]
-pub struct SandMaterial {
+pub struct DruckerPragerMaterial {
     pub lambda: f32,
     pub mu: f32,
     /// φ₀: Initial friction angle (radians). Dry sand ≈ 35° = 0.611 rad. (Klar 2016 h₀)
@@ -28,7 +29,7 @@ pub struct SandMaterial {
     pub dilatancy_angle: f32,
 }
 
-impl SandMaterial {
+impl DruckerPragerMaterial {
     /// Construct with Lamé parameters and default Klar 2016 friction-angle hardening.
     ///
     /// Use [`from_young_modulus`](Self::from_young_modulus) if you prefer E/ν inputs.
@@ -54,15 +55,14 @@ impl SandMaterial {
         Self::new(lambda, mu)
     }
 
-    /// Preset: dry cohesionless sand, φ=35°, no dilatancy.
-    /// Equivalent to Klar 2016 default parameters at the given stiffness.
-    pub fn dry_sand(lambda: f32, mu: f32) -> Self {
-        Self::new(lambda, mu) // all defaults are already dry-sand correct
+    /// Cohesionless: φ=35°, no dilatancy. Klar 2016 defaults. Dry sand regime.
+    pub fn cohesionless(young_modulus: f32, poisson_ratio: f32) -> Self {
+        Self::from_young_modulus(young_modulus, poisson_ratio)
     }
 
-    /// Preset: loose sand / silty soil, φ=25°, weaker hardening.
-    /// Flows more readily than dry sand — suitable for wet or disturbed terrain.
-    pub fn loose_sand(lambda: f32, mu: f32) -> Self {
+    /// Low friction: φ=25°, weaker hardening. Loose silty soil regime.
+    pub fn low_friction(young_modulus: f32, poisson_ratio: f32) -> Self {
+        let (lambda, mu) = lame_from_young(young_modulus, poisson_ratio);
         Self {
             friction_angle: 25.0_f32.to_radians(),
             hardening_peak: 4.0_f32.to_radians(),
@@ -72,9 +72,9 @@ impl SandMaterial {
         }
     }
 
-    /// Preset: dense compacted sand with Reynolds dilatancy (φ=38°, ψ=12°).
-    /// Expands under shear — produces more pronounced pile shoulders.
-    pub fn dense_sand(lambda: f32, mu: f32) -> Self {
+    /// Dilatant: φ=38°, ψ=12° Reynolds dilatancy. Dense compacted sand regime.
+    pub fn dilatant(young_modulus: f32, poisson_ratio: f32) -> Self {
+        let (lambda, mu) = lame_from_young(young_modulus, poisson_ratio);
         Self {
             friction_angle: 38.0_f32.to_radians(),
             dilatancy_angle: 12.0_f32.to_radians(),
@@ -132,7 +132,23 @@ impl SandMaterial {
     }
 }
 
-impl MaterialModel for SandMaterial {
+impl FromSI<GranularProps> for DruckerPragerMaterial {
+    fn from_physical(props: &GranularProps, config: &crate::SimConfig) -> Self {
+        let (lambda, mu) = scale_lame(
+            props.elastic.e_pa,
+            props.elastic.nu,
+            props.elastic.rho_kg_m3,
+            config,
+        );
+        Self {
+            friction_angle: props.friction_angle_deg.to_radians(),
+            dilatancy_angle: props.dilatancy_angle_deg.to_radians(),
+            ..Self::new(lambda, mu)
+        }
+    }
+}
+
+impl MaterialModel for DruckerPragerMaterial {
     fn constitutive_model(&self) -> ConstitutiveModel {
         ConstitutiveModel::DruckerPrager
     }

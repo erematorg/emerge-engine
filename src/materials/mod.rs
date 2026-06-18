@@ -2,8 +2,10 @@ pub mod bingham;
 pub mod corotated;
 pub mod elastic;
 pub mod fluid;
+pub mod granular_fluid;
 pub mod nacc;
 pub mod params;
+pub mod physical_props;
 pub mod rankine;
 pub mod registry;
 pub mod sand;
@@ -14,17 +16,22 @@ pub mod utils;
 pub mod viscoelastic;
 pub mod von_mises;
 
+pub use physical_props::{
+    Elastic, Elastoplastic, Fluid, FluidGranular, FromSI, PlasticityModel, Viscoelastic,
+};
+
 pub use bingham::BinghamFluidMaterial;
 pub use corotated::CorotatedMaterial;
 pub use elastic::NeoHookeanMaterial;
 pub use fluid::NewtonianFluidMaterial;
+pub use granular_fluid::GranularFluidMaterial;
 pub use nacc::NaccMaterial;
 pub use params::MaterialParams;
 pub use rankine::RankineMaterial;
 pub use registry::{MAX_MATERIAL_SLOTS, MaterialRegistry};
-pub use sand::SandMaterial;
-pub use sand_mui::SandMuIMaterial;
-pub use snow::SnowMaterial;
+pub use sand::DruckerPragerMaterial;
+pub use sand_mui::MuIRheologyMaterial;
+pub use snow::StomakhinMaterial;
 pub use utils::{
     elastic_wave_dt, gravity_to_grid, lame_from_si, lame_from_young, polar_decomposition_2d,
 };
@@ -38,6 +45,7 @@ use crate::particle::{Particle, Particles};
 /// Identifies which constitutive model a material implements.
 /// `repr(u32)` so this discriminant can be stored directly in GPU uniform buffers.
 /// Explicit values are stable across recompiles — do not change them.
+#[non_exhaustive]
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConstitutiveModel {
@@ -52,7 +60,27 @@ pub enum ConstitutiveModel {
     DruckerPragerMuI = 8, // Rate-dependent DP — µ(I) rheology, granular flow
     Viscoelastic = 9,     // Kelvin-Voigt: NeoHookean elastic + viscous dashpot in parallel
     Nacc = 10,            // Non-Associated Cam-Clay — wet soil, clay, bio tissue under compression
+    GranularFluid = 11, // Granular-fluid mixture — Tait EOS + corotated deviatoric + SVD plasticity
 }
+
+// WGSL shaders (p2g.wgsl, particles_update.wgsl) index material branches by the
+// ConstitutiveModel discriminant cast to u32. These assertions catch any enum reordering
+// that would silently run the wrong GPU stress branch on a material.
+const _: () = {
+    use ConstitutiveModel as C;
+    assert!(C::Fallback as u32 == 0);
+    assert!(C::Fluid as u32 == 1);
+    assert!(C::NeoHookean as u32 == 2);
+    assert!(C::Corotated as u32 == 3);
+    assert!(C::Snow as u32 == 4);
+    assert!(C::DruckerPrager as u32 == 5);
+    assert!(C::VonMises as u32 == 6);
+    assert!(C::Rankine as u32 == 7);
+    assert!(C::DruckerPragerMuI as u32 == 8);
+    assert!(C::Viscoelastic as u32 == 9);
+    assert!(C::Nacc as u32 == 10);
+    assert!(C::GranularFluid as u32 == 11);
+};
 
 pub trait MaterialModel: Send + Sync + core::fmt::Debug {
     /// Which constitutive law this material implements.
@@ -135,3 +163,134 @@ pub trait MaterialModel: Send + Sync + core::fmt::Debug {
 pub(crate) struct FallbackMaterial;
 
 impl MaterialModel for FallbackMaterial {}
+
+// ── props.material(&config) — property-first material construction ─────────────
+
+use physical_props::{
+    BinghamProps, BrittleProps, DuctileProps, GranularProps, NewtonianFluid, SnowProps,
+};
+
+impl Elastic {
+    /// Canonical model: `NeoHookeanMaterial` (Simo-Pister vol-dev split).
+    /// For corotated linear elasticity: `CorotatedMaterial::from_physical(self, config)`.
+    pub fn material(&self, config: &crate::SimConfig) -> Box<dyn MaterialModel> {
+        Box::new(NeoHookeanMaterial::from_physical(self, config))
+    }
+}
+
+impl Elastoplastic {
+    /// Dispatches to the correct constitutive model based on `self.model`:
+    /// - `Snow`                  → `StomakhinMaterial`
+    /// - `Granular`              → `DruckerPragerMaterial`
+    /// - `GranularRateDependent` → `MuIRheologyMaterial`
+    /// - `Ductile`               → `VonMisesMaterial`
+    /// - `Brittle`               → `RankineMaterial`
+    pub fn material(&self, config: &crate::SimConfig) -> Box<dyn MaterialModel> {
+        use PlasticityModel::*;
+        match self.model {
+            Snow => Box::new(StomakhinMaterial::from_physical(
+                &SnowProps {
+                    elastic: self.elastic,
+                },
+                config,
+            )),
+            Granular {
+                friction_angle_deg,
+                dilatancy_angle_deg,
+            } => Box::new(DruckerPragerMaterial::from_physical(
+                &GranularProps {
+                    elastic: self.elastic,
+                    friction_angle_deg,
+                    dilatancy_angle_deg,
+                },
+                config,
+            )),
+            GranularRateDependent {
+                friction_angle_deg,
+                dilatancy_angle_deg,
+            } => Box::new(MuIRheologyMaterial::from_physical(
+                &GranularProps {
+                    elastic: self.elastic,
+                    friction_angle_deg,
+                    dilatancy_angle_deg,
+                },
+                config,
+            )),
+            Ductile { yield_stress_pa } => Box::new(VonMisesMaterial::from_physical(
+                &DuctileProps {
+                    elastic: self.elastic,
+                    yield_stress_pa,
+                },
+                config,
+            )),
+            Brittle {
+                tensile_strength_pa,
+                softening_rate,
+            } => Box::new(RankineMaterial::from_physical(
+                &BrittleProps {
+                    elastic: self.elastic,
+                    tensile_strength_pa,
+                    softening_rate,
+                },
+                config,
+            )),
+        }
+    }
+}
+
+impl Viscoelastic {
+    pub fn material(&self, config: &crate::SimConfig) -> Box<dyn MaterialModel> {
+        Box::new(ViscoelasticMaterial::from_physical(self, config))
+    }
+}
+
+impl FluidGranular {
+    /// Dispatches to `GranularFluidMaterial` — Tait EOS pressure + corotated deviatoric + SVD plasticity.
+    pub fn material(&self, config: &crate::SimConfig) -> Box<dyn MaterialModel> {
+        use physical_props::{scale_lame, scale_stress};
+        const GAMMA: f32 = 7.0;
+        let (lambda, mu) = scale_lame(self.e_pa, self.nu, self.rho_kg_m3, config);
+        let eos = scale_stress(self.bulk_modulus_pa / GAMMA, self.rho_kg_m3, config);
+        let rho_grid = self.rho_kg_m3 * config.dx_meters * config.dx_meters
+            / (config.dt_seconds * config.dt_seconds);
+        Box::new(GranularFluidMaterial {
+            mu,
+            lambda,
+            rest_density: rho_grid,
+            eos_stiffness: eos,
+            eos_power: GAMMA,
+            hardening_exponent: self.hardening_exponent,
+            compression_limit: self.compression_limit,
+            stretch_limit: self.stretch_limit,
+            min_plastic_jacobian: 0.2,
+            max_plastic_jacobian: 3.0,
+            pressure_floor: 0.0,
+        })
+    }
+}
+
+impl Fluid {
+    /// `yield_stress_pa = None`  → `NewtonianFluidMaterial`
+    /// `yield_stress_pa = Some(τ₀)` → `BinghamFluidMaterial`
+    pub fn material(&self, config: &crate::SimConfig) -> Box<dyn MaterialModel> {
+        match self.yield_stress_pa {
+            None => Box::new(NewtonianFluidMaterial::from_physical(
+                &NewtonianFluid {
+                    rho_kg_m3: self.rho_kg_m3,
+                    eta_pa_s: self.eta_pa_s,
+                    bulk_modulus_pa: self.bulk_modulus_pa,
+                },
+                config,
+            )),
+            Some(tau0) => Box::new(BinghamFluidMaterial::from_physical(
+                &BinghamProps {
+                    rho_kg_m3: self.rho_kg_m3,
+                    eta_pa_s: self.eta_pa_s,
+                    bulk_modulus_pa: self.bulk_modulus_pa,
+                    yield_stress_pa: tau0,
+                },
+                config,
+            )),
+        }
+    }
+}

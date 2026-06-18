@@ -78,23 +78,23 @@ impl NaccMaterial {
         Self::new(mu, kappa, friction, cohesion, hardening_factor)
     }
 
-    /// Saturated soft clay. κ = 2e4, M = 1.2, β = 0, ξ = 2.
-    pub fn soft_clay() -> Self {
-        let (lambda, mu) = lame_from_young(5.0e4, 0.3);
+    /// Saturated soft clay: M=1.2, β=0, ξ=2 (Klar 2016 soft clay params).
+    pub fn soft_clay(young_modulus: f32, poisson_ratio: f32) -> Self {
+        let (lambda, mu) = lame_from_young(young_modulus, poisson_ratio);
         let kappa = lambda + (2.0 / 3.0) * mu;
         Self::new(mu, kappa, 1.2, 0.0, 2.0)
     }
 
-    /// Wet compressed soil (paddy field, river bank). Stiffer, higher friction.
-    pub fn wet_soil() -> Self {
-        let (lambda, mu) = lame_from_young(2.0e5, 0.35);
+    /// Wet compressed soil (paddy field, river bank): M=1.0, β=0, ξ=3.
+    pub fn wet_soil(young_modulus: f32, poisson_ratio: f32) -> Self {
+        let (lambda, mu) = lame_from_young(young_modulus, poisson_ratio);
         let kappa = lambda + (2.0 / 3.0) * mu;
         Self::new(mu, kappa, 1.0, 0.0, 3.0)
     }
 
-    /// Biological soft tissue under large compression. Very soft, no tensile strength.
-    pub fn soft_tissue() -> Self {
-        let (lambda, mu) = lame_from_young(5.0e3, 0.45);
+    /// High critical-slope, low hardening: M=1.5, β=0, ξ=1. Soft material under large compression.
+    pub fn low_hardening(young_modulus: f32, poisson_ratio: f32) -> Self {
+        let (lambda, mu) = lame_from_young(young_modulus, poisson_ratio);
         let kappa = lambda + (2.0 / 3.0) * mu;
         Self::new(mu, kappa, 1.5, 0.0, 1.0)
     }
@@ -194,7 +194,7 @@ impl NaccMaterial {
         // Case C: project onto yield surface.
         // B_n1 eigenvalues: solve for scaled deviatoric + isotropic.
         let b_n1 = (-y1 / y0.max(1.0e-10_f32)).max(0.0).sqrt()
-            * (j_e_tr.powf(2.0 / 2.0) / self.mu)
+            * (j_e_tr / self.mu)
             * s_tr.normalize_or_zero()
             + Vec2::splat(sv_sq_trace / 2.0);
 
