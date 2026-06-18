@@ -1,320 +1,259 @@
-/// Viscoplastic fluids — GPU MLS-MPM, Newtonian water + Bingham mud.
+﻿extern crate emerge_engine as emerge;
+
+/// GPU viscoplastic fluids — Newtonian water dam-break + Bingham mud blob, zero CPU readback.
 ///
-/// Mirrors basic_fluids (CPU) qualitatively:
-///   Mat 0  Newtonian water (blue)  — Tait EOS dam-break column on the left
-///   Mat 1  Bingham mud    (brown)  — viscoplastic blob on the right
+///   Mat 0  Newtonian water (blue) — Tait EOS + deviatoric viscosity
+///   Mat 1  Bingham mud    (gold)  — viscoplastic with yield stress
 ///
-///   cargo run --example basic_fluids_gpu --features "bevy_examples,gpu"
-use bevy::prelude::*;
-use bevy::tasks::block_on;
-use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
-use emerge::gpu::{GpuForceFieldEntry, GpuSolver};
-use emerge::runtime::fixed_step::FixedStepController;
+///   cargo run --example basic_fluids_gpu --features "render"
+use std::sync::Arc;
+
+use emerge::diagnostics::log_frame_gpu;
+use emerge::render::{ColorMode, Renderer};
 use emerge::{
-    BinghamFluidMaterial, MaterialRegistry, NewtonianFluidMaterial, SolverConfig, SpawnConfig,
-    build_particles, log_frame_gpu,
+    BinghamFluidMaterial, GpuSimulation, MaterialRegistry, NewtonianFluidMaterial, SimConfig,
+    SpawnRegion, build_particles,
 };
 use glam::{IVec2, Vec2};
+use winit::application::ApplicationHandler;
+use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::window::{Window, WindowId};
 
 const GRID: usize = 64;
 const DT: f32 = 0.1;
-const PPC: f32 = 10.0;
-const LABELS: &[(u32, &str)] = &[(0, "water"), (1, "mud")];
-
 const MAT_WATER: u32 = 0;
 const MAT_MUD: u32 = 1;
+const LABELS: &[(u32, &str)] = &[(MAT_WATER, "water"), (MAT_MUD, "mud")];
 
-const WATER_CENTER: Vec2 = Vec2::new(11.0, 30.0);
-const WATER_SIZE: IVec2 = IVec2::new(14, 52);
-const MUD_CENTER: Vec2 = Vec2::new(50.0, 38.0);
-const MUD_SIZE: IVec2 = IVec2::new(16, 18);
-
-#[derive(Resource, Clone, Copy, PartialEq)]
-struct Params {
-    hz: f32,
-    gravity: f32,
-    water_viscosity: f32,
-    water_bulk_viscosity: f32,
-    water_stiffness: f32,
-    water_surface_tension: f32,
-    mud_viscosity: f32,
-    mud_yield_stress: f32,
-    water_settling: f32,
-    mud_settling: f32,
-    cursor_strength: f32,
-    cursor_radius: f32,
+struct App {
+    window: Option<Arc<Window>>,
+    state: Option<State>,
 }
 
-const DEFAULTS: Params = Params {
-    hz: 60.0,
-    gravity: -0.3,
-    water_viscosity: 0.1,
-    water_bulk_viscosity: 0.1,
-    water_stiffness: 10.0,
-    water_surface_tension: 0.0,
-    mud_viscosity: 8.0,
-    mud_yield_stress: 4.0,
-    water_settling: 0.01,
-    mud_settling: 0.02,
-    cursor_strength: 30.0,
-    cursor_radius: 5.0,
-};
-
-#[derive(Resource)]
-struct Sim {
-    solver: GpuSolver,
-    stepper: FixedStepController,
-    prev: Params,
+struct State {
+    surface: wgpu::Surface<'static>,
+    surface_config: wgpu::SurfaceConfiguration,
+    sim: GpuSimulation,
+    renderer: Renderer,
+    cursor_pos: [f32; 2],
+    lmb: bool,
+    rmb: bool,
+    frame: u64,
+    fps_timer: std::time::Instant,
+    fps_frames: u64,
 }
 
-impl Sim {
-    fn new(p: Params) -> Self {
-        let config = SolverConfig {
-            gravity: Vec2::new(0.0, p.gravity),
-            ..SolverConfig::earth(GRID, 0.01, DT)
-        };
-        let spawn_water = SpawnConfig {
-            spacing: 0.5,
-            box_size: WATER_SIZE,
-            box_center: WATER_CENTER,
-            material_id: MAT_WATER,
-            initial_velocity_scale: 0.0,
-            ..SpawnConfig::for_solver(&config)
-        };
-        let spawn_mud = SpawnConfig {
-            spacing: 0.5,
-            box_size: MUD_SIZE,
-            box_center: MUD_CENTER,
-            material_id: MAT_MUD,
-            initial_velocity_scale: 0.0,
-            ..SpawnConfig::for_solver(&config)
-        };
+fn make_sim_data(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) -> GpuSimulation {
+    let config = SimConfig {
+        min_dt: 1.0e-3,
+        max_substeps_per_step: 8,
+        recompute_density_each_step: true,
+        cfl_include_affine_speed: false,
+        gravity: Vec2::new(0.0, -0.3),
+        ..SimConfig::earth(GRID, 0.01, DT)
+    };
+    let spawn_water = SpawnRegion {
+        spacing: 0.6,
+        box_size: IVec2::new(14, 52),
+        box_center: Vec2::new(11.0, 30.0),
+        material_id: MAT_WATER,
+        precompute_initial_volumes: true,
+        ..SpawnRegion::for_sim(&config)
+    };
+    let spawn_mud = SpawnRegion {
+        spacing: 0.6,
+        box_size: IVec2::new(16, 18),
+        box_center: Vec2::new(50.0, 38.0),
+        material_id: MAT_MUD,
+        precompute_initial_volumes: true,
+        ..SpawnRegion::for_sim(&config)
+    };
+    let mut particles = build_particles(&config, spawn_water);
+    particles.extend(build_particles(&config, spawn_mud));
 
-        let mut particles = build_particles(&config, spawn_water);
-        particles.extend(build_particles(&config, spawn_mud));
+    let water = NewtonianFluidMaterial::new(4.0, 0.1, 10.0, 3.0);
+    let mud = BinghamFluidMaterial::new(4.0, 8.0, 5.0, 3.0, 4.0);
+    let mut registry = MaterialRegistry::with_default(Box::new(water));
+    registry.insert(MAT_MUD, Box::new(mud));
 
-        let mut registry = MaterialRegistry::with_default(Box::new(make_water(&p)));
-        registry.insert(MAT_MUD, Box::new(make_mud(&p)));
-        let solver = block_on(GpuSolver::new(config, particles, registry));
+    GpuSimulation::with_device(device, queue, config, particles, registry)
+}
 
+impl State {
+    async fn new(window: Arc<Window>) -> Self {
+        let size = window.inner_size();
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let surface = instance.create_surface(window.clone()).unwrap();
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+            })
+            .await
+            .expect("no GPU adapter");
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor::default())
+            .await
+            .unwrap();
+        let caps = surface.get_capabilities(&adapter);
+        let fmt = caps.formats.iter().find(|f| f.is_srgb()).copied().unwrap_or(caps.formats[0]);
+        let sc = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: fmt,
+            width: size.width,
+            height: size.height,
+            present_mode: wgpu::PresentMode::AutoVsync,
+            desired_maximum_frame_latency: 2,
+            alpha_mode: caps.alpha_modes[0],
+            view_formats: vec![],
+        };
+        surface.configure(&device, &sc);
+        let sim = make_sim_data(Arc::new(device), Arc::new(queue));
+        let mut renderer = Renderer::new(sim.device(), sim.particle_count(), fmt);
+        renderer.set_camera(sim.queue(), GRID as u32, size.width, size.height, 0.6, true);
+        renderer.set_color_mode(ColorMode::ByMaterial);
+        println!(
+            "fluids GPU: {} particles  |  LMB push  RMB pull  R reset  Q quit",
+            sim.particle_count()
+        );
         Self {
-            solver,
-            stepper: FixedStepController::standard(DT, p.hz),
-            prev: p,
+            surface,
+            surface_config: sc,
+            sim,
+            renderer,
+            cursor_pos: [0.0; 2],
+            lmb: false,
+            rmb: false,
+            frame: 0,
+            fps_timer: std::time::Instant::now(),
+            fps_frames: 0,
         }
+    }
+
+    fn resize(&mut self, w: u32, h: u32) {
+        if w == 0 || h == 0 {
+            return;
+        }
+        self.surface_config.width = w;
+        self.surface_config.height = h;
+        self.surface.configure(self.sim.device(), &self.surface_config);
+        self.renderer.set_camera(self.sim.queue(), GRID as u32, w, h, 0.6, true);
+    }
+
+    fn cursor_grid(&self) -> Vec2 {
+        Vec2::new(
+            self.cursor_pos[0] / self.surface_config.width as f32 * GRID as f32,
+            (1.0 - self.cursor_pos[1] / self.surface_config.height as f32) * GRID as f32,
+        )
+    }
+
+    fn reset(&mut self) {
+        let (device, queue) = (self.sim.device().clone(), self.sim.queue().clone());
+        self.sim = make_sim_data(device, queue);
+        self.frame = 0;
+        println!("reset");
+    }
+
+    fn update_and_render(&mut self) {
+        if self.lmb || self.rmb {
+            let mag = if self.lmb { 2.0 } else { -2.0 };
+            self.sim.apply_radial_impulse(self.cursor_grid(), 5.0, mag);
+        }
+        let output = match self.surface.get_current_texture() {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+        self.sim.step_frame();
+        self.frame += 1;
+        self.fps_frames += 1;
+        if self.fps_timer.elapsed().as_secs_f32() >= 2.0 {
+            let fps = self.fps_frames as f32 / self.fps_timer.elapsed().as_secs_f32();
+            println!("frame={} fps={:.0}", self.frame, fps);
+            self.fps_timer = std::time::Instant::now();
+            self.fps_frames = 0;
+        }
+        if self.frame % 60 == 0 {
+            log_frame_gpu(self.frame, DT, self.sim.particles(), LABELS, 1);
+            let snap = self.sim.diagnostics_snapshot();
+            println!(
+                "  non_finite={}  out_of_bounds={}  max_speed={:.3}  sub={}  cfl={:.4}",
+                snap.non_finite_particle_values,
+                snap.out_of_bounds_particles,
+                snap.max_particle_speed,
+                snap.substeps_last_step,
+                snap.cfl_number,
+            );
+        }
+        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.renderer.render_gpu(
+            self.sim.device(),
+            self.sim.queue(),
+            self.sim.particle_buffer(),
+            self.sim.particle_count(),
+            &view,
+            true,
+        );
+        output.present();
     }
 }
 
-fn make_water(p: &Params) -> NewtonianFluidMaterial {
-    let mut m = NewtonianFluidMaterial::new(4.0, p.water_viscosity, p.water_stiffness, 3.0);
-    m.bulk_viscosity = p.water_bulk_viscosity;
-    m.surface_tension_coeff = p.water_surface_tension;
-    m.pressure_floor = 0.0;
-    m.settling_damping = p.water_settling;
-    m
-}
+impl ApplicationHandler for App {
+    fn resumed(&mut self, el: &ActiveEventLoop) {
+        let w = Arc::new(
+            el.create_window(
+                winit::window::WindowAttributes::default()
+                    .with_title("emerge -- Fluids GPU [Water / Bingham Mud]")
+                    .with_inner_size(winit::dpi::LogicalSize::new(480u32, 480u32)),
+            )
+            .unwrap(),
+        );
+        self.state = Some(pollster::block_on(State::new(w.clone())));
+        self.window = Some(w);
+    }
 
-fn make_mud(p: &Params) -> BinghamFluidMaterial {
-    let mut m = BinghamFluidMaterial::new(4.0, p.mud_viscosity, 15.0, 3.0, p.mud_yield_stress);
-    m.settling_damping = p.mud_settling;
-    m
-}
-
-fn fluid_color(mat: u32) -> Color {
-    match mat {
-        0 => Color::srgb(0.10, 0.55, 1.00), // vivid blue  — water
-        _ => Color::srgb(0.62, 0.38, 0.14), // earthy brown — mud
+    fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        let Some(s) = self.state.as_mut() else { return };
+        match event {
+            WindowEvent::CloseRequested => el.exit(),
+            WindowEvent::CursorMoved { position, .. } => {
+                s.cursor_pos = [position.x as f32, position.y as f32];
+            }
+            WindowEvent::MouseInput { state, button, .. } => match button {
+                MouseButton::Left => s.lmb = state == ElementState::Pressed,
+                MouseButton::Right => s.rmb = state == ElementState::Pressed,
+                _ => {}
+            },
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(key),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } => match key {
+                KeyCode::Escape | KeyCode::KeyQ => el.exit(),
+                KeyCode::KeyR => s.reset(),
+                _ => {}
+            },
+            WindowEvent::Resized(sz) => s.resize(sz.width, sz.height),
+            WindowEvent::RedrawRequested => {
+                s.update_and_render();
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            _ => {}
+        }
     }
 }
 
 fn main() {
-    App::new()
-        .insert_resource(ClearColor(Color::srgb(0.05, 0.07, 0.09)))
-        .insert_resource(DEFAULTS)
-        .insert_resource(Sim::new(DEFAULTS))
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "MLS-MPM Fluids (GPU) — Water · Bingham Mud".into(),
-                resolution: (700u32, 700u32).into(),
-                ..default()
-            }),
-            ..default()
-        }))
-        .add_plugins(EguiPlugin::default())
-        .add_systems(Startup, setup)
-        .add_systems(Update, (reset, cursor, step, sync).chain())
-        .add_systems(EguiPrimaryContextPass, ui)
-        .run();
-}
-
-#[derive(Component)]
-struct PVis(usize);
-
-fn setup(mut commands: Commands, sim: Res<Sim>) {
-    commands.spawn(Camera2d);
-    for (i, p) in sim.solver.particles().iter().enumerate() {
-        commands.spawn((
-            PVis(i),
-            Sprite {
-                color: fluid_color(p.material_id),
-                custom_size: Some(Vec2::splat(4.0)),
-                ..default()
-            },
-            Transform::from_translation(p2w(p.x)),
-        ));
-    }
-}
-
-fn reset(
-    keys: Res<ButtonInput<KeyCode>>,
-    mut sim: ResMut<Sim>,
-    mut p: ResMut<Params>,
-    mut commands: Commands,
-    vis: Query<Entity, With<PVis>>,
-) {
-    if keys.just_pressed(KeyCode::KeyR) {
-        *p = DEFAULTS;
-        *sim = Sim::new(DEFAULTS);
-        for e in &vis {
-            commands.entity(e).despawn();
-        }
-        for (i, pt) in sim.solver.particles().iter().enumerate() {
-            commands.spawn((
-                PVis(i),
-                Sprite {
-                    color: fluid_color(pt.material_id),
-                    custom_size: Some(Vec2::splat(4.0)),
-                    ..default()
-                },
-                Transform::from_translation(p2w(pt.x)),
-            ));
-        }
-    }
-}
-
-fn cursor(
-    windows: Query<&Window>,
-    cam: Query<(&Camera, &GlobalTransform)>,
-    mb: Res<ButtonInput<MouseButton>>,
-    mut sim: ResMut<Sim>,
-    params: Res<Params>,
-) {
-    sim.solver.clear_force_fields_gpu();
-    if !mb.pressed(MouseButton::Left) && !mb.pressed(MouseButton::Right) {
-        return;
-    }
-    let Ok(win) = windows.single() else { return };
-    let Some(cp) = win.cursor_position() else {
-        return;
-    };
-    let Ok((cam, ct)) = cam.single() else { return };
-    let Ok(wp) = cam.viewport_to_world_2d(ct, cp) else {
-        return;
-    };
-    let gp = wp / PPC + Vec2::splat(GRID as f32 * 0.5);
-    let gm = if mb.pressed(MouseButton::Right) {
-        params.cursor_strength
-    } else {
-        -params.cursor_strength
-    };
-    let r = params.cursor_radius;
-    sim.solver
-        .add_force_field_gpu(GpuForceFieldEntry::gravity_well(gp, gm, 4.0, r, r * 0.4));
-}
-
-fn step(time: Res<Time>, mut sim: ResMut<Sim>, params: Res<Params>) {
-    sim.solver.set_gravity(Vec2::new(0.0, params.gravity));
-    sim.stepper.set_simulation_speed(params.hz * DT);
-    let n = sim.stepper.steps_for_frame(time.delta_secs());
-    if n == 0 {
-        return;
-    }
-    if sim.prev != *params {
-        sim.solver
-            .set_default_material(Box::new(make_water(&params)));
-        sim.solver
-            .set_material(MAT_MUD, Box::new(make_mud(&params)));
-        sim.prev = *params;
-    }
-    for _ in 0..n {
-        sim.solver.step_frame();
-    }
-    sim.solver.sync_particles_blocking();
-    static FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let f = FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    log_frame_gpu(f, DT, sim.solver.particles(), LABELS, 60);
-}
-
-fn sync(sim: Res<Sim>, mut vis: Query<(&PVis, &mut Transform, &mut Sprite)>) {
-    let particles = sim.solver.particles();
-    for (pv, mut t, mut s) in &mut vis {
-        if let Some(p) = particles.get(pv.0) {
-            t.translation = p2w(p.x);
-            s.color = fluid_color(p.material_id);
-        }
-    }
-}
-
-fn ui(mut ctx: EguiContexts, mut p: ResMut<Params>, mut sim: ResMut<Sim>, time: Res<Time>) {
-    let Ok(ctx) = ctx.ctx_mut() else { return };
-    egui::Window::new("Fluids (GPU)")
-        .default_pos([10.0, 10.0])
-        .default_width(270.0)
-        .resizable(false)
-        .show(ctx, |ui| {
-            ui.label(format!(
-                "fps={:.0}  n={}  [GPU]",
-                time.delta_secs().recip(),
-                sim.solver.particle_count(),
-            ));
-            ui.separator();
-            ui.add(egui::Slider::new(&mut p.hz, 5.0..=60.0).text("solver_hz"));
-            ui.add(egui::Slider::new(&mut p.gravity, -3.0..=0.0).text("gravity"));
-            ui.separator();
-            ui.colored_label(
-                egui::Color32::from_rgb(59, 169, 245),
-                "Newtonian water (blue)",
-            );
-            ui.add(
-                egui::Slider::new(&mut p.water_viscosity, 0.0..=5.0)
-                    .text("shear µ")
-                    .logarithmic(true),
-            );
-            ui.add(
-                egui::Slider::new(&mut p.water_bulk_viscosity, 0.0..=5.0)
-                    .text("bulk ζ (wave damp)")
-                    .logarithmic(true),
-            );
-            ui.add(egui::Slider::new(&mut p.water_settling, 0.0..=1.0).text("settling damp"));
-            ui.add(
-                egui::Slider::new(&mut p.water_stiffness, 1.0..=500.0)
-                    .text("eos_k")
-                    .logarithmic(true),
-            );
-            ui.add(
-                egui::Slider::new(&mut p.water_surface_tension, 0.0..=2.0).text("surface tension"),
-            );
-            ui.separator();
-            ui.colored_label(egui::Color32::from_rgb(133, 97, 56), "Bingham mud (brown)");
-            ui.add(egui::Slider::new(&mut p.mud_viscosity, 0.5..=30.0).text("viscosity"));
-            ui.add(egui::Slider::new(&mut p.mud_yield_stress, 0.0..=20.0).text("yield stress"));
-            ui.add(egui::Slider::new(&mut p.mud_settling, 0.0..=2.0).text("settling damp"));
-            ui.separator();
-            ui.add(
-                egui::Slider::new(&mut p.cursor_strength, 5.0..=200.0)
-                    .text("cursor force")
-                    .logarithmic(true),
-            );
-            ui.add(egui::Slider::new(&mut p.cursor_radius, 1.0..=15.0).text("cursor radius"));
-            ui.label("LMB: push  RMB: pull  R: reset");
-            if ui.button("Reset (R)").clicked() {
-                *p = DEFAULTS;
-                *sim = Sim::new(DEFAULTS);
-            }
-        });
-}
-
-fn p2w(pos: Vec2) -> Vec3 {
-    let c = (pos - Vec2::splat(GRID as f32 * 0.5)) * PPC;
-    Vec3::new(c.x, c.y, 0.0)
+    let el = EventLoop::new().unwrap();
+    el.set_control_flow(ControlFlow::Poll);
+    let mut app = App { window: None, state: None };
+    el.run_app(&mut app).unwrap();
 }

@@ -1,395 +1,345 @@
-/// Three-material showcase — sand terrain, fluid pool, and elastic blob — GPU compute.
-///
-/// Same scene as basic_showcase but runs on the GPU solver:
-///   Mat 0  NeoHookean elastic  (green)  — creature body
-///   Mat 1  Sand (Drucker-Prager) (gold)  — terrain
-///   Mat 2  Newtonian fluid      (blue)  — water pool
-///
-/// Controls:
-///   ↑ ↓ ← →   apply impulse to the elastic blob
-///   LMB / RMB  push / pull all particles under cursor
-///   R          reset scene
-///
-///   cargo run --example basic_showcase_gpu --features "bevy_examples,gpu"
-use bevy::prelude::*;
-use bevy::tasks::block_on;
-use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
-use emerge::gpu::{GpuForceFieldEntry, GpuSolver};
-use emerge::runtime::fixed_step::FixedStepController;
+extern crate emerge_engine as emerge;
+
+use emerge::diagnostics::log_frame_gpu;
+use emerge::gpu::GpuSimulation;
+use emerge::render::{ColorMode, Renderer};
 use emerge::{
-    MaterialRegistry, NeoHookeanMaterial, NewtonianFluidMaterial, SandMaterial, SolverConfig,
-    SpawnConfig, build_particles, log_frame_gpu,
+    DruckerPragerMaterial, MaterialRegistry, NeoHookeanMaterial, NewtonianFluidMaterial, SimConfig,
+    SpawnRegion, build_particles,
 };
 use glam::{IVec2, Vec2};
+/// GPU three-material showcase -- sand terrain, fluid pool, elastic blob.
+///
+///   Mat 0  NeoHookean elastic (blue)  -- creature body, arrow-key drive
+///   Mat 1  Sand Drucker-Prager (gold) -- terrain
+///   Mat 2  Newtonian fluid  (cyan)    -- water pool
+///
+///   arrow keys  drive elastic blob  |  LMB push  RMB pull  |  R reset  Q quit
+///   cargo run --example basic_showcase_gpu --features "render,gpu"
+use std::sync::Arc;
+use winit::application::ApplicationHandler;
+use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::window::{Window, WindowId};
 
 const GRID: usize = 64;
 const DT: f32 = 0.1;
-const PPC: f32 = 10.0;
-const MAX_DT: f32 = 1.0 / 15.0;
-
 const ELASTIC_ID: u32 = 0;
 const SAND_ID: u32 = 1;
 const FLUID_ID: u32 = 2;
+const SPACING: f32 = 0.7;
+const LABELS: &[(u32, &str)] = &[(ELASTIC_ID, "elastic"), (SAND_ID, "sand"), (FLUID_ID, "fluid")];
 
-const LABELS: &[(u32, &str)] = &[
-    (ELASTIC_ID, "elastic"),
-    (SAND_ID, "sand"),
-    (FLUID_ID, "fluid"),
-];
-
-const DRIVE_STRENGTH: f32 = 10.0;
-const DRIVE_RADIUS: f32 = 12.0;
-
-#[derive(Resource, Clone, Copy, PartialEq)]
-struct Params {
-    hz: f32,
-    gravity: f32,
-    e_lambda: f32,
-    e_mu: f32,
-    s_lambda: f32,
-    s_mu: f32,
-    f_density: f32,
-    f_viscosity: f32,
-    f_eos_k: f32,
-    cursor_strength: f32,
-    cursor_radius: f32,
+struct App {
+    window: Option<Arc<Window>>,
+    state: Option<State>,
 }
 
-const DEFAULTS: Params = Params {
-    hz: 60.0,
-    gravity: -0.3,
-    e_lambda: 40.0,
-    e_mu: 80.0,
-    s_lambda: 400.0,
-    s_mu: 200.0,
-    f_density: 4.0,
-    f_viscosity: 0.1,
-    f_eos_k: 10.0,
-    cursor_strength: 200.0,
-    cursor_radius: 5.0,
-};
-
-#[derive(Resource)]
-struct Sim {
-    solver: GpuSolver,
-    stepper: FixedStepController,
-    prev: Params,
-    // Elastic blob centroid — updated each frame for arrow-key drive.
-    elastic_centroid: Vec2,
-    physics_frame: u64,
+struct State {
+    surface: wgpu::Surface<'static>,
+    surface_config: wgpu::SurfaceConfiguration,
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
+    sim: GpuSimulation,
+    renderer: Renderer,
+    cursor_pos: [f32; 2],
+    physics_colors: bool,
+    lmb: bool,
+    rmb: bool,
+    arrow_up: bool,
+    arrow_down: bool,
+    arrow_left: bool,
+    arrow_right: bool,
+    frame: u64,
+    fps_timer: std::time::Instant,
+    fps_frames: u64,
 }
 
-impl Sim {
-    fn new(p: Params) -> Self {
-        let config = SolverConfig {
-            min_dt: 0.005,
-            max_substeps_per_step: 16,
-            recompute_density_each_step: true,
-            gravity: Vec2::new(0.0, p.gravity),
-            ..SolverConfig::earth(GRID, 0.01, DT)
-        };
-
-        const SPACING: f32 = 0.7;
-
-        let sand_spawn = SpawnConfig {
+fn make_sim(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) -> GpuSimulation {
+    let config = SimConfig {
+        min_dt: 0.005,
+        max_substeps_per_step: 16,
+        recompute_density_each_step: true,
+        gravity: Vec2::new(0.0, -0.3),
+        ..SimConfig::earth(GRID, 0.01, DT)
+    };
+    let mut p = build_particles(
+        &config,
+        SpawnRegion {
             spacing: SPACING,
             box_size: IVec2::new(22, 14),
             box_center: Vec2::new(19.0, 9.0),
             material_id: SAND_ID,
-            initial_velocity_scale: 0.0,
             precompute_initial_volumes: true,
-            ..SpawnConfig::for_solver(&config)
-        };
-        let fluid_spawn = SpawnConfig {
+            ..SpawnRegion::for_sim(&config)
+        },
+    );
+    p.extend(build_particles(
+        &config,
+        SpawnRegion {
             spacing: SPACING,
             box_size: IVec2::new(22, 14),
             box_center: Vec2::new(45.0, 9.0),
             material_id: FLUID_ID,
-            initial_velocity_scale: 0.0,
             precompute_initial_volumes: true,
-            ..SpawnConfig::for_solver(&config)
-        };
-        let elastic_spawn = SpawnConfig {
+            ..SpawnRegion::for_sim(&config)
+        },
+    ));
+    p.extend(build_particles(
+        &config,
+        SpawnRegion {
             spacing: SPACING,
             box_size: IVec2::new(12, 12),
             box_center: Vec2::new(32.0, 46.0),
             material_id: ELASTIC_ID,
-            initial_velocity_scale: 0.0,
             precompute_initial_volumes: true,
-            ..SpawnConfig::for_solver(&config)
+            ..SpawnRegion::for_sim(&config)
+        },
+    ));
+    let elastic = NeoHookeanMaterial::new(40.0, 80.0);
+    let sand = DruckerPragerMaterial::new(400.0, 200.0);
+    let fluid = NewtonianFluidMaterial::new(4.0, 0.1, 10.0, 4.0);
+    let mut reg = MaterialRegistry::with_default(Box::new(elastic));
+    reg.insert(SAND_ID, Box::new(sand));
+    reg.insert(FLUID_ID, Box::new(fluid));
+    GpuSimulation::with_device(device, queue, config, p, reg)
+}
+
+impl State {
+    async fn new(window: Arc<Window>) -> Self {
+        let size = window.inner_size();
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let surface = instance.create_surface(window.clone()).unwrap();
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+            })
+            .await
+            .expect("no GPU adapter");
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor::default())
+            .await
+            .unwrap();
+        let device = Arc::new(device);
+        let queue = Arc::new(queue);
+        let caps = surface.get_capabilities(&adapter);
+        let fmt = caps
+            .formats
+            .iter()
+            .find(|f| f.is_srgb())
+            .copied()
+            .unwrap_or(caps.formats[0]);
+        let sc = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: fmt,
+            width: size.width,
+            height: size.height,
+            present_mode: wgpu::PresentMode::AutoVsync,
+            desired_maximum_frame_latency: 2,
+            alpha_mode: caps.alpha_modes[0],
+            view_formats: vec![],
+        };
+        surface.configure(&device, &sc);
+        let sim = make_sim(device.clone(), queue.clone());
+        let mut renderer = Renderer::new(&device, sim.particle_count(), fmt);
+        renderer.set_camera(&queue, GRID as u32, size.width, size.height, 0.6, true);
+        renderer.set_color_mode(ColorMode::ByPhysics);
+        println!(
+            "showcase_gpu: {} particles  |  arrow keys=drive blob  LMB/RMB push/pull  R reset  Q quit",
+            sim.particle_count()
+        );
+        Self {
+            surface,
+            surface_config: sc,
+            device,
+            queue,
+            sim,
+            renderer,
+            cursor_pos: [0.0; 2],
+            lmb: false,
+            physics_colors: true,
+            rmb: false,
+            arrow_up: false,
+            arrow_down: false,
+            arrow_left: false,
+            arrow_right: false,
+            frame: 0,
+            fps_timer: std::time::Instant::now(),
+            fps_frames: 0,
+        }
+    }
+
+    fn resize(&mut self, w: u32, h: u32) {
+        if w == 0 || h == 0 {
+            return;
+        }
+        self.surface_config.width = w;
+        self.surface_config.height = h;
+        self.surface.configure(&self.device, &self.surface_config);
+        self.renderer
+            .set_camera(&self.queue, GRID as u32, w, h, 0.6, true);
+    }
+
+    fn cursor_grid(&self) -> Vec2 {
+        Vec2::new(
+            self.cursor_pos[0] / self.surface_config.width as f32 * GRID as f32,
+            (1.0 - self.cursor_pos[1] / self.surface_config.height as f32) * GRID as f32,
+        )
+    }
+
+    fn update_and_render(&mut self) {
+        // Arrow-key drive on elastic blob centroid.
+        let mut dir = Vec2::ZERO;
+        if self.arrow_up {
+            dir.y += 1.0;
+        }
+        if self.arrow_down {
+            dir.y -= 1.0;
+        }
+        if self.arrow_left {
+            dir.x -= 1.0;
+        }
+        if self.arrow_right {
+            dir.x += 1.0;
+        }
+        if dir != Vec2::ZERO {
+            let impulse = dir.normalize() * 10.0;
+            let particles = self.sim.particles();
+            let (sum, n) = particles
+                .iter()
+                .filter(|p| p.material_id == ELASTIC_ID)
+                .fold((Vec2::ZERO, 0usize), |(s, n), p| (s + p.x, n + 1));
+            if n > 0 {
+                let centroid = sum / n as f32;
+                self.sim.apply_impulse(centroid, 12.0, impulse);
+            }
+        }
+
+        if self.lmb || self.rmb {
+            let mag = if self.lmb { 2.0 } else { -2.0 };
+            self.sim.apply_radial_impulse(self.cursor_grid(), 5.0, mag);
+        }
+
+        let output = match self.surface.get_current_texture() {
+            Ok(t) => t,
+            Err(_) => return,
         };
 
-        let mut particles = build_particles(&config, sand_spawn);
-        particles.extend(build_particles(&config, fluid_spawn));
-        particles.extend(build_particles(&config, elastic_spawn));
-
-        let mut registry =
-            MaterialRegistry::with_default(Box::new(NeoHookeanMaterial::new(p.e_lambda, p.e_mu)));
-        registry.insert(SAND_ID, Box::new(SandMaterial::new(p.s_lambda, p.s_mu)));
-        registry.insert(
-            FLUID_ID,
-            Box::new(NewtonianFluidMaterial::new(
-                p.f_density,
-                p.f_viscosity,
-                p.f_eos_k,
-                4.0,
-            )),
-        );
-
-        let elastic_centroid = Vec2::new(32.0, 46.0);
-
-        let solver = block_on(GpuSolver::new(config, particles, registry));
-
-        println!("[showcase-gpu] total particles: {}", solver.particle_count());
-
-        Self {
-            solver,
-            stepper: FixedStepController::standard(DT, p.hz),
-            prev: p,
-            elastic_centroid,
-            physics_frame: 0,
+        self.sim.step_frame();
+        self.frame += 1;
+        self.fps_frames += 1;
+        if self.fps_timer.elapsed().as_secs_f32() >= 2.0 {
+            let fps = self.fps_frames as f32 / self.fps_timer.elapsed().as_secs_f32();
+            println!("frame={} fps={:.0}", self.frame, fps);
+            self.fps_timer = std::time::Instant::now();
+            self.fps_frames = 0;
         }
+        if self.frame % 60 == 0 {
+            log_frame_gpu(self.frame, DT, self.sim.particles(), LABELS, 1);
+            let snap = self.sim.diagnostics_snapshot();
+            println!(
+                "  non_finite={}  out_of_bounds={}  max_speed={:.3}  sub={}  cfl={:.4}",
+                snap.non_finite_particle_values,
+                snap.out_of_bounds_particles,
+                snap.max_particle_speed,
+                snap.substeps_last_step,
+                snap.cfl_number,
+            );
+        }
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        self.renderer.render_gpu(
+            &self.device,
+            &self.queue,
+            self.sim.particle_buffer(),
+            self.sim.particle_count(),
+            &view,
+            true,
+        );
+        output.present();
     }
 }
 
-fn mat_color(id: u32) -> Color {
-    match id {
-        SAND_ID => Color::srgb(0.80, 0.64, 0.22),
-        FLUID_ID => Color::srgb(0.22, 0.62, 0.95),
-        _ => Color::srgb(0.38, 0.80, 0.48),
+impl ApplicationHandler for App {
+    fn resumed(&mut self, el: &ActiveEventLoop) {
+        let w = Arc::new(
+            el.create_window(
+                winit::window::WindowAttributes::default()
+                    .with_title("emerge -- Showcase GPU [Sand / Fluid / Elastic]")
+                    .with_inner_size(winit::dpi::LogicalSize::new(480u32, 480u32)),
+            )
+            .unwrap(),
+        );
+        self.state = Some(pollster::block_on(State::new(w.clone())));
+        self.window = Some(w);
+    }
+
+    fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        let Some(s) = self.state.as_mut() else { return };
+        match event {
+            WindowEvent::CloseRequested => el.exit(),
+            WindowEvent::CursorMoved { position, .. } => {
+                s.cursor_pos = [position.x as f32, position.y as f32];
+            }
+            WindowEvent::MouseInput { state, button, .. } => match button {
+                MouseButton::Left => s.lmb = state == ElementState::Pressed,
+                MouseButton::Right => s.rmb = state == ElementState::Pressed,
+                _ => {}
+            },
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(key),
+                        state,
+                        ..
+                    },
+                ..
+            } => {
+                let pressed = state == ElementState::Pressed;
+                match key {
+                    KeyCode::Escape | KeyCode::KeyQ if pressed => el.exit(),
+                    KeyCode::KeyG if pressed => {
+                        s.physics_colors = !s.physics_colors;
+                        s.renderer.set_color_mode(if s.physics_colors {
+                            ColorMode::ByPhysics
+                        } else {
+                            ColorMode::ByMaterial
+                        });
+                    }
+                    KeyCode::KeyR if pressed => {
+                        s.sim = make_sim(s.device.clone(), s.queue.clone());
+                        s.frame = 0;
+                        println!("reset");
+                    }
+                    KeyCode::ArrowUp => s.arrow_up = pressed,
+                    KeyCode::ArrowDown => s.arrow_down = pressed,
+                    KeyCode::ArrowLeft => s.arrow_left = pressed,
+                    KeyCode::ArrowRight => s.arrow_right = pressed,
+                    _ => {}
+                }
+            }
+            WindowEvent::Resized(sz) => s.resize(sz.width, sz.height),
+            WindowEvent::RedrawRequested => {
+                s.update_and_render();
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            _ => {}
+        }
     }
 }
 
 fn main() {
-    App::new()
-        .insert_resource(ClearColor(Color::srgb(0.06, 0.06, 0.09)))
-        .insert_resource(DEFAULTS)
-        .insert_resource(Sim::new(DEFAULTS))
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "emerge — Sand + Fluid + Elastic [GPU]  (arrows: move blob, R: reset)"
-                    .into(),
-                resolution: (900u32, 900u32).into(),
-                ..default()
-            }),
-            ..default()
-        }))
-        .add_plugins(EguiPlugin::default())
-        .add_systems(Startup, setup)
-        .add_systems(Update, (reset, cursor, drive, step, sync).chain())
-        .add_systems(EguiPrimaryContextPass, ui)
-        .run();
-}
-
-#[derive(Component)]
-struct PVis(usize);
-
-fn setup(mut commands: Commands, sim: Res<Sim>) {
-    commands.spawn(Camera2d);
-    for (i, p) in sim.solver.particles().iter().enumerate() {
-        commands.spawn((
-            PVis(i),
-            Sprite {
-                color: mat_color(p.material_id),
-                custom_size: Some(Vec2::ONE),
-                ..default()
-            },
-            Transform::from_translation(p2w(p.x)),
-        ));
-    }
-}
-
-fn reset(
-    keys: Res<ButtonInput<KeyCode>>,
-    mut sim: ResMut<Sim>,
-    mut p: ResMut<Params>,
-    mut commands: Commands,
-    vis: Query<Entity, With<PVis>>,
-) {
-    if keys.just_pressed(KeyCode::KeyR) {
-        *p = DEFAULTS;
-        *sim = Sim::new(DEFAULTS);
-        for e in &vis {
-            commands.entity(e).despawn();
-        }
-        for (i, pt) in sim.solver.particles().iter().enumerate() {
-            commands.spawn((
-                PVis(i),
-                Sprite {
-                    color: mat_color(pt.material_id),
-                    custom_size: Some(Vec2::ONE),
-                    ..default()
-                },
-                Transform::from_translation(p2w(pt.x)),
-            ));
-        }
-    }
-}
-
-fn cursor(
-    windows: Query<&Window>,
-    cam: Query<(&Camera, &GlobalTransform)>,
-    mb: Res<ButtonInput<MouseButton>>,
-    mut sim: ResMut<Sim>,
-    params: Res<Params>,
-) {
-    sim.solver.clear_force_fields_gpu();
-    if !mb.pressed(MouseButton::Left) && !mb.pressed(MouseButton::Right) {
-        return;
-    }
-    let Ok(win) = windows.single() else { return };
-    let Some(cp) = win.cursor_position() else {
-        return;
+    let el = EventLoop::new().unwrap();
+    el.set_control_flow(ControlFlow::Poll);
+    let mut app = App {
+        window: None,
+        state: None,
     };
-    let Ok((cam, ct)) = cam.single() else { return };
-    let Ok(wp) = cam.viewport_to_world_2d(ct, cp) else {
-        return;
-    };
-    let gp = wp / PPC + Vec2::splat(GRID as f32 * 0.5);
-    let gm = if mb.pressed(MouseButton::Right) {
-        params.cursor_strength
-    } else {
-        -params.cursor_strength
-    };
-    let r = params.cursor_radius;
-    sim.solver
-        .add_force_field_gpu(GpuForceFieldEntry::gravity_well(gp, gm, 4.0, r, r * 0.4));
-}
-
-fn drive(keys: Res<ButtonInput<KeyCode>>, mut sim: ResMut<Sim>, time: Res<Time>) {
-    let dir = {
-        let mut d = Vec2::ZERO;
-        if keys.pressed(KeyCode::ArrowLeft) {
-            d.x -= 1.0;
-        }
-        if keys.pressed(KeyCode::ArrowRight) {
-            d.x += 1.0;
-        }
-        if keys.pressed(KeyCode::ArrowUp) {
-            d.y += 1.0;
-        }
-        if keys.pressed(KeyCode::ArrowDown) {
-            d.y -= 1.0;
-        }
-        d
-    };
-    if dir == Vec2::ZERO {
-        return;
-    }
-
-    let impulse = dir.normalize() * DRIVE_STRENGTH * time.delta_secs().min(MAX_DT);
-    let centroid = sim.elastic_centroid;
-    for p in sim.solver.particles_mut() {
-        if p.material_id != ELASTIC_ID {
-            continue;
-        }
-        let dist = (p.x - centroid).length();
-        if dist < DRIVE_RADIUS {
-            p.v += impulse * (1.0 - dist / DRIVE_RADIUS);
-        }
-    }
-}
-
-fn step(time: Res<Time>, mut sim: ResMut<Sim>, params: Res<Params>) {
-    sim.solver.set_gravity(Vec2::new(0.0, params.gravity));
-    sim.stepper.set_simulation_speed(params.hz * DT);
-    let n = sim.stepper.steps_for_frame(time.delta_secs());
-    if n == 0 {
-        return;
-    }
-    if sim.prev != *params {
-        sim.solver
-            .set_default_material(Box::new(NeoHookeanMaterial::new(
-                params.e_lambda,
-                params.e_mu,
-            )));
-        sim.solver
-            .set_material(SAND_ID, Box::new(SandMaterial::new(params.s_lambda, params.s_mu)));
-        sim.solver.set_material(
-            FLUID_ID,
-            Box::new(NewtonianFluidMaterial::new(
-                params.f_density,
-                params.f_viscosity,
-                params.f_eos_k,
-                4.0,
-            )),
-        );
-        sim.prev = *params;
-    }
-    for _ in 0..n {
-        sim.solver.step_frame();
-        sim.physics_frame += 1;
-    }
-    sim.solver.sync_particles_blocking();
-    log_frame_gpu(sim.physics_frame, DT, sim.solver.particles(), LABELS, 60);
-
-    // Update elastic centroid from CPU mirror for arrow-key drive.
-    let (sum, count) = sim
-        .solver
-        .particles()
-        .iter()
-        .filter(|p| p.material_id == ELASTIC_ID)
-        .fold((Vec2::ZERO, 0usize), |(s, n), p| (s + p.x, n + 1));
-    if count > 0 {
-        sim.elastic_centroid = sum / count as f32;
-    }
-}
-
-fn sync(sim: Res<Sim>, mut vis: Query<(&PVis, &mut Transform, &mut Sprite)>) {
-    for (pv, mut t, mut s) in &mut vis {
-        if let Some(p) = sim.solver.particles().get(pv.0) {
-            t.translation = p2w(p.x);
-            s.color = mat_color(p.material_id);
-        }
-    }
-}
-
-fn ui(mut ctx: EguiContexts, mut p: ResMut<Params>, mut sim: ResMut<Sim>, time: Res<Time>) {
-    let Ok(ctx) = ctx.ctx_mut() else { return };
-    egui::Window::new("Showcase [GPU]")
-        .default_pos([10.0, 10.0])
-        .default_width(260.0)
-        .resizable(false)
-        .show(ctx, |ui| {
-            ui.label(format!(
-                "fps={:.0}  n={}  [GPU]",
-                time.delta_secs().recip(),
-                sim.solver.particle_count(),
-            ));
-            ui.separator();
-            ui.label("↑ ↓ ← →  move blob    R  reset");
-            ui.label("LMB push  RMB pull (cursor field)");
-            ui.separator();
-            ui.add(egui::Slider::new(&mut p.hz, 5.0..=60.0).text("solver_hz"));
-            ui.add(egui::Slider::new(&mut p.gravity, -3.0..=0.0).text("gravity"));
-            ui.separator();
-            ui.colored_label(egui::Color32::from_rgb(97, 204, 122), "Elastic blob (NeoHookean)");
-            ui.add(egui::Slider::new(&mut p.e_lambda, 5.0..=200.0).text("λ"));
-            ui.add(egui::Slider::new(&mut p.e_mu, 5.0..=400.0).text("µ"));
-            ui.separator();
-            ui.colored_label(egui::Color32::from_rgb(204, 163, 56), "Sand terrain (Drucker-Prager)");
-            ui.add(egui::Slider::new(&mut p.s_lambda, 50.0..=2000.0).text("λ"));
-            ui.add(egui::Slider::new(&mut p.s_mu, 25.0..=1000.0).text("µ"));
-            ui.separator();
-            ui.colored_label(egui::Color32::from_rgb(56, 158, 242), "Fluid pool (Tait EOS)");
-            ui.add(egui::Slider::new(&mut p.f_density, 1.0..=10.0).text("rho0"));
-            ui.add(egui::Slider::new(&mut p.f_viscosity, 0.0..=5.0).text("viscosity"));
-            ui.add(egui::Slider::new(&mut p.f_eos_k, 1.0..=50.0).text("eos_k"));
-            ui.separator();
-            ui.add(
-                egui::Slider::new(&mut p.cursor_strength, 10.0..=1000.0)
-                    .text("cursor force")
-                    .logarithmic(true),
-            );
-            ui.add(egui::Slider::new(&mut p.cursor_radius, 1.0..=15.0).text("cursor radius"));
-            if ui.button("Reset (R)").clicked() {
-                *p = DEFAULTS;
-                *sim = Sim::new(DEFAULTS);
-            }
-        });
-}
-
-fn p2w(pos: Vec2) -> Vec3 {
-    let c = (pos - Vec2::splat(GRID as f32 * 0.5)) * PPC;
-    Vec3::new(c.x.round(), c.y.round(), 0.0)
+    el.run_app(&mut app).unwrap();
 }

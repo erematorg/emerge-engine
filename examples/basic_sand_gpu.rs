@@ -1,295 +1,254 @@
-/// Drucker-Prager sand (GPU) — angle of repose comparison.
+extern crate emerge_engine as emerge;
+
+/// GPU Drucker-Prager sand — angle of repose comparison, zero CPU readback.
 ///
-/// Two piles fall from the same height:
-///   Mat 0  loose sand  (φ=20°, light yellow) — shallow repose angle
-///   Mat 1  dense sand  (φ=40°, dark brown)   — steep repose angle
+///   Mat 0  loose sand  (blue, phi=20 deg) — shallow repose
+///   Mat 1  dense sand  (gold, phi=40 deg) — steep repose
 ///
-/// All plasticity runs in g2p.wgsl — no CPU roundtrip per substep.
-///   cargo run --example basic_sand_gpu --features "bevy_examples,gpu"
-use bevy::prelude::*;
-use bevy::tasks::block_on;
-use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
-use emerge::gpu::{GpuForceFieldEntry, GpuSolver};
-use emerge::runtime::fixed_step::FixedStepController;
+///   cargo run --example basic_sand_gpu --features "render"
+use std::sync::Arc;
+
+use emerge::diagnostics::log_frame_gpu;
+use emerge::render::{ColorMode, Renderer};
 use emerge::{
-    MaterialRegistry, SandMaterial, SolverConfig, SpawnConfig, build_particles, log_frame_gpu,
+    DruckerPragerMaterial, GpuSimulation, MaterialRegistry, SimConfig, SpawnRegion, build_particles,
 };
-use glam::Vec2;
+use glam::{IVec2, Vec2};
+use winit::application::ApplicationHandler;
+use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::window::{Window, WindowId};
 
 const GRID: usize = 64;
 const DT: f32 = 0.1;
-const PPC: f32 = 10.0;
-const LABELS: &[(u32, &str)] = &[(0, "loose"), (1, "dense")];
-
 const MAT_LOOSE: u32 = 0;
 const MAT_DENSE: u32 = 1;
+const LABELS: &[(u32, &str)] = &[(MAT_LOOSE, "loose"), (MAT_DENSE, "dense")];
 
-#[derive(Resource, Clone, Copy, PartialEq)]
-struct Params {
-    hz: f32,
-    gravity: f32,
-    loose_phi: f32,
-    dense_phi: f32,
-    lambda: f32,
-    mu: f32,
-    cursor_strength: f32,
-    cursor_radius: f32,
+struct App {
+    window: Option<Arc<Window>>,
+    state: Option<State>,
 }
 
-const DEFAULTS: Params = Params {
-    hz: 60.0,
-    gravity: -0.3,
-    loose_phi: 20.0,
-    dense_phi: 40.0,
-    lambda: 5000.0,
-    mu: 3000.0,
-    cursor_strength: 150.0,
-    cursor_radius: 7.0,
-};
-
-#[derive(Resource)]
-struct Sim {
-    solver: GpuSolver,
-    stepper: FixedStepController,
-    prev: Params,
+struct State {
+    surface: wgpu::Surface<'static>,
+    surface_config: wgpu::SurfaceConfiguration,
+    sim: GpuSimulation,
+    renderer: Renderer,
+    cursor_pos: [f32; 2],
+    lmb: bool,
+    rmb: bool,
+    frame: u64,
+    fps_timer: std::time::Instant,
+    fps_frames: u64,
 }
 
-impl Sim {
-    fn new(p: Params) -> Self {
-        let config = SolverConfig {
-            boundary_thickness: 3,
-            max_substeps_per_step: 20,
-            gravity: Vec2::new(0.0, p.gravity),
-            ..SolverConfig::earth(GRID, 0.01, DT)
-        };
-        let spawn = |center: Vec2, mat: u32| {
-            SpawnConfig::for_solver(&config)
-                .at(center)
-                .box_of(glam::IVec2::new(28, 20))
-                .spacing(0.5)
-                .jitter(0.2)
-                .material(mat)
-        };
-        let mut particles = build_particles(&config, spawn(Vec2::new(26.0, 44.0), MAT_LOOSE));
-        particles.extend(build_particles(
-            &config,
-            spawn(Vec2::new(70.0, 44.0), MAT_DENSE),
-        ));
-
-        let mut registry =
-            MaterialRegistry::with_default(Box::new(make_sand(p.lambda, p.mu, p.loose_phi)));
-        registry.insert(MAT_DENSE, Box::new(make_sand(p.lambda, p.mu, p.dense_phi)));
-
-        let solver = block_on(GpuSolver::new(config, particles, registry));
-        Self {
-            solver,
-            stepper: FixedStepController::standard(DT, p.hz),
-            prev: p,
-        }
-    }
-}
-
-fn make_sand(lambda: f32, mu: f32, friction_deg: f32) -> SandMaterial {
-    let mut m = SandMaterial::new(lambda, mu);
-    m.friction_angle = friction_deg.to_radians();
+fn make_sand(lambda: f32, mu: f32, phi_deg: f32) -> DruckerPragerMaterial {
+    let mut m = DruckerPragerMaterial::new(lambda, mu);
+    m.friction_angle = phi_deg.to_radians();
     m
 }
 
-fn main() {
-    App::new()
-        .insert_resource(ClearColor(Color::srgb(0.08, 0.06, 0.04)))
-        .insert_resource(DEFAULTS)
-        .insert_resource(Sim::new(DEFAULTS))
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "MLS-MPM Sand (GPU) — Angle of Repose".into(),
-                resolution: (960u32, 700u32).into(),
-                ..default()
-            }),
-            ..default()
-        }))
-        .add_plugins(EguiPlugin::default())
-        .add_systems(Startup, setup)
-        .add_systems(Update, (reset, cursor, step, sync).chain())
-        .add_systems(EguiPrimaryContextPass, ui)
-        .run();
-}
-
-#[derive(Component)]
-struct PVis(usize);
-
-fn setup(mut commands: Commands, sim: Res<Sim>) {
-    commands.spawn(Camera2d);
-    for (i, p) in sim.solver.particles().iter().enumerate() {
-        let color = sand_color(p.material_id);
-        commands.spawn((
-            PVis(i),
-            Sprite {
-                color,
-                custom_size: Some(Vec2::ONE),
-                ..default()
-            },
-            Transform::from_translation(p2w(p.x)),
-        ));
-    }
-}
-
-fn sand_color(mat: u32) -> Color {
-    match mat {
-        0 => Color::srgb(0.90, 0.82, 0.50), // loose — light yellow
-        _ => Color::srgb(0.42, 0.28, 0.14), // dense — dark brown
-    }
-}
-
-fn reset(
-    keys: Res<ButtonInput<KeyCode>>,
-    mut sim: ResMut<Sim>,
-    mut p: ResMut<Params>,
-    mut commands: Commands,
-    vis: Query<Entity, With<PVis>>,
-) {
-    if keys.just_pressed(KeyCode::KeyR) {
-        *p = DEFAULTS;
-        *sim = Sim::new(DEFAULTS);
-        for e in &vis {
-            commands.entity(e).despawn();
-        }
-        for (i, pt) in sim.solver.particles().iter().enumerate() {
-            commands.spawn((
-                PVis(i),
-                Sprite {
-                    color: sand_color(pt.material_id),
-                    custom_size: Some(Vec2::ONE),
-                    ..default()
-                },
-                Transform::from_translation(p2w(pt.x)),
-            ));
-        }
-    }
-}
-
-fn cursor(
-    windows: Query<&Window>,
-    cam: Query<(&Camera, &GlobalTransform)>,
-    mb: Res<ButtonInput<MouseButton>>,
-    mut sim: ResMut<Sim>,
-    params: Res<Params>,
-) {
-    sim.solver.clear_force_fields_gpu();
-    if !mb.pressed(MouseButton::Left) && !mb.pressed(MouseButton::Right) {
-        return;
-    }
-    let Ok(win) = windows.single() else { return };
-    let Some(cp) = win.cursor_position() else {
-        return;
+fn make_sim_data(
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
+) -> GpuSimulation {
+    let config = SimConfig {
+        boundary_thickness: 3,
+        max_substeps_per_step: 12,
+        gravity: Vec2::new(0.0, -0.3),
+        ..SimConfig::earth(GRID, 0.01, DT)
     };
-    let Ok((cam, ct)) = cam.single() else { return };
-    let Ok(wp) = cam.viewport_to_world_2d(ct, cp) else {
-        return;
+    let spawn = |c: Vec2, mat: u32, seed: u32| SpawnRegion {
+        spacing: 0.5,
+        box_size: IVec2::new(18, 14),
+        box_center: c,
+        material_id: mat,
+        precompute_initial_volumes: true,
+        rng_seed: seed,
+        ..SpawnRegion::for_sim(&config)
     };
-    let gp = wp / PPC + Vec2::splat(GRID as f32 * 0.5);
-    let gm = if mb.pressed(MouseButton::Right) {
-        params.cursor_strength
-    } else {
-        -params.cursor_strength
-    };
-    let r = params.cursor_radius;
-    sim.solver
-        .add_force_field_gpu(GpuForceFieldEntry::gravity_well(gp, gm, 4.0, r, r * 0.4));
+    let mut particles = build_particles(&config, spawn(Vec2::new(17.0, 40.0), MAT_LOOSE, 11));
+    particles.extend(build_particles(&config, spawn(Vec2::new(47.0, 40.0), MAT_DENSE, 22)));
+    let mut registry = MaterialRegistry::with_default(Box::new(make_sand(5000.0, 3000.0, 20.0)));
+    registry.insert(MAT_DENSE, Box::new(make_sand(5000.0, 3000.0, 40.0)));
+    GpuSimulation::with_device(device, queue, config, particles, registry)
 }
 
-fn step(time: Res<Time>, mut sim: ResMut<Sim>, params: Res<Params>) {
-    sim.solver.set_gravity(Vec2::new(0.0, params.gravity));
-    sim.stepper.set_simulation_speed(params.hz * DT);
-    let n = sim.stepper.steps_for_frame(time.delta_secs());
-    if n == 0 {
-        return;
-    }
-    if sim.prev != *params {
-        sim.solver.set_default_material(Box::new(make_sand(
-            params.lambda,
-            params.mu,
-            params.loose_phi,
-        )));
-        sim.solver.set_material(
-            MAT_DENSE,
-            Box::new(make_sand(params.lambda, params.mu, params.dense_phi)),
+impl State {
+    async fn new(window: Arc<Window>) -> Self {
+        let size = window.inner_size();
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let surface = instance.create_surface(window.clone()).unwrap();
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+            })
+            .await
+            .expect("no GPU adapter");
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor::default())
+            .await
+            .unwrap();
+        let caps = surface.get_capabilities(&adapter);
+        let fmt = caps.formats.iter().find(|f| f.is_srgb()).copied().unwrap_or(caps.formats[0]);
+        let sc = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: fmt,
+            width: size.width,
+            height: size.height,
+            present_mode: wgpu::PresentMode::AutoVsync,
+            desired_maximum_frame_latency: 2,
+            alpha_mode: caps.alpha_modes[0],
+            view_formats: vec![],
+        };
+        surface.configure(&device, &sc);
+        let sim = make_sim_data(Arc::new(device), Arc::new(queue));
+        let mut renderer = Renderer::new(sim.device(), sim.particle_count(), fmt);
+        renderer.set_camera(sim.queue(), GRID as u32, size.width, size.height, 0.6, true);
+        renderer.set_color_mode(ColorMode::ByMaterial);
+        println!(
+            "sand GPU: {} particles  |  LMB push  RMB pull  R reset  Q quit",
+            sim.particle_count()
         );
-        sim.prev = *params;
+        Self {
+            surface,
+            surface_config: sc,
+            sim,
+            renderer,
+            cursor_pos: [0.0; 2],
+            lmb: false,
+            rmb: false,
+            frame: 0,
+            fps_timer: std::time::Instant::now(),
+            fps_frames: 0,
+        }
     }
-    for _ in 0..n {
-        sim.solver.step_frame();
+
+    fn resize(&mut self, w: u32, h: u32) {
+        if w == 0 || h == 0 {
+            return;
+        }
+        self.surface_config.width = w;
+        self.surface_config.height = h;
+        self.surface.configure(self.sim.device(), &self.surface_config);
+        self.renderer.set_camera(self.sim.queue(), GRID as u32, w, h, 0.6, true);
     }
-    sim.solver.sync_particles_blocking();
-    static FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let f = FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    log_frame_gpu(f, DT, sim.solver.particles(), LABELS, 60);
+
+    fn cursor_grid(&self) -> Vec2 {
+        Vec2::new(
+            self.cursor_pos[0] / self.surface_config.width as f32 * GRID as f32,
+            (1.0 - self.cursor_pos[1] / self.surface_config.height as f32) * GRID as f32,
+        )
+    }
+
+    fn reset(&mut self) {
+        let (device, queue) = (self.sim.device().clone(), self.sim.queue().clone());
+        self.sim = make_sim_data(device, queue);
+        self.frame = 0;
+        println!("reset");
+    }
+
+    fn update_and_render(&mut self) {
+        if self.lmb || self.rmb {
+            let mag = if self.lmb { 12.0 } else { -12.0 };
+            self.sim.apply_radial_impulse(self.cursor_grid(), 7.0, mag);
+        }
+        let output = match self.surface.get_current_texture() {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+        self.sim.step_frame();
+        self.frame += 1;
+        self.fps_frames += 1;
+        if self.fps_timer.elapsed().as_secs_f32() >= 2.0 {
+            let fps = self.fps_frames as f32 / self.fps_timer.elapsed().as_secs_f32();
+            println!("frame={} fps={:.0}", self.frame, fps);
+            self.fps_timer = std::time::Instant::now();
+            self.fps_frames = 0;
+        }
+        if self.frame % 60 == 0 {
+            log_frame_gpu(self.frame, DT, self.sim.particles(), LABELS, 1);
+            let snap = self.sim.diagnostics_snapshot();
+            println!(
+                "  non_finite={}  out_of_bounds={}  max_speed={:.3}  sub={}  cfl={:.4}",
+                snap.non_finite_particle_values,
+                snap.out_of_bounds_particles,
+                snap.max_particle_speed,
+                snap.substeps_last_step,
+                snap.cfl_number,
+            );
+        }
+        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.renderer.render_gpu(
+            self.sim.device(),
+            self.sim.queue(),
+            self.sim.particle_buffer(),
+            self.sim.particle_count(),
+            &view,
+            true,
+        );
+        output.present();
+    }
 }
 
-fn sync(sim: Res<Sim>, mut vis: Query<(&PVis, &mut Transform)>) {
-    for (pv, mut t) in &mut vis {
-        if let Some(p) = sim.solver.particles().get(pv.0) {
-            t.translation = p2w(p.x);
+impl ApplicationHandler for App {
+    fn resumed(&mut self, el: &ActiveEventLoop) {
+        let w = Arc::new(
+            el.create_window(
+                winit::window::WindowAttributes::default()
+                    .with_title("emerge — Sand GPU [Drucker-Prager: loose phi=20 / dense phi=40]")
+                    .with_inner_size(winit::dpi::LogicalSize::new(480u32, 480u32)),
+            )
+            .unwrap(),
+        );
+        self.state = Some(pollster::block_on(State::new(w.clone())));
+        self.window = Some(w);
+    }
+
+    fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        let Some(s) = self.state.as_mut() else { return };
+        match event {
+            WindowEvent::CloseRequested => el.exit(),
+            WindowEvent::CursorMoved { position, .. } => {
+                s.cursor_pos = [position.x as f32, position.y as f32];
+            }
+            WindowEvent::MouseInput { state, button, .. } => match button {
+                MouseButton::Left => s.lmb = state == ElementState::Pressed,
+                MouseButton::Right => s.rmb = state == ElementState::Pressed,
+                _ => {}
+            },
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(key),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } => match key {
+                KeyCode::Escape | KeyCode::KeyQ => el.exit(),
+                KeyCode::KeyR => s.reset(),
+                _ => {}
+            },
+            WindowEvent::Resized(sz) => s.resize(sz.width, sz.height),
+            WindowEvent::RedrawRequested => {
+                s.update_and_render();
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            _ => {}
         }
     }
 }
 
-fn ui(mut ctx: EguiContexts, mut p: ResMut<Params>, mut sim: ResMut<Sim>, time: Res<Time>) {
-    let Ok(ctx) = ctx.ctx_mut() else { return };
-    egui::Window::new("Sand (GPU)")
-        .default_pos([10.0, 10.0])
-        .default_width(280.0)
-        .resizable(false)
-        .show(ctx, |ui| {
-            ui.label(format!(
-                "fps={:.0}  n={}  [GPU DP]",
-                time.delta_secs().recip(),
-                sim.solver.particle_count(),
-            ));
-            ui.separator();
-            ui.add(egui::Slider::new(&mut p.hz, 5.0..=60.0).text("solver_hz"));
-            ui.add(egui::Slider::new(&mut p.gravity, -5.0..=0.0).text("gravity"));
-            ui.separator();
-            ui.label("Drucker-Prager friction angles");
-            ui.add(
-                egui::Slider::new(&mut p.loose_phi, 5.0..=60.0)
-                    .text("loose φ (left)")
-                    .suffix("°"),
-            );
-            ui.add(
-                egui::Slider::new(&mut p.dense_phi, 5.0..=60.0)
-                    .text("dense φ (right)")
-                    .suffix("°"),
-            );
-            ui.label("↑ steeper φ → steeper pile slope");
-            ui.separator();
-            ui.label("Stiffness (shared)");
-            ui.add(
-                egui::Slider::new(&mut p.lambda, 1000.0..=100000.0)
-                    .text("λ")
-                    .logarithmic(true),
-            );
-            ui.add(
-                egui::Slider::new(&mut p.mu, 500.0..=80000.0)
-                    .text("µ")
-                    .logarithmic(true),
-            );
-            ui.separator();
-            ui.add(
-                egui::Slider::new(&mut p.cursor_strength, 10.0..=1000.0)
-                    .text("cursor force")
-                    .logarithmic(true),
-            );
-            ui.add(egui::Slider::new(&mut p.cursor_radius, 1.0..=20.0).text("cursor radius"));
-            ui.label("LMB: push  RMB: pull  R: reset");
-            if ui.button("Reset (R)").clicked() {
-                *p = DEFAULTS;
-                *sim = Sim::new(DEFAULTS);
-            }
-        });
-}
-
-fn p2w(pos: Vec2) -> Vec3 {
-    let c = (pos - Vec2::splat(GRID as f32 * 0.5)) * PPC;
-    Vec3::new(c.x, c.y, 0.0)
+fn main() {
+    let el = EventLoop::new().unwrap();
+    el.set_control_flow(ControlFlow::Poll);
+    let mut app = App { window: None, state: None };
+    el.run_app(&mut app).unwrap();
 }

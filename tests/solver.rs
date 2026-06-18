@@ -1,3 +1,5 @@
+﻿extern crate emerge_engine as emerge;
+
 use std::collections::HashMap;
 
 use emerge::fields::{
@@ -5,30 +7,30 @@ use emerge::fields::{
 };
 use emerge::thermodynamics::{ThermalConfig, ThermalDiffusion};
 use emerge::{
-    MpmSolver, NaccMaterial, NeoHookeanMaterial, NewtonianFluidMaterial, RankineMaterial,
-    SandMaterial, SandMuIMaterial, SlipBoundary, SnowMaterial, SolverConfig, SpawnConfig,
-    VonMisesMaterial,
+    DruckerPragerMaterial, MuIRheologyMaterial, NaccMaterial, NeoHookeanMaterial,
+    NewtonianFluidMaterial, RankineMaterial, SimConfig, Simulation, SlipBoundary, SpawnRegion,
+    StomakhinMaterial, VonMisesMaterial,
 };
 use glam::{IVec2, Vec2};
 
 // --- helpers ---
 
-fn small_solver_config() -> SolverConfig {
-    SolverConfig {
+fn small_solver_config() -> SimConfig {
+    SimConfig {
         grid_res: 32,
         dt: 0.1,
         adaptive_timestep: true,
-        ..SolverConfig::default()
+        ..SimConfig::default()
     }
 }
 
-fn small_spawn_config(center: f32) -> SpawnConfig {
-    SpawnConfig {
+fn small_spawn_config(center: f32) -> SpawnRegion {
+    SpawnRegion {
         spacing: 0.5,
         box_size: IVec2::new(8, 8),
         box_center: Vec2::splat(center),
         initial_velocity_scale: 0.0,
-        ..SpawnConfig::default()
+        ..SpawnRegion::default()
     }
 }
 
@@ -36,7 +38,7 @@ fn small_spawn_config(center: f32) -> SpawnConfig {
 
 #[test]
 fn step_keeps_particles_inside_domain() {
-    let mut solver = MpmSolver::new(SolverConfig::default(), SpawnConfig::default());
+    let mut solver = Simulation::new(SimConfig::default(), SpawnRegion::default());
     solver.step_n(20);
     let min = solver.config().boundary_thickness.saturating_sub(1) as f32;
     let max = solver
@@ -51,11 +53,11 @@ fn step_keeps_particles_inside_domain() {
 
 #[test]
 fn precomputed_volumes_are_positive() {
-    let spawn = SpawnConfig {
+    let spawn = SpawnRegion {
         precompute_initial_volumes: true,
-        ..SpawnConfig::default()
+        ..SpawnRegion::default()
     };
-    let solver = MpmSolver::new(SolverConfig::default(), spawn);
+    let solver = Simulation::new(SimConfig::default(), spawn);
     for p in solver.particles() {
         assert!(p.initial_volume > 0.0);
     }
@@ -65,7 +67,7 @@ fn precomputed_volumes_are_positive() {
 
 #[test]
 fn jelly_stable_after_many_steps() {
-    let mut solver = MpmSolver::new(small_solver_config(), small_spawn_config(16.0))
+    let mut solver = Simulation::new(small_solver_config(), small_spawn_config(16.0))
         .with_default_material(Box::new(NeoHookeanMaterial::new(10.0, 20.0)));
 
     solver.step_n(200);
@@ -89,11 +91,11 @@ fn jelly_stable_after_many_steps() {
 
 #[test]
 fn fluid_stable_after_many_steps() {
-    let solver_config = SolverConfig {
+    let solver_config = SimConfig {
         recompute_density_each_step: true,
         ..small_solver_config()
     };
-    let mut solver = MpmSolver::new(solver_config, small_spawn_config(16.0))
+    let mut solver = Simulation::new(solver_config, small_spawn_config(16.0))
         .with_default_material(Box::new(NewtonianFluidMaterial::new(4.0, 0.1, 10.0, 4.0)));
 
     solver.step_n(200);
@@ -115,12 +117,12 @@ fn fluid_stable_after_many_steps() {
 }
 
 #[test]
-fn spawn_for_solver_adapts_center_to_grid_resolution() {
-    let config = SolverConfig {
+fn spawn_for_sim_adapts_center_to_grid_resolution() {
+    let config = SimConfig {
         grid_res: 128,
-        ..SolverConfig::default()
+        ..SimConfig::default()
     };
-    let spawn = SpawnConfig::for_solver(&config);
+    let spawn = SpawnRegion::for_sim(&config);
     assert_eq!(spawn.box_center, Vec2::splat(64.0));
 }
 
@@ -128,8 +130,8 @@ fn spawn_for_solver_adapts_center_to_grid_resolution() {
 
 #[test]
 fn snow_stable_after_many_steps() {
-    let snow = SnowMaterial::new(38_889.0, 58_333.0, 10.0, 0.02, 0.006, 0.05, 20.0);
-    let mut solver = MpmSolver::new(small_solver_config(), small_spawn_config(16.0))
+    let snow = StomakhinMaterial::new(38_889.0, 58_333.0, 10.0, 0.02, 0.006, 0.05, 20.0);
+    let mut solver = Simulation::new(small_solver_config(), small_spawn_config(16.0))
         .with_default_material(Box::new(snow));
     solver.step_n(200);
     for (i, p) in solver.particles().iter().enumerate() {
@@ -151,8 +153,8 @@ fn snow_stable_after_many_steps() {
 
 #[test]
 fn sand_stable_after_many_steps() {
-    let sand = SandMaterial::new(1_000.0, 500.0);
-    let mut solver = MpmSolver::new(small_solver_config(), small_spawn_config(16.0))
+    let sand = DruckerPragerMaterial::new(1_000.0, 500.0);
+    let mut solver = Simulation::new(small_solver_config(), small_spawn_config(16.0))
         .with_default_material(Box::new(sand));
     solver.step_n(200);
     for (i, p) in solver.particles().iter().enumerate() {
@@ -175,15 +177,15 @@ fn sand_stable_after_many_steps() {
 #[test]
 fn von_mises_yield_stays_finite() {
     let vm = VonMisesMaterial::new(500.0, 200.0, 50.0);
-    let config = SolverConfig {
+    let config = SimConfig {
         gravity: Vec2::new(0.0, -9.81),
         ..small_solver_config()
     };
-    let spawn = SpawnConfig {
+    let spawn = SpawnRegion {
         initial_velocity_scale: 10.0,
         ..small_spawn_config(16.0)
     };
-    let mut solver = MpmSolver::new(config, spawn).with_default_material(Box::new(vm));
+    let mut solver = Simulation::new(config, spawn).with_default_material(Box::new(vm));
     solver.step_n(100);
     for (i, p) in solver.particles().iter().enumerate() {
         assert!(p.x.is_finite(), "vm particle {i}: position non-finite");
@@ -198,16 +200,16 @@ fn von_mises_yield_stays_finite() {
 fn rankine_damage_stays_finite_and_j_positive() {
     // High tensile load: spawn with upward velocity so particles stretch.
     // Rankine should project tensile stress and accumulate finite damage.
-    let rock = RankineMaterial::rock(2_000.0, 1_000.0);
-    let config = SolverConfig {
-        gravity: Vec2::new(0.0, 9.81), // upward — stretches the block in tension
+    let rock = RankineMaterial::stiff_brittle(2666.7, 0.333);
+    let config = SimConfig {
+        gravity: Vec2::new(0.0, 9.81), // upward â€” stretches the block in tension
         ..small_solver_config()
     };
-    let spawn = SpawnConfig {
+    let spawn = SpawnRegion {
         initial_velocity_scale: 5.0,
         ..small_spawn_config(16.0)
     };
-    let mut solver = MpmSolver::new(config, spawn).with_default_material(Box::new(rock));
+    let mut solver = Simulation::new(config, spawn).with_default_material(Box::new(rock));
     solver.step_n(100);
     for (i, p) in solver.particles().iter().enumerate() {
         assert!(p.x.is_finite(), "rankine particle {i}: position non-finite");
@@ -236,10 +238,10 @@ fn rankine_softening_reduces_tensile_strength() {
     p.initial_volume = 1.0;
     p.volume = 1.0;
     p.density = 1.0;
-    // Deformation gradient: pure extension in x by 20% — puts particle in tension
+    // Deformation gradient: pure extension in x by 20% â€” puts particle in tension
     p.deformation_gradient =
         glam::Mat2::from_cols(glam::Vec2::new(1.2, 0.0), glam::Vec2::new(0.0, 1.0));
-    // Velocity gradient: zero (no ongoing flow — just check state update)
+    // Velocity gradient: zero (no ongoing flow â€” just check state update)
     p.velocity_gradient = glam::Mat2::ZERO;
 
     let mut soa = Particles::from(vec![p]);
@@ -263,7 +265,7 @@ fn phase_transition_switches_material_ids() {
     const JELLY_ID: u32 = 0;
     const FLUID_ID: u32 = 1;
 
-    let mut solver = MpmSolver::new(small_solver_config(), small_spawn_config(16.0))
+    let mut solver = Simulation::new(small_solver_config(), small_spawn_config(16.0))
         .with_default_material(Box::new(NeoHookeanMaterial::new(100.0, 50.0)))
         .with_material(
             FLUID_ID,
@@ -286,35 +288,35 @@ fn phase_transition_switches_material_ids() {
     assert!(fluid_count > 0, "no particles transitioned to fluid");
     assert!(
         jelly_count > 0,
-        "all particles transitioned — expected partial"
+        "all particles transitioned â€” expected partial"
     );
     assert_eq!(fluid_count + jelly_count, solver.particles().len());
 }
 
 #[test]
 fn small_grid_validation_is_consistent_with_grid_constructor() {
-    let config = SolverConfig {
+    let config = SimConfig {
         grid_res: 3,
-        ..SolverConfig::default()
+        ..SimConfig::default()
     };
-    let spawn = SpawnConfig::for_solver(&config);
+    let spawn = SpawnRegion::for_sim(&config);
     let result = std::panic::catch_unwind(|| {
-        let _ = MpmSolver::new(config, spawn);
+        let _ = Simulation::new(config, spawn);
     });
     assert!(result.is_err(), "grid_res=3 should fail validation");
 }
 
-// --- ForceField integration tests ---
+// --- Field integration tests ---
 
 #[test]
 fn gravity_well_pulls_particles_toward_source() {
     // Zero background gravity so only the well acts.
-    // Blob placed left, well placed right — centre of mass must drift rightward.
-    let config = SolverConfig {
+    // Blob placed left, well placed right â€” centre of mass must drift rightward.
+    let config = SimConfig {
         gravity: Vec2::ZERO,
         ..small_solver_config()
     };
-    let spawn = SpawnConfig {
+    let spawn = SpawnRegion {
         box_center: Vec2::new(8.0, 16.0),
         ..small_spawn_config(8.0)
     };
@@ -327,7 +329,7 @@ fn gravity_well_pulls_particles_toward_source() {
     )
     .with_cutoff(30.0);
 
-    let mut solver = MpmSolver::new(config, spawn)
+    let mut solver = Simulation::new(config, spawn)
         .with_default_material(Box::new(NeoHookeanMaterial::new(10.0, 20.0)))
         .with_force_field(Box::new(well));
 
@@ -358,23 +360,23 @@ fn gravity_well_pulls_particles_toward_source() {
 #[test]
 fn radial_confinement_keeps_particles_inside() {
     // High-velocity particles should not escape beyond confinement radius + 2 cell tolerance.
-    let config = SolverConfig {
+    let config = SimConfig {
         gravity: Vec2::ZERO,
         ..small_solver_config()
     };
     let center = Vec2::splat(16.0);
     let radius = 6.0_f32;
 
-    let spawn = SpawnConfig {
+    let spawn = SpawnRegion {
         box_center: center,
         box_size: IVec2::new(4, 4),
         initial_velocity_scale: 15.0,
-        ..SpawnConfig::default()
+        ..SpawnRegion::default()
     };
 
     let field = RadialConfinementField::new(center, radius, 500.0);
 
-    let mut solver = MpmSolver::new(config, spawn)
+    let mut solver = Simulation::new(config, spawn)
         .with_default_material(Box::new(NeoHookeanMaterial::new(10.0, 20.0)))
         .with_force_field(Box::new(field));
 
@@ -396,19 +398,19 @@ fn radial_confinement_keeps_particles_inside() {
 #[test]
 fn coulomb_repulsion_pushes_charged_particles_away() {
     // Positive point source at center. Same-sign material particles should spread outward.
-    let config = SolverConfig {
+    let config = SimConfig {
         gravity: Vec2::ZERO,
         ..small_solver_config()
     };
     let source_pos = Vec2::splat(16.0);
-    let spawn = SpawnConfig {
+    let spawn = SpawnRegion {
         box_center: source_pos,
         box_size: IVec2::new(4, 4),
-        ..SpawnConfig::default()
+        ..SpawnRegion::default()
     };
 
     let mut mat_charges = HashMap::new();
-    mat_charges.insert(0u32, 1.0_f32); // material 0 = positive charge, same as source → repels
+    mat_charges.insert(0u32, 1.0_f32); // material 0 = positive charge, same as source â†’ repels
 
     let field = CoulombField::new(
         vec![(source_pos, 10.0)],
@@ -418,7 +420,7 @@ fn coulomb_repulsion_pushes_charged_particles_away() {
     )
     .with_cutoff(20.0);
 
-    let mut solver = MpmSolver::new(config, spawn)
+    let mut solver = Simulation::new(config, spawn)
         .with_default_material(Box::new(NeoHookeanMaterial::new(10.0, 20.0)))
         .with_force_field(Box::new(field));
 
@@ -455,7 +457,7 @@ fn coulomb_repulsion_pushes_charged_particles_away() {
 fn thermal_diffusion_spreads_heat() {
     // Left half hot, right half cold. After diffusion:
     // max temp must drop (hot cools), min temp must rise (cold warms).
-    let config = SolverConfig {
+    let config = SimConfig {
         gravity: Vec2::ZERO,
         ..small_solver_config()
     };
@@ -470,7 +472,7 @@ fn thermal_diffusion_spreads_heat() {
         config.grid_res,
     );
 
-    let mut solver = MpmSolver::new(config, small_spawn_config(16.0))
+    let mut solver = Simulation::new(config, small_spawn_config(16.0))
         .with_default_material(Box::new(NeoHookeanMaterial::new(10.0, 20.0)))
         .with_thermal(thermal);
 
@@ -481,7 +483,7 @@ fn thermal_diffusion_spreads_heat() {
         }
     }
 
-    // Mean temperature of each half — more robust than min/max at a sharp discontinuity.
+    // Mean temperature of each half â€” more robust than min/max at a sharp discontinuity.
     let mean_hot_before = {
         let hot: Vec<f32> = solver
             .particles()
@@ -541,8 +543,8 @@ fn thermal_diffusion_spreads_heat() {
 
 #[test]
 fn thermal_uniform_temperature_stays_stable() {
-    // All particles at the same temperature as ambient — diffusion should produce no drift.
-    let config = SolverConfig {
+    // All particles at the same temperature as ambient â€” diffusion should produce no drift.
+    let config = SimConfig {
         gravity: Vec2::ZERO,
         ..small_solver_config()
     };
@@ -551,14 +553,14 @@ fn thermal_uniform_temperature_stays_stable() {
         ThermalConfig {
             conductivity: 1.0,
             heat_capacity: 1000.0,
-            ambient: initial_temp, // same as particles → no boundary sink/source
+            ambient: initial_temp, // same as particles â†’ no boundary sink/source
             grid_cell_size: 0.1,
             ..Default::default()
         },
         config.grid_res,
     );
 
-    let mut solver = MpmSolver::new(config, small_spawn_config(16.0))
+    let mut solver = Simulation::new(config, small_spawn_config(16.0))
         .with_default_material(Box::new(NeoHookeanMaterial::new(10.0, 20.0)))
         .with_thermal(thermal);
 
@@ -585,11 +587,11 @@ fn thermal_uniform_temperature_stays_stable() {
 #[test]
 fn apply_impulse_shifts_velocity() {
     // Apply rightward impulse from center. All particles near center should gain +x velocity.
-    let config = SolverConfig {
+    let config = SimConfig {
         gravity: Vec2::ZERO,
         ..small_solver_config()
     };
-    let mut solver = MpmSolver::new(config, small_spawn_config(16.0))
+    let mut solver = Simulation::new(config, small_spawn_config(16.0))
         .with_default_material(Box::new(NeoHookeanMaterial::new(10.0, 20.0)));
 
     let avg_vx_before: f32 =
@@ -609,11 +611,11 @@ fn apply_impulse_shifts_velocity() {
 #[test]
 fn apply_radial_impulse_increases_avg_speed() {
     // Outward radial impulse: all directions cancel in mean velocity but speed goes up.
-    let config = SolverConfig {
+    let config = SimConfig {
         gravity: Vec2::ZERO,
         ..small_solver_config()
     };
-    let mut solver = MpmSolver::new(config, small_spawn_config(16.0))
+    let mut solver = Simulation::new(config, small_spawn_config(16.0))
         .with_default_material(Box::new(NeoHookeanMaterial::new(10.0, 20.0)));
 
     let avg_speed_before: f32 = solver.particles().iter().map(|p| p.v.length()).sum::<f32>()
@@ -633,14 +635,14 @@ fn apply_radial_impulse_increases_avg_speed() {
 #[test]
 fn material_state_counts_and_centroid() {
     const FLUID_ID: u32 = 1;
-    let mut solver = MpmSolver::new(small_solver_config(), small_spawn_config(16.0))
+    let mut solver = Simulation::new(small_solver_config(), small_spawn_config(16.0))
         .with_default_material(Box::new(NeoHookeanMaterial::new(10.0, 20.0)))
         .with_material(
             FLUID_ID,
             Box::new(NewtonianFluidMaterial::new(4.0, 0.1, 10.0, 4.0)),
         );
 
-    // Left half → FLUID_ID, right half → default (0).
+    // Left half â†’ FLUID_ID, right half â†’ default (0).
     solver.phase_transition(|p| p.x.x < 16.0, FLUID_ID);
 
     let total = solver.particles().len();
@@ -677,7 +679,7 @@ fn material_state_counts_and_centroid() {
 #[test]
 fn region_state_returns_subset_in_radius() {
     // Small radius should include fewer particles than a large radius.
-    let solver = MpmSolver::new(small_solver_config(), small_spawn_config(16.0))
+    let solver = Simulation::new(small_solver_config(), small_spawn_config(16.0))
         .with_default_material(Box::new(NeoHookeanMaterial::new(10.0, 20.0)));
 
     let center = Vec2::splat(16.0);
@@ -703,22 +705,22 @@ fn region_state_returns_subset_in_radius() {
 #[test]
 fn aabb_confinement_keeps_particles_inside() {
     // High-velocity particles should stay within the AABB soft wall bounds.
-    let config = SolverConfig {
+    let config = SimConfig {
         gravity: Vec2::ZERO,
         ..small_solver_config()
     };
     let min = Vec2::new(8.0, 8.0);
     let max = Vec2::new(24.0, 24.0);
 
-    let spawn = SpawnConfig {
+    let spawn = SpawnRegion {
         box_center: Vec2::splat(16.0),
         box_size: IVec2::new(4, 4),
         initial_velocity_scale: 15.0,
-        ..SpawnConfig::default()
+        ..SpawnRegion::default()
     };
 
     let field = AabbConfinementField::new(min, max, 500.0);
-    let mut solver = MpmSolver::new(config, spawn)
+    let mut solver = Simulation::new(config, spawn)
         .with_default_material(Box::new(NeoHookeanMaterial::new(10.0, 20.0)))
         .with_force_field(Box::new(field));
 
@@ -745,12 +747,12 @@ fn spawn_region_appends_particles() {
     // First region at left side, second region at right side.
     // spawn_region must return the correct index range and increase particle count.
     let config = small_solver_config();
-    let first_spawn = SpawnConfig {
+    let first_spawn = SpawnRegion {
         box_center: Vec2::new(10.0, 16.0),
         box_size: IVec2::new(4, 4),
-        ..SpawnConfig::default()
+        ..SpawnRegion::default()
     };
-    let mut solver = MpmSolver::new(config, first_spawn)
+    let mut solver = Simulation::new(config, first_spawn)
         .with_default_material(Box::new(NeoHookeanMaterial::new(10.0, 20.0)));
 
     let count_before = solver.particles().len();
@@ -759,26 +761,33 @@ fn spawn_region_appends_particles() {
         "spawn_region: initial spawn produced no particles"
     );
 
-    let second_spawn = SpawnConfig {
+    let second_spawn = SpawnRegion {
         box_center: Vec2::new(22.0, 16.0),
         box_size: IVec2::new(4, 4),
-        ..SpawnConfig::default()
+        ..SpawnRegion::default()
     };
-    let tag = solver.spawn_group(second_spawn);
+    let tag = solver.add_body(second_spawn);
 
     let count_after = solver.particles().len();
-    assert!(count_after > count_before, "spawn_group: spawned zero particles");
+    assert!(
+        count_after > count_before,
+        "add_body: spawned zero particles"
+    );
 
     let group_count = solver.group_count(tag);
-    assert!(group_count > 0, "spawn_group: tag_index has no entries");
-    assert_eq!(group_count, count_after - count_before, "spawn_group: group_count mismatch");
+    assert!(group_count > 0, "add_body: tag_index has no entries");
+    assert_eq!(
+        group_count,
+        count_after - count_before,
+        "add_body: group_count mismatch"
+    );
 
     // All particles in the new group should be in the right region.
     let ps = solver.particles();
     for i in solver.particles_with_tag(tag) {
         assert!(
             ps.x[i].x > 16.0,
-            "spawn_group: particle not in expected region (x={:.2})",
+            "add_body: particle not in expected region (x={:.2})",
             ps.x[i].x
         );
     }
@@ -786,7 +795,7 @@ fn spawn_region_appends_particles() {
 
 #[test]
 fn diagnostics_snapshot_is_clean_after_stable_sim() {
-    let mut solver = MpmSolver::new(small_solver_config(), small_spawn_config(16.0))
+    let mut solver = Simulation::new(small_solver_config(), small_spawn_config(16.0))
         .with_default_material(Box::new(NeoHookeanMaterial::new(10.0, 20.0)));
 
     solver.step_n(20);
@@ -815,25 +824,25 @@ fn diagnostics_snapshot_is_clean_after_stable_sim() {
 #[test]
 fn gravity_well_cutoff_prevents_far_particles_from_moving() {
     // Particles placed far beyond cutoff. With gravity=0, they should not accelerate.
-    let config = SolverConfig {
+    let config = SimConfig {
         gravity: Vec2::ZERO,
         grid_res: 64,
-        ..SolverConfig::default()
+        ..SimConfig::default()
     };
-    // Well at center (32,32), cutoff=5 cells. Particles far away at (56,32) → dist=24 >> cutoff.
+    // Well at center (32,32), cutoff=5 cells. Particles far away at (56,32) â†’ dist=24 >> cutoff.
     let well = GravityWellField::new(
         vec![(Vec2::new(32.0, 32.0), 1_000_000.0)],
         1.0, // strong G
         1.0, // softening
     )
-    .with_cutoff(5.0); // cutoff — particles at dist=24 are 4.8× beyond cutoff
-    let spawn = SpawnConfig {
+    .with_cutoff(5.0); // cutoff â€” particles at dist=24 are 4.8Ã— beyond cutoff
+    let spawn = SpawnRegion {
         box_center: Vec2::new(56.0, 32.0),
         box_size: IVec2::new(4, 4),
         initial_velocity_scale: 0.0,
-        ..SpawnConfig::default()
+        ..SpawnRegion::default()
     };
-    let mut solver = MpmSolver::new(config, spawn)
+    let mut solver = Simulation::new(config, spawn)
         .with_default_material(Box::new(NeoHookeanMaterial::new(10.0, 20.0)))
         .with_force_field(Box::new(well));
 
@@ -845,7 +854,7 @@ fn gravity_well_cutoff_prevents_far_particles_from_moving() {
     let cx_after: f32 =
         solver.particles().iter().map(|p| p.x.x).sum::<f32>() / solver.particles().len() as f32;
 
-    // CoM should not have drifted left (toward well) — cutoff blocks the force.
+    // CoM should not have drifted left (toward well) â€” cutoff blocks the force.
     // Allow 0.5-cell drift from boundary reflection and elastic oscillation.
     assert!(
         (cx_after - cx_before).abs() < 0.5,
@@ -854,30 +863,30 @@ fn gravity_well_cutoff_prevents_far_particles_from_moving() {
 }
 
 /// GPU and CPU solvers must produce statistically equivalent physics.
-/// Compares aggregate quantities (centre of mass, mean speed) — not per-particle positions,
+/// Compares aggregate quantities (centre of mass, mean speed) â€” not per-particle positions,
 /// since GPU atomic-scatter ordering causes sub-cell trajectory differences that are
 /// physically equivalent but particle-ID-permuted.
 #[cfg(feature = "gpu")]
 #[test]
 fn gpu_cpu_parity() {
-    use emerge::gpu::GpuSolver;
+    use emerge::gpu::GpuSimulation;
     use emerge::materials::MaterialRegistry;
 
-    let config = SolverConfig {
+    let config = SimConfig {
         grid_res: 32,
         dt: 0.002,
         adaptive_timestep: false,
         gravity: Vec2::new(0.0, -1.0),
-        ..SolverConfig::default()
+        ..SimConfig::default()
     };
     let material = NeoHookeanMaterial::new(1_000.0, 500.0);
 
-    let mut cpu = MpmSolver::new(config.clone(), small_spawn_config(16.0))
-        .with_default_material(Box::new(material));
+    let mut cpu =
+        Simulation::new(config, small_spawn_config(16.0)).with_default_material(Box::new(material));
 
     // Identical starting state for GPU.
-    let mut gpu = pollster::block_on(GpuSolver::new(
-        config.clone(),
+    let mut gpu = pollster::block_on(GpuSimulation::new(
+        config,
         cpu.particles().to_vec(),
         MaterialRegistry::with_default(Box::new(material)),
     ));
@@ -912,17 +921,17 @@ fn gpu_cpu_parity() {
 
 #[test]
 fn sand_mui_stable_after_many_steps() {
-    // µ(I) sand: high-velocity spawn stresses the rate-dependent return mapping.
-    let mui = SandMuIMaterial::new(1_000.0, 500.0);
-    let config = SolverConfig {
+    // Âµ(I) sand: high-velocity spawn stresses the rate-dependent return mapping.
+    let mui = MuIRheologyMaterial::new(1_000.0, 500.0);
+    let config = SimConfig {
         gravity: Vec2::new(0.0, -0.5),
         ..small_solver_config()
     };
-    let spawn = SpawnConfig {
+    let spawn = SpawnRegion {
         initial_velocity_scale: 5.0,
         ..small_spawn_config(16.0)
     };
-    let mut solver = MpmSolver::new(config, spawn).with_default_material(Box::new(mui));
+    let mut solver = Simulation::new(config, spawn).with_default_material(Box::new(mui));
     solver.step_n(200);
     for (i, p) in solver.particles().iter().enumerate() {
         assert!(p.x.is_finite(), "mui particle {i}: position non-finite");
@@ -944,13 +953,13 @@ fn sand_mui_stable_after_many_steps() {
 
 #[test]
 fn nacc_stable_after_many_steps() {
-    let nacc = NaccMaterial::soft_clay();
-    let config = SolverConfig {
+    let nacc = NaccMaterial::soft_clay(5.0e4, 0.3);
+    let config = SimConfig {
         gravity: Vec2::new(0.0, -0.3),
         ..small_solver_config()
     };
     let mut solver =
-        MpmSolver::new(config, small_spawn_config(16.0)).with_default_material(Box::new(nacc));
+        Simulation::new(config, small_spawn_config(16.0)).with_default_material(Box::new(nacc));
     solver.step_n(200);
     for (i, p) in solver.particles().iter().enumerate() {
         assert!(p.x.is_finite(), "nacc particle {i}: position non-finite");
@@ -969,22 +978,22 @@ fn nacc_stable_after_many_steps() {
 fn retain_particles_syncs_active_count_and_steps_cleanly() {
     // Regression: particles_mut().retain() desynchronised active_count,
     // causing index-out-of-bounds in scatter_particle_mass on next step.
-    let config = SolverConfig {
+    let config = SimConfig {
         grid_res: 32,
         dt: 0.1,
-        ..SolverConfig::standard(32, 0.1, Vec2::new(0.0, -0.1))
+        ..SimConfig::standard(32, 0.1, Vec2::new(0.0, -0.1))
     };
-    let spawn = SpawnConfig {
+    let spawn = SpawnRegion {
         spacing: 0.5,
         box_size: glam::IVec2::new(16, 16),
         box_center: Vec2::splat(16.0),
         initial_velocity_scale: 0.0,
-        ..SpawnConfig::for_solver(&config)
+        ..SpawnRegion::for_sim(&config)
     };
-    let mut solver = MpmSolver::empty(config)
+    let mut solver = Simulation::empty(config)
         .with_default_material(Box::new(NeoHookeanMaterial::new(100.0, 50.0)))
         .with_boundary(Box::new(SlipBoundary::new(config.boundary_thickness)));
-    let _ = solver.spawn_group(spawn);
+    let _ = solver.add_body(spawn);
 
     let before = solver.particles().len();
     // Keep only particles in the left half.
@@ -992,49 +1001,9 @@ fn retain_particles_syncs_active_count_and_steps_cleanly() {
     let after = solver.particles().len();
     assert!(after < before, "retain should remove particles");
 
-    // Must not panic — active_count must match particle array length.
+    // Must not panic â€” active_count must match particle array length.
     solver.step_n(5);
     for p in solver.particles() {
         assert!(p.x.is_finite(), "position non-finite after retain + step");
-    }
-}
-
-#[test]
-fn split_particles_where_conserves_mass_and_increases_count() {
-    let config = SolverConfig::standard(32, 0.1, Vec2::new(0.0, -0.1));
-    let spawn = SpawnConfig {
-        spacing: 0.5,
-        box_size: glam::IVec2::new(8, 8),
-        box_center: Vec2::splat(16.0),
-        ..SpawnConfig::for_solver(&config)
-    };
-    let mut solver = MpmSolver::empty(config)
-        .with_default_material(Box::new(NeoHookeanMaterial::new(100.0, 50.0)))
-        .with_boundary(Box::new(SlipBoundary::new(config.boundary_thickness)));
-    let _ = solver.spawn_group(spawn);
-
-    // Run a few steps to build up some deformation gradient variation.
-    solver.step_n(5);
-
-    let total_mass_before: f32 = solver.particles().iter().map(|p| p.mass).sum();
-    let count_before = solver.particles().len();
-
-    // Split all active particles (unconditionally for test).
-    solver.split_particles_where(|_| true, 0.2);
-
-    let total_mass_after: f32 = solver.particles().iter().map(|p| p.mass).sum();
-    let count_after = solver.particles().len();
-
-    assert!(count_after > count_before, "particle count must increase after split");
-    assert!(count_after <= count_before * 2, "particle count cannot exceed double");
-    assert!(
-        (total_mass_after - total_mass_before).abs() < 1e-3,
-        "total mass must be conserved: before={total_mass_before:.4} after={total_mass_after:.4}"
-    );
-
-    // Must still simulate without panic.
-    solver.step_n(3);
-    for (i, p) in solver.particles().iter().enumerate() {
-        assert!(p.x.is_finite(), "particle {i} non-finite after split");
     }
 }

@@ -1,236 +1,255 @@
-/// GPU elastic solids — NeoHookean + Corotated + Viscoelastic, three-body comparison.
+extern crate emerge_engine as emerge;
+
+/// GPU elastic solids — NeoHookean / Corotated / Viscoelastic, zero CPU readback.
 ///
-///   cargo run --example basic_jellies_gpu --features "bevy_examples,gpu"
-use bevy::prelude::*;
-use bevy::tasks::block_on;
-use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
-use emerge::gpu::{GpuForceFieldEntry, GpuSolver};
-use emerge::runtime::fixed_step::FixedStepController;
+///   Mat 0  NeoHookean   (orange) — soft hyperelastic
+///   Mat 1  Corotated    (teal)   — stiffer corotated linear
+///   Mat 2  Viscoelastic (purple) — Kelvin-Voigt dashpot
+///
+///   cargo run --example basic_jellies_gpu --features "render"
+use std::sync::Arc;
+
+use emerge::diagnostics::log_frame_gpu;
+use emerge::render::{ColorMode, Renderer};
 use emerge::{
-    CorotatedMaterial, MaterialRegistry, NeoHookeanMaterial, SolverConfig, SpawnConfig,
-    ViscoelasticMaterial, build_particles, log_frame_gpu,
+    CorotatedMaterial, GpuSimulation, MaterialRegistry, NeoHookeanMaterial, SimConfig, SpawnRegion,
+    ViscoelasticMaterial, build_particles,
 };
-use glam::Vec2;
+use glam::{IVec2, Vec2};
+use winit::application::ApplicationHandler;
+use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::window::{Window, WindowId};
 
 const GRID: usize = 64;
 const DT: f32 = 0.1;
-const PPC: f32 = 10.0;
-const LABELS: &[(u32, &str)] = &[(0, "neo"), (1, "cor"), (2, "vis")];
-
 const MAT_NEO: u32 = 0;
 const MAT_COR: u32 = 1;
 const MAT_VIS: u32 = 2;
+const LABELS: &[(u32, &str)] = &[(MAT_NEO, "neo"), (MAT_COR, "corot"), (MAT_VIS, "viscoelastic")];
 
-#[derive(Resource, Clone, Copy, PartialEq)]
-struct Params {
-    hz: f32,
-    gravity: f32,
-    neo_lambda: f32,
-    neo_mu: f32,
-    cor_lambda: f32,
-    cor_mu: f32,
-    vis_lambda: f32,
-    vis_mu: f32,
-    vis_viscosity: f32,
-    cursor_strength: f32,
-    cursor_radius: f32,
+struct App {
+    window: Option<Arc<Window>>,
+    state: Option<State>,
 }
 
-const DEFAULTS: Params = Params {
-    hz: 60.0,
-    gravity: -0.3,
-    neo_lambda: 10.0,
-    neo_mu: 20.0,
-    cor_lambda: 30.0,
-    cor_mu: 60.0,
-    vis_lambda: 10.0,
-    vis_mu: 15.0,
-    vis_viscosity: 0.15,
-    cursor_strength: 200.0,
-    cursor_radius: 5.0,
-};
-
-#[derive(Resource)]
-struct Sim {
-    solver: GpuSolver,
-    stepper: FixedStepController,
-    prev: Params,
-    physics_frame: u64,
+struct State {
+    surface: wgpu::Surface<'static>,
+    surface_config: wgpu::SurfaceConfiguration,
+    sim: GpuSimulation,
+    renderer: Renderer,
+    cursor_pos: [f32; 2],
+    lmb: bool,
+    rmb: bool,
+    frame: u64,
+    fps_timer: std::time::Instant,
+    fps_frames: u64,
 }
 
-impl Sim {
-    fn new(p: Params) -> Self {
-        let config = SolverConfig {
-            min_dt: 0.01,
-            max_substeps_per_step: 8,
-            gravity: Vec2::new(0.0, p.gravity),
-            ..SolverConfig::earth(GRID, 0.01, DT)
+fn make_sim_data(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) -> GpuSimulation {
+    let config = SimConfig {
+        max_substeps_per_step: 12,
+        gravity: Vec2::new(0.0, -0.3),
+        ..SimConfig::earth(GRID, 0.01, DT)
+    };
+    let blob = |cx: f32, mat: u32, seed: u32| SpawnRegion {
+        spacing: 0.5,
+        box_size: IVec2::new(16, 16),
+        box_center: Vec2::new(cx, 48.0),
+        material_id: mat,
+        precompute_initial_volumes: true,
+        rng_seed: seed,
+        ..SpawnRegion::for_sim(&config)
+    };
+    let mut particles = build_particles(&config, blob(16.0, MAT_NEO, 1));
+    particles.extend(build_particles(&config, blob(32.0, MAT_COR, 2)));
+    particles.extend(build_particles(&config, blob(48.0, MAT_VIS, 3)));
+
+    let mut registry = MaterialRegistry::with_default(Box::new(
+        NeoHookeanMaterial::new(10.0, 20.0),
+    ));
+    registry.insert(MAT_COR, Box::new(CorotatedMaterial::new(30.0, 60.0)));
+    registry.insert(
+        MAT_VIS,
+        Box::new(ViscoelasticMaterial::new(10.0, 15.0, 0.15)),
+    );
+    GpuSimulation::with_device(device, queue, config, particles, registry)
+}
+
+impl State {
+    async fn new(window: Arc<Window>) -> Self {
+        let size = window.inner_size();
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let surface = instance.create_surface(window.clone()).unwrap();
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+            })
+            .await
+            .expect("no GPU adapter");
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor::default())
+            .await
+            .unwrap();
+        let caps = surface.get_capabilities(&adapter);
+        let fmt = caps.formats.iter().find(|f| f.is_srgb()).copied().unwrap_or(caps.formats[0]);
+        let sc = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: fmt,
+            width: size.width,
+            height: size.height,
+            present_mode: wgpu::PresentMode::AutoVsync,
+            desired_maximum_frame_latency: 2,
+            alpha_mode: caps.alpha_modes[0],
+            view_formats: vec![],
         };
-        let spawn = |center: Vec2, mat: u32| {
-            SpawnConfig::for_solver(&config)
-                .at(center)
-                .disk(7.0)
-                .spacing(0.5)
-                .material(mat)
-                .precompute_volumes()
+        surface.configure(&device, &sc);
+        let sim = make_sim_data(Arc::new(device), Arc::new(queue));
+        let mut renderer = Renderer::new(sim.device(), sim.particle_count(), fmt);
+        renderer.set_camera(sim.queue(), GRID as u32, size.width, size.height, 0.6, true);
+        renderer.set_color_mode(ColorMode::ByMaterial);
+        println!(
+            "jellies GPU: {} particles  |  LMB push  RMB pull  R reset  Q quit",
+            sim.particle_count()
+        );
+        Self {
+            surface,
+            surface_config: sc,
+            sim,
+            renderer,
+            cursor_pos: [0.0; 2],
+            lmb: false,
+            rmb: false,
+            frame: 0,
+            fps_timer: std::time::Instant::now(),
+            fps_frames: 0,
+        }
+    }
+
+    fn resize(&mut self, w: u32, h: u32) {
+        if w == 0 || h == 0 {
+            return;
+        }
+        self.surface_config.width = w;
+        self.surface_config.height = h;
+        self.surface.configure(self.sim.device(), &self.surface_config);
+        self.renderer.set_camera(self.sim.queue(), GRID as u32, w, h, 0.6, true);
+    }
+
+    fn cursor_grid(&self) -> Vec2 {
+        Vec2::new(
+            self.cursor_pos[0] / self.surface_config.width as f32 * GRID as f32,
+            (1.0 - self.cursor_pos[1] / self.surface_config.height as f32) * GRID as f32,
+        )
+    }
+
+    fn reset(&mut self) {
+        let (device, queue) = (self.sim.device().clone(), self.sim.queue().clone());
+        self.sim = make_sim_data(device, queue);
+        self.frame = 0;
+        println!("reset");
+    }
+
+    fn update_and_render(&mut self) {
+        if self.lmb || self.rmb {
+            let mag = if self.lmb { 8.0 } else { -8.0 };
+            self.sim.apply_radial_impulse(self.cursor_grid(), 6.0, mag);
+        }
+        let output = match self.surface.get_current_texture() {
+            Ok(t) => t,
+            Err(_) => return,
         };
-
-        let mut particles = build_particles(&config, spawn(Vec2::new(14.0, 50.0), MAT_NEO));
-        particles.extend(build_particles(&config, spawn(Vec2::new(32.0, 50.0), MAT_COR)));
-        particles.extend(build_particles(&config, spawn(Vec2::new(50.0, 50.0), MAT_VIS)));
-
-        let mut registry =
-            MaterialRegistry::with_default(Box::new(NeoHookeanMaterial::new(p.neo_lambda, p.neo_mu)));
-        registry.insert(MAT_COR, Box::new(CorotatedMaterial::new(p.cor_lambda, p.cor_mu)));
-        registry.insert(MAT_VIS, Box::new(ViscoelasticMaterial::new(p.vis_lambda, p.vis_mu, p.vis_viscosity)));
-        let solver = block_on(GpuSolver::new(config, particles, registry));
-
-        Self { solver, stepper: FixedStepController::standard(DT, p.hz), prev: p, physics_frame: 0 }
+        self.sim.step_frame();
+        self.frame += 1;
+        self.fps_frames += 1;
+        if self.fps_timer.elapsed().as_secs_f32() >= 2.0 {
+            let fps = self.fps_frames as f32 / self.fps_timer.elapsed().as_secs_f32();
+            println!("frame={} fps={:.0}", self.frame, fps);
+            self.fps_timer = std::time::Instant::now();
+            self.fps_frames = 0;
+        }
+        if self.frame % 60 == 0 {
+            log_frame_gpu(self.frame, DT, self.sim.particles(), LABELS, 1);
+            let snap = self.sim.diagnostics_snapshot();
+            println!(
+                "  non_finite={}  out_of_bounds={}  max_speed={:.3}  sub={}  cfl={:.4}",
+                snap.non_finite_particle_values,
+                snap.out_of_bounds_particles,
+                snap.max_particle_speed,
+                snap.substeps_last_step,
+                snap.cfl_number,
+            );
+        }
+        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.renderer.render_gpu(
+            self.sim.device(),
+            self.sim.queue(),
+            self.sim.particle_buffer(),
+            self.sim.particle_count(),
+            &view,
+            true,
+        );
+        output.present();
     }
 }
 
-fn mat_color(mat: u32) -> Color {
-    match mat {
-        0 => Color::srgb(0.94, 0.52, 0.27),
-        1 => Color::srgb(0.25, 0.78, 0.65),
-        _ => Color::srgb(0.72, 0.40, 0.90),
+impl ApplicationHandler for App {
+    fn resumed(&mut self, el: &ActiveEventLoop) {
+        let w = Arc::new(
+            el.create_window(
+                winit::window::WindowAttributes::default()
+                    .with_title("emerge — Jellies GPU [NeoHookean / Corotated / Viscoelastic]")
+                    .with_inner_size(winit::dpi::LogicalSize::new(480u32, 480u32)),
+            )
+            .unwrap(),
+        );
+        self.state = Some(pollster::block_on(State::new(w.clone())));
+        self.window = Some(w);
+    }
+
+    fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        let Some(s) = self.state.as_mut() else { return };
+        match event {
+            WindowEvent::CloseRequested => el.exit(),
+            WindowEvent::CursorMoved { position, .. } => {
+                s.cursor_pos = [position.x as f32, position.y as f32];
+            }
+            WindowEvent::MouseInput { state, button, .. } => match button {
+                MouseButton::Left => s.lmb = state == ElementState::Pressed,
+                MouseButton::Right => s.rmb = state == ElementState::Pressed,
+                _ => {}
+            },
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(key),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } => match key {
+                KeyCode::Escape | KeyCode::KeyQ => el.exit(),
+                KeyCode::KeyR => s.reset(),
+                _ => {}
+            },
+            WindowEvent::Resized(sz) => s.resize(sz.width, sz.height),
+            WindowEvent::RedrawRequested => {
+                s.update_and_render();
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            _ => {}
+        }
     }
 }
 
 fn main() {
-    App::new()
-        .insert_resource(ClearColor(Color::srgb(0.07, 0.06, 0.08)))
-        .insert_resource(DEFAULTS)
-        .insert_resource(Sim::new(DEFAULTS))
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "MLS-MPM Jellies (GPU) — NeoHookean · Corotated · Viscoelastic".into(),
-                resolution: (900u32, 900u32).into(),
-                ..default()
-            }),
-            ..default()
-        }))
-        .add_plugins(EguiPlugin::default())
-        .add_systems(Startup, setup)
-        .add_systems(Update, (reset, cursor, step, sync).chain())
-        .add_systems(EguiPrimaryContextPass, ui)
-        .run();
-}
-
-#[derive(Component)]
-struct PVis(usize);
-
-fn setup(mut commands: Commands, sim: Res<Sim>) {
-    commands.spawn(Camera2d);
-    for (i, p) in sim.solver.particles().iter().enumerate() {
-        commands.spawn((
-            PVis(i),
-            Sprite { color: mat_color(p.material_id), custom_size: Some(Vec2::ONE), ..default() },
-            Transform::from_translation(p2w(p.x)),
-        ));
-    }
-}
-
-fn reset(
-    keys: Res<ButtonInput<KeyCode>>,
-    mut sim: ResMut<Sim>,
-    mut p: ResMut<Params>,
-    mut commands: Commands,
-    vis: Query<Entity, With<PVis>>,
-) {
-    if keys.just_pressed(KeyCode::KeyR) {
-        *p = DEFAULTS;
-        *sim = Sim::new(DEFAULTS);
-        for e in &vis { commands.entity(e).despawn(); }
-        for (i, pt) in sim.solver.particles().iter().enumerate() {
-            commands.spawn((
-                PVis(i),
-                Sprite { color: mat_color(pt.material_id), custom_size: Some(Vec2::ONE), ..default() },
-                Transform::from_translation(p2w(pt.x)),
-            ));
-        }
-    }
-}
-
-fn cursor(
-    windows: Query<&Window>,
-    cam: Query<(&Camera, &GlobalTransform)>,
-    mb: Res<ButtonInput<MouseButton>>,
-    mut sim: ResMut<Sim>,
-    params: Res<Params>,
-) {
-    sim.solver.clear_force_fields_gpu();
-    if !mb.pressed(MouseButton::Left) && !mb.pressed(MouseButton::Right) { return; }
-    let Ok(win) = windows.single() else { return };
-    let Some(cp) = win.cursor_position() else { return };
-    let Ok((cam, ct)) = cam.single() else { return };
-    let Ok(wp) = cam.viewport_to_world_2d(ct, cp) else { return };
-    let gp = wp / PPC + Vec2::splat(GRID as f32 * 0.5);
-    let gm = if mb.pressed(MouseButton::Right) { params.cursor_strength } else { -params.cursor_strength };
-    let r = params.cursor_radius;
-    sim.solver.add_force_field_gpu(GpuForceFieldEntry::gravity_well(gp, gm, 4.0, r, r * 0.4));
-}
-
-fn step(time: Res<Time>, mut sim: ResMut<Sim>, params: Res<Params>) {
-    sim.solver.set_gravity(Vec2::new(0.0, params.gravity));
-    sim.stepper.set_simulation_speed(params.hz * DT);
-    let n = sim.stepper.steps_for_frame(time.delta_secs());
-    if n == 0 { return; }
-    if sim.prev != *params {
-        sim.solver.set_default_material(Box::new(NeoHookeanMaterial::new(params.neo_lambda, params.neo_mu)));
-        sim.solver.set_material(MAT_COR, Box::new(CorotatedMaterial::new(params.cor_lambda, params.cor_mu)));
-        sim.solver.set_material(MAT_VIS, Box::new(ViscoelasticMaterial::new(params.vis_lambda, params.vis_mu, params.vis_viscosity)));
-        sim.prev = *params;
-    }
-    for _ in 0..n {
-        sim.solver.step_frame();
-        sim.physics_frame += 1;
-    }
-    sim.solver.sync_particles_blocking();
-    log_frame_gpu(sim.physics_frame, DT, sim.solver.particles(), LABELS, 60);
-}
-
-fn sync(sim: Res<Sim>, mut vis: Query<(&PVis, &mut Transform)>) {
-    for (pv, mut t) in &mut vis {
-        if let Some(p) = sim.solver.particles().get(pv.0) {
-            t.translation = p2w(p.x);
-        }
-    }
-}
-
-fn ui(mut ctx: EguiContexts, mut p: ResMut<Params>, mut sim: ResMut<Sim>, time: Res<Time>) {
-    let Ok(ctx) = ctx.ctx_mut() else { return };
-    egui::Window::new("Jellies (GPU)")
-        .default_pos([10.0, 10.0])
-        .default_width(300.0)
-        .resizable(false)
-        .show(ctx, |ui| {
-            ui.label(format!("fps={:.0}  n={}  [GPU]", time.delta_secs().recip(), sim.solver.particle_count()));
-            ui.separator();
-            ui.add(egui::Slider::new(&mut p.hz, 5.0..=60.0).text("solver_hz"));
-            ui.add(egui::Slider::new(&mut p.gravity, -3.0..=0.0).text("gravity"));
-            ui.separator();
-            ui.colored_label(egui::Color32::from_rgb(240, 133, 69), "NeoHookean (orange)");
-            ui.add(egui::Slider::new(&mut p.neo_lambda, 1.0..=200.0).text("λ"));
-            ui.add(egui::Slider::new(&mut p.neo_mu, 1.0..=400.0).text("µ"));
-            ui.separator();
-            ui.colored_label(egui::Color32::from_rgb(64, 199, 166), "Corotated (teal)");
-            ui.add(egui::Slider::new(&mut p.cor_lambda, 1.0..=200.0).text("λ"));
-            ui.add(egui::Slider::new(&mut p.cor_mu, 1.0..=400.0).text("µ"));
-            ui.separator();
-            ui.colored_label(egui::Color32::from_rgb(184, 102, 230), "Viscoelastic (purple)");
-            ui.add(egui::Slider::new(&mut p.vis_lambda, 1.0..=200.0).text("λ"));
-            ui.add(egui::Slider::new(&mut p.vis_mu, 1.0..=400.0).text("µ"));
-            ui.add(egui::Slider::new(&mut p.vis_viscosity, 0.0..=5.0).text("viscosity"));
-            ui.separator();
-            ui.add(egui::Slider::new(&mut p.cursor_strength, 10.0..=1000.0).text("cursor force").logarithmic(true));
-            ui.add(egui::Slider::new(&mut p.cursor_radius, 1.0..=15.0).text("cursor radius"));
-            ui.label("LMB: push  RMB: pull  R: reset");
-            if ui.button("Reset (R)").clicked() { *p = DEFAULTS; *sim = Sim::new(DEFAULTS); }
-        });
-}
-
-fn p2w(pos: Vec2) -> Vec3 {
-    let c = (pos - Vec2::splat(GRID as f32 * 0.5)) * PPC;
-    Vec3::new(c.x, c.y, 0.0)
+    let el = EventLoop::new().unwrap();
+    el.set_control_flow(ControlFlow::Poll);
+    let mut app = App { window: None, state: None };
+    el.run_app(&mut app).unwrap();
 }
