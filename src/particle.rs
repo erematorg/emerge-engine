@@ -30,8 +30,8 @@ pub struct Particle {
     /// 1.0 = baseline stiffness. > 1.0 = stiffened by compression (e.g. compacted snow).
     pub hardening_scale: f32,
     /// Per-material plastic scalar — meaning depends on the active material:
-    /// - `SandMaterial`: Drucker-Prager friction accumulator q (Klar 2016)
-    /// - `SandMuIMaterial`: current µ(I) value (rate-dependent friction coefficient)
+    /// - `DruckerPragerMaterial`: Drucker-Prager friction accumulator q (Klar 2016)
+    /// - `MuIRheologyMaterial`: current µ(I) value (rate-dependent friction coefficient)
     /// - `VonMisesMaterial`: isotropic hardening κ (equivalent plastic strain)
     /// - `RankineMaterial`: damage accumulator d ∈ [0, 1] (0 = intact, 1 = fully failed)
     pub friction_hardening: f32,
@@ -154,7 +154,7 @@ pub struct Particles {
 
     // ── Sleep state — not in the hot path ────────────────────────────────────
     /// True when the particle is in the sleeping partition and skipped by P2G/G2P.
-    /// Do not write directly — use `MpmSolver::wake` / `MpmSolver::sleep`.
+    /// Do not write directly — use `Simulation::wake` / `Simulation::sleep`.
     pub sleeping: Vec<bool>,
 }
 
@@ -297,7 +297,9 @@ impl Particles {
     /// Swap all SoA fields for indices `a` and `b`. Used by sleep/wake partition logic.
     #[inline]
     pub fn swap(&mut self, a: usize, b: usize) {
-        if a == b { return; }
+        if a == b {
+            return;
+        }
         self.x.swap(a, b);
         self.v.swap(a, b);
         self.velocity_gradient.swap(a, b);
@@ -320,10 +322,12 @@ impl Particles {
     }
 
     /// Rotate `[start..end]` so that `[mid..end]` precedes `[start..mid]`.
-    /// Used by spawn_group to insert new particles before the sleeping zone.
+    /// Used by add_body to insert new particles before the sleeping zone.
     /// Standard 3-reversal algorithm — O(end − start) swaps.
     pub fn rotate_range(&mut self, start: usize, mid: usize, end: usize) {
-        if start >= mid || mid >= end { return; }
+        if start >= mid || mid >= end {
+            return;
+        }
         self.reverse_range(start, mid);
         self.reverse_range(mid, end);
         self.reverse_range(start, end);
@@ -407,22 +411,23 @@ impl Default for Particles {
 
 // ── Iteration helpers ────────────────────────────────────────────────────────
 
-/// Owning iterator over collected [`Particle`] views.
-pub struct ParticlesIter {
-    particles: Vec<Particle>,
+/// Lazy iterator over [`Particle`] views from a borrowed [`Particles`] store.
+///
+/// Constructs each `Particle` on demand from SoA storage — no upfront allocation.
+pub struct ParticlesIter<'a> {
+    particles: &'a Particles,
     index: usize,
 }
 
-impl Iterator for ParticlesIter {
+impl<'a> Iterator for ParticlesIter<'a> {
     type Item = Particle;
     fn next(&mut self) -> Option<Particle> {
-        if self.index < self.particles.len() {
-            let p = self.particles[self.index];
-            self.index += 1;
-            Some(p)
-        } else {
-            None
+        if self.index >= self.particles.len() {
+            return None;
         }
+        let p = self.particles.get(self.index);
+        self.index += 1;
+        Some(p)
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
         let rem = self.particles.len() - self.index;
@@ -430,19 +435,16 @@ impl Iterator for ParticlesIter {
     }
 }
 
-impl ExactSizeIterator for ParticlesIter {}
+impl ExactSizeIterator for ParticlesIter<'_> {}
 
 impl Particles {
-    /// Iterate over all particles as owned [`Particle`] views (cheap copies).
-    ///
-    /// Each element is an independent stack copy — modifying a particle in the
-    /// iterator does not write back to storage. Use index-based access or
-    /// [`Particles::set`] to write back.
-    pub fn iter(&self) -> impl Iterator<Item = Particle> + '_ {
-        self.indices().map(move |i| self.get(i))
+    pub fn iter(&self) -> ParticlesIter<'_> {
+        ParticlesIter {
+            particles: self,
+            index: 0,
+        }
     }
 
-    /// Iterate with indices: `(usize, Particle)`.
     pub fn iter_enumerated(&self) -> impl Iterator<Item = (usize, Particle)> + '_ {
         self.indices().map(move |i| (i, self.get(i)))
     }
@@ -450,12 +452,9 @@ impl Particles {
 
 impl<'a> IntoIterator for &'a Particles {
     type Item = Particle;
-    type IntoIter = ParticlesIter;
-    fn into_iter(self) -> ParticlesIter {
-        ParticlesIter {
-            particles: self.to_vec(),
-            index: 0,
-        }
+    type IntoIter = ParticlesIter<'a>;
+    fn into_iter(self) -> ParticlesIter<'a> {
+        self.iter()
     }
 }
 

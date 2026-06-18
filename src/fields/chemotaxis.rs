@@ -15,6 +15,7 @@
 //!
 //! # Usage
 //! ```rust,no_run
+//! # extern crate emerge_engine as emerge;
 //! # use emerge::prelude::*;
 //! # use emerge::fields::ChemotaxisField;
 //! # use emerge::{ScalarDiffusionField, ScalarDiffusionConfig};
@@ -31,7 +32,7 @@
 //!
 //! // Per substep (after pheromone.apply):
 //! chemo.sync_from(&pheromone);
-//! // ... pass chemo as a ForceField to the solver
+//! // ... pass chemo as a Field to the solver
 //! ```
 //!
 //! # Reference
@@ -40,14 +41,14 @@
 
 use glam::Vec2;
 
-use crate::fields::ForceField;
+use crate::fields::Field;
 use crate::particle::Particles;
 use crate::thermodynamics::ScalarDiffusionField;
 
 /// Gradient-following force derived from a scalar concentration field (Keller-Segel).
 ///
 /// Call `sync_from(&scalar_field)` once per substep (after `scalar_field.apply()`)
-/// to update the internal snapshot, then register with the solver as a `ForceField`.
+/// to update the internal snapshot, then register with the solver as a `Field`.
 pub struct ChemotaxisField {
     /// Grid resolution — must match the ScalarDiffusionField and MPM solver.
     grid_res: usize,
@@ -64,7 +65,7 @@ pub struct ChemotaxisField {
 impl ChemotaxisField {
     /// Create a new chemotaxis field.
     ///
-    /// - `grid_res`: must match `ScalarDiffusionField` and `MpmSolver` grid resolution.
+    /// - `grid_res`: must match `ScalarDiffusionField` and `Simulation` grid resolution.
     /// - `sensitivity`: χ — positive for attraction, negative for repulsion.
     pub fn new(grid_res: usize, sensitivity: f32) -> Self {
         Self {
@@ -109,16 +110,16 @@ impl ChemotaxisField {
     }
 }
 
-impl ForceField for ChemotaxisField {
+impl Field for ChemotaxisField {
     fn prepare(&mut self, _particles: &Particles) {
         // Gradient is computed on-demand from the snapshot; no pre-computation needed.
     }
 
     fn acceleration(&self, particles: &Particles, i: usize) -> Vec2 {
-        if let Some(id) = self.material_filter {
-            if particles.material_id[i] != id {
-                return Vec2::ZERO;
-            }
+        if let Some(id) = self.material_filter
+            && particles.material_id[i] != id
+        {
+            return Vec2::ZERO;
         }
         let ix = particles.x[i].x.floor() as i32;
         let iy = particles.x[i].y.floor() as i32;

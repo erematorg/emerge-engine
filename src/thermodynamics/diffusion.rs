@@ -47,7 +47,7 @@ pub struct ThermalConfig {
     /// Boundary cells equilibrate toward this value.
     pub ambient: f32,
 
-    /// Grid cell physical size in meters (matches `SolverConfig::grid_cell_size`).
+    /// Grid cell physical size in meters (matches `SimConfig::grid_cell_size`).
     ///
     /// Used to convert conductivity/capacity into grid-unit diffusivity.
     pub grid_cell_size: f32,
@@ -72,7 +72,7 @@ impl ThermalConfig {
 
 /// Grid-based Fourier heat diffusion.
 ///
-/// Add to `MpmSolver` via `solver.with_thermal(ThermalDiffusion::new(config, grid_res))`.
+/// Add to `Simulation` via `solver.with_thermal(ThermalDiffusion::new(config, grid_res))`.
 /// Applied once per MPM substep, after force fields, before state projection.
 pub struct ThermalDiffusion {
     pub config: ThermalConfig,
@@ -95,7 +95,7 @@ impl ThermalDiffusion {
         }
     }
 
-    /// Apply one thermal substep. Call from `MpmSolver::do_substep` after force fields.
+    /// Apply one thermal substep. Call from `Simulation::do_substep` after force fields.
     ///
     /// `sub_dt`: substep duration in seconds.
     pub fn apply(&mut self, particles: &mut Particles, sub_dt: f32) {

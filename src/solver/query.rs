@@ -14,7 +14,7 @@ use crate::particle::{Particle, Particles};
 /// }
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct MaterialState {
+pub struct BodyState {
     /// Number of particles in the queried set.
     pub count: usize,
     /// Mean plastic Jacobian Jp. 1.0 = undeformed; < 1.0 = compressed; > 1.0 = expanded.
@@ -32,8 +32,8 @@ pub struct MaterialState {
 }
 
 /// Aggregate state for all particles of the given material.
-pub fn material_state_of(particles: &Particles, material_id: u32) -> MaterialState {
-    let mut s = MaterialState::default();
+pub fn body_state_of(particles: &Particles, material_id: u32) -> BodyState {
+    let mut s = BodyState::default();
     for i in particles.indices() {
         if particles.material_id[i] == material_id {
             s.accumulate(
@@ -50,9 +50,9 @@ pub fn material_state_of(particles: &Particles, material_id: u32) -> MaterialSta
 }
 
 /// Aggregate state for all particles of the given material from a CPU mirror slice.
-/// Used by GpuSolver which maintains a `Vec<Particle>` mirror.
-pub fn material_state_of_slice(particles: &[Particle], material_id: u32) -> MaterialState {
-    let mut s = MaterialState::default();
+/// Used by GpuSimulation which maintains a `Vec<Particle>` mirror.
+pub fn body_state_of_slice(particles: &[Particle], material_id: u32) -> BodyState {
+    let mut s = BodyState::default();
     for p in particles {
         if p.material_id == material_id {
             s.accumulate(
@@ -69,9 +69,9 @@ pub fn material_state_of_slice(particles: &[Particle], material_id: u32) -> Mate
 }
 
 /// Aggregate state for all particles within `radius` grid-cells of `center`.
-pub fn region_state_of(particles: &Particles, center: Vec2, radius: f32) -> MaterialState {
+pub fn region_body_state_of(particles: &Particles, center: Vec2, radius: f32) -> BodyState {
     let r2 = radius * radius;
-    let mut s = MaterialState::default();
+    let mut s = BodyState::default();
     for i in particles.indices() {
         if (particles.x[i] - center).length_squared() <= r2 {
             s.accumulate(
@@ -87,10 +87,10 @@ pub fn region_state_of(particles: &Particles, center: Vec2, radius: f32) -> Mate
     s
 }
 
-/// Aggregate state within radius from a CPU mirror slice (GpuSolver).
-pub fn region_state_of_slice(particles: &[Particle], center: Vec2, radius: f32) -> MaterialState {
+/// Aggregate state within radius from a CPU mirror slice (GpuSimulation).
+pub fn region_body_state_of_slice(particles: &[Particle], center: Vec2, radius: f32) -> BodyState {
     let r2 = radius * radius;
-    let mut s = MaterialState::default();
+    let mut s = BodyState::default();
     for p in particles {
         if (p.x - center).length_squared() <= r2 {
             s.accumulate(
@@ -106,7 +106,7 @@ pub fn region_state_of_slice(particles: &[Particle], center: Vec2, radius: f32) 
     s
 }
 
-impl MaterialState {
+impl BodyState {
     /// Empty state — returned when no particles match the query.
     pub fn empty() -> Self {
         Self {

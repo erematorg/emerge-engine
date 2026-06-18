@@ -31,7 +31,7 @@ fn shannon_bits(counts: &[u32]) -> f32 {
 ///
 /// Bins each particle by its grid cell (floor of position). O(N).
 pub fn spatial_entropy(particles: &Particles, grid_res: usize) -> f32 {
-    if grid_res == 0 || particles.len() == 0 {
+    if grid_res == 0 || particles.is_empty() {
         return 0.0;
     }
     let mut counts = vec![0u32; grid_res * grid_res];
@@ -51,10 +51,14 @@ pub fn spatial_entropy(particles: &Particles, grid_res: usize) -> f32 {
 /// H = log₂(bins) → speeds uniformly spread (thermal chaos).
 /// O(N).
 pub fn kinetic_entropy(particles: &Particles, bins: usize) -> f32 {
-    if particles.len() == 0 || bins == 0 {
+    if particles.is_empty() || bins == 0 {
         return 0.0;
     }
-    let v_max = particles.v.iter().map(|v| v.length()).fold(0.0f32, f32::max);
+    let v_max = particles
+        .v
+        .iter()
+        .map(|v| v.length())
+        .fold(0.0f32, f32::max);
     if v_max < f32::EPSILON {
         return 0.0;
     }
@@ -72,7 +76,7 @@ pub fn kinetic_entropy(particles: &Particles, bins: usize) -> f32 {
 /// H = log₂(num_materials) → materials equally distributed.
 /// O(N).
 pub fn phase_entropy(particles: &Particles) -> f32 {
-    if particles.len() == 0 {
+    if particles.is_empty() {
         return 0.0;
     }
     let mut counts = [0u32; MAX_MATERIAL_SLOTS];

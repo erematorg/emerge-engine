@@ -15,7 +15,11 @@ pub const STEFAN_BOLTZMANN: f32 = 5.670_374_4e-8;
 /// Governs how fast temperature equalises: ∂T/∂t = α·∇²T (Fourier).
 /// Feeds the CFL bound for explicit diffusion: dt ≤ C·dx²/α.
 #[inline]
-pub fn thermal_diffusivity(conductivity_w_m_k: f32, density_kg_m3: f32, specific_heat_j_kg_k: f32) -> f32 {
+pub fn thermal_diffusivity(
+    conductivity_w_m_k: f32,
+    density_kg_m3: f32,
+    specific_heat_j_kg_k: f32,
+) -> f32 {
     conductivity_w_m_k / (density_kg_m3 * specific_heat_j_kg_k).max(f32::EPSILON)
 }
 
@@ -24,7 +28,12 @@ pub fn thermal_diffusivity(conductivity_w_m_k: f32, density_kg_m3: f32, specific
 /// `temp_diff` K, `area` m², `distance` m, `conductivity` W/(m·K).
 /// Positive when heat flows from hot to cold (ΔT > 0).
 #[inline]
-pub fn heat_conduction(temp_diff_k: f32, area_m2: f32, distance_m: f32, conductivity_w_m_k: f32) -> f32 {
+pub fn heat_conduction(
+    temp_diff_k: f32,
+    area_m2: f32,
+    distance_m: f32,
+    conductivity_w_m_k: f32,
+) -> f32 {
     conductivity_w_m_k * area_m2 * temp_diff_k / distance_m.max(f32::EPSILON)
 }
 
@@ -41,7 +50,10 @@ pub fn heat_radiation(
     emissivity: f32,
     view_factor: f32,
 ) -> f32 {
-    STEFAN_BOLTZMANN * emissivity * area_m2 * view_factor
+    STEFAN_BOLTZMANN
+        * emissivity
+        * area_m2
+        * view_factor
         * (hot_temp_k.powi(4) - cold_temp_k.powi(4))
 }
 

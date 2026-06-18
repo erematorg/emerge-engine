@@ -1,6 +1,6 @@
 //! Electromagnetic force fields for MPM particles.
 //!
-//! Bridges `electromagnetics::` field math into the `ForceField` substep hook.
+//! Bridges `electromagnetics::` field math into the `Field` substep hook.
 //!
 //! `UniformElectricField` applies a spatially-constant external E-field to charged particles.
 //! This is distinct from `CoulombField` (which models point-source interactions).
@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use glam::Vec2;
 
-use crate::fields::ForceField;
+use crate::fields::Field;
 use crate::particle::Particles;
 
 /// Uniform external electric field E applied to charged particles.
@@ -49,7 +49,7 @@ impl UniformElectricField {
     }
 }
 
-impl ForceField for UniformElectricField {
+impl Field for UniformElectricField {
     fn acceleration(&self, particles: &Particles, i: usize) -> Vec2 {
         let q = match self.material_charges.get(&particles.material_id[i]) {
             Some(&q) if q.abs() > f32::EPSILON => q,

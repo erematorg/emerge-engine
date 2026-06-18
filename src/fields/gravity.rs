@@ -13,7 +13,7 @@
 
 use glam::Vec2;
 
-use crate::fields::{FADE_ONSET_RATIO, ForceField};
+use crate::fields::{FADE_ONSET_RATIO, Field};
 use crate::particle::Particles;
 use crate::solver::cutoff::smooth_cutoff;
 
@@ -76,7 +76,7 @@ impl GravityWellField {
     }
 }
 
-impl ForceField for GravityWellField {
+impl Field for GravityWellField {
     fn acceleration(&self, particles: &Particles, i: usize) -> Vec2 {
         let mut acc = Vec2::ZERO;
         let eps2 = self.softening * self.softening;

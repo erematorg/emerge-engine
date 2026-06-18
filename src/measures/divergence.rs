@@ -151,7 +151,7 @@ mod tests {
         let p = [0.6, 0.3, 0.1];
         let q = [0.1, 0.2, 0.7];
         let js = KLDivergence::jensen_shannon(&p, &q);
-        assert!(js >= 0.0 && js <= 1.0, "JS out of [0,1]: {}", js);
+        assert!((0.0..=1.0).contains(&js), "JS out of [0,1]: {}", js);
     }
 
     #[test]
@@ -180,6 +180,10 @@ mod tests {
         let p = [0.6, 0.4];
         let q = [0.2, 0.8];
         let tv = KLDivergence::total_variation(&p, &q);
-        assert!(tv >= 0.0 && tv <= 1.0, "TV must be in [0, 1], got {}", tv);
+        assert!(
+            (0.0..=1.0).contains(&tv),
+            "TV must be in [0, 1], got {}",
+            tv
+        );
     }
 }

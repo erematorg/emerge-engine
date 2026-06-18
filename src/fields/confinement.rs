@@ -5,7 +5,7 @@
 
 use glam::Vec2;
 
-use crate::fields::ForceField;
+use crate::fields::Field;
 use crate::particle::Particles;
 
 /// Circular confinement: harmonic restoring force for particles outside radius.
@@ -41,7 +41,7 @@ impl RadialConfinementField {
     }
 }
 
-impl ForceField for RadialConfinementField {
+impl Field for RadialConfinementField {
     fn acceleration(&self, particles: &Particles, i: usize) -> Vec2 {
         let r_vec = particles.x[i] - self.center;
         let dist = r_vec.length();
@@ -78,7 +78,7 @@ impl AabbConfinementField {
     }
 }
 
-impl ForceField for AabbConfinementField {
+impl Field for AabbConfinementField {
     fn acceleration(&self, particles: &Particles, i: usize) -> Vec2 {
         let p = particles.x[i];
         let mut acc = Vec2::ZERO;

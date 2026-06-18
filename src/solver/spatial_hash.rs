@@ -3,7 +3,7 @@ use std::collections::HashMap;
 
 /// Flat spatial hash over active particles.
 ///
-/// Particles live in grid-coordinate space (same units as `SolverConfig::grid_cell_size`).
+/// Particles live in grid-coordinate space (same units as `SimConfig::grid_cell_size`).
 /// `cell_size` should match the MPM grid cell width so the natural particle spacing
 /// (roughly one particle per cell) puts ≈1 particle per bucket.
 ///
@@ -34,8 +34,8 @@ impl SpatialHash {
         for v in self.table.values_mut() {
             v.clear();
         }
-        for i in 0..active_count {
-            let c = self.cell_of(positions[i]);
+        for (i, &pos) in positions.iter().enumerate().take(active_count) {
+            let c = self.cell_of(pos);
             self.table.entry(c).or_default().push(i);
         }
     }
@@ -86,12 +86,12 @@ impl<'a> Iterator for SpatialHashIter<'a> {
                 return None;
             }
             let cell = (self.cx + self.gx, self.cy + self.gy);
-            if let Some(bucket) = self.hash.table.get(&cell) {
-                if self.bucket_pos < bucket.len() {
-                    let idx = bucket[self.bucket_pos];
-                    self.bucket_pos += 1;
-                    return Some(idx);
-                }
+            if let Some(bucket) = self.hash.table.get(&cell)
+                && self.bucket_pos < bucket.len()
+            {
+                let idx = bucket[self.bucket_pos];
+                self.bucket_pos += 1;
+                return Some(idx);
             }
             // Advance to next cell.
             self.bucket_pos = 0;

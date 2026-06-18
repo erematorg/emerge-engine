@@ -21,7 +21,7 @@ use std::collections::HashMap;
 
 use glam::Vec2;
 
-use crate::fields::{FADE_ONSET_RATIO, ForceField};
+use crate::fields::{FADE_ONSET_RATIO, Field};
 use crate::particle::Particles;
 use crate::solver::cutoff::smooth_cutoff;
 
@@ -89,7 +89,7 @@ impl CoulombField {
     }
 }
 
-impl ForceField for CoulombField {
+impl Field for CoulombField {
     fn acceleration(&self, particles: &Particles, i: usize) -> Vec2 {
         let q_particle = match self.material_charges.get(&particles.material_id[i]) {
             Some(&q) if q.abs() > f32::EPSILON => q,

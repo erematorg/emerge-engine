@@ -2,9 +2,10 @@ use glam::{IVec2, Mat2, Vec2};
 
 /// Shape mask applied to the particle grid during spawning.
 ///
-/// The grid always iterates the bounding box defined by `SpawnConfig::box_size`.
+/// The grid always iterates the bounding box defined by `SpawnRegion::box_size`.
 /// `SpawnShape::Disk` discards particles whose grid position falls outside the
 /// circle, producing a disk-shaped region with the same spacing and jitter.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SpawnShape {
     /// Fill the entire axis-aligned bounding box (default).
@@ -22,7 +23,7 @@ pub(crate) const KERNEL_D_INVERSE: f32 = 4.0;
 
 /// Parameters that control the physics solver and its runtime behavior.
 #[derive(Clone, Copy, Debug)]
-pub struct SolverConfig {
+pub struct SimConfig {
     pub grid_res: usize,
     pub grid_cell_size: f32,
     pub dt: f32,
@@ -77,19 +78,22 @@ pub struct SolverConfig {
     pub dt_seconds: f32,
 }
 
-impl Default for SolverConfig {
+impl Default for SimConfig {
+    /// Safe production defaults: adaptive timestepping on, state projection on.
+    /// Use [`SimConfig::standard`] or [`SimConfig::earth`] in practice — they set the
+    /// important physical parameters (grid_res, dt, gravity) from arguments.
     fn default() -> Self {
         Self {
             grid_res: 64,
             grid_cell_size: 1.0,
             dt: 1.0,
-            adaptive_timestep: false,
+            adaptive_timestep: true,
             cfl_include_affine_speed: true,
             cfl_coefficient: 0.9,
             material_cfl_coefficient: 0.5,
             viscous_timestep_coefficient: 0.5,
             min_dt: 1.0e-3,
-            project_invalid_state: false,
+            project_invalid_state: true,
             projection_min_density: 1.0e-6,
             projection_min_volume: 1.0e-6,
             projection_min_deformation_j: 1.0e-6,
@@ -108,22 +112,28 @@ impl Default for SolverConfig {
     }
 }
 
-impl SolverConfig {
-    /// Simulation-ready defaults for interactive examples.
+impl SimConfig {
+    /// Simulation-ready config: sets the three physical parameters that differ per sim.
     ///
-    /// Enables adaptive timestepping and state projection — the two settings that are almost
-    /// always desired in practice but are off in `Default` for backward compatibility.
+    /// Inherits safe defaults from `Default` (adaptive timestepping, state projection on).
     pub fn standard(grid_res: usize, dt: f32, gravity: Vec2) -> Self {
         Self {
             grid_res,
             dt,
             gravity,
-            adaptive_timestep: true,
-            project_invalid_state: true,
-            // Fluid EOS requires per-step density from grid mass gather (two-pass equivalent).
-            // Without this, fluid density is static from initialization → EOS pressure = 0 always.
-            // Reference: incremental_mpm two-pass P2G, basic_fluids.rs explicit setting.
-            recompute_density_each_step: true,
+            ..Self::default()
+        }
+    }
+
+    /// Stripped-down config with adaptive timestepping and state projection disabled.
+    ///
+    /// Use only for: unit tests that need exact deterministic substeps, benchmarks
+    /// where you want to measure a fixed workload, or comparing against an external reference.
+    /// Never use for real simulations — J can go negative and NaN-cascade.
+    pub fn unsafe_defaults() -> Self {
+        Self {
+            adaptive_timestep: false,
+            project_invalid_state: false,
             ..Self::default()
         }
     }
@@ -143,9 +153,10 @@ impl SolverConfig {
     ///
     /// # Example
     /// ```rust,no_run
-    /// # use emerge::SolverConfig;
+    /// # extern crate emerge_engine as emerge;
+    /// # use emerge::SimConfig;
     /// // 64-cell domain, 1 cm/cell → g = 981 cells/s²
-    /// let config = SolverConfig::earth(64, 0.01, 0.05);
+    /// let config = SimConfig::earth(64, 0.01, 0.05);
     /// ```
     pub fn earth(grid_res: usize, cell_m: f32, dt: f32) -> Self {
         // g [cells/s²] = 9.81 [m/s²] / cell_m [m/cell]
@@ -156,6 +167,34 @@ impl SolverConfig {
             dt_seconds: dt,
             ..Self::standard(grid_res, dt, Vec2::new(0.0, -g_solver))
         }
+    }
+
+    // ── SI conversion helpers ─────────────────────────────────────────────────
+
+    /// Convert SI Young's modulus (Pa) + Poisson ratio to grid-unit Lamé parameters.
+    ///
+    /// Equivalent to `lame_from_si(e_pa, nu, rho, self.dx_meters, self.dt_seconds)`.
+    /// Requires `earth()` or explicit `dx_meters`/`dt_seconds` to be meaningful.
+    pub fn lame_from_si_cfg(&self, e_pa: f32, nu: f32, rho_kg_m3: f32) -> (f32, f32) {
+        crate::materials::lame_from_si(e_pa, nu, rho_kg_m3, self.dx_meters, self.dt_seconds)
+    }
+
+    /// Convert SI stress or pressure (Pa) to grid units.
+    ///
+    /// Use for: yield stress, tensile strength, eos_stiffness, surface tension.
+    /// Scale: `p_grid = p_SI · dt² / (ρ · dx²)`
+    pub fn stress_from_si(&self, pa: f32, rho_kg_m3: f32) -> f32 {
+        pa * self.dt_seconds * self.dt_seconds / (rho_kg_m3 * self.dx_meters * self.dx_meters)
+    }
+
+    /// Convert SI dynamic viscosity (Pa·s) to grid units.
+    ///
+    /// Viscosity multiplies the velocity gradient (units: 1/step in grid space), so its
+    /// non-dimensionalization has one extra factor of dt versus stress:
+    /// `η_grid = η_SI · ρ · dx² / dt³`
+    pub fn visc_from_si(&self, eta_pa_s: f32, rho_kg_m3: f32) -> f32 {
+        eta_pa_s * rho_kg_m3 * self.dx_meters * self.dx_meters
+            / (self.dt_seconds * self.dt_seconds * self.dt_seconds)
     }
 
     /// Validate solver-side numerical and domain constraints.
@@ -212,19 +251,20 @@ impl SolverConfig {
 
 /// Initial particle layout — consumed once at spawn, not needed afterward.
 ///
-/// Build via fluent methods on `SpawnConfig::for_solver`:
+/// Build via fluent methods on `SpawnRegion::for_sim`:
 /// ```rust,no_run
-/// # use emerge::{SolverConfig, SpawnConfig};
+/// # extern crate emerge_engine as emerge;
+/// # use emerge::{SimConfig, SpawnRegion};
 /// # use glam::Vec2;
-/// # let config = SolverConfig::standard(64, 0.05, Vec2::NEG_Y * 0.3);
-/// let spawn = SpawnConfig::for_solver(&config)
+/// # let config = SimConfig::standard(64, 0.05, Vec2::NEG_Y * 0.3);
+/// let spawn = SpawnRegion::for_sim(&config)
 ///     .at(Vec2::new(32.0, 40.0))
 ///     .disk(12.0)            // circle instead of box
 ///     .spacing(0.5)
 ///     .material(1);
 /// ```
 #[derive(Clone, Copy, Debug)]
-pub struct SpawnConfig {
+pub struct SpawnRegion {
     pub spacing: f32,
     pub box_size: IVec2,
     pub box_center: Vec2,
@@ -243,7 +283,7 @@ pub struct SpawnConfig {
     pub material_id: u32,
 }
 
-impl Default for SpawnConfig {
+impl Default for SpawnRegion {
     fn default() -> Self {
         Self {
             spacing: 1.0,
@@ -260,11 +300,11 @@ impl Default for SpawnConfig {
     }
 }
 
-impl SpawnConfig {
+impl SpawnRegion {
     /// Starting point for fluent spawn configuration, centered in the solver domain.
     ///
     /// The center tracks `grid_res` so examples remain correct when you change resolution.
-    pub fn for_solver(solver: &SolverConfig) -> Self {
+    pub fn for_sim(solver: &SimConfig) -> Self {
         Self {
             box_center: Vec2::splat(solver.grid_res as f32 * 0.5),
             ..Self::default()
@@ -339,7 +379,7 @@ impl SpawnConfig {
     }
 
     /// Validate spawn-side constraints relative to the solver domain.
-    pub fn validate_for_solver(&self, solver: &SolverConfig) {
+    pub fn validate_for_sim(&self, solver: &SimConfig) {
         assert!(self.spacing > 0.0, "spacing must be positive");
         assert!(self.box_size.x > 0, "box_size.x must be positive");
         assert!(self.box_size.y > 0, "box_size.y must be positive");
@@ -367,4 +407,3 @@ impl SpawnConfig {
         );
     }
 }
-

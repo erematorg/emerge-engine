@@ -18,7 +18,7 @@
 
 use glam::Vec2;
 
-use crate::fields::ForceField;
+use crate::fields::Field;
 use crate::particle::Particles;
 
 // ── Quadtree defaults ───────────────────────────────────────────────────────
@@ -268,7 +268,7 @@ impl Quadtree {
 }
 
 // ---------------------------------------------------------------------------
-// ForceField implementation
+// Field implementation
 // ---------------------------------------------------------------------------
 
 /// N-body gravitational acceleration via Barnes-Hut quadtree (O(N log N)).
@@ -325,7 +325,7 @@ impl NBodyGravityField {
     }
 }
 
-impl ForceField for NBodyGravityField {
+impl Field for NBodyGravityField {
     fn prepare(&mut self, particles: &crate::particle::Particles) {
         self.snapshot.clear();
         self.snapshot.extend(
@@ -428,7 +428,11 @@ mod orbit_tests {
         let (g, m, r) = (1.0, 100.0, 10.0);
         let vc = circular_velocity(g, m, r);
         let ve = escape_velocity(g, m, r);
-        assert!((ve / vc - 2.0_f32.sqrt()).abs() < 1e-5, "ve/vc = {}", ve / vc);
+        assert!(
+            (ve / vc - 2.0_f32.sqrt()).abs() < 1e-5,
+            "ve/vc = {}",
+            ve / vc
+        );
     }
 
     #[test]

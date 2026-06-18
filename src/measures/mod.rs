@@ -11,4 +11,4 @@ pub mod divergence;
 pub mod spatial;
 
 pub use divergence::KLDivergence;
-pub use spatial::{kinetic_entropy, phase_entropy, spatial_entropy, local_phase_mi};
+pub use spatial::{kinetic_entropy, local_phase_mi, phase_entropy, spatial_entropy};

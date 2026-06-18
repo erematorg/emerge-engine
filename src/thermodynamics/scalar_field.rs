@@ -34,6 +34,7 @@ use crate::{
 ///
 /// # Example — pheromone field
 /// ```rust,no_run
+/// # extern crate emerge_engine as emerge;
 /// # use emerge::{ScalarDiffusionConfig, ScalarDiffusionField};
 /// # use emerge::particle::Particle;
 /// // Pheromone stored in particle.temperature; evaporates in ~10s.

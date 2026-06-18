@@ -179,11 +179,11 @@ impl Grid {
     pub fn update_velocities(&mut self, dt: f32, gravity: Vec2) {
         let (dirty, cells) = (&self.dirty, &mut self.cells);
         for &idx in dirty {
-            if let Some(cell) = cells.get_mut(&idx) {
-                if cell.mass > 0.0 {
-                    cell.momentum /= cell.mass;
-                    cell.momentum += gravity * dt;
-                }
+            if let Some(cell) = cells.get_mut(&idx)
+                && cell.mass > 0.0
+            {
+                cell.momentum /= cell.mass;
+                cell.momentum += gravity * dt;
             }
         }
     }

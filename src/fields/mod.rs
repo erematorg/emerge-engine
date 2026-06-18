@@ -1,7 +1,7 @@
 //! Classical field implementations — spatial sources that apply acceleration to particles.
 //!
 //! All positions are in grid coordinates (same units as `Particle::x`).
-//! The `ForceField` trait is defined here — it is the substep hook for external body forces.
+//! The `Field` trait is defined here — it is the substep hook for external body forces.
 //! Dependency is one-way: fields → core particle, never reverse.
 
 /// Fraction of `cutoff` at which the force-switch fade begins.
@@ -23,6 +23,6 @@ pub use chemotaxis::ChemotaxisField;
 pub use confinement::{AabbConfinementField, RadialConfinementField};
 pub use coulomb::CoulombField;
 pub use em::UniformElectricField;
-pub use force_field::ForceField;
+pub use force_field::Field;
 pub use gravity::GravityWellField;
 pub use n_body::NBodyGravityField;

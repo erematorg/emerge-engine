@@ -50,11 +50,18 @@ pub fn scatter_particles_to_grid(
                 let weight = weights.wx[gx] * weights.wy[gy];
                 let cell_pos = weights.base_cell + IVec2::new(gx as i32 - 1, gy as i32 - 1);
                 let cell_dist = cell_pos.as_vec2() - x + Vec2::splat(0.5);
-                let momentum = weight * (mass_i * (v_i + c_i * cell_dist) + stress_coeff * (stress * cell_dist));
+                let momentum = weight
+                    * (mass_i * (v_i + c_i * cell_dist) + stress_coeff * (stress * cell_dist));
                 grid.add_mass_momentum(cell_pos, weight * mass_i, momentum);
             }
         }
     }
+}
+
+pub struct G2PParams {
+    pub vel_limit: f32,
+    pub apic_blend: f32,
+    pub active_count: usize,
 }
 
 /// G2P: read grid velocities back into particles, advance state, apply boundaries.
@@ -65,10 +72,13 @@ pub fn gather_grid_to_particles(
     dt: f32,
     boundaries: &[Box<dyn BoundaryCondition>],
     materials: &MaterialRegistry,
-    vel_limit: f32,
-    apic_blend: f32,
-    active_count: usize,
+    params: G2PParams,
 ) -> usize {
+    let G2PParams {
+        vel_limit,
+        apic_blend,
+        active_count,
+    } = params;
     let mut clamp_count = 0usize;
     let grid_res = grid.resolution();
     for i in 0..active_count {

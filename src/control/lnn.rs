@@ -1,3 +1,8 @@
+// TODO(LP): This controller belongs in LP's mpm crate, not in a general physics engine.
+// emerge's job is to expose `activation`, `activation_dir`, and the F·A·Fᵀ active stress.
+// LP builds the creature locomotion controller on top of those primitives.
+// Kept here temporarily until LP integration is wired.
+
 /// Liquid Time-constant Network (LNN) — Hasani et al. 2020 (NeurIPS).
 ///
 /// Continuous-time recurrent ODE neuron model:
@@ -65,17 +70,17 @@ impl Lnn {
     pub fn step(&mut self, dt: f32) {
         let n = self.state.len();
         let mut dx = vec![0.0f32; n];
-        for i in 0..n {
+        for (i, dx_i) in dx.iter_mut().enumerate() {
             let net: f32 = (0..n)
                 .map(|j| self.weights[i * n + j] * self.state[j])
                 .sum::<f32>()
                 + self.bias[i];
             let gate = sigmoid(net);
-            dx[i] =
+            *dx_i =
                 (-self.state[i] / self.tau[i] + gate * (self.amplitude[i] - self.state[i])) * dt;
         }
-        for i in 0..n {
-            self.state[i] += dx[i];
+        for (state, dxi) in self.state.iter_mut().zip(dx.iter()) {
+            *state += dxi;
         }
     }
 

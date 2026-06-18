@@ -1,6 +1,7 @@
 //! Common imports for LP / game consumers.
 //!
 //! ```rust,no_run
+//! # extern crate emerge_engine as emerge;
 //! use emerge::prelude::*;
 //! ```
 //!
@@ -10,8 +11,10 @@
 pub use crate::{
     AabbConfinementField,
     ActivationStatsPlugin,
-    // Materials — all eleven
+    // Materials — all twelve (*Material types only)
     BinghamFluidMaterial,
+    // Queries + density field export
+    BodyState,
     // Boundary conditions
     BoundaryCondition,
     BuoyancyField,
@@ -22,27 +25,25 @@ pub use crate::{
     DiagnosticsPlugin,
     // Diagnostics
     DiagnosticsRegistry,
+    DruckerPragerMaterial,
+    // Force fields
+    Field,
     // Runtime
     FixedStepConfig,
     FixedStepController,
 
-    // Force fields
-    ForceField,
     FrictionBoundary,
-
+    GranularFluidMaterial,
     GravityWellField,
+    HeightmapBoundary,
+
     // Creature locomotion controller
     Lnn,
     MaterialCountPlugin,
     MaterialHandle,
     MaterialModel,
     MaterialParams,
-    // Queries + density field export
-    MaterialState,
-    MpmSnapshot,
-
-    // Solver
-    MpmSolver,
+    MuIRheologyMaterial,
     NBodyGravityField,
     NaccMaterial,
     NeoHookeanMaterial,
@@ -55,16 +56,18 @@ pub use crate::{
     RadialConfinementField,
     RankineMaterial,
     RollingPlugin,
-    SandMaterial,
-    SandMuIMaterial,
     ScalarDiffusionConfig,
     ScalarDiffusionField,
 
+    SimConfig,
+    SimSnapshot,
+
+    // Solver
+    Simulation,
     SlipBoundary,
-    SnowMaterial,
-    SolverConfig,
-    SpawnConfig,
+    SpawnRegion,
     SpawnShape,
+    StomakhinMaterial,
     // Thermodynamics
     ThermalConfig,
     ThermalDiffusion,
@@ -75,11 +78,7 @@ pub use crate::{
     VonMisesMaterial,
     // Particle construction helpers
     build_particles,
-    collect_mpm_snapshot,
-    compute_density_grid,
-
-    estimate_particle_volumes,
-
+    collect_snapshot,
     gravity_to_grid,
 
     lame_from_si,

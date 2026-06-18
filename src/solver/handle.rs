@@ -1,6 +1,6 @@
 //! Typed handles for materials and particle groups.
 
-use crate::solver::query::MaterialState;
+use crate::solver::query::BodyState;
 
 /// Typed handle for a registered material.
 ///
@@ -39,16 +39,17 @@ impl std::fmt::Display for MaterialHandle {
 /// A stable handle to a group of particles, identified by `user_tag`.
 ///
 /// Physical indices change whenever particles sleep or wake — the tag is the
-/// only stable identity. All operations delegate to `MpmSolver`'s tag-based API,
+/// only stable identity. All operations delegate to `Simulation`'s tag-based API,
 /// which uses `tag_index` for O(group_size) access.
 ///
 /// # Example — LP creature management
 /// ```rust,no_run
-/// # use emerge::solver::MpmSolver;
-/// # use emerge::{SolverConfig, SpawnConfig};
-/// # let config = SolverConfig::standard(64, 0.05, glam::Vec2::NEG_Y);
-/// # let mut solver = MpmSolver::empty(config);
-/// let creature = solver.spawn_group(SpawnConfig::for_solver(&config));
+/// # extern crate emerge_engine as emerge;
+/// # use emerge::solver::Simulation;
+/// # use emerge::{SimConfig, SpawnRegion};
+/// # let config = SimConfig::standard(64, 0.05, glam::Vec2::NEG_Y);
+/// # let mut solver = Simulation::empty(config);
+/// let creature = solver.add_body(SpawnRegion::for_sim(&config));
 /// solver.set_group_activation(creature, 1.0);
 /// let centroid = solver.group_centroid(creature);
 /// let state = solver.group_state(creature);
@@ -66,7 +67,10 @@ impl ParticleGroup {
     }
 
     pub fn named(tag: u32, label: &'static str) -> Self {
-        Self { tag, label: Some(label) }
+        Self {
+            tag,
+            label: Some(label),
+        }
     }
 
     pub fn tag(self) -> u32 {
@@ -89,8 +93,8 @@ impl std::fmt::Display for ParticleGroup {
     }
 }
 
-/// Aggregate MaterialState for a tag — delegates to MpmSolver::group_state.
+/// Aggregate BodyState for a tag — delegates to Simulation::group_state.
 /// Kept here for callers that hold a ParticleGroup and want a one-liner.
-pub fn group_state_of(_group: ParticleGroup, state: MaterialState) -> MaterialState {
+pub fn group_state_of(_group: ParticleGroup, state: BodyState) -> BodyState {
     state
 }

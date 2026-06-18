@@ -4,20 +4,20 @@
 // Module layout:
 //
 //   Core physics (always compiled, stable API)
-//   ├── solver/          MpmSolver, SolverConfig, SpawnConfig, query, density, cutoff
+//   ├── solver/          Simulation, SimConfig, SpawnRegion, query, density, cutoff
 //   ├── particle         Particle struct
 //   ├── grid/            Grid, Cell, kernel (quadratic weights)
 //   ├── materials/       MaterialModel trait, constitutive models, MaterialRegistry
 //   ├── boundary         BoundaryCondition + impls
 //   ├── transfer         P2G / G2P transfer kernels
-//   ├── fields/          ForceField trait + impls (gravity, Coulomb, EM, confinement)
+//   ├── fields/          Field trait + impls (gravity, Coulomb, EM, confinement)
 //   ├── control/         Lnn (Liquid Time-constant Network locomotion controller)
 //   ├── thermodynamics/  ThermalDiffusion · ScalarDiffusionField
 //   ├── diagnostics/     health monitoring · plugin-based stats collection
 //   └── runtime/         FixedStepController
 //
 //   Compute backends (feature-gated)
-//   ├── gpu/             GpuSolver + WGSL shaders        [feature = "gpu"]
+//   ├── gpu/             GpuSimulation + WGSL shaders        [feature = "gpu"]
 //   └── render/          Instanced particle debug draw    [feature = "render"]
 //
 //   Extended physics (experimental, not part of LP-stable API)
@@ -57,28 +57,32 @@ pub mod measures;
 pub mod prelude;
 
 // ── Flat re-exports ───────────────────────────────────────────────────────────
-// `use emerge::MpmSolver` instead of `use emerge::solver::MpmSolver`.
+// `use emerge::Simulation` instead of `use emerge::solver::Simulation`.
 
 // Solver core
 pub use grid::{Cell, Grid};
 pub use particle::{Particle, Particles};
-pub use solver::MpmSolver;
-pub use solver::config::{SolverConfig, SpawnConfig, SpawnShape};
+pub use solver::Simulation;
+pub use solver::config::{SimConfig, SpawnRegion, SpawnShape};
 pub use solver::handle::{MaterialHandle, ParticleGroup};
 
 // Materials
 pub use materials::{
-    BinghamFluidMaterial, ConstitutiveModel, CorotatedMaterial, MAX_MATERIAL_SLOTS, MaterialModel,
-    MaterialParams, MaterialRegistry, NaccMaterial, NeoHookeanMaterial, NewtonianFluidMaterial,
-    RankineMaterial, SandMaterial, SandMuIMaterial, SnowMaterial, ViscoelasticMaterial,
-    VonMisesMaterial, gravity_to_grid, lame_from_si, lame_from_young,
+    BinghamFluidMaterial, ConstitutiveModel, CorotatedMaterial, DruckerPragerMaterial, Elastic,
+    Elastoplastic, Fluid, FluidGranular, FromSI, GranularFluidMaterial, MAX_MATERIAL_SLOTS,
+    MaterialModel, MaterialParams, MaterialRegistry, MuIRheologyMaterial, NaccMaterial,
+    NeoHookeanMaterial, NewtonianFluidMaterial, PlasticityModel, RankineMaterial,
+    StomakhinMaterial, Viscoelastic, ViscoelasticMaterial, VonMisesMaterial, gravity_to_grid,
+    lame_from_si, lame_from_young,
 };
 
 // Boundary conditions
-pub use boundary::{BoundaryCondition, FrictionBoundary, PredictiveBoundary, SlipBoundary};
+pub use boundary::{
+    BoundaryCondition, FrictionBoundary, HeightmapBoundary, PredictiveBoundary, SlipBoundary,
+};
 
 // Force fields
-pub use fields::ForceField;
+pub use fields::Field;
 pub use fields::{
     AabbConfinementField, BuoyancyField, ChemotaxisField, CoulombField, GravityWellField,
     NBodyGravityField, RadialConfinementField, UniformElectricField,
@@ -87,26 +91,27 @@ pub use fields::{
 // State queries + density export for rendering
 pub use control::Lnn;
 pub use solver::density::compute_density_grid;
-pub use solver::query::MaterialState;
+pub use solver::query::BodyState;
 
-/// Build a `Vec<Particle>` from a `SpawnConfig` — the primary way to construct
-/// initial particle regions for `GpuSolver::new` or to merge multiple regions.
+/// Build a `Vec<Particle>` from a `SpawnRegion` — the primary way to construct
+/// initial particle regions for `GpuSimulation::new` or to merge multiple regions.
 ///
-/// Respects `SpawnConfig::shape` (box or disk), jitter, and material assignment.
+/// Respects `SpawnRegion::shape` (box or disk), jitter, and material assignment.
 /// For physically accurate initial volumes call with `spawn.precompute_volumes()`
 /// or follow up with `estimate_particle_volumes`.
 ///
 /// LP pattern:
 /// ```rust,no_run
-/// # use emerge::{SolverConfig, SpawnConfig, build_particles, NewtonianFluidMaterial};
+/// # extern crate emerge_engine as emerge;
+/// # use emerge::{SimConfig, SpawnRegion, build_particles, NewtonianFluidMaterial};
 /// # use glam::Vec2;
-/// # let config = SolverConfig::standard(64, 0.05, Vec2::NEG_Y * 0.3);
+/// # let config = SimConfig::standard(64, 0.05, Vec2::NEG_Y * 0.3);
 /// let mut particles = build_particles(&config,
-///     SpawnConfig::for_solver(&config).at(Vec2::new(20.0, 32.0)).disk(10.0).spacing(0.5).material(0));
+///     SpawnRegion::for_sim(&config).at(Vec2::new(20.0, 32.0)).disk(10.0).spacing(0.5).material(0));
 /// particles.extend(build_particles(&config,
-///     SpawnConfig::for_solver(&config).at(Vec2::new(44.0, 32.0)).disk(10.0).spacing(0.5).material(1)));
+///     SpawnRegion::for_sim(&config).at(Vec2::new(44.0, 32.0)).disk(10.0).spacing(0.5).material(1)));
 /// ```
-pub fn build_particles(config: &SolverConfig, spawn: SpawnConfig) -> Vec<Particle> {
+pub fn build_particles(config: &SimConfig, spawn: SpawnRegion) -> Vec<Particle> {
     use crate::solver::LcgRng;
     let mut rng = LcgRng::new(spawn.rng_seed);
     let mut particles = crate::solver::initialize_particles(config, spawn, &mut rng);
@@ -118,9 +123,9 @@ pub fn build_particles(config: &SolverConfig, spawn: SpawnConfig) -> Vec<Particl
 
 /// Estimate initial particle volumes from P2G density.
 ///
-/// Use when building particles manually for `GpuSolver::new` and you need the same
-/// physically accurate density that `SpawnConfig::precompute_volumes()` gives you
-/// inside `MpmSolver::spawn_region`. Without it, initial particle density is geometric
+/// Use when building particles manually for `GpuSimulation::new` and you need the same
+/// physically accurate density that `SpawnRegion::precompute_volumes()` gives you
+/// inside `Simulation::spawn_region`. Without it, initial particle density is geometric
 /// (`mass / spacing²`) which can cause a pressure spike on the first substep.
 pub fn estimate_particle_volumes(particles: &mut Vec<Particle>, grid_res: usize) {
     use crate::solver::density::estimate_particle_volumes as density_estimate;
@@ -143,18 +148,20 @@ pub use diagnostics::{
     // Plugin infrastructure
     DiagnosticsPlugin,
     DiagnosticsRegistry,
+    // Snapshot + health
+    FrameLogger,
     MaterialCountPlugin,
     // Per-material stats + logging
     MaterialStats,
-    MpmHealthStatus,
-    MpmHealthThresholds,
-    MpmSnapshot,
     RollingPlugin,
+    SimSnapshot,
+    StabilityStatus,
+    StabilityThresholds,
+    StepTiming,
     ThermalStatsPlugin,
-    // Snapshot + health
-    FrameLogger,
-    collect_mpm_snapshot,
-    evaluate_mpm_health,
+    collect_snapshot,
+    collect_snapshot_particles_only,
+    evaluate_stability,
     log_frame,
     log_frame_full,
     log_frame_gpu,
@@ -167,8 +174,8 @@ pub use runtime::{FixedStepConfig, FixedStepController};
 
 // GPU backend
 #[cfg(feature = "gpu")]
-pub use gpu::{GpuForceFieldEntry, GpuForceFieldsParams, GpuSolver, MAX_FORCE_FIELDS, field_type};
+pub use gpu::{GpuFieldEntry, GpuFieldsParams, GpuSimulation, MAX_FORCE_FIELDS, field_type};
 
 // Render backend
 #[cfg(feature = "render")]
-pub use render::{ColorMode, MpmRenderer};
+pub use render::{ColorMode, Renderer};
