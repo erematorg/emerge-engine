@@ -1,7 +1,7 @@
-use crate::diagnostics::snapshot::MpmSnapshot;
+use crate::diagnostics::snapshot::SimSnapshot;
 
 #[derive(Debug, Clone, Copy)]
-pub struct MpmHealthThresholds {
+pub struct StabilityThresholds {
     pub max_cfl: f32,
     pub max_relative_mass_error: f32,
     pub max_relative_momentum_error: f32,
@@ -22,7 +22,7 @@ pub struct MpmHealthThresholds {
     pub max_j_projection_count: usize,
 }
 
-impl MpmHealthThresholds {
+impl StabilityThresholds {
     pub fn for_spacing(spacing: f32) -> Self {
         Self::for_spacing_with_options(spacing, f32::INFINITY, f32::INFINITY)
     }
@@ -42,7 +42,7 @@ impl MpmHealthThresholds {
     }
 }
 
-impl Default for MpmHealthThresholds {
+impl Default for StabilityThresholds {
     fn default() -> Self {
         Self {
             max_cfl: 1.0,
@@ -65,7 +65,7 @@ impl Default for MpmHealthThresholds {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-pub struct MpmHealthStatus {
+pub struct StabilityStatus {
     pub particle_count_violation: bool,
     pub inactive_grid_violation: bool,
     pub cell_concentration_violation: bool,
@@ -84,7 +84,7 @@ pub struct MpmHealthStatus {
     pub j_projection_violation: bool,
 }
 
-impl MpmHealthStatus {
+impl StabilityStatus {
     pub fn healthy(self) -> bool {
         !self.particle_count_violation
             && !self.inactive_grid_violation
@@ -181,13 +181,13 @@ impl MpmHealthStatus {
     }
 }
 
-pub fn evaluate_mpm_health(
-    snapshot: &MpmSnapshot,
-    thresholds: &MpmHealthThresholds,
-) -> MpmHealthStatus {
+pub fn evaluate_stability(
+    snapshot: &SimSnapshot,
+    thresholds: &StabilityThresholds,
+) -> StabilityStatus {
     let non_finite_total = snapshot.non_finite_particle_values + snapshot.non_finite_grid_values;
 
-    MpmHealthStatus {
+    StabilityStatus {
         particle_count_violation: snapshot.particle_count < thresholds.min_particle_count,
         inactive_grid_violation: snapshot.particle_count > 0
             && snapshot.active_grid_cells < thresholds.min_active_grid_cells,

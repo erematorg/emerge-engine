@@ -13,5 +13,5 @@ pub use plugin::{
     ActivationStatsPlugin, DiagnosticsFrame, DiagnosticsPlugin, DiagnosticsRegistry,
     MaterialCountPlugin, RollingPlugin, ThermalStatsPlugin,
 };
-pub use rules::{MpmHealthStatus, MpmHealthThresholds, evaluate_mpm_health};
-pub use snapshot::{MpmSnapshot, collect_mpm_snapshot};
+pub use rules::{StabilityStatus, StabilityThresholds, evaluate_stability};
+pub use snapshot::{SimSnapshot, StepTiming, collect_snapshot, collect_snapshot_particles_only};

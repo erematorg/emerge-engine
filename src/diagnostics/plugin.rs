@@ -6,6 +6,7 @@
 //!
 //! # Quick start — closure plugin
 //! ```rust,no_run
+//! # extern crate emerge_engine as emerge;
 //! # use emerge::{DiagnosticsRegistry, DiagnosticsFrame};
 //! let mut registry = DiagnosticsRegistry::new()
 //!     .with_fn("alive", |particles, _snap| {
@@ -15,13 +16,14 @@
 //!
 //! # Stateful plugin (rolling average)
 //! ```rust,no_run
+//! # extern crate emerge_engine as emerge;
 //! # use emerge::{DiagnosticsPlugin, DiagnosticsRegistry};
-//! # use emerge::diagnostics::MpmSnapshot;
+//! # use emerge::diagnostics::SimSnapshot;
 //! # use emerge::particle::Particle;
 //! struct EnergyPlugin { history: Vec<f32> }
 //! impl DiagnosticsPlugin for EnergyPlugin {
 //!     fn name(&self) -> &'static str { "energy" }
-//!     fn collect(&mut self, particles: &[Particle], _snap: &MpmSnapshot) -> Vec<(String, f32)> {
+//!     fn collect(&mut self, particles: &[Particle], _snap: &SimSnapshot) -> Vec<(String, f32)> {
 //!         let ke: f32 = particles.iter().map(|p| 0.5 * p.mass * p.v.length_squared()).sum();
 //!         self.history.push(ke);
 //!         vec![("ke".into(), ke)]
@@ -31,7 +33,7 @@
 
 use std::fmt;
 
-use crate::diagnostics::snapshot::MpmSnapshot;
+use crate::diagnostics::snapshot::SimSnapshot;
 use crate::particle::Particle;
 
 // ─── Trait ──────────────────────────────────────────────────────────────────
@@ -50,7 +52,7 @@ pub trait DiagnosticsPlugin: Send + Sync {
     ///
     /// Called once per [`DiagnosticsRegistry::collect`] invocation.
     /// `&mut self` enables stateful plugins (see module-level example).
-    fn collect(&mut self, particles: &[Particle], snapshot: &MpmSnapshot) -> Vec<(String, f32)>;
+    fn collect(&mut self, particles: &[Particle], snapshot: &SimSnapshot) -> Vec<(String, f32)>;
 }
 
 // ─── Registry ───────────────────────────────────────────────────────────────
@@ -61,6 +63,7 @@ pub trait DiagnosticsPlugin: Send + Sync {
 /// or add plugins at runtime via [`register`](Self::register).
 ///
 /// ```rust,no_run
+/// # extern crate emerge_engine as emerge;
 /// # use emerge::{DiagnosticsRegistry, ActivationStatsPlugin, ThermalStatsPlugin};
 /// let mut registry = DiagnosticsRegistry::new()
 ///     .with(Box::new(ActivationStatsPlugin))
@@ -91,7 +94,7 @@ impl DiagnosticsRegistry {
     pub fn with_fn(
         mut self,
         name: &'static str,
-        f: impl Fn(&[Particle], &MpmSnapshot) -> Vec<(String, f32)> + Send + Sync + 'static,
+        f: impl Fn(&[Particle], &SimSnapshot) -> Vec<(String, f32)> + Send + Sync + 'static,
     ) -> Self {
         self.plugins.push(Box::new(FnPlugin {
             name,
@@ -109,7 +112,7 @@ impl DiagnosticsRegistry {
     pub fn register_fn(
         &mut self,
         name: &'static str,
-        f: impl Fn(&[Particle], &MpmSnapshot) -> Vec<(String, f32)> + Send + Sync + 'static,
+        f: impl Fn(&[Particle], &SimSnapshot) -> Vec<(String, f32)> + Send + Sync + 'static,
     ) {
         self.plugins.push(Box::new(FnPlugin {
             name,
@@ -121,7 +124,7 @@ impl DiagnosticsRegistry {
     ///
     /// Plugins are called in registration order. Duplicate keys are preserved
     /// (last writer wins when using `get`).
-    pub fn collect(&mut self, particles: &[Particle], snapshot: &MpmSnapshot) -> DiagnosticsFrame {
+    pub fn collect(&mut self, particles: &[Particle], snapshot: &SimSnapshot) -> DiagnosticsFrame {
         let mut stats = Vec::new();
         for plugin in &mut self.plugins {
             stats.extend(plugin.collect(particles, snapshot));
@@ -211,7 +214,7 @@ impl DiagnosticsPlugin for ActivationStatsPlugin {
         "activation"
     }
 
-    fn collect(&mut self, particles: &[Particle], _snap: &MpmSnapshot) -> Vec<(String, f32)> {
+    fn collect(&mut self, particles: &[Particle], _snap: &SimSnapshot) -> Vec<(String, f32)> {
         if particles.is_empty() {
             return vec![("act_mean".into(), 0.0), ("act_frac".into(), 0.0)];
         }
@@ -239,7 +242,7 @@ impl DiagnosticsPlugin for ThermalStatsPlugin {
         "thermal"
     }
 
-    fn collect(&mut self, particles: &[Particle], _snap: &MpmSnapshot) -> Vec<(String, f32)> {
+    fn collect(&mut self, particles: &[Particle], _snap: &SimSnapshot) -> Vec<(String, f32)> {
         if particles.is_empty() {
             return vec![("T_mean".into(), 0.0), ("T_max".into(), 0.0)];
         }
@@ -266,7 +269,7 @@ impl DiagnosticsPlugin for MaterialCountPlugin {
         "mat_counts"
     }
 
-    fn collect(&mut self, particles: &[Particle], _snap: &MpmSnapshot) -> Vec<(String, f32)> {
+    fn collect(&mut self, particles: &[Particle], _snap: &SimSnapshot) -> Vec<(String, f32)> {
         let mut counts: std::collections::BTreeMap<u32, usize> = std::collections::BTreeMap::new();
         for p in particles {
             *counts.entry(p.material_id).or_default() += 1;
@@ -288,6 +291,7 @@ impl DiagnosticsPlugin for MaterialCountPlugin {
 /// Output keys are prefixed with `ema_`.
 ///
 /// ```rust,no_run
+/// # extern crate emerge_engine as emerge;
 /// # use emerge::{DiagnosticsRegistry, ActivationStatsPlugin};
 /// # use emerge::diagnostics::plugin::RollingPlugin;
 /// let registry = DiagnosticsRegistry::new()
@@ -318,7 +322,7 @@ impl DiagnosticsPlugin for RollingPlugin {
         self.inner.name()
     }
 
-    fn collect(&mut self, particles: &[Particle], snapshot: &MpmSnapshot) -> Vec<(String, f32)> {
+    fn collect(&mut self, particles: &[Particle], snapshot: &SimSnapshot) -> Vec<(String, f32)> {
         let raw = self.inner.collect(particles, snapshot);
         let alpha = self.alpha;
         raw.iter()
@@ -336,16 +340,18 @@ impl DiagnosticsPlugin for RollingPlugin {
 
 // ─── Internal: fn pointer plugin ────────────────────────────────────────────
 
+type PluginFn = Box<dyn Fn(&[Particle], &SimSnapshot) -> Vec<(String, f32)> + Send + Sync>;
+
 struct FnPlugin {
     name: &'static str,
-    f: Box<dyn Fn(&[Particle], &MpmSnapshot) -> Vec<(String, f32)> + Send + Sync>,
+    f: PluginFn,
 }
 
 impl DiagnosticsPlugin for FnPlugin {
     fn name(&self) -> &'static str {
         self.name
     }
-    fn collect(&mut self, particles: &[Particle], snapshot: &MpmSnapshot) -> Vec<(String, f32)> {
+    fn collect(&mut self, particles: &[Particle], snapshot: &SimSnapshot) -> Vec<(String, f32)> {
         (self.f)(particles, snapshot)
     }
 }

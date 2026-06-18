@@ -1,11 +1,11 @@
 use glam::Vec2;
 use std::collections::HashMap;
 
-use crate::solver::config::SolverConfig;
+use crate::solver::config::SimConfig;
 use crate::{grid::Grid, particle::Particles};
 
 #[derive(Debug, Clone, Copy, Default)]
-pub struct MpmSnapshot {
+pub struct SimSnapshot {
     pub frame_index: u64,
     /// Frame duration as configured: the total simulation time advanced by one `step()` call.
     pub configured_dt: f32,
@@ -57,16 +57,136 @@ pub struct MpmSnapshot {
     /// Simulation time (seconds) dropped due to `max_substeps_per_step` cap this step.
     /// Nonzero = simulation running slower than real-time; reduce stiffness or raise cap.
     pub sim_time_dropped: f32,
+    /// Wall-clock time breakdown for the last `step()` call. All values in microseconds.
+    /// Accumulated across all substeps — divide by `substeps_last_step` for per-substep cost.
+    pub timing: StepTiming,
 }
 
-pub fn collect_mpm_snapshot(
+/// Wall-clock timing breakdown for one `step()` call (sum of all substeps).
+/// Measured with `std::time::Instant` — zero external dependencies.
+/// Read via `solver.diagnostics_snapshot().timing`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StepTiming {
+    /// P2G scatter: particle → grid momentum/stress accumulation.
+    pub p2g_us: u64,
+    /// Grid update: momentum normalization + gravity + boundary application.
+    pub grid_update_us: u64,
+    /// G2P gather: grid → particle velocity/position + plasticity update.
+    pub g2p_us: u64,
+    /// Force fields (NBody, gravity wells, Coulomb). Zero if no fields registered.
+    pub fields_us: u64,
+    /// Thermal + scalar diffusion. Zero if neither is active.
+    pub thermal_us: u64,
+    /// CFL timestep selection (choose_substep_dt) — iterates all particles once per substep.
+    pub cfl_us: u64,
+    /// Spatial hash rebuild (O(N) per substep) — powers particles_near / count_near queries.
+    pub spatial_hash_us: u64,
+    /// Phase rule evaluation + sleep scoring (O(N) per substep).
+    pub phase_sleep_us: u64,
+    /// `project_invalid_state` admissibility scan (O(N) pre-P2G, only when standard config).
+    pub project_us: u64,
+    /// Density recompute via P2G volume estimation (only when fluid materials present).
+    pub density_us: u64,
+    /// Total wall time for the step (includes overhead not captured in individual phases).
+    pub total_us: u64,
+}
+
+/// Particle-only snapshot — no grid required. Used by `GpuSimulation::diagnostics_snapshot`.
+/// Grid-side fields (mass error, momentum error, grid speed, active cells) are left at zero.
+pub fn collect_snapshot_particles_only(
+    frame_index: u64,
+    particles: &[crate::particle::Particle],
+    config: &SimConfig,
+    step_dt: f32,
+    substeps_last_step: usize,
+) -> SimSnapshot {
+    let mut snap = SimSnapshot {
+        frame_index,
+        configured_dt: config.dt,
+        effective_dt: step_dt,
+        substeps_last_step,
+        particle_count: particles.len(),
+        recommended_max_dt_from_velocity_cfl: f32::INFINITY,
+        min_deformation_j: f32::INFINITY,
+        max_deformation_j: f32::NEG_INFINITY,
+        min_plastic_jacobian: f32::INFINITY,
+        avg_plastic_jacobian: 1.0,
+        avg_elastic_hardening: 1.0,
+        ..Default::default()
+    };
+    let min_bound = config.boundary_thickness.saturating_sub(1) as f32;
+    let max_bound = config.grid_res.saturating_sub(config.boundary_thickness) as f32;
+    let mut jp_sum = 0.0f32;
+    let mut h_sum = 0.0f32;
+
+    for p in particles {
+        let deformation_j = p.deformation_gradient.determinant();
+        snap.total_particle_mass += p.mass;
+        snap.total_particle_momentum += p.mass * p.v;
+        snap.max_particle_speed = snap.max_particle_speed.max(p.v.length());
+        if deformation_j.is_finite() {
+            snap.min_deformation_j = snap.min_deformation_j.min(deformation_j);
+            snap.max_deformation_j = snap.max_deformation_j.max(deformation_j);
+        }
+        if p.x.x < min_bound || p.x.x > max_bound || p.x.y < min_bound || p.x.y > max_bound {
+            snap.out_of_bounds_particles += 1;
+        }
+        let jp = p.plastic_volume_ratio;
+        let h = p.hardening_scale;
+        if jp.is_finite() {
+            jp_sum += jp;
+            snap.min_plastic_jacobian = snap.min_plastic_jacobian.min(jp);
+        }
+        if h.is_finite() {
+            h_sum += h;
+        }
+        let non_finite = [
+            p.x.x, p.x.y, p.v.x, p.v.y,
+            p.velocity_gradient.x_axis.x, p.velocity_gradient.x_axis.y,
+            p.velocity_gradient.y_axis.x, p.velocity_gradient.y_axis.y,
+            p.deformation_gradient.x_axis.x, p.deformation_gradient.x_axis.y,
+            p.deformation_gradient.y_axis.x, p.deformation_gradient.y_axis.y,
+            p.mass, p.initial_volume, p.volume, p.density, p.plastic_volume_ratio,
+        ]
+        .iter()
+        .filter(|v| !v.is_finite())
+        .count();
+        snap.non_finite_particle_values += non_finite;
+        if non_finite == 0 {
+            snap.valid_particle_count += 1;
+        }
+        if p.mass <= 0.0 || p.volume <= 0.0 || p.initial_volume <= 0.0
+            || p.density <= 0.0 || deformation_j <= 0.0 || jp <= 0.0
+        {
+            snap.invalid_physical_particle_values += 1;
+        }
+    }
+
+    if !particles.is_empty() {
+        let n = particles.len() as f32;
+        snap.avg_plastic_jacobian = jp_sum / n;
+        snap.avg_elastic_hardening = h_sum / n;
+        if snap.min_plastic_jacobian.is_infinite() {
+            snap.min_plastic_jacobian = 1.0;
+        }
+    }
+
+    let cell_size = config.grid_cell_size.max(f32::EPSILON);
+    snap.cfl_number = snap.max_particle_speed * step_dt / cell_size;
+    if snap.max_particle_speed > f32::EPSILON {
+        snap.recommended_max_dt_from_velocity_cfl = cell_size / snap.max_particle_speed;
+    }
+    snap
+}
+
+pub fn collect_snapshot(
     frame_index: u64,
     particles: &Particles,
     grid: &Grid,
-    config: &SolverConfig,
+    config: &SimConfig,
     step_dt: f32,
     substeps_last_step: usize,
-) -> MpmSnapshot {
+) -> SimSnapshot {
     #[derive(Clone, Copy, Debug)]
     struct MaterialCellState {
         first_material_id: u32,
@@ -74,7 +194,7 @@ pub fn collect_mpm_snapshot(
         particle_count: usize,
     }
 
-    let mut snapshot = MpmSnapshot {
+    let mut snapshot = SimSnapshot {
         frame_index,
         configured_dt: config.dt,
         effective_dt: step_dt,

@@ -3,7 +3,7 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use crate::diagnostics::per_material::MaterialStats;
-use crate::diagnostics::snapshot::MpmSnapshot;
+use crate::diagnostics::snapshot::SimSnapshot;
 
 /// NDJSON frame logger — one JSON object per line, one file per run.
 ///
@@ -44,14 +44,15 @@ impl FrameLogger {
         frame: u64,
         dt: f32,
         stats: &[MaterialStats],
-        snap: &MpmSnapshot,
+        snap: &SimSnapshot,
         labels: &[(u32, &str)],
     ) {
-        let health = if snap.non_finite_particle_values > 0 || snap.invalid_physical_particle_values > 0 {
-            "WARN"
-        } else {
-            "OK"
-        };
+        let health =
+            if snap.non_finite_particle_values > 0 || snap.invalid_physical_particle_values > 0 {
+                "WARN"
+            } else {
+                "OK"
+            };
 
         let mut line = format!(
             "{{\"frame\":{},\"dt\":{:.4},\"active\":{},\"sleeping\":{},\"substeps\":{},\"cfl\":{:.4},\"j\":[{:.4},{:.4}],\"health\":\"{}\"",
@@ -74,7 +75,10 @@ impl FrameLogger {
             line.push_str(&format!(",\"j_proj\":{}", snap.j_projection_count));
         }
         if snap.non_finite_particle_values > 0 {
-            line.push_str(&format!(",\"nan_particles\":{}", snap.non_finite_particle_values));
+            line.push_str(&format!(
+                ",\"nan_particles\":{}",
+                snap.non_finite_particle_values
+            ));
         }
 
         // Per-material array.
@@ -112,7 +116,10 @@ impl FrameLogger {
                 line.push_str(&format!(",\"q\":{:.4}", s.mean_damage));
             }
             if s.max_activation > 1e-4 {
-                line.push_str(&format!(",\"act_mean\":{:.4},\"act_max\":{:.4}", s.mean_activation, s.max_activation));
+                line.push_str(&format!(
+                    ",\"act_mean\":{:.4},\"act_max\":{:.4}",
+                    s.mean_activation, s.max_activation
+                ));
             }
             if s.mean_temperature.abs() > 1e-4 {
                 line.push_str(&format!(",\"T\":{:.4}", s.mean_temperature));

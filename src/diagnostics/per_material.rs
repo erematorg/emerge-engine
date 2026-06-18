@@ -1,8 +1,8 @@
 use glam::Vec2;
 use std::collections::BTreeMap;
 
-use crate::diagnostics::rules::{MpmHealthThresholds, evaluate_mpm_health};
-use crate::diagnostics::snapshot::MpmSnapshot;
+use crate::diagnostics::rules::{StabilityThresholds, evaluate_stability};
+use crate::diagnostics::snapshot::SimSnapshot;
 use crate::particle::{Particle, Particles};
 
 /// Per-material aggregate statistics — one entry per unique `material_id`.
@@ -77,7 +77,10 @@ impl MaterialStats {
         }
         // Activation — only for creature materials.
         if self.max_activation > 1e-4 {
-            s.push_str(&format!("  act={:.2}/{:.2}", self.mean_activation, self.max_activation));
+            s.push_str(&format!(
+                "  act={:.2}/{:.2}",
+                self.mean_activation, self.max_activation
+            ));
         }
         // Temperature — only when non-zero.
         if self.mean_temperature.abs() > 1e-4 {
@@ -200,7 +203,7 @@ pub fn log_frame(
     labels: &[(u32, &str)],
     interval: u64,
 ) {
-    if interval > 0 && frame % interval != 0 {
+    if interval > 0 && !frame.is_multiple_of(interval) {
         return;
     }
     let stats = per_material_stats(particles);
@@ -232,13 +235,13 @@ pub fn log_frame_full(
     dt: f32,
     particles: &Particles,
     labels: &[(u32, &str)],
-    snapshot: &MpmSnapshot,
+    snapshot: &SimSnapshot,
     interval: u64,
 ) {
-    if interval > 0 && frame % interval != 0 {
+    if interval > 0 && !frame.is_multiple_of(interval) {
         return;
     }
-    let health = evaluate_mpm_health(snapshot, &MpmHealthThresholds::default());
+    let health = evaluate_stability(snapshot, &StabilityThresholds::default());
     let health_tag = if health.healthy() {
         "OK".to_string()
     } else {
@@ -292,7 +295,7 @@ pub fn log_frame_full(
     }
 }
 
-/// GPU-compatible per-frame log. Takes a `&[Particle]` slice (CPU mirror from GpuSolver).
+/// GPU-compatible per-frame log. Takes a `&[Particle]` slice (CPU mirror from GpuSimulation).
 ///
 /// No CFL or health check — those require grid data unavailable on the GPU path.
 /// Shows global J range computed from the particle mirror (1-frame lag vs GPU state).
@@ -305,7 +308,7 @@ pub fn log_frame_gpu(
     labels: &[(u32, &str)],
     interval: u64,
 ) {
-    if interval > 0 && frame % interval != 0 {
+    if interval > 0 && !frame.is_multiple_of(interval) {
         return;
     }
     let stats = per_material_stats_of(particles);
