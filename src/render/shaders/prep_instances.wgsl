@@ -49,13 +49,21 @@ struct InstanceData {
 struct RenderConfig {
     mode:           u32,
     particle_count: u32,
-    vel_scale:      f32, // 1 / (max expected speed) — maps |v| to [0, 1]
+    vel_scale:      f32,
     _pad:           u32,
+}
+
+// Per-material optical absorption: σ_a [r, g, b, _pad] × 16 slots.
+// Beer-Lambert: transmitted_rgb = exp(-σ_a_rgb).
+// High σ = strong absorption = dark / hue-shifted toward complementary color.
+struct OpticalTable {
+    slots: array<vec4<f32>, 16>,
 }
 
 @group(0) @binding(0) var<storage, read>       particles: array<Particle>;
 @group(0) @binding(1) var<storage, read_write> instances: array<InstanceData>;
 @group(0) @binding(2) var<uniform>             config:    RenderConfig;
+@group(0) @binding(3) var<uniform>             optics:    OpticalTable;
 
 // ── Color helpers ─────────────────────────────────────────────────────────────
 
@@ -111,11 +119,35 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     } else if config.mode == 1u {
         // ByVelocity: |v| * vel_scale → heat map.
         color = heat(length(p.v) * config.vel_scale);
-    } else {
-        // ByVolume: J = det(F). J < 1 → compressed (blue), J > 1 → expanded (red).
-        // Map: J=0 → t=0 (blue), J=1 → t=0.5 (green/white), J=2 → t=1 (red).
+    } else if config.mode == 2u {
+        // ByVolume: J = det(F). J < 1 → blue (compressed), J > 1 → red (expanded).
         let j = det2(f);
         color = heat(clamp(j * 0.5, 0.0, 1.0));
+    } else if config.mode == 3u {
+        // ByPhysics: Beer-Lambert absorption + blackbody thermal emission.
+        //
+        // Absorption: white light transmitted through one particle layer.
+        //   transmitted = exp(-σ_a)   [Beer-Lambert, depth=1 particle]
+        //   J < 1 (compressed) → denser → deeper optical path → more absorption.
+        let slot = p.material_id % 16u;
+        let sigma_a = optics.slots[slot].rgb;
+        let j = clamp(det2(p.deformation_gradient), 0.05, 4.0);
+        let optical_depth = 1.0 / j; // compressed = denser = deeper path
+        let transmitted = exp(-sigma_a * optical_depth);
+        //
+        // Thermal emission: blackbody additive glow above ~300 K.
+        //   Normalized to 5000 K (solar surface) — biological temps near zero.
+        let t_norm = clamp(p.temperature / 5000.0, 0.0, 1.0);
+        let emission = heat(0.5 + t_norm * 0.5).rgb * (t_norm * t_norm) * 2.0;
+        //
+        color = vec4(clamp(transmitted + emission, vec3(0.0), vec3(1.0)), 1.0);
+    } else if config.mode == 4u {
+        // ByThermal: blackbody emission only. Cold → black, warm → orange, hot → white.
+        let t_norm = clamp(p.temperature / 1500.0, 0.0, 1.0);
+        color = vec4(heat(t_norm).rgb * (0.1 + t_norm * 0.9), 1.0);
+    } else {
+        // ByActivation: muscle activation [0,1] → cool (rest) → warm (firing).
+        color = heat(clamp(p.activation, 0.0, 1.0) * 0.8);
     }
 
     instances[id] = InstanceData(
