@@ -2,24 +2,24 @@
 members = ["."]
 
 [package]
-name = "emerge"
+name = "emerge-engine"
 version = "0.1.0"
 edition = "2024"
+authors = ["Eremat"]
 license = "MIT OR Apache-2.0"
-description = "Real-time MLS-MPM physics engine — continuum simulation for Life's Progress."
+description = "Real-time MLS-MPM continuum physics engine — fluids, granular, elastic solids, active matter."
+repository = "https://github.com/M1thieu/emerge"
+readme = "README.md"
 keywords = ["physics", "mpm", "simulation", "game", "continuum"]
 categories = ["game-engines", "simulation", "science"]
 
 [dependencies]
 glam = { version = "0.30", features = ["bytemuck"] }
 bytemuck = { version = "1", features = ["derive"] }
-bevy = { version = "0.18", optional = true }
-bevy_egui = { version = "0.39", optional = true }
 wgpu = { version = "27", optional = true }
 
 [features]
 default = []
-bevy_examples = ["dep:bevy", "dep:bevy_egui"]
 # GPU compute: 7-pass wgpu pipeline. All plasticity (Snow SVD, DP, VonMises) runs on GPU.
 gpu = ["dep:wgpu"]
 # Standalone debug renderer: instanced particle draw via wgpu. Requires gpu.
@@ -31,14 +31,18 @@ experimental = []
 [dev-dependencies]
 pollster = "0.3"
 criterion = "0.5"
+winit = "0.30"
+egui = "0.33.3"
+egui-winit = "0.33.3"
+egui-wgpu = "0.33.3"
 
 [[bench]]
 name = "scaling"
 harness = false
 
 [profile.dev]
-opt-level = 1  # Basic optimization for better dev performance
-debug = 1      # Line tables only — avoids MSVC PDB stream limit with Bevy's type graph
+opt-level = 1
+debug = 1
 
 [profile.dev.package."*"]
 opt-level = 3  # Full optimization for dependencies
@@ -48,44 +52,54 @@ lto = "thin"
 codegen-units = 1
 
 [[example]]
-name = "basic_showcase"
-required-features = ["bevy_examples"]
+name = "headless"
 
-[[example]]
-name = "basic_fluids"
-required-features = ["bevy_examples"]
-
-[[example]]
-name = "basic_jellies"
-required-features = ["bevy_examples"]
-
-[[example]]
-name = "basic_snow"
-required-features = ["bevy_examples"]
-
-[[example]]
-name = "basic_sand"
-required-features = ["bevy_examples"]
-
+# --- GPU examples: current focus ---
 [[example]]
 name = "basic_jellies_gpu"
-required-features = ["bevy_examples", "gpu"]
+required-features = ["render"]
 
 [[example]]
 name = "basic_sand_gpu"
-required-features = ["bevy_examples", "gpu"]
+required-features = ["render"]
 
 [[example]]
 name = "basic_snow_gpu"
-required-features = ["bevy_examples", "gpu"]
+required-features = ["render"]
 
 [[example]]
 name = "basic_fluids_gpu"
-required-features = ["bevy_examples", "gpu"]
+required-features = ["render"]
+
+[[example]]
+name = "basic_showcase_gpu"
+required-features = ["render"]
+
+[[example]]
+name = "render_physics"
+required-features = ["render"]
+
+# --- CPU examples: deferred. Reference / fallback only. ---
+[[example]]
+name = "basic_showcase"
+required-features = ["render"]
+
+[[example]]
+name = "basic_fluids"
+required-features = ["render"]
+
+[[example]]
+name = "basic_jellies"
+required-features = ["render"]
+
+[[example]]
+name = "basic_snow"
+required-features = ["render"]
+
+[[example]]
+name = "basic_sand"
+required-features = ["render"]
 
 [[example]]
 name = "basic_creature"
-required-features = ["bevy_examples"]
-
-[[example]]
-name = "headless"
+required-features = ["render"]

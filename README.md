@@ -1,113 +1,110 @@
 # emerge
 
-Real-time continuum physics engine. MLS-MPM (Hu et al. 2018), pure Rust, wgpu GPU backend.
+[![crates.io](https://img.shields.io/crates/v/emerge-engine.svg)](https://crates.io/crates/emerge-engine)
+[![docs.rs](https://docs.rs/emerge-engine/badge.svg)](https://docs.rs/emerge-engine)
+[![license](https://img.shields.io/crates/l/emerge-engine.svg)](LICENSE-MIT)
 
-Built for [Life's Progress](https://github.com/M1thieu/LP) — a systemic simulation game.
-Not a game engine: no ECS, no rendering, no game logic. Physics only.
+Real-time continuum physics engine. MLS-MPM (Hu et al. 2018), pure Rust, optional wgpu GPU backend.
 
-## Materials
-
-| Model | Use case |
-|---|---|
-| `NeoHookeanMaterial` | Soft solids, muscle, elastic bodies |
-| `CorotatedMaterial` | Stiffer elastic baseline |
-| `ViscoelasticMaterial` | Tissue, hydrogel, damped solids (Kelvin-Voigt) |
-| `NewtonianFluidMaterial` | Water, thin fluids (Tait EOS + viscosity) |
-| `BinghamFluidMaterial` | Viscoplastic fluids with yield stress |
-| `SnowMaterial` | Compressible granular + SVD plasticity (Stomakhin 2013) |
-| `SandMaterial` | Drucker-Prager return mapping + dilatancy (Klar 2016) |
-| `SandMuIMaterial` | Rate-dependent granular friction µ(I)-rheology |
-| `VonMisesMaterial` | J2 plasticity, linear isotropic hardening |
-| `RankineMaterial` | Tensile cutoff + exponential softening (brittle fracture) |
-
-## Quick start
+Built for [Life's Progress](https://github.com/M1thieu/LP), a systemic simulation game. Not a game engine: no ECS, no rendering, no game loop. Physics only.
 
 ```toml
 [dependencies]
-emerge = { path = "path/to/emerge" }
-# GPU backend:
-emerge = { path = "path/to/emerge", features = ["gpu"] }
+emerge = { package = "emerge-engine", version = "0.1" }
+# with GPU compute:
+emerge = { package = "emerge-engine", version = "0.1", features = ["gpu"] }
 ```
+
+## Quick start
 
 ```rust
 use emerge::prelude::*;
 
-const FLUID_ID: u32 = 1;
+const WATER: u32 = 1;
 
-let config = SolverConfig::standard(64, 0.05, Vec2::NEG_Y);
+let config = SimConfig::standard(64, 0.05, Vec2::NEG_Y);
 
-// Default material (id=0): elastic jelly in the centre.
-let elastic_spawn = SpawnConfig {
-    spacing: 0.5,
+let mut sim = Simulation::empty(config)
+    .with_default_material(Box::new(NeoHookeanMaterial::new(400.0, 200.0)))
+    .with_material(WATER, Box::new(NewtonianFluidMaterial::water(1000.0, 1e4)))
+    .with_boundary(Box::new(SlipBoundary::new(2)));
+
+sim.add_body(SpawnRegion {
     box_size: IVec2::new(12, 12),
     box_center: Vec2::new(24.0, 40.0),
     precompute_initial_volumes: true,
-    ..SpawnConfig::for_solver(&config)
-};
+    ..SpawnRegion::for_sim(&config)
+});
 
-// Material 1: Newtonian fluid, spawned separately.
-let fluid_spawn = SpawnConfig {
-    spacing: 0.5,
+sim.add_body(SpawnRegion {
     box_size: IVec2::new(12, 8),
     box_center: Vec2::new(40.0, 36.0),
-    material_id: FLUID_ID,
+    material_id: WATER,
     precompute_initial_volumes: true,
-    ..SpawnConfig::for_solver(&config)
-};
+    ..SpawnRegion::for_sim(&config)
+});
 
-let mut solver = MpmSolver::new(config, elastic_spawn)
-    .with_default_material(Box::new(NeoHookeanMaterial::new(400.0, 200.0)))
-    .with_material(FLUID_ID, Box::new(NewtonianFluidMaterial::new(1000.0, 1e-3, 1e4, 7.0)))
-    .with_boundary(Box::new(SlipBoundary::new(config.boundary_thickness)));
+sim.step_n(60);
 
-solver.spawn_region(fluid_spawn);
-solver.step_n(60);
-
-let state = solver.material_state(FLUID_ID);
-println!("fluid centroid: {:?}  avg_speed: {:.3}", state.centroid, state.avg_speed);
+let state = sim.region_state(Vec2::new(40.0, 36.0), 10.0);
+println!("avg speed: {:.3}", state.avg_speed);
 ```
+
+## Materials
+
+| Model | Constitutive description |
+|---|---|
+| `NeoHookeanMaterial` | Hyperelastic, finite-strain (Green-Lagrange energy) |
+| `CorotatedMaterial` | Corotated linear elasticity, stiff baseline |
+| `ViscoelasticMaterial` | Kelvin-Voigt: elastic spring + viscous dashpot in parallel |
+| `NewtonianFluidMaterial` | Tait EOS pressure + Newtonian viscosity |
+| `BinghamFluidMaterial` | Tait EOS + viscoplastic yield stress (Bingham) |
+| `StomakhinMaterial` | Corotated elastoplastic, SVD singular-value return mapping, Jp hardening (Stomakhin 2013) |
+| `DruckerPragerMaterial` | Elastoplastic, Drucker-Prager cone yield surface, dilatancy (Klar 2016) |
+| `MuIRheologyMaterial` | Elastoplastic, rate-dependent friction µ(I), dense granular flow |
+| `VonMisesMaterial` | J2 plasticity, linear isotropic hardening |
+| `RankineMaterial` | Tensile cutoff + exponential damage softening (brittle) |
+| `NaccMaterial` | Non-Associated Cam-Clay, critical state soil mechanics |
+| `GranularFluidMaterial` | Tait EOS + corotated deviatoric + SVD plasticity (fluid-granular) |
+
+Surface tension is built into `NewtonianFluidMaterial` and `BinghamFluidMaterial` via `surface_tension_coeff`.
+
+## Features
+
+| Flag | Description |
+|---|---|
+| `gpu` | wgpu WGSL compute backend, all plasticity on GPU |
+| `render` | Instanced particle debug renderer (requires `gpu`) |
+| `experimental` | Acoustics, EM, information-theoretic measures |
 
 ## Examples
 
 ```sh
-# No dependencies — start here
-cargo run --example headless
-
-# Bevy visualisation
-cargo run --example basic_sand    --features bevy_examples
-cargo run --example basic_snow    --features bevy_examples
-cargo run --example basic_fluids  --features bevy_examples
-cargo run --example basic_jellies --features bevy_examples
-cargo run --example basic_showcase --features bevy_examples
-
-# GPU variants (wgpu compute — all plasticity on GPU)
-cargo run --example basic_fluids_gpu  --features bevy_examples,gpu
-cargo run --example basic_jellies_gpu --features bevy_examples,gpu
-cargo run --example basic_sand_gpu    --features bevy_examples,gpu
-cargo run --example basic_snow_gpu    --features bevy_examples,gpu
+cargo run --example headless        # no feature flags, start here
+cargo run --example basic_sand
+cargo run --example basic_fluids
+cargo run --example basic_jellies
+cargo run --example basic_showcase  # three materials at once
+cargo run --example basic_sand_gpu     --features gpu
+cargo run --example basic_fluids_gpu   --features gpu
 ```
 
-## GPU pipeline
+## Physics references
 
-Per substep: `grid_clear → p2g → grid_update → g2p → particles_update → force_fields`
-
-All plasticity runs on GPU. No CPU roundtrip per substep.
-Particle sort: identity permutation currently (radix sort — future work).
-
-## Features
-
-| Feature | Description |
+| Module | Paper |
 |---|---|
-| `gpu` | wgpu WGSL compute backend |
-| `render` | Instanced particle debug draw (requires `gpu`) |
-| `bevy_examples` | Bevy + egui examples |
-| `experimental` | Acoustics, electromagnetics, information-theoretic measures |
+| MLS-APIC transfer | Hu et al. 2018, *A Moving Least Squares Material Point Method* |
+| NeoHookean / Corotated | Stomakhin et al. 2012, *Energetically Consistent Invertible Elasticity* |
+| Snow | Stomakhin et al. 2013, *A Material Point Method for Snow Simulation* |
+| Sand | Klar et al. 2016, *Drucker-Prager Elastoplasticity for Sand Animation* |
+| µ(I)-rheology | Dunatunga & Kamrin 2015, *Continuum modelling and simulation of granular flow* |
+| Surface tension | Stomakhin et al. 2014, *Augmented MPM for cloth and soft bodies* |
+| N-body gravity | Barnes & Hut 1986, *A hierarchical O(N log N) force-calculation algorithm* |
 
-## Build
+## Contributing
 
-```sh
-cargo test          # 97 tests, physics correctness + integration
-cargo check --features gpu,experimental
-```
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
-Debug mode only during development. Never `cargo clean` — full rebuild is 10–30 min.
+## License
+
+Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) at your option.
