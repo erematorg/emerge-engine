@@ -1,13 +1,14 @@
 extern crate emerge_engine as emerge;
 
 use emerge::render::{ColorMode, Renderer};
-use emerge::{FrictionBoundary, NeoHookeanMaterial, SimConfig, Simulation, SpawnRegion};
+use emerge::{FrictionBoundary, Lnn, NeoHookeanMaterial, SimConfig, Simulation, SpawnRegion};
 use glam::{IVec2, Vec2};
-use std::f32::consts::TAU;
 /// CPU creature -- NeoHookean soft body with peristaltic muscle activation.
 ///
 /// Traveling wave of vertical muscle contraction -- segments squats into floor
-/// -> grips -> neighbors slide forward. Arrow keys steer / adjust wave speed.
+/// -> grips -> neighbors slide forward. Driven by an `Lnn` (Liquid Time-constant Network)
+/// continuous-time CPG, not a hand-coded sine wave -- the same controller LP's creatures use.
+/// Up/down adjusts wave speed (LNN clock rate). Left/right adjusts amplitude.
 /// Space pauses. R resets.
 ///
 ///   cargo run --example basic_creature --features "render"
@@ -41,11 +42,10 @@ struct State {
     queue: wgpu::Queue,
     sim: Simulation,
     body_range: std::ops::Range<usize>,
-    sim_time: f32,
+    lnn: Lnn,
     paused: bool,
     wave_speed: f32,
     wave_amplitude: f32,
-    steer: f32,
     renderer: Renderer,
     frame: u64,
     fps_timer: std::time::Instant,
@@ -100,7 +100,10 @@ impl State {
             .await
             .expect("no GPU adapter");
         let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor::default())
+            .request_device(&wgpu::DeviceDescriptor {
+                required_limits: adapter.limits(), // use full hardware limits, not wgpu defaults
+                ..Default::default()
+            })
             .await
             .unwrap();
         let caps = surface.get_capabilities(&adapter);
@@ -126,7 +129,7 @@ impl State {
         renderer.set_camera(&queue, GRID as u32, size.width, size.height, 0.6, true);
         renderer.set_color_mode(ColorMode::ByActivation);
         println!(
-            "creature: {} particles  |  up/down wave speed  left/right steer  Space pause  R reset  Q quit",
+            "creature: {} particles  |  up/down wave speed  left/right amplitude  Space pause  R reset  Q quit",
             sim.particles().len()
         );
         Self {
@@ -136,11 +139,10 @@ impl State {
             queue,
             sim,
             body_range,
-            sim_time: 0.0,
+            lnn: Lnn::traveling_wave(MUSCLE_GROUPS as usize, 1.0),
             paused: false,
             wave_speed: 1.0,
             wave_amplitude: 0.9,
-            steer: 0.0,
             renderer,
             frame: 0,
             fps_timer: std::time::Instant::now(),
@@ -161,17 +163,17 @@ impl State {
 
     fn update_and_render(&mut self) {
         if !self.paused {
-            self.sim_time += DT;
-            let t = self.sim_time;
+            // wave_speed scales the LNN's internal clock -- faster wave_speed runs the
+            // continuous-time ODE forward faster, raising the oscillation frequency, without
+            // needing to reconstruct the network (tau/weights stay fixed).
+            self.lnn.step(DT * self.wave_speed);
+            let activations: Vec<f32> = self.lnn.activations().collect();
             let body_range = self.body_range.clone();
-            let (wave_speed, wave_amplitude, steer) =
-                (self.wave_speed, self.wave_amplitude, self.steer);
+            let wave_amplitude = self.wave_amplitude;
             let particles = self.sim.particles_mut();
             for i in body_range {
-                let group = particles.muscle_group_id[i] as f32;
-                let phase = group / MUSCLE_GROUPS as f32 * TAU;
-                let wave = (TAU * wave_speed * t - phase + steer).sin();
-                particles.activation[i] = wave_amplitude * (wave * 0.5 + 0.5);
+                let group = particles.muscle_group_id[i] as usize;
+                particles.activation[i] = wave_amplitude * activations[group];
             }
             self.sim.step();
             self.frame += 1;
@@ -234,14 +236,18 @@ impl ApplicationHandler for App {
                         let (sim, range) = make_sim();
                         s.sim = sim;
                         s.body_range = range;
-                        s.sim_time = 0.0;
+                        s.lnn = Lnn::traveling_wave(MUSCLE_GROUPS as usize, 1.0);
                         s.frame = 0;
                         println!("reset");
                     }
                     KeyCode::ArrowUp if pressed => s.wave_speed = (s.wave_speed + 0.2).min(6.0),
                     KeyCode::ArrowDown if pressed => s.wave_speed = (s.wave_speed - 0.2).max(0.1),
-                    KeyCode::ArrowLeft if pressed => s.steer = (s.steer - 0.3).max(-2.0),
-                    KeyCode::ArrowRight if pressed => s.steer = (s.steer + 0.3).min(2.0),
+                    KeyCode::ArrowLeft if pressed => {
+                        s.wave_amplitude = (s.wave_amplitude - 0.1).max(0.1)
+                    }
+                    KeyCode::ArrowRight if pressed => {
+                        s.wave_amplitude = (s.wave_amplitude + 0.1).min(2.0)
+                    }
                     _ => {}
                 }
             }
