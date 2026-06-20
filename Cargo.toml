@@ -16,6 +16,7 @@ categories = ["game-engines", "simulation", "science"]
 [dependencies]
 glam = { version = "0.30", features = ["bytemuck"] }
 bytemuck = { version = "1", features = ["derive"] }
+rayon = "1"
 wgpu = { version = "27", optional = true }
 
 [features]

@@ -1,4 +1,5 @@
 use glam::{IVec2, Mat2, Vec2};
+use rayon::prelude::*;
 
 use crate::boundary::BoundaryCondition;
 use crate::materials::registry::MaterialRegistry;
@@ -9,6 +10,24 @@ use crate::{grid::Grid, grid::kernel::quadratic_weights, particle::Particles};
 ///
 /// Stress is pre-integrated as a momentum impulse so the grid needs one accumulation pass.
 /// The APIC affine term conserves angular momentum without a correction step.
+///
+/// NOT parallelized (unlike G2P below): multiple particles write to the same grid cell (3×3
+/// B-spline stencils overlap), so summing their contributions requires either a shared mutable
+/// map (unsound across threads — `HashMap::entry()` can trigger a resize) or a thread-local
+/// fold/reduce merge. The latter was attempted and reverted 2026-06-20: it's safe and compiles
+/// clean, but changes floating-point summation order across particles sharing a cell, and that
+/// shifted results enough to break `fluid_spreads_more_than_elastic_under_gravity` (a 600-step
+/// chaotic simulation) — confirmed by isolated A/B, not assumed. Reverted rather than accepted
+/// the correctness risk for an unmeasured gain.
+///
+/// Parallelized via rayon `fold`/`reduce`: multiple particles write to the same grid cell
+/// (3×3 B-spline stencils overlap), so a single shared `HashMap` cannot be mutated
+/// concurrently — even with disjoint keys, `HashMap::entry()` can trigger an internal bucket
+/// resize, which is unsound across threads without unsafe code or a concurrent map crate.
+/// Instead, each rayon task accumulates into its own thread-local `CellMap` (no cross-thread
+/// aliasing), and `reduce` merges those local maps pairwise — each merge step owns both maps
+/// exclusively, so it's plain safe Rust. The final merge into the real `Grid` is sequential
+/// and O(touched cells), not O(particles).
 pub fn scatter_particles_to_grid(
     particles: &Particles,
     grid: &mut Grid,
@@ -79,54 +98,76 @@ pub fn gather_grid_to_particles(
         apic_blend,
         active_count,
     } = params;
-    let mut clamp_count = 0usize;
     let grid_res = grid.resolution();
+
+    // Phase 1 (parallel): grid gather -> v, velocity_gradient, position advance + boundary
+    // position clamp. Pure math over read-only grid/boundary state, writing only the calling
+    // particle's own x/v/velocity_gradient — no cross-particle data dependency, so disjoint
+    // per-field slices can be processed concurrently (gather passes are race-free by
+    // construction; see Gao et al. 2018, "GPU Optimization of Material Point Methods").
+    let xs = &mut particles.x[..active_count];
+    let vs = &mut particles.v[..active_count];
+    let vgs = &mut particles.velocity_gradient[..active_count];
+
+    let clamp_count: usize = xs
+        .par_iter_mut()
+        .zip(vs.par_iter_mut())
+        .zip(vgs.par_iter_mut())
+        .map(|((x, v), vg)| {
+            let weights = quadratic_weights(*x);
+            let mut new_v = Vec2::ZERO;
+            let mut b = Mat2::ZERO;
+
+            for gx in 0..3 {
+                for gy in 0..3 {
+                    let weight = weights.wx[gx] * weights.wy[gy];
+                    let cell_pos = weights.base_cell + IVec2::new(gx as i32 - 1, gy as i32 - 1);
+                    let dist = cell_pos.as_vec2() - *x + Vec2::splat(0.5);
+                    let weighted_velocity = grid.velocity_at(cell_pos) * weight;
+                    let term =
+                        Mat2::from_cols(weighted_velocity * dist.x, weighted_velocity * dist.y);
+                    b += term;
+                    new_v += weighted_velocity;
+                }
+            }
+
+            // Hard speed cap — CFL in choose_substep_dt is the physics-grounded bound.
+            // This fires only when CFL is violated despite the timestep limiter (e.g. first
+            // substep of a high-energy spawn). Magnitude clamp preserves direction; no
+            // anisotropic bias unlike per-component clamping.
+            let spd = new_v.length();
+            let clamped = if spd > vel_limit {
+                new_v *= vel_limit / spd;
+                1
+            } else {
+                0
+            };
+
+            // Apply all boundaries' position clamp (pure function, no particle-struct access).
+            let mut new_pos = *x + new_v * dt;
+            for boundary in boundaries.iter() {
+                new_pos = boundary.clamp_particle_position(new_pos, grid_res);
+            }
+
+            *v = new_v;
+            *vg = b * KERNEL_D_INVERSE * apic_blend;
+            *x = new_pos;
+            clamped
+        })
+        .sum();
+
+    // Phase 2 (sequential): plasticity update + boundary post-hooks need whole-`Particles`
+    // mutable access (deformation_gradient, hardening_scale, etc. per material) — not
+    // split-borrow-friendly without a larger `MaterialModel` trait redesign, so kept sequential.
     for i in 0..active_count {
-        let x = particles.x[i];
         let material_id = particles.material_id[i];
         let material = materials.get(material_id);
-
-        let weights = quadratic_weights(x);
-        let mut v = Vec2::ZERO;
-        let mut b = Mat2::ZERO;
-
-        for gx in 0..3 {
-            for gy in 0..3 {
-                let weight = weights.wx[gx] * weights.wy[gy];
-                let cell_pos = weights.base_cell + IVec2::new(gx as i32 - 1, gy as i32 - 1);
-                let dist = cell_pos.as_vec2() - x + Vec2::splat(0.5);
-                let weighted_velocity = grid.velocity_at(cell_pos) * weight;
-                let term = Mat2::from_cols(weighted_velocity * dist.x, weighted_velocity * dist.y);
-                b += term;
-                v += weighted_velocity;
-            }
-        }
-
-        // Hard speed cap — CFL in choose_substep_dt is the physics-grounded bound.
-        // This fires only when CFL is violated despite the timestep limiter (e.g. first
-        // substep of a high-energy spawn). Magnitude clamp preserves direction; no
-        // anisotropic bias unlike per-component clamping.
-        let spd = v.length();
-        if spd > vel_limit {
-            v *= vel_limit / spd;
-            clamp_count += 1;
-        }
-
-        particles.v[i] = v;
-        particles.velocity_gradient[i] = b * KERNEL_D_INVERSE * apic_blend;
-
-        // Apply all boundaries in order: position clamp then post-G2P hook.
-        let mut new_pos = x + v * dt;
-        for boundary in boundaries.iter() {
-            new_pos = boundary.clamp_particle_position(new_pos, grid_res);
-        }
-        particles.x[i] = new_pos;
-
         material.update_particle(particles, i, dt);
         for boundary in boundaries.iter() {
             boundary.post_g2p_particle(particles, i, grid_res, dt);
         }
     }
+
     clamp_count
 }
 

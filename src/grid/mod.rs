@@ -53,7 +53,23 @@ impl BuildHasher for FxU32BuildHasher {
 }
 
 /// Sparse cell storage keyed by flat index, using the fast non-crypto hasher.
-type CellMap = HashMap<u32, Cell, FxU32BuildHasher>;
+/// `pub(crate)` so `transfer.rs` can build thread-local accumulators for parallel P2G.
+pub(crate) type CellMap = HashMap<u32, Cell, FxU32BuildHasher>;
+
+/// Converts a cell position to the flat HashMap key, or `None` if out of domain bounds.
+/// Shared by `Grid::add_mass_momentum` and the parallel P2G scatter in `transfer.rs` — both
+/// must agree on bounds-checking and indexing, so this is the single source of truth.
+pub(crate) fn flat_index(cell_pos: IVec2, resolution: usize) -> Option<u32> {
+    if cell_pos.x < 0 || cell_pos.y < 0 {
+        return None;
+    }
+    let x = cell_pos.x as usize;
+    let y = cell_pos.y as usize;
+    if x >= resolution || y >= resolution {
+        return None;
+    }
+    Some((x * resolution + y) as u32)
+}
 
 /// One grid cell — `repr(C)` for stable GPU buffer layout.
 #[repr(C)]
@@ -108,17 +124,16 @@ impl Grid {
 
     /// Accumulate mass and momentum during P2G. OOB silently ignored.
     pub fn add_mass_momentum(&mut self, cell_pos: IVec2, mass: f32, momentum: Vec2) {
-        if cell_pos.x < 0 || cell_pos.y < 0 {
+        let Some(idx) = flat_index(cell_pos, self.resolution) else {
             return;
-        }
-        let x = cell_pos.x as usize;
-        let y = cell_pos.y as usize;
-        if x >= self.resolution || y >= self.resolution {
-            return;
-        }
-        let idx = (x * self.resolution + y) as u32;
-        // Single hash lookup via entry() — was contains_key + insert + get_mut (3 lookups)
-        // in the hottest scatter loop. dirty only grows on first touch of a cell.
+        };
+        self.accumulate(idx, mass, momentum);
+    }
+
+    /// Accumulate by pre-computed flat index (already bounds-checked by the caller).
+    /// Single hash lookup via entry() — was contains_key + insert + get_mut (3 lookups)
+    /// in the hottest scatter loop. dirty only grows on first touch of a cell.
+    fn accumulate(&mut self, idx: u32, mass: f32, momentum: Vec2) {
         match self.cells.entry(idx) {
             std::collections::hash_map::Entry::Occupied(mut e) => {
                 let cell = e.get_mut();
