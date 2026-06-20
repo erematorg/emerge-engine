@@ -50,10 +50,7 @@ fn make_sand(lambda: f32, mu: f32, phi_deg: f32) -> DruckerPragerMaterial {
     m
 }
 
-fn make_sim_data(
-    device: Arc<wgpu::Device>,
-    queue: Arc<wgpu::Queue>,
-) -> GpuSimulation {
+fn make_sim_data(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) -> GpuSimulation {
     let config = SimConfig {
         boundary_thickness: 3,
         max_substeps_per_step: 12,
@@ -70,7 +67,10 @@ fn make_sim_data(
         ..SpawnRegion::for_sim(&config)
     };
     let mut particles = build_particles(&config, spawn(Vec2::new(17.0, 40.0), MAT_LOOSE, 11));
-    particles.extend(build_particles(&config, spawn(Vec2::new(47.0, 40.0), MAT_DENSE, 22)));
+    particles.extend(build_particles(
+        &config,
+        spawn(Vec2::new(47.0, 40.0), MAT_DENSE, 22),
+    ));
     let mut registry = MaterialRegistry::with_default(Box::new(make_sand(5000.0, 3000.0, 20.0)));
     registry.insert(MAT_DENSE, Box::new(make_sand(5000.0, 3000.0, 40.0)));
     GpuSimulation::with_device(device, queue, config, particles, registry)
@@ -90,11 +90,19 @@ impl State {
             .await
             .expect("no GPU adapter");
         let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor::default())
+            .request_device(&wgpu::DeviceDescriptor {
+                required_limits: adapter.limits(), // use full hardware limits, not wgpu defaults
+                ..Default::default()
+            })
             .await
             .unwrap();
         let caps = surface.get_capabilities(&adapter);
-        let fmt = caps.formats.iter().find(|f| f.is_srgb()).copied().unwrap_or(caps.formats[0]);
+        let fmt = caps
+            .formats
+            .iter()
+            .find(|f| f.is_srgb())
+            .copied()
+            .unwrap_or(caps.formats[0]);
         let sc = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: fmt,
@@ -134,8 +142,10 @@ impl State {
         }
         self.surface_config.width = w;
         self.surface_config.height = h;
-        self.surface.configure(self.sim.device(), &self.surface_config);
-        self.renderer.set_camera(self.sim.queue(), GRID as u32, w, h, 0.6, true);
+        self.surface
+            .configure(self.sim.device(), &self.surface_config);
+        self.renderer
+            .set_camera(self.sim.queue(), GRID as u32, w, h, 0.6, true);
     }
 
     fn cursor_grid(&self) -> Vec2 {
@@ -182,7 +192,9 @@ impl State {
                 snap.cfl_number,
             );
         }
-        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
         self.renderer.render_gpu(
             self.sim.device(),
             self.sim.queue(),
@@ -249,6 +261,9 @@ impl ApplicationHandler for App {
 fn main() {
     let el = EventLoop::new().unwrap();
     el.set_control_flow(ControlFlow::Poll);
-    let mut app = App { window: None, state: None };
+    let mut app = App {
+        window: None,
+        state: None,
+    };
     el.run_app(&mut app).unwrap();
 }

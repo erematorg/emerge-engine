@@ -1,4 +1,4 @@
-﻿extern crate emerge_engine as emerge;
+extern crate emerge_engine as emerge;
 
 /// GPU viscoplastic fluids — Newtonian water dam-break + Bingham mud blob, zero CPU readback.
 ///
@@ -95,11 +95,19 @@ impl State {
             .await
             .expect("no GPU adapter");
         let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor::default())
+            .request_device(&wgpu::DeviceDescriptor {
+                required_limits: adapter.limits(), // use full hardware limits, not wgpu defaults
+                ..Default::default()
+            })
             .await
             .unwrap();
         let caps = surface.get_capabilities(&adapter);
-        let fmt = caps.formats.iter().find(|f| f.is_srgb()).copied().unwrap_or(caps.formats[0]);
+        let fmt = caps
+            .formats
+            .iter()
+            .find(|f| f.is_srgb())
+            .copied()
+            .unwrap_or(caps.formats[0]);
         let sc = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: fmt,
@@ -139,8 +147,10 @@ impl State {
         }
         self.surface_config.width = w;
         self.surface_config.height = h;
-        self.surface.configure(self.sim.device(), &self.surface_config);
-        self.renderer.set_camera(self.sim.queue(), GRID as u32, w, h, 0.6, true);
+        self.surface
+            .configure(self.sim.device(), &self.surface_config);
+        self.renderer
+            .set_camera(self.sim.queue(), GRID as u32, w, h, 0.6, true);
     }
 
     fn cursor_grid(&self) -> Vec2 {
@@ -187,7 +197,9 @@ impl State {
                 snap.cfl_number,
             );
         }
-        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
         self.renderer.render_gpu(
             self.sim.device(),
             self.sim.queue(),
@@ -254,6 +266,9 @@ impl ApplicationHandler for App {
 fn main() {
     let el = EventLoop::new().unwrap();
     el.set_control_flow(ControlFlow::Poll);
-    let mut app = App { window: None, state: None };
+    let mut app = App {
+        window: None,
+        state: None,
+    };
     el.run_app(&mut app).unwrap();
 }

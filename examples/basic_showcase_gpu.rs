@@ -29,7 +29,11 @@ const ELASTIC_ID: u32 = 0;
 const SAND_ID: u32 = 1;
 const FLUID_ID: u32 = 2;
 const SPACING: f32 = 0.7;
-const LABELS: &[(u32, &str)] = &[(ELASTIC_ID, "elastic"), (SAND_ID, "sand"), (FLUID_ID, "fluid")];
+const LABELS: &[(u32, &str)] = &[
+    (ELASTIC_ID, "elastic"),
+    (SAND_ID, "sand"),
+    (FLUID_ID, "fluid"),
+];
 
 struct App {
     window: Option<Arc<Window>>,
@@ -120,7 +124,10 @@ impl State {
             .await
             .expect("no GPU adapter");
         let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor::default())
+            .request_device(&wgpu::DeviceDescriptor {
+                required_limits: adapter.limits(), // use full hardware limits, not wgpu defaults
+                ..Default::default()
+            })
             .await
             .unwrap();
         let device = Arc::new(device);

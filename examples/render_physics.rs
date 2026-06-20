@@ -69,7 +69,10 @@ impl State {
             .expect("no GPU adapter");
 
         let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor::default())
+            .request_device(&wgpu::DeviceDescriptor {
+                required_limits: adapter.limits(), // use full hardware limits, not wgpu defaults
+                ..Default::default()
+            })
             .await
             .expect("device request failed");
         let device = Arc::new(device);
@@ -167,7 +170,9 @@ impl State {
         renderer.set_optical_params(WATER_ID as usize, SIGMA_WATER);
 
         println!("render_physics [GPU]: {} particles", sim.particle_count());
-        println!("  [G] toggle Beer-Lambert/material  [1-4] color modes  LMB push  RMB pull  [Q] quit");
+        println!(
+            "  [G] toggle Beer-Lambert/material  [1-4] color modes  LMB push  RMB pull  [Q] quit"
+        );
 
         Self {
             surface,
