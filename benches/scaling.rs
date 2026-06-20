@@ -1,14 +1,17 @@
-﻿//! Micro-benchmarks for the emerge hot path.
+//! Micro-benchmarks for the emerge hot path.
 //!
 //! Groups:
-//!   step_scaling    -- full solver.step() at varying particle counts (regression guard)
-//!   mixed_materials -- step() with sand + fluid + jelly simultaneously (LP workload)
-//!   sand_sheared    -- step() on pre-deformed sand (50 warm-up steps before measuring)
-//!   p2g             -- scatter_particles_to_grid in isolation
-//!   g2p             -- gather_grid_to_particles in isolation
-//!   kirchhoff       -- kirchhoff_stress per material (NeoHookean / Sand / Fluid / Snow)
-//!   update_particle -- plasticity update per material
-//!   grid_update     -- grid.update_velocities in isolation
+//!   step_scaling          -- full solver.step() at varying particle counts (regression guard)
+//!   mixed_materials       -- step() with sand + fluid + jelly simultaneously (LP workload)
+//!   material_count_scaling -- step() at fixed particle count, varying distinct material count
+//!   force_field_scaling   -- step() at fixed particle count, varying active force field count
+//!   grid_resolution_scaling -- step() at fixed particle count, varying grid resolution
+//!   sand_sheared          -- step() on pre-deformed sand (50 warm-up steps before measuring)
+//!   p2g                   -- scatter_particles_to_grid in isolation
+//!   g2p                   -- gather_grid_to_particles in isolation
+//!   kirchhoff             -- kirchhoff_stress per material (NeoHookean / Sand / Fluid / Snow)
+//!   update_particle       -- plasticity update per material
+//!   grid_update           -- grid.update_velocities in isolation
 //!
 //!   cargo bench --bench scaling
 //!   cargo bench --bench scaling -- mixed_materials   (single group)
@@ -19,9 +22,10 @@ extern crate emerge_engine as emerge;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use emerge::{
-    BoundaryCondition, DruckerPragerMaterial, Grid, MaterialModel, MaterialRegistry,
-    NeoHookeanMaterial, NewtonianFluidMaterial, Particles, SimConfig, Simulation, SlipBoundary,
-    SpawnRegion, StomakhinMaterial, ViscoelasticMaterial, build_particles, lame_from_young,
+    BoundaryCondition, DruckerPragerMaterial, Grid, MAX_MATERIAL_SLOTS, MaterialModel,
+    MaterialRegistry, NeoHookeanMaterial, NewtonianFluidMaterial, Particles,
+    RadialConfinementField, SimConfig, Simulation, SlipBoundary, SpawnRegion, StomakhinMaterial,
+    ViscoelasticMaterial, build_particles, lame_from_young,
 };
 use glam::{IVec2, Vec2};
 
@@ -306,8 +310,13 @@ fn build_mixed_sim(n_each: usize) -> Simulation {
     };
 
     let mut sim = Simulation::empty(config)
-        .with_default_material(Box::new(ViscoelasticMaterial::near_incompressible(5.0e4, 10.0)))
-        .with_material(SAND_ID, Box::new(DruckerPragerMaterial::cohesionless(133.3, 0.333)))
+        .with_default_material(Box::new(ViscoelasticMaterial::near_incompressible(
+            5.0e4, 10.0,
+        )))
+        .with_material(
+            SAND_ID,
+            Box::new(DruckerPragerMaterial::cohesionless(133.3, 0.333)),
+        )
         .with_material(
             WATER_ID,
             Box::new(NewtonianFluidMaterial::low_viscosity(1000.0, 1.28e5)),
@@ -333,7 +342,131 @@ fn bench_mixed_materials(c: &mut Criterion) {
     group.finish();
 }
 
-// â”€â”€ sand_sheared â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── material_count_scaling ───────────────────────────────────────────────────
+//
+// Fixed-size regions, varying number of distinct active materials (1..MAX_MATERIAL_SLOTS).
+// Stresses per-particle material dispatch (registry lookup + kirchhoff_stress vtable call) as
+// material diversity grows — the axis LP pushes as it adds more constitutive models to one scene.
+
+fn build_material_count_sim(k: usize) -> Simulation {
+    let config = base_config();
+    let side = 2i32; // 4x4 particles per region at spacing 0.5
+    let grid_dim = (k as f32).sqrt().ceil() as usize;
+    let spacing_cells = GRID as f32 / (grid_dim as f32 + 1.0);
+
+    let spawns: Vec<SpawnRegion> = (0..k)
+        .map(|i| {
+            let col = i % grid_dim;
+            let row = i / grid_dim;
+            let center = Vec2::new(
+                (col as f32 + 1.0) * spacing_cells,
+                (row as f32 + 1.0) * spacing_cells,
+            );
+            SpawnRegion {
+                spacing: 0.5,
+                box_size: IVec2::splat(side),
+                box_center: center,
+                material_id: i as u32,
+                precompute_initial_volumes: true,
+                ..SpawnRegion::for_sim(&config)
+            }
+        })
+        .collect();
+
+    let (l, u) = lame_from_young(5.0e4, 0.3);
+    let mut sim = Simulation::empty(config).with_boundary(Box::new(SlipBoundary::new(2)));
+    for i in 0..k {
+        sim = sim.with_material(i as u32, Box::new(NeoHookeanMaterial::new(l, u)));
+    }
+    for spawn in spawns {
+        let _ = sim.add_body(spawn);
+    }
+    sim.step_n(5);
+    sim
+}
+
+fn bench_material_count_scaling(c: &mut Criterion) {
+    let mut group = c.benchmark_group("material_count_scaling");
+    for &k in &[1usize, 4, 8, 16, 32, MAX_MATERIAL_SLOTS] {
+        let mut sim = build_material_count_sim(k);
+        group.bench_with_input(BenchmarkId::from_parameter(k), &k, |b, _| {
+            b.iter(|| sim.step());
+        });
+    }
+    group.finish();
+}
+
+// ── force_field_scaling ──────────────────────────────────────────────────────
+//
+// Fixed particle count, varying number of active force fields (1..16, mirrors GPU
+// MAX_FORCE_FIELDS). Each field is evaluated per-particle per-substep — stresses the
+// linear scan over `force_fields` in the post-step pass as field count grows.
+
+fn build_force_field_sim(n: usize, k: usize) -> Simulation {
+    let config = base_config();
+    let side = ((n as f32).sqrt() * 0.5).ceil() as i32;
+    let (l, u) = lame_from_young(5.0e4, 0.3);
+    let mut sim = Simulation::new(config, box_body(&config, side))
+        .with_default_material(Box::new(NeoHookeanMaterial::new(l, u)))
+        .with_boundary(Box::new(SlipBoundary::new(2)));
+    for i in 0..k {
+        // Centers far outside the particle cluster — fields contribute negligible force,
+        // isolating dispatch overhead from confinement-induced dynamics.
+        let center = Vec2::new(GRID as f32 * 2.0 + i as f32, GRID as f32 * 2.0);
+        sim.add_force_field(Box::new(RadialConfinementField::new(center, 5.0, 100.0)));
+    }
+    sim
+}
+
+fn bench_force_field_scaling(c: &mut Criterion) {
+    let mut group = c.benchmark_group("force_field_scaling");
+    for &k in &[1usize, 4, 8, 16] {
+        let mut sim = build_force_field_sim(2000, k);
+        group.bench_with_input(BenchmarkId::from_parameter(k), &k, |b, _| {
+            b.iter(|| sim.step());
+        });
+    }
+    group.finish();
+}
+
+// ── grid_resolution_scaling ───────────────────────────────────────────────────
+//
+// Fixed particle count, varying grid resolution (32/64/128/256). The CPU grid is sparse
+// (HashMap keyed by touched cell index, src/grid/mod.rs) — this should stay flat as
+// grid_res grows, confirming cost tracks particle count, not domain size. The GPU grid is
+// dense (grid_res² buffer, src/gpu/buffers.rs) and does NOT have this property — this bench
+// is the CPU-side baseline that motivates a sparse GPU grid for LP's planetary scale (roadmap).
+
+fn build_grid_res_sim(grid_res: usize) -> Simulation {
+    let config = SimConfig::standard(grid_res, 0.1, Vec2::new(0.0, -0.3));
+    let side = 16i32; // fixed particle cluster size regardless of grid_res
+    let spawn = SpawnRegion {
+        spacing: 0.5,
+        box_size: IVec2::splat(side),
+        box_center: Vec2::splat(grid_res as f32 * 0.5),
+        precompute_initial_volumes: true,
+        ..SpawnRegion::for_sim(&config)
+    };
+    let (l, u) = lame_from_young(5.0e4, 0.3);
+    let mut sim = Simulation::new(config, spawn)
+        .with_default_material(Box::new(NeoHookeanMaterial::new(l, u)))
+        .with_boundary(Box::new(SlipBoundary::new(2)));
+    sim.step_n(5);
+    sim
+}
+
+fn bench_grid_resolution_scaling(c: &mut Criterion) {
+    let mut group = c.benchmark_group("grid_resolution_scaling");
+    for &grid_res in &[32usize, 64, 128, 256] {
+        let mut sim = build_grid_res_sim(grid_res);
+        group.bench_with_input(BenchmarkId::from_parameter(grid_res), &grid_res, |b, _| {
+            b.iter(|| sim.step());
+        });
+    }
+    group.finish();
+}
+
+// ── sand_sheared ───────────────────────────────────────────────────────────
 //
 // step() on sand that has already undergone plastic deformation. Undeformed sand skips the
 // yield-surface projection; this captures the cost of active return-mapping in real sims.
@@ -366,6 +499,9 @@ criterion_group!(
     benches,
     step_scaling,
     bench_mixed_materials,
+    bench_material_count_scaling,
+    bench_force_field_scaling,
+    bench_grid_resolution_scaling,
     bench_sand_sheared,
     bench_p2g,
     bench_g2p,
