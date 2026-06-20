@@ -141,12 +141,23 @@ pub fn collect_snapshot_particles_only(
             h_sum += h;
         }
         let non_finite = [
-            p.x.x, p.x.y, p.v.x, p.v.y,
-            p.velocity_gradient.x_axis.x, p.velocity_gradient.x_axis.y,
-            p.velocity_gradient.y_axis.x, p.velocity_gradient.y_axis.y,
-            p.deformation_gradient.x_axis.x, p.deformation_gradient.x_axis.y,
-            p.deformation_gradient.y_axis.x, p.deformation_gradient.y_axis.y,
-            p.mass, p.initial_volume, p.volume, p.density, p.plastic_volume_ratio,
+            p.x.x,
+            p.x.y,
+            p.v.x,
+            p.v.y,
+            p.velocity_gradient.x_axis.x,
+            p.velocity_gradient.x_axis.y,
+            p.velocity_gradient.y_axis.x,
+            p.velocity_gradient.y_axis.y,
+            p.deformation_gradient.x_axis.x,
+            p.deformation_gradient.x_axis.y,
+            p.deformation_gradient.y_axis.x,
+            p.deformation_gradient.y_axis.y,
+            p.mass,
+            p.initial_volume,
+            p.volume,
+            p.density,
+            p.plastic_volume_ratio,
         ]
         .iter()
         .filter(|v| !v.is_finite())
@@ -155,8 +166,12 @@ pub fn collect_snapshot_particles_only(
         if non_finite == 0 {
             snap.valid_particle_count += 1;
         }
-        if p.mass <= 0.0 || p.volume <= 0.0 || p.initial_volume <= 0.0
-            || p.density <= 0.0 || deformation_j <= 0.0 || jp <= 0.0
+        if p.mass <= 0.0
+            || p.volume <= 0.0
+            || p.initial_volume <= 0.0
+            || p.density <= 0.0
+            || deformation_j <= 0.0
+            || jp <= 0.0
         {
             snap.invalid_physical_particle_values += 1;
         }

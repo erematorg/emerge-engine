@@ -1,4 +1,4 @@
-﻿//! Physics correctness tests for emerge.
+//! Physics correctness tests for emerge.
 //!
 //! These tests verify conservation laws, material invariants, and solver properties
 //! that must hold for the engine to be physically valid.
@@ -931,8 +931,9 @@ fn bingham_j_positive() {
 #[test]
 fn bingham_lava_stable() {
     let config = SimConfig::standard(64, 0.05, Vec2::new(0.0, -9.81));
-    let mut solver = Simulation::new(config, center_spawn(64, 6))
-        .with_default_material(Box::new(BinghamFluidMaterial::viscous_high_yield(2700.0, 1.0e5)));
+    let mut solver = Simulation::new(config, center_spawn(64, 6)).with_default_material(Box::new(
+        BinghamFluidMaterial::viscous_high_yield(2700.0, 1.0e5),
+    ));
     solver.step_n(40);
     for p in solver.particles() {
         assert!(p.x.is_finite() && p.v.is_finite(), "lava particle NaN");
@@ -947,8 +948,9 @@ fn bingham_lava_stable() {
 #[test]
 fn viscoelastic_soft_tissue_stable() {
     let config = SimConfig::standard(64, 0.05, Vec2::new(0.0, -9.81));
-    let mut solver = Simulation::new(config, center_spawn(64, 8))
-        .with_default_material(Box::new(ViscoelasticMaterial::near_incompressible(5.0e4, 10.0)));
+    let mut solver = Simulation::new(config, center_spawn(64, 8)).with_default_material(Box::new(
+        ViscoelasticMaterial::near_incompressible(5.0e4, 10.0),
+    ));
     solver.step_n(60);
     for p in solver.particles() {
         assert!(p.x.is_finite() && p.v.is_finite(), "tissue particle NaN");
@@ -961,8 +963,9 @@ fn viscoelastic_soft_tissue_stable() {
 #[test]
 fn viscoelastic_cell_body_stable() {
     let config = SimConfig::standard(64, 0.05, Vec2::new(0.0, -9.81));
-    let mut solver = Simulation::new(config, center_spawn(64, 6))
-        .with_default_material(Box::new(ViscoelasticMaterial::moderately_compressible(5.0e3, 0.05)));
+    let mut solver = Simulation::new(config, center_spawn(64, 6)).with_default_material(Box::new(
+        ViscoelasticMaterial::moderately_compressible(5.0e3, 0.05),
+    ));
     solver.step_n(60);
     for p in solver.particles() {
         assert!(p.x.is_finite() && p.v.is_finite(), "cell particle NaN");
