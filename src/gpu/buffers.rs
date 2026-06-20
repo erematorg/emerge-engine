@@ -51,9 +51,14 @@ pub struct GpuBuffers {
     /// Impulse descriptors for the apply_impulses pass — UNIFORM | COPY_DST
     pub impulse_params: wgpu::Buffer,
     /// Sorted particle index permutation — STORAGE.
-    /// Written once per frame by particle_sort pass (identity for now).
-    /// Read by p2g and particles_update for cache-coherent particle access.
+    /// Written once per frame by the particle_sort count→scan→scatter pipeline (block-level
+    /// counting sort by spatial position). Read by p2g and particles_update for cache-coherent
+    /// particle access (Gao et al. 2018, "GPU Optimization of Material Point Methods").
     pub sorted_particle_ids: wgpu::Buffer,
+    /// Per-block atomic counters for the particle_sort pipeline — NUM_BLOCKS (256) × u32.
+    /// Cleared, filled (histogram), scanned (exclusive prefix sum), then reused as the atomic
+    /// scatter cursor — all in one frame's particle_sort pass sequence.
+    pub block_counts: wgpu::Buffer,
     /// Persistent readback staging buffer — pre-allocated to avoid per-frame alloc/dealloc.
     /// COPY_DST | MAP_READ. Same size as `particles`.
     pub readback_staging: wgpu::Buffer,
@@ -125,6 +130,15 @@ impl GpuBuffers {
         let sorted_particle_ids = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mpm_sorted_particle_ids"),
             size: (particle_count * mem::size_of::<u32>()) as u64,
+            // COPY_SRC: needed for test-only readback (gpu_particle_sort_is_valid_permutation).
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        // NUM_BLOCKS (256) must match particle_sort.wgsl's NUM_BLOCKS_PER_DIM² exactly.
+        let block_counts = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mpm_block_counts"),
+            size: (256 * mem::size_of::<u32>()) as u64,
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
@@ -144,6 +158,7 @@ impl GpuBuffers {
             force_fields_params,
             impulse_params,
             sorted_particle_ids,
+            block_counts,
             readback_staging,
         }
     }
@@ -223,6 +238,39 @@ impl GpuBuffers {
         drop(mapped);
         self.readback_staging.unmap();
         particles
+    }
+
+    /// Blocking GPU → CPU readback of an arbitrary u32 storage buffer (e.g.
+    /// `sorted_particle_ids`). Test/verification use only — uses a throwaway staging buffer,
+    /// never call from the render/game loop.
+    pub fn readback_u32_blocking(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        buffer: &wgpu::Buffer,
+        count: usize,
+    ) -> Vec<u32> {
+        let byte_count = (count * mem::size_of::<u32>()) as u64;
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mpm_u32_readback_staging"),
+            size: byte_count,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("mpm_u32_readback"),
+        });
+        encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, byte_count);
+        queue.submit(std::iter::once(encoder.finish()));
+        device.poll(wgpu::PollType::wait_indefinitely()).ok();
+        let slice = staging.slice(..byte_count);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::PollType::wait_indefinitely()).ok();
+        let mapped = slice.get_mapped_range();
+        let values = bytemuck::cast_slice::<u8, u32>(&mapped).to_vec();
+        drop(mapped);
+        staging.unmap();
+        values
     }
 
     /// Read mapped staging data into a Vec and unmap. Call only after the readback receiver fires.

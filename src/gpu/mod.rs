@@ -423,11 +423,15 @@ mod solver {
                 .await
                 .expect("no suitable GPU adapter found");
 
+            // Request the adapter's actual limits, not wgpu's conservative defaults (128MiB
+            // storage binding). Hardware commonly supports far more (e.g. 2047MiB on desktop
+            // GPUs) — capping at the default artificially shrinks the single-buffer particle/grid
+            // ceiling well below what the device can actually do.
             let (device, queue) = adapter
                 .request_device(&wgpu::DeviceDescriptor {
                     label: Some("emerge_gpu"),
                     required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::default(),
+                    required_limits: adapter.limits(),
                     ..Default::default() // experimental_features, trace, memory_hints
                 })
                 .await
@@ -530,6 +534,18 @@ mod solver {
             &self.buffers.particles
         }
 
+        /// Verification-only accessor: read back `sorted_particle_ids` as a `Vec<u32>`.
+        /// Used by tests to confirm the particle_sort pipeline produces a valid permutation —
+        /// not part of the render/game-loop API.
+        pub fn sorted_particle_ids_blocking(&self) -> Vec<u32> {
+            self.buffers.readback_u32_blocking(
+                &self.device,
+                &self.queue,
+                &self.buffers.sorted_particle_ids,
+                self.particle_count,
+            )
+        }
+
         /// Advance one frame of simulation time (`config.dt`) using the GPU.
         ///
         /// All substeps are encoded into a single command buffer and submitted once — one driver
@@ -542,7 +558,6 @@ mod solver {
             // Impulses are now applied by a dedicated GPU compute pass (apply_impulses) that
             // reads LIVE GPU positions — no CPU mirror upload needed for impulse-only frames.
             let needs_upload = self.layout_dirty || any_cpu;
-            let needs_particle_sort = needs_upload;
             if needs_upload {
                 let res = self.config.grid_res as u32;
                 self.particles.sort_unstable_by_key(|p| {
@@ -649,8 +664,13 @@ mod solver {
                 self.pending_impulses.clear();
             }
 
-            // — particle_sort pass (after layout upload, before physics) —
-            if needs_particle_sort {
+            // — particle_sort pass: clear -> count -> scan -> scatter, every frame —
+            //
+            // Runs unconditionally (not gated on layout_dirty) because particle positions drift
+            // every substep even when the CPU mirror is never touched — without a per-frame
+            // re-sort, sorted_particle_ids would stay frozen at whatever ordering existed at the
+            // last CPU upload, going stale as GPU-resident particles move. See particle_sort.wgsl.
+            {
                 let sort_slot = self.buffers.step_params_pool.len() - 1;
                 let sort_params =
                     GpuStepParams::new(&self.config, self.config.dt, self.particle_count);
@@ -665,8 +685,14 @@ mod solver {
                     label: Some("particle_sort"),
                     timestamp_writes: None,
                 });
-                pass.set_pipeline(&self.pipelines.particle_sort);
                 pass.set_bind_group(0, &sort_bg, &[]);
+                pass.set_pipeline(&self.pipelines.particle_sort_clear);
+                pass.dispatch_workgroups(1, 1, 1); // 1 workgroup of 256 == NUM_BLOCKS
+                pass.set_pipeline(&self.pipelines.particle_sort_count);
+                pass.dispatch_workgroups(particle_wg, 1, 1);
+                pass.set_pipeline(&self.pipelines.particle_sort_scan);
+                pass.dispatch_workgroups(1, 1, 1); // 1 workgroup of 256 == NUM_BLOCKS
+                pass.set_pipeline(&self.pipelines.particle_sort_scatter);
                 pass.dispatch_workgroups(particle_wg, 1, 1);
             }
             for bg in &bind_groups {

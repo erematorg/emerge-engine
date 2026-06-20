@@ -1,8 +1,11 @@
 /// Compute pipeline setup for MLS-MPM GPU passes.
 ///
-/// Seven passes per frame/substep:
-///   Once per frame:
-///     0. particle_sort    — write identity permutation to sorted_particle_ids (placeholder GPU sort)
+/// Ten passes per frame:
+///   Once per frame, in order (block-level counting sort, see particle_sort.wgsl):
+///     0a. particle_sort_clear    — zero the 256-entry block histogram
+///     0b. particle_sort_count    — one thread per particle, build histogram
+///     0c. particle_sort_scan     — one workgroup, exclusive prefix sum -> scatter cursor
+///     0d. particle_sort_scatter  — one thread per particle, write sorted_particle_ids
 ///   Per substep:
 ///     1. grid_clear       — zero all grid cells (one thread per cell, 8×8 workgroups)
 ///     2. p2g              — scatter particles → grid (sorted access, 64-wide workgroups)
@@ -18,6 +21,7 @@
 ///   binding 3: step_params          — uniform (GpuStepParams, 32 bytes)
 ///   binding 4: force_fields_params  — uniform (GpuFieldsParams, 784 bytes)
 ///   binding 5: sorted_particle_ids  — storage read_write (u32 per particle)
+///   binding 6: block_counts         — storage read_write (256 atomic<u32>, particle_sort only)
 ///
 /// Passes that don't use a binding still share the same layout — avoids rebinding.
 use super::buffers::GpuBuffers;
@@ -26,8 +30,12 @@ use super::step_params::{MAX_FORCE_FIELDS, MAX_MATERIALS};
 
 /// All compiled compute pipelines for one GpuSimulation instance.
 pub struct SimPipelines {
-    /// Once per frame: initializes sorted_particle_ids to identity permutation.
-    pub particle_sort: wgpu::ComputePipeline,
+    /// Once per frame, in order: clear histogram -> count per-block -> scan (exclusive prefix
+    /// sum) -> scatter into sorted_particle_ids. See particle_sort.wgsl for the algorithm.
+    pub particle_sort_clear: wgpu::ComputePipeline,
+    pub particle_sort_count: wgpu::ComputePipeline,
+    pub particle_sort_scan: wgpu::ComputePipeline,
+    pub particle_sort_scatter: wgpu::ComputePipeline,
     pub grid_clear: wgpu::ComputePipeline,
     pub p2g: wgpu::ComputePipeline,
     pub grid_update: wgpu::ComputePipeline,
@@ -116,6 +124,17 @@ impl SimPipelines {
                     },
                     count: None,
                 },
+                // binding 6: block_counts — storage read_write (256 atomic<u32>, particle_sort only)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -133,12 +152,36 @@ impl SimPipelines {
         // MAX_FORCE_FIELDS: loop-bound constant — uses WGSL `override` (proper pipeline specialization).
         let ff_consts: &[(&str, f64)] = &[("MAX_FORCE_FIELDS", MAX_FORCE_FIELDS as f64)];
 
-        let particle_sort = make_pipeline(
+        let particle_sort_clear = make_pipeline(
             device,
             &pipeline_layout,
             shaders::PARTICLE_SORT,
-            "particle_sort_main",
-            "particle_sort",
+            "particle_sort_clear_main",
+            "particle_sort_clear",
+            &[],
+        );
+        let particle_sort_count = make_pipeline(
+            device,
+            &pipeline_layout,
+            shaders::PARTICLE_SORT,
+            "particle_sort_count_main",
+            "particle_sort_count",
+            &[],
+        );
+        let particle_sort_scan = make_pipeline(
+            device,
+            &pipeline_layout,
+            shaders::PARTICLE_SORT,
+            "particle_sort_scan_main",
+            "particle_sort_scan",
+            &[],
+        );
+        let particle_sort_scatter = make_pipeline(
+            device,
+            &pipeline_layout,
+            shaders::PARTICLE_SORT,
+            "particle_sort_scatter_main",
+            "particle_sort_scatter",
             &[],
         );
         let grid_clear = make_pipeline(
@@ -158,7 +201,14 @@ impl SimPipelines {
             "grid_update",
             ff_consts,
         );
-        let g2p = make_pipeline(device, &pipeline_layout, shaders::G2P, "g2p_main", "g2p", &[]);
+        let g2p = make_pipeline(
+            device,
+            &pipeline_layout,
+            shaders::G2P,
+            "g2p_main",
+            "g2p",
+            &[],
+        );
         let particles_update = make_pipeline(
             device,
             &pipeline_layout,
@@ -219,7 +269,10 @@ impl SimPipelines {
         );
 
         Self {
-            particle_sort,
+            particle_sort_clear,
+            particle_sort_count,
+            particle_sort_scan,
+            particle_sort_scatter,
             grid_clear,
             p2g,
             grid_update,
@@ -290,6 +343,10 @@ impl SimPipelines {
                 wgpu::BindGroupEntry {
                     binding: 5,
                     resource: buffers.sorted_particle_ids.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: buffers.block_counts.as_entire_binding(),
                 },
             ],
         })
