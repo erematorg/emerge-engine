@@ -380,6 +380,11 @@ fn make_pipeline(
         entry_point: Some(entry_point),
         compilation_options: wgpu::PipelineCompilationOptions {
             constants,
+            // WebGPU mandates zeroing workgroup-scoped memory by default for determinism
+            // safety. The only `var<workgroup>` in any shader (particle_sort.wgsl's scan_temp)
+            // is always explicitly written by every thread before any read (barrier-guarded) —
+            // skipping the mandated zero-init is sound here and avoids that cost.
+            zero_initialize_workgroup_memory: false,
             ..Default::default()
         },
         cache: None,
