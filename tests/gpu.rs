@@ -224,7 +224,11 @@ mod gpu_tests {
         for frame in 0..10 {
             solver.step_frame();
             let ids = solver.sorted_particle_ids_blocking();
-            assert_eq!(ids.len(), n, "frame {frame}: sorted_particle_ids length mismatch");
+            assert_eq!(
+                ids.len(),
+                n,
+                "frame {frame}: sorted_particle_ids length mismatch"
+            );
             let mut seen = vec![false; n];
             for &id in &ids {
                 assert!(
