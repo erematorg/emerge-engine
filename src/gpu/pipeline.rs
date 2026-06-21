@@ -159,6 +159,7 @@ impl SimPipelines {
             "particle_sort_clear_main",
             "particle_sort_clear",
             &[],
+            false,
         );
         let particle_sort_count = make_pipeline(
             device,
@@ -167,7 +168,11 @@ impl SimPipelines {
             "particle_sort_count_main",
             "particle_sort_count",
             &[],
+            false,
         );
+        // particle_sort_scan is the ONLY pipeline with var<workgroup> memory (scan_temp) —
+        // see the skip_workgroup_zero_init doc on make_pipeline for the safety argument.
+        // Every other pipeline keeps the WebGPU-mandated zero-init (false here = default ON).
         let particle_sort_scan = make_pipeline(
             device,
             &pipeline_layout,
@@ -175,6 +180,7 @@ impl SimPipelines {
             "particle_sort_scan_main",
             "particle_sort_scan",
             &[],
+            true,
         );
         let particle_sort_scatter = make_pipeline(
             device,
@@ -183,6 +189,7 @@ impl SimPipelines {
             "particle_sort_scatter_main",
             "particle_sort_scatter",
             &[],
+            false,
         );
         let grid_clear = make_pipeline(
             device,
@@ -191,8 +198,17 @@ impl SimPipelines {
             "grid_clear_main",
             "grid_clear",
             &[],
+            false,
         );
-        let p2g = make_pipeline(device, &pipeline_layout, &p2g_src, "p2g_main", "p2g", &[]);
+        let p2g = make_pipeline(
+            device,
+            &pipeline_layout,
+            &p2g_src,
+            "p2g_main",
+            "p2g",
+            &[],
+            false,
+        );
         let grid_update = make_pipeline(
             device,
             &pipeline_layout,
@@ -200,6 +216,7 @@ impl SimPipelines {
             "grid_update_main",
             "grid_update",
             ff_consts,
+            false,
         );
         let g2p = make_pipeline(
             device,
@@ -208,6 +225,7 @@ impl SimPipelines {
             "g2p_main",
             "g2p",
             &[],
+            false,
         );
         let particles_update = make_pipeline(
             device,
@@ -216,6 +234,7 @@ impl SimPipelines {
             "particles_update_main",
             "particles_update",
             &[],
+            false,
         );
         let force_fields = make_pipeline(
             device,
@@ -224,6 +243,7 @@ impl SimPipelines {
             "force_fields_main",
             "force_fields",
             ff_consts,
+            false,
         );
 
         // Impulse pass has a minimal 2-binding layout: particles + impulse_params.
@@ -266,6 +286,7 @@ impl SimPipelines {
             "apply_impulses_main",
             "apply_impulses",
             &[],
+            false,
         );
 
         Self {
@@ -361,6 +382,15 @@ fn patch_shader(source: &str) -> String {
     source.replace("{{MAX_MATERIALS}}", &MAX_MATERIALS.to_string())
 }
 
+/// `skip_workgroup_zero_init`: opt-IN per pipeline, NOT a global default. WebGPU mandates
+/// zeroing `var<workgroup>` memory before use, as a safety net against reading stale data from
+/// a prior dispatch. Pass `true` ONLY if every `var<workgroup>` declared in this specific
+/// shader is provably written by every thread before any read (barrier-guarded) — skipping the
+/// zero-init then costs nothing in correctness and saves real time (measured: ~10-18% on the
+/// one pipeline that currently qualifies, particle_sort_scan). This is NOT compiler-checked —
+/// if a future edit to that shader (or a copy-pasted call site for a new shader) adds a
+/// `var<workgroup>` without re-verifying the write-before-read invariant, this flag must be
+/// re-audited or set back to `false`. Default to `false` for any new pipeline.
 fn make_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
@@ -368,6 +398,7 @@ fn make_pipeline(
     entry_point: &str,
     label: &str,
     constants: &[(&str, f64)],
+    skip_workgroup_zero_init: bool,
 ) -> wgpu::ComputePipeline {
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(label),
@@ -380,11 +411,7 @@ fn make_pipeline(
         entry_point: Some(entry_point),
         compilation_options: wgpu::PipelineCompilationOptions {
             constants,
-            // WebGPU mandates zeroing workgroup-scoped memory by default for determinism
-            // safety. The only `var<workgroup>` in any shader (particle_sort.wgsl's scan_temp)
-            // is always explicitly written by every thread before any read (barrier-guarded) —
-            // skipping the mandated zero-init is sound here and avoids that cost.
-            zero_initialize_workgroup_memory: false,
+            zero_initialize_workgroup_memory: !skip_workgroup_zero_init,
             ..Default::default()
         },
         cache: None,
