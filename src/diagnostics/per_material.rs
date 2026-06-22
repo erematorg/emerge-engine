@@ -26,7 +26,7 @@ pub struct MaterialStats {
     /// Mean elastic hardening multiplier h = exp(ξ*(1−Jp)). 1.0 = no hardening.
     /// Rises above 1.0 for compacted snow.
     pub avg_hardening_scale: f32,
-    /// Mean activation ∈ [0,1]. 0 if no particles have activation.
+    /// Mean activation ∈ `[0,1]`. 0 if no particles have activation.
     pub mean_activation: f32,
     /// Max activation. Useful to confirm the oscillator is reaching full contraction.
     pub max_activation: f32,

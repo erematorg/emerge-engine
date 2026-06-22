@@ -47,11 +47,11 @@ use crate::SimConfig;
 /// For corotated linear elasticity use `CorotatedMaterial::from_physical`.
 #[derive(Debug, Clone, Copy)]
 pub struct Elastic {
-    /// Young's modulus [Pa]
+    /// Young's modulus `[Pa]`
     pub e_pa: f32,
     /// Poisson's ratio (dimensionless, −1 < ν < 0.5)
     pub nu: f32,
-    /// Rest density [kg/m³]
+    /// Rest density `[kg/m³]`
     pub rho_kg_m3: f32,
 }
 
@@ -77,9 +77,9 @@ pub enum PlasticityModel {
     /// Drucker-Prager cohesionless granular (rate-independent).
     /// → `DruckerPragerMaterial`
     Granular {
-        /// Peak internal friction angle [degrees]. Dry sand ≈ 30–38°.
+        /// Peak internal friction angle `[degrees]`. Dry sand ≈ 30–38°.
         friction_angle_deg: f32,
-        /// Reynolds dilatancy angle [degrees]. 0 = non-dilatant.
+        /// Reynolds dilatancy angle `[degrees]`. 0 = non-dilatant.
         dilatancy_angle_deg: f32,
     },
 
@@ -87,16 +87,16 @@ pub enum PlasticityModel {
     /// Better for dense granular at high shear rates. CPU-only.
     /// → `MuIRheologyMaterial`
     GranularRateDependent {
-        /// Static friction angle [degrees].
+        /// Static friction angle `[degrees]`.
         friction_angle_deg: f32,
-        /// Dilatancy angle [degrees].
+        /// Dilatancy angle `[degrees]`.
         dilatancy_angle_deg: f32,
     },
 
     /// J2 ductile plastic flow (von Mises), linear isotropic hardening.
     /// → `VonMisesMaterial`
     Ductile {
-        /// Yield stress [Pa]. Flow begins above this deviatoric stress.
+        /// Yield stress `[Pa]`. Flow begins above this deviatoric stress.
         yield_stress_pa: f32,
     },
 
@@ -104,7 +104,7 @@ pub enum PlasticityModel {
     /// Models brittle fracture under tension. CPU-only.
     /// → `RankineMaterial`
     Brittle {
-        /// Tensile strength [Pa]. Fracture initiates above this.
+        /// Tensile strength `[Pa]`. Fracture initiates above this.
         tensile_strength_pa: f32,
         /// Exponential softening rate. Higher = faster strength loss post-fracture.
         softening_rate: f32,
@@ -119,7 +119,7 @@ pub enum PlasticityModel {
 #[derive(Debug, Clone, Copy)]
 pub struct Viscoelastic {
     pub elastic: Elastic,
-    /// Dynamic viscosity η [Pa·s]
+    /// Dynamic viscosity η `[Pa·s]`
     pub eta_pa_s: f32,
 }
 
@@ -131,11 +131,11 @@ pub struct Viscoelastic {
 /// Distinct from `Fluid` (no elastic restoring force) and `Elastoplastic` (no EOS bulk pressure).
 #[derive(Debug, Clone, Copy)]
 pub struct FluidGranular {
-    /// Rest density [kg/m³]
+    /// Rest density `[kg/m³]`
     pub rho_kg_m3: f32,
-    /// Bulk modulus K [Pa] — EOS stiffness. Controls compressibility.
+    /// Bulk modulus K `[Pa]` — EOS stiffness. Controls compressibility.
     pub bulk_modulus_pa: f32,
-    /// Young's modulus E [Pa] — elastic shear stiffness. Controls shape-restoring force.
+    /// Young's modulus E `[Pa]` — elastic shear stiffness. Controls shape-restoring force.
     pub e_pa: f32,
     /// Poisson's ratio ν
     pub nu: f32,
@@ -196,12 +196,12 @@ impl FluidGranular {
 #[derive(Debug, Clone, Copy)]
 pub struct Fluid {
     pub rho_kg_m3: f32,
-    /// Dynamic (shear) viscosity η [Pa·s]
+    /// Dynamic (shear) viscosity η `[Pa·s]`
     pub eta_pa_s: f32,
-    /// Bulk modulus K [Pa]. Sets EOS stiffness (compressibility).
+    /// Bulk modulus K `[Pa]`. Sets EOS stiffness (compressibility).
     /// Real water K ≈ 2.2 GPa. Use K = ρ·c_ref²/γ with c_ref = 10·v_max for weakly-compressible.
     pub bulk_modulus_pa: f32,
-    /// `None` = Newtonian. `Some(τ₀)` = Bingham: plug flow below τ₀ [Pa].
+    /// `None` = Newtonian. `Some(τ₀)` = Bingham: plug flow below τ₀ `[Pa]`.
     pub yield_stress_pa: Option<f32>,
 }
 

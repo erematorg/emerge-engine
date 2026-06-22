@@ -44,7 +44,7 @@ pub struct GpuBuffers {
     /// One MaterialParams per registered material slot — UNIFORM | COPY_DST
     pub materials: wgpu::Buffer,
     /// Per-substep constants pool — one buffer per max_substeps slot, each 32 bytes.
-    /// Substep i reads step_params_pool[i] so all substeps can be encoded in one command buffer.
+    /// Substep i reads `step_params_pool[i]` so all substeps can be encoded in one command buffer.
     pub step_params_pool: Vec<wgpu::Buffer>,
     /// Non-uniform force-field entries for the force_fields pass — UNIFORM | COPY_DST
     pub force_fields_params: wgpu::Buffer,

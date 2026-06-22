@@ -40,7 +40,7 @@ pub fn heat_conduction(
 /// Stefan–Boltzmann radiative exchange q = σ·ε·A·F·(T_hot⁴ − T_cold⁴) — Watts.
 ///
 /// Radiation needs no medium (unlike conduction), so it is the heat-transfer mode
-/// that crosses vacuum. `emissivity` ε ∈ [0,1], `view_factor` F ∈ [0,1] (geometry).
+/// that crosses vacuum. `emissivity` ε ∈ `[0,1]`, `view_factor` F ∈ `[0,1]` (geometry).
 /// Also the physical basis for blackbody glow in the render emission pass.
 #[inline]
 pub fn heat_radiation(

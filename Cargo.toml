@@ -12,6 +12,9 @@ repository = "https://github.com/M1thieu/emerge"
 readme = "README.md"
 keywords = ["physics", "mpm", "simulation", "game", "continuum"]
 categories = ["game-engines", "simulation", "science"]
+# Internal design docs — not useful to consumers, and PLANNING_PROMPT.md names local
+# absolute paths from the author's machine.
+exclude = ["LP_MPM_SPEC.md", "PLANNING_PROMPT.md"]
 
 [dependencies]
 glam = { version = "0.30", features = ["bytemuck"] }

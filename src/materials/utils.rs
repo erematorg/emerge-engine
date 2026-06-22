@@ -46,7 +46,7 @@ pub(crate) fn stress_to_hencky(tau: Vec2, lambda: f32, mu: f32) -> Vec2 {
 /// 2D polar decomposition: returns the rotation R such that F = R·S.
 ///
 /// Uses the analytical formula for 2×2 matrices (no SVD needed):
-///   x = F₀₀+F₁₁, y = F₁₀−F₀₁, norm = √(x²+y²), R = [[x,−y],[y,x]]/norm
+///   x = F₀₀+F₁₁, y = F₁₀−F₀₁, norm = √(x²+y²), R = `[[x,−y],[y,x]]`/norm
 /// Returns Mat2::IDENTITY when F is near-singular (norm ≤ ε).
 /// Used identically by CorotatedMaterial, StomakhinMaterial, VonMisesMaterial, DruckerPragerMaterial.
 pub fn polar_decomposition_2d(f: Mat2) -> Mat2 {

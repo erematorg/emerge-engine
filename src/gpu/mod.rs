@@ -66,7 +66,7 @@ mod step_params {
     ///   offset  4: particle_count u32
     ///   offset  8: dt             f32
     ///   offset 12: kernel_d_inverse      f32  (always 4.0 — quadratic B-spline)
-    ///   offset 16: gravity        vec2<f32>  (8 bytes; 8-byte aligned in WGSL ✓)
+    ///   offset 16: gravity        `vec2<f32>`  (8 bytes; 8-byte aligned in WGSL ✓)
     ///   offset 24: boundary_thickness u32
     ///   offset 28: vel_limit      f32
     ///                             = 32 bytes, 16-byte aligned ✓
@@ -982,7 +982,7 @@ mod solver {
         }
 
         /// The live GPU grid buffer (STORAGE | COPY_SRC).
-        /// Layout: array<Cell> where Cell = { momentum: vec2, mass: f32, _pad: f32 } (16 bytes).
+        /// Layout: `array<Cell>` where Cell = { momentum: vec2, mass: f32, _pad: f32 } (16 bytes).
         /// Consumers (e.g. LP's metaball renderer) can bind this read-only in their own compute pass.
         pub fn grid_buffer(&self) -> &wgpu::Buffer {
             &self.buffers.grid
