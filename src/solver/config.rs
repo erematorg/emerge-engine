@@ -281,6 +281,15 @@ pub struct SpawnRegion {
     pub rng_seed: u32,
     /// Material for all particles in this region (default 0).
     pub material_id: u32,
+    /// Per-region particle mass override (grid units). `None` (default) falls back to
+    /// `SimConfig::particle_mass` — the single global value used when every material in a
+    /// scene has the same real density. Set this explicitly when spawning multiple materials
+    /// with different `rho_kg_m3` in the same simulation: `SimConfig::particle_mass` is one
+    /// value shared by the whole `Simulation`, so without a per-region override every
+    /// material's particles get identical mass regardless of their specified density —
+    /// stiffness differs correctly (via Lamé/EOS conversion) but inertia does not.
+    /// Compute as `rho_kg_m3 * (spacing * dx_meters).powi(2)` for a 2D areal-density particle.
+    pub mass_override: Option<f32>,
 }
 
 impl Default for SpawnRegion {
@@ -296,6 +305,7 @@ impl Default for SpawnRegion {
             position_jitter: 0.0,
             rng_seed: 1,
             material_id: 0,
+            mass_override: None,
         }
     }
 }
@@ -345,6 +355,13 @@ impl SpawnRegion {
     /// Material ID for all particles in this region.
     pub fn material(mut self, id: u32) -> Self {
         self.material_id = id;
+        self
+    }
+
+    /// Per-region particle mass override (grid units), for scenes mixing materials with
+    /// different real densities. See the field doc on `mass_override` for the SI formula.
+    pub fn mass(mut self, particle_mass: f32) -> Self {
+        self.mass_override = Some(particle_mass);
         self
     }
 

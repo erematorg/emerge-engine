@@ -1183,6 +1183,7 @@ pub(crate) fn initialize_particles(
     rng: &mut LcgRng,
 ) -> Vec<Particle> {
     use crate::solver::config::SpawnShape;
+    let mass = spawn.mass_override.unwrap_or(config.particle_mass);
     let mut particles = Vec::new();
     let half = spawn.box_size.as_vec2() * 0.5;
     let min = spawn.box_center - half;
@@ -1212,10 +1213,10 @@ pub(crate) fn initialize_particles(
                     v: velocity,
                     velocity_gradient: Mat2::ZERO,
                     deformation_gradient: spawn.initial_deformation_gradient,
-                    mass: config.particle_mass,
+                    mass,
                     initial_volume: config.default_initial_volume,
                     volume: config.default_initial_volume,
-                    density: config.particle_mass / config.default_initial_volume,
+                    density: mass / config.default_initial_volume,
                     material_id: spawn.material_id,
                     plastic_volume_ratio: 1.0,
                     hardening_scale: 1.0,

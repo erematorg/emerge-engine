@@ -176,6 +176,14 @@ impl Elastic {
     pub fn material(&self, config: &crate::SimConfig) -> Box<dyn MaterialModel> {
         Box::new(NeoHookeanMaterial::from_physical(self, config))
     }
+
+    /// Particle mass (grid units) for a `SpawnRegion` spawning this material at `spacing`.
+    /// Pass to `SpawnRegion { mass_override: Some(props.particle_mass(spacing, &config)), .. }`
+    /// — without this, every material in a multi-material scene gets the same inertia
+    /// regardless of `rho_kg_m3` (only `SimConfig::particle_mass`, one global value, is used).
+    pub fn particle_mass(&self, spacing: f32, config: &crate::SimConfig) -> f32 {
+        self.rho_kg_m3 * (spacing * config.dx_meters).powi(2)
+    }
 }
 
 impl Elastoplastic {
@@ -236,11 +244,21 @@ impl Elastoplastic {
             )),
         }
     }
+
+    /// See `Elastic::particle_mass` — density lives in `self.elastic.rho_kg_m3`.
+    pub fn particle_mass(&self, spacing: f32, config: &crate::SimConfig) -> f32 {
+        self.elastic.particle_mass(spacing, config)
+    }
 }
 
 impl Viscoelastic {
     pub fn material(&self, config: &crate::SimConfig) -> Box<dyn MaterialModel> {
         Box::new(ViscoelasticMaterial::from_physical(self, config))
+    }
+
+    /// See `Elastic::particle_mass` — density lives in `self.elastic.rho_kg_m3`.
+    pub fn particle_mass(&self, spacing: f32, config: &crate::SimConfig) -> f32 {
+        self.elastic.particle_mass(spacing, config)
     }
 }
 
@@ -267,6 +285,11 @@ impl FluidGranular {
             pressure_floor: 0.0,
         })
     }
+
+    /// See `Elastic::particle_mass`.
+    pub fn particle_mass(&self, spacing: f32, config: &crate::SimConfig) -> f32 {
+        self.rho_kg_m3 * (spacing * config.dx_meters).powi(2)
+    }
 }
 
 impl Fluid {
@@ -292,5 +315,10 @@ impl Fluid {
                 config,
             )),
         }
+    }
+
+    /// See `Elastic::particle_mass`.
+    pub fn particle_mass(&self, spacing: f32, config: &crate::SimConfig) -> f32 {
+        self.rho_kg_m3 * (spacing * config.dx_meters).powi(2)
     }
 }
