@@ -9,8 +9,9 @@ extern crate emerge_engine as emerge;
 mod gpu_tests {
     use emerge::gpu::GpuSimulation;
     use emerge::{
-        DruckerPragerMaterial, MaterialRegistry, NeoHookeanMaterial, NewtonianFluidMaterial,
-        SimConfig, SpawnRegion, StomakhinMaterial, ViscoelasticMaterial, build_particles,
+        DruckerPragerMaterial, MaterialRegistry, MuIRheologyMaterial, NeoHookeanMaterial,
+        NewtonianFluidMaterial, RankineMaterial, SimConfig, SpawnRegion, StomakhinMaterial,
+        ViscoelasticMaterial, build_particles,
     };
     use glam::Vec2;
     use pollster::block_on;
@@ -148,6 +149,65 @@ mod gpu_tests {
             assert!(
                 p.plastic_volume_ratio.is_finite(),
                 "gpu snow particle {i}: Jp NaN"
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_rankine_stable() {
+        // Rankine has needs_cpu_update()=false and a real GPU plasticity branch
+        // (particles_update.wgsl, model==7) but had zero GPU-specific test coverage
+        // before this — implemented, never verified on that path.
+        if !gpu_available() {
+            return;
+        }
+        let config = small_config();
+        let particles = spawn_disk(&config, Vec2::splat(16.0), 0);
+        let rankine = RankineMaterial::stiff_brittle(1000.0, 0.25);
+        let registry = MaterialRegistry::with_default(Box::new(rankine));
+        let mut solver = block_on(GpuSimulation::new(config, particles, registry));
+        for _ in 0..30 {
+            solver.step_frame();
+        }
+        solver.sync_particles_blocking();
+        for (i, p) in solver.particles().iter().enumerate() {
+            assert!(p.x.is_finite(), "gpu rankine particle {i}: position NaN");
+            assert!(
+                p.deformation_gradient.determinant() > 0.0,
+                "gpu rankine particle {i}: J collapsed"
+            );
+            assert!(
+                p.friction_hardening.is_finite(),
+                "gpu rankine particle {i}: damage NaN"
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_mui_rheology_stable() {
+        // Same coverage gap as gpu_rankine_stable: MuIRheology has needs_cpu_update()=false
+        // and a real GPU plasticity branch (model==8) but no prior GPU test.
+        if !gpu_available() {
+            return;
+        }
+        let config = small_config();
+        let particles = spawn_disk(&config, Vec2::splat(16.0), 0);
+        let mui = MuIRheologyMaterial::new(400.0, 200.0);
+        let registry = MaterialRegistry::with_default(Box::new(mui));
+        let mut solver = block_on(GpuSimulation::new(config, particles, registry));
+        for _ in 0..30 {
+            solver.step_frame();
+        }
+        solver.sync_particles_blocking();
+        for (i, p) in solver.particles().iter().enumerate() {
+            assert!(p.x.is_finite(), "gpu mui particle {i}: position NaN");
+            assert!(
+                p.deformation_gradient.determinant() > 0.0,
+                "gpu mui particle {i}: J collapsed"
+            );
+            assert!(
+                p.friction_hardening.is_finite(),
+                "gpu mui particle {i}: mu(I) NaN"
             );
         }
     }

@@ -31,6 +31,3 @@ Initial release.
   (~12° vs ~35° for dry sand) — documented in `tests/accuracy.rs`, not yet tuned.
 - Phase transitions (`add_phase_rule`) swap `material_id` with no latent-heat
   energy cost.
-- `RankineMaterial` and `MuIRheologyMaterial` have real GPU plasticity branches
-  (`particles_update.wgsl`, model==7/8) but no GPU-specific test exercises them —
-  implemented, not yet verified on that path.
