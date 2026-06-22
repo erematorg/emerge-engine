@@ -47,7 +47,12 @@ pub struct ThermalConfig {
     /// Boundary cells equilibrate toward this value.
     pub ambient: f32,
 
-    /// Grid cell physical size in meters (matches `SimConfig::grid_cell_size`).
+    /// Grid cell physical size in meters — pass `SimConfig::dx_meters`, NOT
+    /// `SimConfig::grid_cell_size` (which is always `1.0`, a grid-unit constant, never a
+    /// physical length). Passing `grid_cell_size` here understates the real cell size by
+    /// orders of magnitude, inflates `alpha_grid()` to match, and silently blows the
+    /// "thermal CFL is never the bottleneck" assumption — explicit Euler overshoots into
+    /// runaway temperatures within a few hundred steps. Verified by reproducing it directly.
     ///
     /// Used to convert conductivity/capacity into grid-unit diffusivity.
     pub grid_cell_size: f32,
