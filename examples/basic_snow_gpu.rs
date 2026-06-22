@@ -202,7 +202,7 @@ impl State {
             self.fps_timer = std::time::Instant::now();
             self.fps_frames = 0;
         }
-        if self.frame % 60 == 0 {
+        if self.frame.is_multiple_of(60) {
             log_frame_gpu(self.frame, DT, self.sim.particles(), LABELS, 1);
             let snap = self.sim.diagnostics_snapshot();
             println!(
@@ -250,10 +250,11 @@ impl ApplicationHandler for App {
             WindowEvent::CursorMoved { position, .. } => {
                 s.cursor_pos = [position.x as f32, position.y as f32];
             }
-            WindowEvent::MouseInput { state, button, .. } => match button {
-                MouseButton::Left => s.lmb = state == ElementState::Pressed,
-                _ => {}
-            },
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } => s.lmb = state == ElementState::Pressed,
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {

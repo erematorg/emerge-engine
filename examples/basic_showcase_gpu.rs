@@ -244,7 +244,7 @@ impl State {
             self.fps_timer = std::time::Instant::now();
             self.fps_frames = 0;
         }
-        if self.frame % 60 == 0 {
+        if self.frame.is_multiple_of(60) {
             log_frame_gpu(self.frame, DT, self.sim.particles(), LABELS, 1);
             let snap = self.sim.diagnostics_snapshot();
             println!(

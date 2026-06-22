@@ -412,7 +412,6 @@ fn make_pipeline(
         compilation_options: wgpu::PipelineCompilationOptions {
             constants,
             zero_initialize_workgroup_memory: !skip_workgroup_zero_init,
-            ..Default::default()
         },
         cache: None,
     })
