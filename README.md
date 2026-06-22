@@ -26,17 +26,17 @@ let config = SimConfig::standard(64, 0.05, Vec2::NEG_Y);
 
 let mut sim = Simulation::empty(config)
     .with_default_material(Box::new(NeoHookeanMaterial::new(400.0, 200.0)))
-    .with_material(WATER, Box::new(NewtonianFluidMaterial::water(1000.0, 1e4)))
+    .with_material(WATER, Box::new(NewtonianFluidMaterial::low_viscosity(1000.0, 1e4)))
     .with_boundary(Box::new(SlipBoundary::new(2)));
 
-sim.add_body(SpawnRegion {
+let _ = sim.add_body(SpawnRegion {
     box_size: IVec2::new(12, 12),
     box_center: Vec2::new(24.0, 40.0),
     precompute_initial_volumes: true,
     ..SpawnRegion::for_sim(&config)
 });
 
-sim.add_body(SpawnRegion {
+let _ = sim.add_body(SpawnRegion {
     box_size: IVec2::new(12, 8),
     box_center: Vec2::new(40.0, 36.0),
     material_id: WATER,
@@ -80,14 +80,17 @@ Surface tension is built into `NewtonianFluidMaterial` and `BinghamFluidMaterial
 ## Examples
 
 ```sh
-cargo run --example headless        # no feature flags, start here
-cargo run --example basic_sand
-cargo run --example basic_fluids
-cargo run --example basic_jellies
-cargo run --example basic_showcase  # three materials at once
-cargo run --example basic_sand_gpu     --features gpu
-cargo run --example basic_fluids_gpu   --features gpu
+cargo run --example headless                       # no feature flags, start here
+cargo run --example basic_sand     --features render
+cargo run --example basic_fluids   --features render
+cargo run --example basic_jellies  --features render
+cargo run --example basic_showcase --features render  # three materials at once
+cargo run --example basic_sand_gpu     --features render
+cargo run --example basic_fluids_gpu   --features render
 ```
+
+All windowed examples (everything except `headless` and `validate_materials`) require
+`--features render` — they render via wgpu/winit directly, no Bevy.
 
 ## Physics references
 
