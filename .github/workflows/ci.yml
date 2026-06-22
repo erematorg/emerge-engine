@@ -42,6 +42,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: test (no features — CPU-only path)
         run: cargo test
+      # gpu/render tests need a Vulkan adapter. ubuntu-latest has no GPU and no software
+      # Vulkan driver by default — without lavapipe, every GPU test panics on
+      # request_adapter().expect(...). windows-latest gets D3D12 WARP from the OS itself,
+      # no extra install needed.
+      - name: install software Vulkan driver (lavapipe)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
       - name: test (all features)
         run: cargo test --all-features
 
