@@ -289,6 +289,9 @@ pub struct SpawnRegion {
     /// material's particles get identical mass regardless of their specified density —
     /// stiffness differs correctly (via Lamé/EOS conversion) but inertia does not.
     /// Compute as `rho_kg_m3 * (spacing * dx_meters).powi(2)` for a 2D areal-density particle.
+    /// `.mass_from(&props, &config)` computes and sets this from a physical-property struct
+    /// using this region's own `spacing` — prefer it over `.mass()` to avoid passing spacing
+    /// twice (a real duplication risk).
     pub mass_override: Option<f32>,
 }
 
@@ -362,6 +365,16 @@ impl SpawnRegion {
     /// different real densities. See the field doc on `mass_override` for the SI formula.
     pub fn mass(mut self, particle_mass: f32) -> Self {
         self.mass_override = Some(particle_mass);
+        self
+    }
+
+    /// Like `.mass()`, but computes the value from a physical-property struct and
+    /// THIS region's own `spacing` (already set via `.spacing()` or the `spacing`
+    /// field) — avoids passing spacing twice, a real duplication risk (see
+    /// `mass_override`'s field doc; LP hit a related sync bug from this exact
+    /// pattern, fixed 2026-06-22).
+    pub fn mass_from(mut self, props: &impl crate::ParticleMass, config: &SimConfig) -> Self {
+        self.mass_override = Some(props.particle_mass(self.spacing, config));
         self
     }
 

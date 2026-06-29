@@ -19,7 +19,9 @@
 ///   grid:        never downloaded
 use std::mem;
 
-use super::step_params::{GpuFieldsParams, GpuImpulseParams, GpuStepParams};
+use super::step_params::{
+    GpuFieldsParams, GpuImpulseParams, GpuSleepWakeParams, GpuStepParams, NUM_BLOCKS,
+};
 use crate::materials::MaterialParams;
 use crate::particle::Particle;
 
@@ -50,6 +52,9 @@ pub struct GpuBuffers {
     pub force_fields_params: wgpu::Buffer,
     /// Impulse descriptors for the apply_impulses pass — UNIFORM | COPY_DST
     pub impulse_params: wgpu::Buffer,
+    /// Force-sleep/force-wake-by-tag entries for the force_fields pass — UNIFORM | COPY_DST.
+    /// Minimal hook for LP's future chunk system — see `GpuSleepWakeParams` doc comment.
+    pub sleep_wake_params: wgpu::Buffer,
     /// Sorted particle index permutation — STORAGE.
     /// Written once per frame by the particle_sort count→scan→scatter pipeline (block-level
     /// counting sort by spatial position). Read by p2g and particles_update for cache-coherent
@@ -59,6 +64,31 @@ pub struct GpuBuffers {
     /// Cleared, filled (histogram), scanned (exclusive prefix sum), then reused as the atomic
     /// scatter cursor — all in one frame's particle_sort pass sequence.
     pub block_counts: wgpu::Buffer,
+    /// Compacted active block IDs, rebuilt every frame — NUM_BLOCKS (256) × u32, STORAGE |
+    /// COPY_SRC (COPY_SRC for test readback, same precedent as sorted_particle_ids). Phase 1
+    /// of the GPU sparse grid (see mpm_technique_survey memory note): block b is "active" iff
+    /// it contains at least one particle this frame, detected from particle_sort's raw
+    /// per-block histogram before scan overwrites it into a scatter cursor. Consumed today
+    /// only by grid_clear (bounds its real work to occupied blocks); the grid buffer itself
+    /// stays dense for now — that's Phase 2.
+    pub active_block_ids: wgpu::Buffer,
+    /// Atomic count of valid entries in `active_block_ids` this frame — 1 × u32, STORAGE |
+    /// COPY_SRC.
+    pub active_block_count: wgpu::Buffer,
+    /// Snapshot of `active_block_ids`/`active_block_count` from the IMMEDIATELY PRECEDING
+    /// substep — NUM_BLOCKS × u32, STORAGE. Real bug fix: without this, a block that stops
+    /// being active never gets cleared again, since grid_clear only ever clears CURRENTLY
+    /// active blocks — its last P2G contribution would sit there permanently until some
+    /// particle wandered back near it much later (see `active_block_swap_main`'s doc comment
+    /// in `particle_sort.wgsl` for the full story, including a first attempt at this fix that
+    /// was wrong). grid_clear processes the union of `active_block_ids` and this buffer,
+    /// giving every block a genuine one-substep grace period before being left alone.
+    pub active_block_ids_prev: wgpu::Buffer,
+    /// Companion to `active_block_ids_prev` — 1 × u32, STORAGE. NOT atomic (only ever written
+    /// by the single-threaded `lid.x == 0u` branch of `active_block_swap_main`, read by
+    /// `grid_clear`), unlike `active_block_count` which needs atomics for concurrent
+    /// `atomicAdd` from `particle_sort_compact_main`.
+    pub active_block_count_prev: wgpu::Buffer,
     /// Persistent readback staging buffer — pre-allocated to avoid per-frame alloc/dealloc.
     /// COPY_DST | MAP_READ. Same size as `particles`.
     pub readback_staging: wgpu::Buffer,
@@ -127,6 +157,13 @@ impl GpuBuffers {
             mapped_at_creation: false,
         });
 
+        let sleep_wake_params = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mpm_sleep_wake_params"),
+            size: mem::size_of::<GpuSleepWakeParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let sorted_particle_ids = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mpm_sorted_particle_ids"),
             size: (particle_count * mem::size_of::<u32>()) as u64,
@@ -138,7 +175,33 @@ impl GpuBuffers {
         // NUM_BLOCKS (256) must match particle_sort.wgsl's NUM_BLOCKS_PER_DIM² exactly.
         let block_counts = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mpm_block_counts"),
-            size: (256 * mem::size_of::<u32>()) as u64,
+            size: (NUM_BLOCKS * mem::size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
+        // GPU sparse grid Phase 1 — see active_block_ids/active_block_count field docs.
+        let active_block_ids = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mpm_active_block_ids"),
+            size: (NUM_BLOCKS * mem::size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let active_block_count = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mpm_active_block_count"),
+            size: mem::size_of::<u32>() as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let active_block_ids_prev = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mpm_active_block_ids_prev"),
+            size: (NUM_BLOCKS * mem::size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let active_block_count_prev = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mpm_active_block_count_prev"),
+            size: mem::size_of::<u32>() as u64,
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
@@ -157,8 +220,13 @@ impl GpuBuffers {
             step_params_pool,
             force_fields_params,
             impulse_params,
+            sleep_wake_params,
             sorted_particle_ids,
             block_counts,
+            active_block_ids,
+            active_block_count,
+            active_block_ids_prev,
+            active_block_count_prev,
             readback_staging,
         }
     }
@@ -182,6 +250,10 @@ impl GpuBuffers {
 
     pub fn upload_impulse_params(&self, queue: &wgpu::Queue, params: &GpuImpulseParams) {
         queue.write_buffer(&self.impulse_params, 0, bytemuck::bytes_of(params));
+    }
+
+    pub fn upload_sleep_wake_params(&self, queue: &wgpu::Queue, params: &GpuSleepWakeParams) {
+        queue.write_buffer(&self.sleep_wake_params, 0, bytemuck::bytes_of(params));
     }
 
     /// Begin an async GPU → CPU readback. Non-blocking — returns a shared flag set when done.
@@ -268,6 +340,40 @@ impl GpuBuffers {
         device.poll(wgpu::PollType::wait_indefinitely()).ok();
         let mapped = slice.get_mapped_range();
         let values = bytemuck::cast_slice::<u8, u32>(&mapped).to_vec();
+        drop(mapped);
+        staging.unmap();
+        values
+    }
+
+    /// Test/diagnostic readback of `count` f32 values from any storage buffer with COPY_SRC.
+    /// Used to inspect the dense `grid` buffer directly (4 f32 per `Cell`: momentum.x,
+    /// momentum.y, mass, _pad — same field order as the WGSL `Cell` struct in every shader)
+    /// without exposing the crate-private `GpuCell` type outside this module.
+    pub fn readback_f32_blocking(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        buffer: &wgpu::Buffer,
+        count: usize,
+    ) -> Vec<f32> {
+        let byte_count = (count * mem::size_of::<f32>()) as u64;
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mpm_f32_readback_staging"),
+            size: byte_count,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("mpm_f32_readback"),
+        });
+        encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, byte_count);
+        queue.submit(std::iter::once(encoder.finish()));
+        device.poll(wgpu::PollType::wait_indefinitely()).ok();
+        let slice = staging.slice(..byte_count);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::PollType::wait_indefinitely()).ok();
+        let mapped = slice.get_mapped_range();
+        let values = bytemuck::cast_slice::<u8, f32>(&mapped).to_vec();
         drop(mapped);
         staging.unmap();
         values

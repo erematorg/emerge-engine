@@ -7,7 +7,7 @@ use emerge::fields::{
 };
 use emerge::thermodynamics::{ThermalConfig, ThermalDiffusion};
 use emerge::{
-    DruckerPragerMaterial, MuIRheologyMaterial, NaccMaterial, NeoHookeanMaterial,
+    DruckerPragerMaterial, Elastic, MuIRheologyMaterial, NaccMaterial, NeoHookeanMaterial,
     NewtonianFluidMaterial, RankineMaterial, SimConfig, Simulation, SlipBoundary, SpawnRegion,
     StomakhinMaterial, VonMisesMaterial,
 };
@@ -257,6 +257,76 @@ fn rankine_softening_reduces_tensile_strength() {
     assert!(
         p.deformation_gradient.determinant() > 0.0,
         "J must stay positive after Rankine update"
+    );
+}
+
+/// Test-only material exposing a fixed `latent_heat()` — everything else (stress,
+/// CFL bound) defaults to Fallback (zero), since these tests only exercise the
+/// `phase_transition`/`add_phase_rule` energy-debit mechanism in isolation, never step().
+#[derive(Debug, Default)]
+struct LatentHeatMaterial(f32);
+
+impl emerge::MaterialModel for LatentHeatMaterial {
+    fn latent_heat(&self) -> f32 {
+        self.0
+    }
+}
+
+#[test]
+fn phase_transition_applies_latent_heat_energy_debit() {
+    const MELTED_ID: u32 = 1;
+    const LATENT_HEAT: f32 = 334.0;
+    const HEAT_CAPACITY: f32 = 4182.0;
+
+    let config = small_solver_config();
+    let thermal = ThermalDiffusion::new(
+        ThermalConfig {
+            heat_capacity: HEAT_CAPACITY,
+            grid_cell_size: 0.1,
+            ..Default::default()
+        },
+        config.grid_res,
+    );
+
+    let mut solver = Simulation::new(config, small_spawn_config(16.0))
+        .with_default_material(Box::new(LatentHeatMaterial(0.0)))
+        .with_material(MELTED_ID, Box::new(LatentHeatMaterial(LATENT_HEAT)))
+        .with_thermal(thermal);
+
+    for t in solver.particles_mut().temperature.iter_mut() {
+        *t = 0.0;
+    }
+
+    solver.phase_transition(|_| true, MELTED_ID);
+
+    let expected = -LATENT_HEAT / HEAT_CAPACITY;
+    for p in solver.particles().iter() {
+        assert_eq!(p.material_id, MELTED_ID);
+        assert!(
+            (p.temperature - expected).abs() < 1e-6,
+            "expected latent-heat debit {expected}, got {}",
+            p.temperature
+        );
+    }
+}
+
+#[test]
+fn phase_transition_skips_latent_heat_without_thermal_model() {
+    const MELTED_ID: u32 = 1;
+
+    let mut solver = Simulation::new(small_solver_config(), small_spawn_config(16.0))
+        .with_default_material(Box::new(LatentHeatMaterial(0.0)))
+        .with_material(MELTED_ID, Box::new(LatentHeatMaterial(334.0)));
+    // No `.with_thermal(...)` — latent_heat must be a no-op without a thermal model.
+
+    for t in solver.particles_mut().temperature.iter_mut() {
+        *t = 12.0;
+    }
+    solver.phase_transition(|_| true, MELTED_ID);
+
+    assert!(
+        solver.particles().iter().all(|p| p.temperature == 12.0),
+        "temperature must be untouched when no thermal model is configured"
     );
 }
 
@@ -1006,4 +1076,150 @@ fn retain_particles_syncs_active_count_and_steps_cleanly() {
     for p in solver.particles() {
         assert!(p.x.is_finite(), "position non-finite after retain + step");
     }
+}
+
+#[test]
+fn split_particles_conserves_mass_and_jitters_apart() {
+    let config = small_solver_config();
+    let spawn = small_spawn_config(16.0);
+    let mut solver = Simulation::empty(config)
+        .with_default_material(Box::new(NeoHookeanMaterial::new(100.0, 50.0)))
+        .with_boundary(Box::new(SlipBoundary::new(config.boundary_thickness)));
+    let _ = solver.add_body(spawn);
+
+    // Mark half the particles as "damaged" directly (mirrors what Rankine's friction_hardening
+    // would accumulate to in a real fracture scenario â€” testing the splitting mechanism
+    // itself, not Rankine's damage accumulation, which already has its own tests).
+    {
+        let particles = solver.particles_mut();
+        for i in 0..particles.len() {
+            if i % 2 == 0 {
+                particles.friction_hardening[i] = 10.0;
+            }
+        }
+    }
+
+    let before_count = solver.particles().len();
+    let total_mass_before: f32 = solver.particles().iter().map(|p| p.mass).sum();
+    let damaged_before: Vec<(Vec2, f32)> = solver
+        .particles()
+        .iter()
+        .filter(|p| p.friction_hardening > 5.0)
+        .map(|p| (p.x, p.mass))
+        .collect();
+
+    solver.split_particles(|p| p.friction_hardening > 5.0, 0.1);
+
+    let after_count = solver.particles().len();
+    let total_mass_after: f32 = solver.particles().iter().map(|p| p.mass).sum();
+
+    assert_eq!(
+        after_count,
+        before_count + damaged_before.len(),
+        "each damaged particle should become exactly 2 (net +1 per split)"
+    );
+    assert!(
+        (total_mass_before - total_mass_after).abs() < 1e-4,
+        "total mass must be conserved by splitting: before={total_mass_before} after={total_mass_after}"
+    );
+
+    // Every damaged particle's mass should have halved, and its two children should not be
+    // exactly co-located (the comb-artifact lesson from this session: an un-jittered split
+    // would place both children at literally the same position).
+    let children: Vec<_> = solver
+        .particles()
+        .iter()
+        .filter(|p| (p.mass - damaged_before[0].1 * 0.5).abs() < 1e-4)
+        .collect();
+    assert!(
+        children.len() >= 2,
+        "expected at least 2 half-mass children from splitting"
+    );
+    let any_separated = children
+        .iter()
+        .zip(children.iter().skip(1))
+        .any(|(a, b)| (a.x - b.x).length() > 1e-6);
+    assert!(
+        any_separated,
+        "split children must not all be exactly co-located"
+    );
+
+    // Must not panic afterward â€” active_count/tag_index/spatial_hash must stay consistent.
+    solver.step_n(5);
+    for p in solver.particles() {
+        assert!(p.x.is_finite(), "position non-finite after split + step");
+    }
+}
+
+/// A settled DP-sand pile's friction-hardening variable `q` is the accumulated plastic
+/// shear-strain norm (Klar et al. 2016) — it is expected to keep growing slowly under
+/// sustained load even once a pile looks visually settled (real critical-state soil
+/// mechanics: friction angle relaxes from peak toward residual as cumulative shear strain
+/// grows). `project()` deliberately matches sparkl/wgsparkl's reference single-pass return
+/// mapping with no self-consistency corrector (see [[sand.rs]] doc comment) — q is not meant
+/// to hit an exact fixed point. This test only verifies q stays bounded by `q_max` and finite,
+/// not that it stops moving.
+#[test]
+fn sand_q_stays_bounded_once_settled() {
+    let mut sand = DruckerPragerMaterial::new(2000.0, 3000.0);
+    sand.friction_angle = 20.0f32.to_radians();
+    let config = SimConfig {
+        gravity: Vec2::new(0.0, -0.3),
+        boundary_thickness: 3,
+        max_substeps_per_step: 12,
+        ..SimConfig::earth(64, 0.01, 0.1)
+    };
+    let spawn = SpawnRegion {
+        spacing: 0.5,
+        box_size: IVec2::new(18, 14),
+        box_center: Vec2::new(32.0, 40.0),
+        precompute_initial_volumes: true,
+        position_jitter: 0.5,
+        rng_seed: 11,
+        ..SpawnRegion::for_sim(&config)
+    };
+    let mut solver = Simulation::new(config, spawn)
+        .with_default_material(Box::new(sand))
+        .with_boundary(Box::new(SlipBoundary::new(config.boundary_thickness)));
+
+    // Settle well past the point the original diagnostic confirmed visible creep (frame 780
+    // onward) — run to frame 1000 first (already well-settled by then), sample, then run much
+    // further (matching the original 780-7500 window that showed real growth) and sample again.
+    solver.step_n(7500);
+
+    let q_max = 5.0 / 0.2_f32; // friction_hardening's q_max clamp = 5.0 / hardening_decay
+    for p in solver.particles() {
+        assert!(p.x.is_finite(), "position non-finite");
+        assert!(p.deformation_gradient.determinant() > 0.0, "J collapsed");
+        assert!(p.friction_hardening.is_finite(), "q non-finite");
+        assert!(
+            p.friction_hardening <= q_max + 1.0e-3,
+            "q exceeded its q_max clamp: {}",
+            p.friction_hardening
+        );
+    }
+}
+
+#[test]
+fn spawn_region_mass_from_matches_manual_particle_mass() {
+    let config = small_solver_config();
+    let elastic = Elastic {
+        e_pa: 1.0e5,
+        nu: 0.2,
+        rho_kg_m3: 1000.0,
+    };
+    let spacing = 0.5;
+
+    let region = SpawnRegion {
+        spacing,
+        ..SpawnRegion::for_sim(&config)
+    }
+    .mass_from(&elastic, &config);
+
+    let expected = elastic.particle_mass(spacing, &config);
+    assert_eq!(
+        region.mass_override,
+        Some(expected),
+        "mass_from should produce the exact same value as calling particle_mass manually"
+    );
 }

@@ -65,8 +65,13 @@ pub struct Particle {
     /// p.activation = controller_output[p.muscle_group_id].
     /// 0 = unassigned / passive.
     pub muscle_group_id: u32,
-    #[doc(hidden)]
-    pub _pad: u32, // padding to 112 bytes for GPU alignment — do not use
+    /// GPU sleep flag: 0 = active, 1 = sleeping (skipped by P2G/G2P/plasticity/force
+    /// fields on the GPU path). Mirrors `Particles.sleeping` for the CPU `Simulation`'s
+    /// own (separate) partition-based sleep bookkeeping — this field is what travels
+    /// with a single particle when converted to/from the AoS form `GpuSimulation` uses
+    /// directly. Only meaningful when `SimConfig::sleep_threshold > 0.0`; otherwise
+    /// always 0 and has no effect.
+    pub sleeping: u32,
 }
 
 impl Particle {
@@ -91,7 +96,7 @@ impl Particle {
             activation: 0.0,
             activation_dir: glam::Vec2::ZERO,
             muscle_group_id: 0,
-            _pad: 0,
+            sleeping: 0,
         }
     }
 
@@ -243,7 +248,7 @@ impl Particles {
             activation: self.activation[i],
             activation_dir: self.activation_dir[i],
             muscle_group_id: self.muscle_group_id[i],
-            _pad: 0,
+            sleeping: self.sleeping[i] as u32,
         }
     }
 
@@ -291,7 +296,11 @@ impl Particles {
         self.activation.push(p.activation);
         self.activation_dir.push(p.activation_dir);
         self.muscle_group_id.push(p.muscle_group_id);
-        self.sleeping.push(false);
+        // Honor the incoming particle's real sleeping state — needed by GpuSimulation's
+        // CPU-plasticity readback path (Particles::from(Vec<Particle>)), which converts
+        // live GPU particles (sleeping state included) into this SoA. Freshly-spawned
+        // particles always have sleeping=0 already, so this is a no-op for that path.
+        self.sleeping.push(p.sleeping != 0);
     }
 
     /// Swap all SoA fields for indices `a` and `b`. Used by sleep/wake partition logic.

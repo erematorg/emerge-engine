@@ -4,14 +4,14 @@
 [![docs.rs](https://docs.rs/emerge-engine/badge.svg)](https://docs.rs/emerge-engine)
 [![license](https://img.shields.io/crates/l/emerge-engine.svg)](LICENSE-MIT)
 
-Real-time continuum physics engine. MLS-MPM (Hu et al. 2018), pure Rust, optional wgpu GPU backend.
+An MLS-MPM continuum solver (Hu et al. 2018). Fluids, sand, snow, elastic and plastic solids, one particle-grid transfer for all of them — no rigid bodies, no separate fluid/cloth/soft-body systems bolted together, just one method that handles all of it. Pure Rust on the CPU path; an optional wgpu backend runs the whole pipeline on GPU.
 
-Built for [Life's Progress](https://github.com/M1thieu/LP), a systemic simulation game. Not a game engine: no ECS, no rendering, no game loop. Physics only.
+Built for [Life's Progress](https://github.com/M1thieu/LP). Not a game engine — no ECS, no renderer, no game loop, no asset pipeline. It steps particles forward and answers queries about regions of space. Everything else is up to the caller.
 
 ```toml
 [dependencies]
 emerge = { package = "emerge-engine", version = "0.1" }
-# with GPU compute:
+# GPU compute, all plasticity included:
 emerge = { package = "emerge-engine", version = "0.1", features = ["gpu"] }
 ```
 
@@ -52,30 +52,21 @@ println!("avg speed: {:.3}", state.avg_speed);
 
 ## Materials
 
-| Model | Constitutive description |
-|---|---|
-| `NeoHookeanMaterial` | Hyperelastic, finite-strain (Green-Lagrange energy) |
-| `CorotatedMaterial` | Corotated linear elasticity, stiff baseline |
-| `ViscoelasticMaterial` | Kelvin-Voigt: elastic spring + viscous dashpot in parallel |
-| `NewtonianFluidMaterial` | Tait EOS pressure + Newtonian viscosity |
-| `BinghamFluidMaterial` | Tait EOS + viscoplastic yield stress (Bingham) |
-| `StomakhinMaterial` | Corotated elastoplastic, SVD singular-value return mapping, Jp hardening (Stomakhin 2013) |
-| `DruckerPragerMaterial` | Elastoplastic, Drucker-Prager cone yield surface, dilatancy (Klar 2016) |
-| `MuIRheologyMaterial` | Elastoplastic, rate-dependent friction µ(I), dense granular flow |
-| `VonMisesMaterial` | J2 plasticity, linear isotropic hardening |
-| `RankineMaterial` | Tensile cutoff + exponential damage softening (brittle) |
-| `NaccMaterial` | Non-Associated Cam-Clay, critical state soil mechanics |
-| `GranularFluidMaterial` | Tait EOS + corotated deviatoric + SVD plasticity (fluid-granular) |
+Twelve constitutive models, grouped by what they're actually for:
 
-Surface tension is built into `NewtonianFluidMaterial` and `BinghamFluidMaterial` via `surface_tension_coeff`.
+**Elastic solids** — `NeoHookeanMaterial` (hyperelastic, finite-strain), `CorotatedMaterial` (stiffer, corotated-linear), `ViscoelasticMaterial` (Kelvin-Voigt spring+dashpot).
+
+**Fluids** — `NewtonianFluidMaterial` (Tait EOS + viscosity), `BinghamFluidMaterial` (adds a yield stress — mud, not water). Both take a `surface_tension_coeff` for free.
+
+**Granular** — `StomakhinMaterial` (snow, SVD return-mapping with hardening), `DruckerPragerMaterial` and `MuIRheologyMaterial` (two different ways to get sand right — cone yield surface vs. rate-dependent µ(I) friction), `GranularFluidMaterial` (granular suspensions — Tait EOS plus corotated deviatoric plasticity).
+
+**Plastic / failure** — `VonMisesMaterial` (ductile yield, J2 plasticity), `RankineMaterial` (brittle — tensile cutoff with damage softening), `NaccMaterial` (Cam-Clay critical-state soil mechanics).
+
+Each one cites its source paper in the doc comment — see [Physics references](#physics-references) below.
 
 ## Features
 
-| Flag | Description |
-|---|---|
-| `gpu` | wgpu WGSL compute backend, all plasticity on GPU |
-| `render` | Instanced particle debug renderer (requires `gpu`) |
-| `experimental` | Acoustics, EM, information-theoretic measures |
+`gpu` ports the entire pipeline (P2G, grid update, G2P, every plasticity model) to WGSL compute. `render` adds an instanced particle debug renderer on top of `gpu`. `experimental` gates acoustics, electromagnetics, and information-theoretic measures — real code, just not part of the guaranteed API yet.
 
 ## Examples
 

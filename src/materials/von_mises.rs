@@ -153,8 +153,8 @@ impl MaterialModel for VonMisesMaterial {
 
     fn timestep_bound(
         &self,
-        particles: &Particles,
-        i: usize,
+        density: f32,
+        _hardening_scale: f32,
         cell_width: f32,
         material_cfl: f32,
         _viscous_cfl: f32,
@@ -163,7 +163,7 @@ impl MaterialModel for VonMisesMaterial {
             self.lambda,
             self.mu,
             1.0,
-            particles.density[i],
+            density,
             MIN_J,
             cell_width,
             material_cfl,

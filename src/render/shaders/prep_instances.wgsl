@@ -29,7 +29,7 @@ struct Particle {
     activation:           f32,
     activation_dir:       vec2<f32>,
     muscle_group_id:      u32,
-    _pad:                 u32,
+    sleeping:             u32,
 }
 
 // InstanceData layout (48 bytes) — must match MpmRenderer's VertexBufferLayout:

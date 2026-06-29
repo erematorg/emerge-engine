@@ -20,7 +20,7 @@ struct Particle {
     activation:           f32,
     activation_dir:       vec2<f32>,
     muscle_group_id:      u32,
-    _pad:                 u32,
+    sleeping:             u32,
 }
 
 struct Cell {
@@ -37,6 +37,10 @@ struct StepParams {
     gravity:            vec2<f32>,
     boundary_thickness: u32,
     vel_limit:          f32,
+    sleep_threshold:    f32,
+    _pad0:              u32,
+    _pad1:              u32,
+    _pad2:              u32,
 }
 
 const BSPLINE_INNER_LIMIT:  f32 = 0.5;
@@ -65,6 +69,37 @@ fn g2p_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p   = particles[p_idx];
     let res = step_params.grid_res;
     let base = vec2<i32>(i32(p.x.x), i32(p.x.y));
+
+    // Sleeping particles are never gathered into — same as CPU, which excludes them
+    // from G2P entirely, leaving v/velocity_gradient frozen at whatever they were when
+    // they fell asleep. Exception: wake propagation — if a nearby cell shows REAL motion
+    // this substep, this particle wakes and falls through to the full gather below,
+    // getting a real G2P this same substep (matches CPU: wake_particle happens before
+    // G2P runs).
+    //
+    // Checks velocity, not mass: P2G now scatters mass for every particle, awake or
+    // asleep (sleeping particles still need to deposit support for neighbors resting on
+    // them — see p2g.wgsl). So "mass nearby" is true almost everywhere near any particle
+    // at all, sleeping or not, and can no longer distinguish real activity from a calm,
+    // settled neighbor. grid.momentum holds actual velocity by this point (grid_update
+    // already converted it) — a cell fed only by frozen, at-rest particles has velocity
+    // near zero; one fed by a genuinely moving particle does not.
+    if p.sleeping != 0u {
+        var should_wake = false;
+        for (var di: i32 = -1; di <= 1; di++) {
+            for (var dj: i32 = -1; dj <= 1; dj++) {
+                let cx = base.x + di;
+                let cy = base.y + dj;
+                if cx < 0 || cy < 0 || cx >= i32(res) || cy >= i32(res) { continue; }
+                let cell = grid[u32(cy) * res + u32(cx)];
+                if cell.mass > NUM_FLOOR && length(cell.momentum) > step_params.sleep_threshold {
+                    should_wake = true;
+                }
+            }
+        }
+        if !should_wake { return; }
+        particles[p_idx].sleeping = 0u;
+    }
 
     var new_v       = vec2<f32>(0.0);
     var B_col0      = vec2<f32>(0.0);

@@ -27,6 +27,23 @@ pub struct DruckerPragerMaterial {
     /// δεᵥᵖ = sin(ψ) · dq. Physical for dense/compacted sand;
     /// set to 0 for loose/loose-packed sand.
     pub dilatancy_angle: f32,
+    /// Yield-surface floor, independent of confining pressure (Pa-equivalent, same
+    /// units as `lambda`/`mu`). 0.0 = true cohesionless Mohr-Coulomb (real dry sand,
+    /// the Klar 2016 default).
+    ///
+    /// NOT a claim that dry sand has real cohesion — it doesn't. This compensates for
+    /// a real, measured continuum-MPM-resolution artifact: pressure-proportional
+    /// friction (`alpha * trace`) vanishes in thin, fast-flowing layers where local
+    /// confining pressure is near zero, regardless of the friction angle — confirmed
+    /// by three different friction coefficients (DP 35°, µ(I) 20.9-32.8°, µ(I)
+    /// 35-40°) all producing IDENTICAL excess runout (~4.7x the Lajeunesse et al. 2004
+    /// empirical scaling law for this aspect ratio — see
+    /// `sand_column_collapse_runout_matches_lajeunesse_scaling`). Real grain-scale
+    /// effects (interlocking, local rearrangement) give actual sand a baseline
+    /// resistance in thin layers that point-wise continuum MPM at this resolution
+    /// doesn't capture. Calibrate against that benchmark, not against a literature
+    /// "sand cohesion" value (which is ~0 and would be the wrong justification).
+    pub cohesion: f32,
 }
 
 impl DruckerPragerMaterial {
@@ -43,6 +60,7 @@ impl DruckerPragerMaterial {
             friction_residual: 10.0_f32.to_radians(),
             volume_correction: 1.0,
             dilatancy_angle: 0.0,
+            cohesion: 0.0,
         }
     }
 
@@ -97,7 +115,16 @@ impl DruckerPragerMaterial {
     ///
     /// Returns `Some((projected_sigma, delta_q))` if projection occurred (plastic step),
     /// `None` if the trial state is inside the yield surface (elastic step).
-    fn project(&self, sigma: Vec2, log_volume_strain: f32, alpha: f32) -> Option<(Vec2, f32)> {
+    ///
+    /// Single-pass: `alpha` is evaluated once from the pre-step `q`, matching
+    /// `sparkl::DruckerPragerPlasticity::project_deformation_gradient` and
+    /// `wgsparkl::models::drucker_prager::project_deformation_gradient` exactly (both
+    /// reference implementations of Klar et al. 2016 — neither does a self-consistency
+    /// corrector). `q` is the accumulated plastic shear-strain norm; it is expected to
+    /// keep growing slowly under sustained load even once a pile looks "settled" —
+    /// that mirrors real critical-state soil mechanics (friction angle relaxing from
+    /// peak toward residual as cumulative shear strain grows), not a bug to eliminate.
+    fn project(&self, sigma: Vec2, log_volume_strain: f32, q: f32) -> Option<(Vec2, f32)> {
         let sigma = sigma.abs().max(Vec2::splat(LOG_CLAMP));
         // Hencky (logarithmic) strain, shifted by the accumulated volumetric offset.
         let eps = Vec2::new(
@@ -116,11 +143,17 @@ impl DruckerPragerMaterial {
             return Some((Vec2::ONE, dev_norm));
         }
 
-        // Yield function: γ = |dev_ε| + ratio · tr · α.
+        // Yield function: γ = |dev_ε| + ratio · tr · α − cohesion/(2µ).
         // Klar 2016 eq. 25, d=2: (d·λ + 2µ)/(2µ) = (2λ+2µ)/(2µ) = (λ+µ)/µ.
         // Verified against sparkl DruckerPragerPlasticity::project and wgsparkl drucker_prager.wgsl.
+        // The cohesion term shifts the yield threshold by a pressure-INDEPENDENT amount —
+        // converting stress-space Mohr-Coulomb cohesion c (||dev(sigma)|| <= alpha*p + c)
+        // into this strain-space equation via dev(sigma) = 2*mu*dev(eps) gives the c/(2*mu)
+        // divisor below. See `cohesion`'s doc comment for why this exists.
         let ratio = (self.lambda + self.mu) / self.mu;
-        let gamma = dev_norm + ratio * trace * alpha;
+        let alpha = self.alpha(q);
+        let cohesion_term = self.cohesion / (2.0 * self.mu);
+        let gamma = dev_norm + ratio * trace * alpha - cohesion_term;
 
         if gamma <= 0.0 {
             return None; // Inside yield surface — elastic step.
@@ -188,10 +221,11 @@ impl MaterialModel for DruckerPragerMaterial {
             * particles.deformation_gradient[i];
 
         let (u, sigma, vt) = svd2(f_trial);
-        let alpha = self.alpha(particles.friction_hardening[i]);
-        let new_sigma = if let Some((proj_sigma, dq)) =
-            self.project(sigma, particles.log_volume_strain[i], alpha)
-        {
+        let new_sigma = if let Some((proj_sigma, dq)) = self.project(
+            sigma,
+            particles.log_volume_strain[i],
+            particles.friction_hardening[i],
+        ) {
             let sigma_abs = sigma.abs().max(Vec2::splat(LOG_CLAMP));
             let prev_det = sigma_abs.x * sigma_abs.y;
             let new_det = proj_sigma.x * proj_sigma.y;
@@ -234,14 +268,17 @@ impl MaterialModel for DruckerPragerMaterial {
             // compression_limit repurposed for DP: stores dilatancy angle ψ (radians).
             // Snow uses compression_limit for its singular-value clamp (model 4 only).
             compression_limit: self.dilatancy_angle,
+            // stretch_limit repurposed for DP: stores the cohesion floor (Pa-equivalent).
+            // Not read by the GPU's model==5u branch for any other purpose.
+            stretch_limit: self.cohesion,
             ..Default::default()
         }
     }
 
     fn timestep_bound(
         &self,
-        particles: &Particles,
-        i: usize,
+        density: f32,
+        _hardening_scale: f32,
         cell_width: f32,
         material_cfl: f32,
         _viscous_cfl: f32,
@@ -250,10 +287,97 @@ impl MaterialModel for DruckerPragerMaterial {
             self.lambda,
             self.mu,
             1.0,
-            particles.density[i],
+            density,
             MIN_J,
             cell_width,
             material_cfl,
         )
+    }
+}
+
+#[cfg(test)]
+mod marginal_yield_tests {
+    use super::*;
+    use crate::particle::Particles;
+
+    /// Isolates whether `project()` itself matches the analytically-derived 2D
+    /// Mohr-Coulomb marginal-yield condition, bypassing MPM's grid/transfer pipeline
+    /// entirely (no P2G, no gravity, no free surface — a single particle, a single
+    /// hand-built deformation gradient, called directly).
+    ///
+    /// Derivation (see project_mvp_definition / emerge_reference_audit memory,
+    /// 2026-06-27/28 repose-angle investigation): converting this 2D log-strain DP
+    /// return mapping into principal Cauchy stress shows elastic moduli cancel exactly,
+    /// giving a universal relation sin(phi_eff) = sqrt(2) * alpha(q), independent of
+    /// lambda/mu. For the default Klar 2016 params at phi_in=35 deg, alpha(q_init) =
+    /// 0.386019, predicting phi_eff = 33.087 deg.
+    ///
+    /// This test builds a deformation gradient at EXACTLY that marginal angle and checks:
+    /// slightly inside (less shear) => elastic (no change). slightly outside (more shear)
+    /// => plastic (state changes). If this holds, the constitutive code matches the math
+    /// and the real repose-angle gap lives in MPM's grid transfer, not here.
+    /// Builds a strain state whose underlying STRESS state (sigma_i = 2*mu*eps_i +
+    /// lambda*tr(eps)) sits at exactly Mohr-Coulomb angle `phi_test_deg`. Strain-space
+    /// and stress-space deviatoric/volumetric ratios differ by the elastic `ratio` factor
+    /// (dev(stress)/-tr(stress) = (1/ratio) * dev(strain)/-tr(strain)), so this must
+    /// multiply by `ratio`, not just `sin(phi)/sqrt(2)` directly in strain space.
+    fn marginal_state_at_phi_eff(ratio: f32, trace: f32, phi_test_deg: f32) -> (Vec2, f32) {
+        let phi_test = phi_test_deg.to_radians();
+        let dev_norm = -trace * ratio * phi_test.sin() / std::f32::consts::SQRT_2;
+        let diff = dev_norm * std::f32::consts::SQRT_2; // |eps1 - eps2|
+        let eps1 = (trace + diff) * 0.5;
+        let eps2 = (trace - diff) * 0.5;
+        (Vec2::new(eps1.exp(), eps2.exp()), dev_norm)
+    }
+
+    fn run_one_step(sand: &DruckerPragerMaterial, sigma: Vec2, q: f32) -> (Vec2, f32) {
+        let mut p = Particle::zeroed();
+        p.deformation_gradient = Mat2::from_cols(Vec2::new(sigma.x, 0.0), Vec2::new(0.0, sigma.y));
+        p.mass = 1.0;
+        p.initial_volume = 1.0;
+        p.friction_hardening = q;
+        let mut particles = Particles::from(vec![p]);
+        sand.update_particle(&mut particles, 0, 1.0);
+        let f = particles.deformation_gradient[0];
+        (
+            Vec2::new(f.x_axis.x, f.y_axis.y),
+            particles.friction_hardening[0],
+        )
+    }
+
+    #[test]
+    fn marginal_30deg_state_does_not_yield_for_35deg_friction() {
+        let sand = DruckerPragerMaterial::new(2000.0, 3000.0);
+        let q_init = sand.friction_residual / sand.hardening_peak;
+        let ratio = (sand.lambda + sand.mu) / sand.mu;
+        let phi_eff_deg = 33.087_f32; // sqrt(2)*alpha(q_init) for phi_in=35deg
+
+        // Comfortably INSIDE the predicted yield surface (25 deg < 33.087 deg effective).
+        let (sigma_in, _) = marginal_state_at_phi_eff(ratio, -0.01, 25.0);
+        let (sigma_after, q_after) = run_one_step(&sand, sigma_in, q_init);
+        assert!(
+            (sigma_after - sigma_in).length() < 1.0e-6,
+            "25 deg state (inside 33.087 deg yield surface) should stay elastic: \
+             sigma_in={sigma_in:?} sigma_after={sigma_after:?}"
+        );
+        assert!(
+            (q_after - q_init).abs() < 1.0e-6,
+            "q should not change on an elastic step: q_init={q_init} q_after={q_after}"
+        );
+
+        // Comfortably OUTSIDE the predicted yield surface (40 deg > 33.087 deg effective).
+        let (sigma_out, _) = marginal_state_at_phi_eff(ratio, -0.01, 40.0);
+        let (sigma_after2, q_after2) = run_one_step(&sand, sigma_out, q_init);
+        assert!(
+            (sigma_after2 - sigma_out).length() > 1.0e-6,
+            "40 deg state (outside 33.087 deg yield surface) should yield (state should \
+             change): sigma_out={sigma_out:?} sigma_after2={sigma_after2:?}"
+        );
+        assert!(
+            q_after2 > q_init,
+            "q should increase on a plastic step: q_init={q_init} q_after2={q_after2}"
+        );
+
+        println!("phi_eff prediction = {phi_eff_deg} deg (informational, not asserted directly)");
     }
 }

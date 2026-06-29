@@ -94,7 +94,8 @@ impl BinghamFluidMaterial {
     /// Compute deviatoric Bingham stress from the APIC velocity gradient C.
     ///
     /// D = (C + Cᵀ)/2 (symmetric strain rate)
-    /// γ̇ = √(2·D:D)   (scalar shear rate)
+    /// γ̇ = √(2·D_dev:D_dev) (scalar shear rate — deviatoric only: a yield criterion
+    /// must not respond to pure volumetric expansion/compression, which isn't shear)
     /// Below yield: returns zero matrix (plug flow).
     /// Above yield: returns (τ₀/γ̇ + η)·D_dev.
     fn deviatoric_stress(&self, c: Mat2) -> Mat2 {
@@ -106,11 +107,10 @@ impl BinghamFluidMaterial {
         let trace = d.x_axis.x + d.y_axis.y;
         let d_dev = d - Mat2::from_diagonal(Vec2::splat(trace * 0.5));
 
-        // Scalar shear rate γ̇ = √(2·D:D) — Frobenius norm of full D, scaled
-        // 2D: D:D = D_xx² + D_yy² + 2·D_xy·D_yx (for symmetric D, 2·D_xy²)
-        let d_xx = d.x_axis.x;
-        let d_yy = d.y_axis.y;
-        let d_xy = d.x_axis.y; // = d.y_axis.x for symmetric D
+        // Scalar shear rate γ̇ = √(2·D_dev:D_dev) — Frobenius norm of deviatoric D, scaled.
+        let d_xx = d_dev.x_axis.x;
+        let d_yy = d_dev.y_axis.y;
+        let d_xy = d_dev.x_axis.y; // = d_dev.y_axis.x for symmetric D
         let d_sq = d_xx * d_xx + d_yy * d_yy + 2.0 * d_xy * d_xy;
         let shear_rate = (2.0 * d_sq).sqrt();
 
@@ -120,20 +120,7 @@ impl BinghamFluidMaterial {
 
         // Apparent viscosity: Bingham formula η_app = τ₀/γ̇ + η
         let eta_app = self.yield_stress / shear_rate + self.dynamic_viscosity;
-        let tau = d_dev * eta_app;
-
-        // Consistency check: if ||τ||_F < τ₀/√2, particle is in plug regime → zero.
-        // (||τ||² for symmetric 2D tensor = τ_xx² + τ_yy² + 2·τ_xy²)
-        let tau_xx = tau.x_axis.x;
-        let tau_yy = tau.y_axis.y;
-        let tau_xy = tau.x_axis.y;
-        let tau_sq = tau_xx * tau_xx + tau_yy * tau_yy + 2.0 * tau_xy * tau_xy;
-        let tau_yield_sq = self.yield_stress * self.yield_stress * 0.5; // (τ₀/√2)²
-        if tau_sq < tau_yield_sq {
-            return Mat2::ZERO;
-        }
-
-        tau
+        d_dev * eta_app
     }
 }
 
@@ -210,13 +197,13 @@ impl MaterialModel for BinghamFluidMaterial {
 
     fn timestep_bound(
         &self,
-        particles: &Particles,
-        i: usize,
+        density: f32,
+        _hardening_scale: f32,
         cell_width: f32,
         material_cfl: f32,
         viscous_cfl: f32,
     ) -> f32 {
-        let density = particles.density[i].max(self.min_density);
+        let density = density.max(self.min_density);
         let ratio = (density / self.rest_density.max(self.min_density)).max(1.0e-6);
 
         let mut dt_bound = f32::INFINITY;

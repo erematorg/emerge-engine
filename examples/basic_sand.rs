@@ -20,6 +20,9 @@ const GRID: usize = 64;
 const DT: f32 = 0.1;
 const MAT_LOOSE: u32 = 0;
 const MAT_DENSE: u32 = 1;
+// Real measured sand absorption (Sherman & Waite 1985, iron-oxide quartz sand) — see
+// basic_sand_gpu.rs for the full reasoning.
+const SIGMA_SAND: [f32; 3] = [0.180, 0.220, 0.550];
 
 struct App {
     window: Option<Arc<Window>>,
@@ -62,11 +65,18 @@ fn make_sim() -> Simulation {
         precompute_initial_volumes: true,
         initial_velocity_scale: 0.0,
         rng_seed: seed,
+        // See basic_sand_gpu.rs's spawn closure for the full reasoning: a perfectly regular
+        // spawn lattice is a grid-crossing artifact with quadratic B-spline MPM kernels,
+        // confirmed via direct frame capture on the GPU path (same spawn pattern here).
+        position_jitter: 0.5,
         ..SpawnRegion::for_sim(&config)
     };
+    // lambda=2000, mu=3000 -> nu≈0.2 — see basic_sand_gpu.rs's make_sand call for the full
+    // reasoning (the previous 5000/3000 implied nu≈0.31, above real dry sand's established
+    // 0.1-0.3 range, and directly resists Drucker-Prager yielding via the (lambda+mu)/mu ratio).
     let mut solver = Simulation::new(config, spawn(Vec2::new(17.0, 40.0), MAT_LOOSE, 11))
-        .with_default_material(Box::new(make_sand(5000.0, 3000.0, 20.0)))
-        .with_material(MAT_DENSE, Box::new(make_sand(5000.0, 3000.0, 40.0)))
+        .with_default_material(Box::new(make_sand(2000.0, 3000.0, 20.0)))
+        .with_material(MAT_DENSE, Box::new(make_sand(2000.0, 3000.0, 40.0)))
         .with_boundary(Box::new(SlipBoundary::new(config.boundary_thickness)));
     let _ = solver.add_body(spawn(Vec2::new(47.0, 40.0), MAT_DENSE, 22));
     solver
@@ -113,7 +123,9 @@ impl State {
         let sim = make_sim();
         let mut renderer = Renderer::new(&device, sim.particles().len(), fmt);
         renderer.set_camera(&queue, GRID as u32, size.width, size.height, 0.6, true);
-        renderer.set_color_mode(ColorMode::ByMaterial);
+        renderer.set_color_mode(ColorMode::ByPhysics);
+        renderer.set_optical_params(MAT_LOOSE as usize, SIGMA_SAND);
+        renderer.set_optical_params(MAT_DENSE as usize, SIGMA_SAND);
         println!(
             "sand: {} particles  |  LMB push  RMB pull  R reset  Q quit",
             sim.particles().len()

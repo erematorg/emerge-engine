@@ -276,6 +276,63 @@ impl Simulation {
             .rebuild(&self.particles.x, self.active_count);
     }
 
+    /// Splits active particles matching `should_split` into two half-mass/half-volume
+    /// children, jittered apart by `jitter` (grid units) so they don't start exactly
+    /// overlapping — an un-jittered split would put both children at the literal same
+    /// position, the same lattice-symmetry failure mode found and fixed for spawn lattices
+    /// earlier this session ("combed" sand). Every other field (velocity, deformation
+    /// gradient, material_id, temperature, etc.) is inherited unchanged from the parent;
+    /// only mass/volume/position differ, and children always wake up (a freshly-fractured
+    /// piece has no reason to start asleep). Sleeping particles are left untouched, never
+    /// split. CPU-only (`Simulation`, not `GpuSimulation`) — splitting requires growing the
+    /// particle buffer, which the GPU path's fixed-size buffers don't support; not attempted
+    /// here, real future work if needed.
+    ///
+    /// LP use case: pass a predicate checking `p.material_id == BONE && p.friction_hardening`
+    /// against a damage threshold (Rankine's `friction_hardening` field IS its damage
+    /// variable) to turn accumulated fracture damage into actual visible breakage instead of
+    /// an invisible internal number.
+    pub fn split_particles<F: Fn(&Particle) -> bool>(&mut self, should_split: F, jitter: f32) {
+        let mut rng = LcgRng::new(0xC0FF_EE11);
+        let n = self.particles.len();
+        let mut new_particles = Particles::from(Vec::with_capacity(n));
+        let mut new_active_count = 0usize;
+        for i in 0..self.active_count {
+            let p = self.particles.get(i);
+            if should_split(&p) {
+                for _ in 0..2 {
+                    let mut child = p;
+                    child.mass *= 0.5;
+                    child.initial_volume *= 0.5;
+                    child.volume *= 0.5;
+                    let jx = (rng.next_f32() - 0.5) * 2.0 * jitter;
+                    let jy = (rng.next_f32() - 0.5) * 2.0 * jitter;
+                    child.x += Vec2::new(jx, jy);
+                    child.sleeping = 0;
+                    new_particles.push(child);
+                    new_active_count += 1;
+                }
+            } else {
+                new_particles.push(p);
+                new_active_count += 1;
+            }
+        }
+        for i in self.active_count..n {
+            new_particles.push(self.particles.get(i));
+        }
+        self.particles = new_particles;
+        self.active_count = new_active_count;
+        self.tag_index.clear();
+        for i in 0..self.particles.len() {
+            self.tag_index
+                .entry(self.particles.user_tag[i])
+                .or_default()
+                .insert(i);
+        }
+        self.spatial_hash
+            .rebuild(&self.particles.x, self.active_count);
+    }
+
     pub fn assign_particle_materials_by_position<F>(&mut self, mut material_for: F)
     where
         F: FnMut(Vec2) -> u32,
@@ -527,6 +584,11 @@ impl Simulation {
     ///
     /// After a transition involving fluid materials, call `recompute_initial_volumes()`
     /// if density has shifted significantly.
+    ///
+    /// If `new_material_id`'s `MaterialModel::latent_heat()` is non-zero and a thermal
+    /// model is configured (`with_thermal`/`set_thermal`), debits `temperature` by
+    /// `latent_heat / heat_capacity` for every transitioned particle — see
+    /// `MaterialModel::latent_heat` for the sign convention.
     pub fn phase_transition<F>(&mut self, predicate: F, new_material_id: u32)
     where
         F: Fn(&Particle) -> bool,
@@ -536,10 +598,15 @@ impl Simulation {
             "phase_transition: material_id {new_material_id} is not registered — \
              call solver.with_material({new_material_id}, ...) first"
         );
+        let latent_heat = self.materials.get(new_material_id).latent_heat();
+        let heat_capacity = self.thermal.as_ref().map(|t| t.config.heat_capacity);
         for i in 0..self.particles.len() {
             let p = self.particles.get(i);
             if predicate(&p) {
                 self.particles.material_id[i] = new_material_id;
+                if let (true, Some(cp)) = (latent_heat != 0.0, heat_capacity) {
+                    self.particles.temperature[i] -= latent_heat / cp;
+                }
             }
         }
     }
@@ -553,6 +620,8 @@ impl Simulation {
     /// All `new_material_id` values returned by the rule must be pre-registered via
     /// `solver.with_material(id, ...)` before any step is taken.
     ///
+    /// Applies the same `latent_heat` energy debit as `phase_transition` — see there.
+    ///
     /// # Examples
     /// ```rust,ignore
     /// # extern crate emerge_engine as emerge;
@@ -565,8 +634,6 @@ impl Simulation {
     ///     if p.material_id == ROCK_ID && p.temperature > 1500.0 { Some(LAVA_ID) } else { None }
     /// });
     /// ```
-    // TODO: latent heat — transitions currently swap material_id with no energy cost.
-    // Fix: add `latent_heat` to MaterialParams, apply T -= latent_heat/heat_capacity here.
     pub fn add_phase_rule<F>(&mut self, rule: F)
     where
         F: Fn(&Particle) -> Option<u32> + Send + Sync + 'static,
@@ -841,11 +908,16 @@ impl Simulation {
         let t5 = std::time::Instant::now();
         if !self.phase_rules.is_empty() {
             let rules = std::mem::take(&mut self.phase_rules);
+            let heat_capacity = self.thermal.as_ref().map(|t| t.config.heat_capacity);
             for i in 0..self.active_count {
                 let p = self.particles.get(i);
                 for rule in &rules {
                     if let Some(new_id) = rule(&p) {
                         self.particles.material_id[i] = new_id;
+                        let latent_heat = self.materials.get(new_id).latent_heat();
+                        if let (true, Some(cp)) = (latent_heat != 0.0, heat_capacity) {
+                            self.particles.temperature[i] -= latent_heat / cp;
+                        }
                         break;
                     }
                 }
@@ -1227,7 +1299,7 @@ pub(crate) fn initialize_particles(
                     activation: 0.0,
                     activation_dir: Vec2::ZERO,
                     muscle_group_id: 0,
-                    _pad: 0,
+                    sleeping: 0,
                 });
             }
 
@@ -1288,8 +1360,8 @@ pub(crate) fn choose_substep_dt(
         }
         max_speed = max_speed.max(s);
         let mdt = materials.get(particles.material_id[i]).timestep_bound(
-            particles,
-            i,
+            particles.density[i],
+            particles.hardening_scale[i],
             config.grid_cell_size,
             config.material_cfl_coefficient,
             config.viscous_timestep_coefficient,
@@ -1303,7 +1375,7 @@ pub(crate) fn choose_substep_dt(
 
 /// Shared CFL formula: clamps dt to advection + material bounds.
 /// Called by both SoA and AoS scan paths after computing their respective max values.
-fn cfl_bound(config: &SimConfig, max_speed: f32, min_mat_dt: f32, max_dt: f32) -> f32 {
+pub(crate) fn cfl_bound(config: &SimConfig, max_speed: f32, min_mat_dt: f32, max_dt: f32) -> f32 {
     let mut dt = max_dt;
     if max_speed > f32::EPSILON {
         dt = dt.min(config.cfl_coefficient * config.grid_cell_size / max_speed);
@@ -1312,7 +1384,7 @@ fn cfl_bound(config: &SimConfig, max_speed: f32, min_mat_dt: f32, max_dt: f32) -
     dt.clamp(config.min_dt.min(max_dt), max_dt)
 }
 
-fn affine_cfl_speed_contribution(c: &Mat2, cell_width: f32) -> f32 {
+pub(crate) fn affine_cfl_speed_contribution(c: &Mat2, cell_width: f32) -> f32 {
     // The APIC affine matrix C encodes the local velocity gradient.
     // The farthest point in the quadratic B-spline 3×3 stencil is at 1.5 cells per axis,
     // so its corner distance is 1.5*√2 cells — the effective maximum affine speed contribution.

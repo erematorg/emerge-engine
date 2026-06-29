@@ -38,7 +38,7 @@ struct Particle {
     activation:           f32,
     activation_dir:       vec2<f32>,
     muscle_group_id:      u32,
-    _pad:                 u32,       // total 112 bytes
+    sleeping:             u32,       // total 112 bytes
 }
 
 struct MaterialParams {
@@ -76,6 +76,10 @@ struct StepParams {
     gravity:            vec2<f32>,
     boundary_thickness: u32,
     vel_limit:          f32,
+    sleep_threshold:    f32,
+    _pad0:              u32,
+    _pad1:              u32,
+    _pad2:              u32,
 }
 
 const MAX_MATERIALS:    u32 = {{MAX_MATERIALS}}u;
@@ -182,9 +186,17 @@ fn dp_plasticity(sigma_in: vec2<f32>, log_volume_strain: f32, q: f32, mat: Mater
         return DpReturn(vec2<f32>(1.0), dn, log(max(prev_det, NUM_FLOOR_TIGHT * NUM_FLOOR_TIGHT)));
     }
 
-    let alpha = dp_alpha(q, mat);
+    // Single-pass: alpha evaluated once from the pre-step q, matching
+    // wgsparkl::models::drucker_prager::project_deformation_gradient exactly (the
+    // reference GPU implementation of Klar et al. 2016 — no self-consistency corrector).
+    // stretch_limit repurposed for DP: cohesion floor, see sand.rs's `cohesion` doc
+    // comment — NOT real "sand cohesion" (dry sand is ~0), a continuum-MPM-resolution
+    // regularization for thin flowing layers, calibrated against the Lajeunesse 2004
+    // runout benchmark.
     let ratio = (mat.lambda + mat.mu) / max(mat.mu, NUM_FLOOR_TIGHT);
-    let gamma = dn + ratio * tr * alpha;
+    let alpha = dp_alpha(q, mat);
+    let cohesion_term = mat.stretch_limit / (2.0 * max(mat.mu, NUM_FLOOR_TIGHT));
+    let gamma = dn + ratio * tr * alpha - cohesion_term;
 
     if gamma <= 0.0 {
         return DpReturn(sigma, 0.0, 0.0);
@@ -338,6 +350,14 @@ fn particles_update_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p_idx = sorted_particle_ids[gid.x]; // sorted for cache-coherent p2g scatter
 
     var p   = particles[p_idx];
+
+    // Still-sleeping particles (didn't wake in g2p this substep) are frozen — skip
+    // state projection, F update, every plasticity branch, and position integration
+    // entirely. Particles that woke in g2p have sleeping=0u by this point and get the
+    // full update below, same as CPU (a newly-woken particle gets a real update the
+    // same substep it wakes).
+    if p.sleeping != 0u { return; }
+
     let mat = materials[p.material_id];
     let dt  = step_params.dt;
     let res = step_params.grid_res;

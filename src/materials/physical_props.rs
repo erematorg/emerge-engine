@@ -218,6 +218,14 @@ pub trait FromSI<P> {
     fn from_physical(props: &P, config: &SimConfig) -> Self;
 }
 
+/// Particle mass (grid units) for a `SpawnRegion` spawning this material at a
+/// given spacing — `rho_kg_m3 * (spacing * dx_meters)^2` for a 2D areal-density
+/// particle. Implemented identically by every physical-property family so
+/// `SpawnRegion::mass_from` can stay generic over which material is being spawned.
+pub trait ParticleMass {
+    fn particle_mass(&self, spacing: f32, config: &SimConfig) -> f32;
+}
+
 // ── Internal bridging structs (pub(super) — not part of LP API) ──────────────
 //
 // These carry the exact parameters that each material impl's `from_physical` needs.

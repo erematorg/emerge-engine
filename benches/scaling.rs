@@ -493,6 +493,94 @@ fn bench_sand_sheared(c: &mut Criterion) {
     group.finish();
 }
 
+// ── gpu_sleep_wake_scaling ──────────────────────────────────────────────────
+//
+// Phase 1 GPU sleep/wake (flag-based, no compaction). Compares step_frame() cost for a
+// large settled sand pile with sleep_threshold=0.0 (off, baseline — every particle does
+// full P2G/G2P/plasticity/force-field work every substep) vs a real threshold (most of
+// the pile asleep, skipping that work). This is the actual measurement the plan's
+// verification step requires before claiming a win — same "measure before claiming a
+// win, revert if it doesn't deliver" rule used for the CPU P2G/G2P parallelization
+// attempts earlier in this project (two reverted, one kept).
+#[cfg(feature = "gpu")]
+mod gpu_benches {
+    use super::*;
+    use emerge::gpu::GpuSimulation;
+    use pollster::block_on;
+
+    fn build_gpu_pile(target: usize, sleep_threshold: f32) -> GpuSimulation {
+        // base_config()'s fixed GRID=64 (tuned for the smaller CPU bench targets) is too
+        // small here — at target=20000, side ≈ 71 cells, bigger than the whole grid,
+        // spawning a boundary-saturated mess from the start (chaotic for reasons unrelated
+        // to sleep/wake). Scale grid_res to the target instead of reusing the CPU constant.
+        let side = ((target as f32).sqrt() * 0.5).ceil() as i32;
+        let grid_res = (side as usize + 32).max(64);
+        let config = SimConfig {
+            sleep_threshold,
+            ..SimConfig::standard(grid_res, 0.1, Vec2::new(0.0, -0.3))
+        };
+        let spawn = SpawnRegion {
+            spacing: 0.5,
+            box_size: IVec2::splat(side),
+            box_center: Vec2::splat(grid_res as f32 * 0.5),
+            precompute_initial_volumes: true,
+            ..SpawnRegion::for_sim(&config)
+        };
+        let particles = build_particles(&config, spawn);
+        let registry =
+            MaterialRegistry::with_default(Box::new(DruckerPragerMaterial::new(400.0, 200.0)));
+        let mut sim = block_on(GpuSimulation::new(config, particles, registry));
+        // Settle under gravity before measuring, until genuinely calm — not a fixed step
+        // count. A boxy DP sand spawn has to collapse and find its angle of repose, which
+        // takes longer at larger scale; a fixed 300-step budget (the original guess) left
+        // larger piles still actively flowing when criterion started measuring, so the
+        // sleep_threshold=0.0 vs >0.0 comparison wasn't measuring the same physical state —
+        // it was comparing "still avalanching" against itself, not "settled" against itself.
+        // Use max speed directly (not the sleeping flag, which doesn't exist when threshold
+        // is 0.0) so both variants settle by the same real criterion.
+        let mut prev_max_v = f32::INFINITY;
+        let mut stable_checks = 0;
+        for _ in 0..400 {
+            for _ in 0..20 {
+                sim.step_frame();
+            }
+            sim.sync_particles_blocking();
+            let max_v = sim
+                .particles()
+                .iter()
+                .map(|p| p.v.length())
+                .fold(0.0f32, f32::max);
+            if max_v < 0.05 && prev_max_v < 0.05 {
+                stable_checks += 1;
+                if stable_checks >= 3 {
+                    break;
+                }
+            } else {
+                stable_checks = 0;
+            }
+            prev_max_v = max_v;
+        }
+        sim
+    }
+
+    pub fn bench_gpu_sleep_wake_scaling(c: &mut Criterion) {
+        let mut group = c.benchmark_group("gpu_sleep_wake_scaling");
+        for &target in &[2_000usize, 8_000, 20_000] {
+            let mut sim_off = build_gpu_pile(target, 0.0);
+            group.bench_with_input(BenchmarkId::new("sleep_off", target), &target, |b, _| {
+                b.iter(|| sim_off.step_frame())
+            });
+            // 0.05: same threshold validated in tests/gpu.rs's gpu_sleep_freezes_settled_particles
+            // — comfortably below genuine free-fall/jostle speed, catches real post-impact rest.
+            let mut sim_on = build_gpu_pile(target, 0.05);
+            group.bench_with_input(BenchmarkId::new("sleep_on", target), &target, |b, _| {
+                b.iter(|| sim_on.step_frame())
+            });
+        }
+        group.finish();
+    }
+}
+
 // â”€â”€ registry â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 criterion_group!(
@@ -509,4 +597,11 @@ criterion_group!(
     bench_update_particle,
     bench_grid_update,
 );
+
+#[cfg(feature = "gpu")]
+criterion_group!(gpu_benches_group, gpu_benches::bench_gpu_sleep_wake_scaling);
+
+#[cfg(feature = "gpu")]
+criterion_main!(benches, gpu_benches_group);
+#[cfg(not(feature = "gpu"))]
 criterion_main!(benches);

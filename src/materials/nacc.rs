@@ -258,8 +258,8 @@ impl MaterialModel for NaccMaterial {
 
     fn timestep_bound(
         &self,
-        particles: &Particles,
-        i: usize,
+        density: f32,
+        hardening_scale: f32,
         cell_width: f32,
         material_cfl: f32,
         _viscous_cfl: f32,
@@ -268,8 +268,8 @@ impl MaterialModel for NaccMaterial {
         elastic_wave_dt(
             lambda,
             self.mu,
-            particles.hardening_scale[i],
-            particles.density[i],
+            hardening_scale,
+            density,
             self.min_density,
             cell_width,
             material_cfl,

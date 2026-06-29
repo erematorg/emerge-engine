@@ -1129,3 +1129,83 @@ fn count_near_matches_manual() {
 
     assert_eq!(api_count, manual_count);
 }
+
+// ─── thermo-mechanical coupling (E(T)) ──────────────────────────────────────────
+//
+// `thermal_expansion` already existed on NeoHookean/Corotated/Viscoelastic and was already
+// wired into both the CPU kirchhoff_stress AND the GPU p2g.wgsl shader (identical formula,
+// `t_scale = 1.0 + thermal_expansion * temperature`) — but had zero tests or examples
+// exercising it anywhere in the repo. This verifies the feature actually does what its own
+// doc comment claims (negative = softening) rather than assuming it from reading the code.
+
+fn stress_frobenius_norm(tau: Mat2) -> f32 {
+    (tau.col(0).length_squared() + tau.col(1).length_squared()).sqrt()
+}
+
+#[test]
+fn neohookean_negative_thermal_expansion_softens_stress() {
+    let mut mat = NeoHookeanMaterial::new(100.0, 200.0);
+    mat.thermal_expansion = -1.0e-3; // per its own doc comment: negative = softening
+
+    let mut p = Particle::zeroed();
+    p.mass = 1.0;
+    p.initial_volume = 1.0;
+    p.volume = 1.0;
+    p.density = 1.0;
+    // Same moderate shear/stretch deformation for both — only temperature differs.
+    p.deformation_gradient = Mat2::from_cols(Vec2::new(1.2, 0.1), Vec2::new(0.15, 0.9));
+    mat.init_particle(&mut p);
+
+    p.temperature = 0.0;
+    let tau_cold = kirchhoff_stress_of(&mat, &p);
+
+    p.temperature = 500.0;
+    let tau_hot = kirchhoff_stress_of(&mat, &p);
+
+    let norm_cold = stress_frobenius_norm(tau_cold);
+    let norm_hot = stress_frobenius_norm(tau_hot);
+    assert!(
+        norm_hot < norm_cold,
+        "heating with negative thermal_expansion should soften (lower stress for the same \
+         deformation): cold={norm_cold:.4} hot={norm_hot:.4}"
+    );
+
+    // Sanity: thermal_expansion=0.0 (the default) must be completely temperature-independent —
+    // this is the "zero behavior change for anything that doesn't opt in" guarantee.
+    let neutral = NeoHookeanMaterial::new(100.0, 200.0);
+    let mut p_neutral = p;
+    p_neutral.temperature = 0.0;
+    let tau_neutral_cold = kirchhoff_stress_of(&neutral, &p_neutral);
+    p_neutral.temperature = 500.0;
+    let tau_neutral_hot = kirchhoff_stress_of(&neutral, &p_neutral);
+    assert!(
+        (stress_frobenius_norm(tau_neutral_cold) - stress_frobenius_norm(tau_neutral_hot)).abs()
+            < 1e-6,
+        "thermal_expansion=0.0 must be exactly temperature-independent"
+    );
+}
+
+#[test]
+fn corotated_negative_thermal_expansion_softens_stress() {
+    let mut mat = CorotatedMaterial::new(100.0, 200.0);
+    mat.thermal_expansion = -1.0e-3;
+
+    let mut p = Particle::zeroed();
+    p.mass = 1.0;
+    p.initial_volume = 1.0;
+    p.volume = 1.0;
+    p.density = 1.0;
+    p.deformation_gradient = Mat2::from_cols(Vec2::new(1.2, 0.1), Vec2::new(0.15, 0.9));
+    mat.init_particle(&mut p);
+
+    p.temperature = 0.0;
+    let norm_cold = stress_frobenius_norm(kirchhoff_stress_of(&mat, &p));
+    p.temperature = 500.0;
+    let norm_hot = stress_frobenius_norm(kirchhoff_stress_of(&mat, &p));
+
+    assert!(
+        norm_hot < norm_cold,
+        "Corotated: heating with negative thermal_expansion should soften: \
+         cold={norm_cold:.4} hot={norm_hot:.4}"
+    );
+}

@@ -1,13 +1,15 @@
 /// Compute pipeline setup for MLS-MPM GPU passes.
 ///
-/// Ten passes per frame:
+/// Eleven passes per frame:
 ///   Once per frame, in order (block-level counting sort, see particle_sort.wgsl):
-///     0a. particle_sort_clear    — zero the 256-entry block histogram
+///     0a. particle_sort_clear    — zero the 256-entry block histogram + active_block_count
 ///     0b. particle_sort_count    — one thread per particle, build histogram
-///     0c. particle_sort_scan     — one workgroup, exclusive prefix sum -> scatter cursor
-///     0d. particle_sort_scatter  — one thread per particle, write sorted_particle_ids
+///     0c. particle_sort_compact  — GPU sparse grid Phase 1: record which blocks are occupied
+///                                  (reads the RAW histogram, must run before scan overwrites it)
+///     0d. particle_sort_scan     — one workgroup, exclusive prefix sum -> scatter cursor
+///     0e. particle_sort_scatter  — one thread per particle, write sorted_particle_ids
 ///   Per substep:
-///     1. grid_clear       — zero all grid cells (one thread per cell, 8×8 workgroups)
+///     1. grid_clear       — zero only cells in active blocks (see grid_clear.wgsl)
 ///     2. p2g              — scatter particles → grid (sorted access, 64-wide workgroups)
 ///     3. grid_update      — normalize momentum→velocity, apply gravity, enforce boundary
 ///     4. g2p              — gather grid → particles, write v + velocity_gradient only
@@ -22,20 +24,32 @@
 ///   binding 4: force_fields_params  — uniform (GpuFieldsParams, 784 bytes)
 ///   binding 5: sorted_particle_ids  — storage read_write (u32 per particle)
 ///   binding 6: block_counts         — storage read_write (256 atomic<u32>, particle_sort only)
+///   binding 7: sleep_wake_params    — uniform (GpuSleepWakeParams, 80 bytes)
+///   binding 8: active_block_ids     — storage read_write (256 u32 — particle_sort writes,
+///                                     grid_clear reads; GPU sparse grid Phase 1)
+///   binding 9: active_block_count   — storage read_write (1 atomic<u32> — same pair as above)
 ///
 /// Passes that don't use a binding still share the same layout — avoids rebinding.
 use super::buffers::GpuBuffers;
 use super::shaders;
-use super::step_params::{MAX_FORCE_FIELDS, MAX_MATERIALS};
+use super::step_params::{
+    MAX_FORCE_FIELDS, MAX_MATERIALS, MAX_SLEEP_WAKE_TAGS, NUM_BLOCKS_PER_DIM,
+};
 
 /// All compiled compute pipelines for one GpuSimulation instance.
 pub struct SimPipelines {
-    /// Once per frame, in order: clear histogram -> count per-block -> scan (exclusive prefix
-    /// sum) -> scatter into sorted_particle_ids. See particle_sort.wgsl for the algorithm.
+    /// Once per frame, in order: clear histogram -> count per-block -> compact (active-block
+    /// list, GPU sparse grid Phase 1) -> scan (exclusive prefix sum) -> scatter into
+    /// sorted_particle_ids. See particle_sort.wgsl for the algorithm.
     pub particle_sort_clear: wgpu::ComputePipeline,
     pub particle_sort_count: wgpu::ComputePipeline,
+    pub particle_sort_compact: wgpu::ComputePipeline,
     pub particle_sort_scan: wgpu::ComputePipeline,
     pub particle_sort_scatter: wgpu::ComputePipeline,
+    /// One-substep grace-period swap (snapshots active_block_ids/count into _prev, resets
+    /// the current count to 0), dispatched FIRST each substep, before clear/count/compact —
+    /// see active_block_swap_main's doc comment in particle_sort.wgsl for why.
+    pub active_block_swap: wgpu::ComputePipeline,
     pub grid_clear: wgpu::ComputePipeline,
     pub p2g: wgpu::ComputePipeline,
     pub grid_update: wgpu::ComputePipeline,
@@ -135,6 +149,68 @@ impl SimPipelines {
                     },
                     count: None,
                 },
+                // binding 7: sleep_wake_params — uniform (GpuSleepWakeParams, 80 bytes)
+                // Only force_fields.wgsl reads this; harmless for shaders that don't.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // binding 8: active_block_ids — storage read_write (256 u32). GPU sparse grid
+                // Phase 1: particle_sort writes, grid_clear reads.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // binding 9: active_block_count — storage read_write (1 atomic<u32>). Same
+                // pair as binding 8.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // binding 10: active_block_ids_prev — storage read_write (256 u32). Snapshot
+                // of last substep's active_block_ids — the one-substep grace period, see
+                // active_block_swap_main.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 10,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // binding 11: active_block_count_prev — storage read_write (1 plain u32, not
+                // atomic — only ever written by active_block_swap_main's single lid.x==0u
+                // thread). Companion to binding 10.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 11,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -149,16 +225,28 @@ impl SimPipelines {
         let p2g_src = patch_shader(shaders::P2G);
         let particles_update_src = patch_shader(shaders::PARTICLES_UPDATE);
 
-        // MAX_FORCE_FIELDS: loop-bound constant — uses WGSL `override` (proper pipeline specialization).
-        let ff_consts: &[(&str, f64)] = &[("MAX_FORCE_FIELDS", MAX_FORCE_FIELDS as f64)];
+        // MAX_FORCE_FIELDS / MAX_SLEEP_WAKE_TAGS: loop-bound constants — uses WGSL
+        // `override` (proper pipeline specialization), not a hardcoded literal in the shader.
+        let ff_consts: &[(&str, f64)] = &[
+            ("MAX_FORCE_FIELDS", MAX_FORCE_FIELDS as f64),
+            ("MAX_SLEEP_WAKE_TAGS", MAX_SLEEP_WAKE_TAGS as f64),
+        ];
 
+        // NUM_BLOCKS_PER_DIM: GPU sparse grid Phase 1 — single Rust-side source of truth,
+        // shared by particle_sort's compaction pass and grid_clear's block-guarded dispatch.
+        let block_consts: &[(&str, f64)] = &[("NUM_BLOCKS_PER_DIM", NUM_BLOCKS_PER_DIM as f64)];
+
+        // NUM_BLOCKS_PER_DIM is an `override` at the particle_sort.wgsl MODULE level (promoted
+        // from a hardcoded const — see GPU sparse grid Phase 1), so every pipeline built from
+        // this file needs it supplied at creation time, not just particle_sort_compact, which
+        // is the only entry point that actually reads it.
         let particle_sort_clear = make_pipeline(
             device,
             &pipeline_layout,
             shaders::PARTICLE_SORT,
             "particle_sort_clear_main",
             "particle_sort_clear",
-            &[],
+            block_consts,
             false,
         );
         let particle_sort_count = make_pipeline(
@@ -167,19 +255,42 @@ impl SimPipelines {
             shaders::PARTICLE_SORT,
             "particle_sort_count_main",
             "particle_sort_count",
-            &[],
+            block_consts,
             false,
         );
         // particle_sort_scan is the ONLY pipeline with var<workgroup> memory (scan_temp) —
         // see the skip_workgroup_zero_init doc on make_pipeline for the safety argument.
         // Every other pipeline keeps the WebGPU-mandated zero-init (false here = default ON).
+        // GPU sparse grid Phase 1 — reads the raw histogram before scan overwrites it into a
+        // scatter cursor, so must run between count and scan, never reordered.
+        let particle_sort_compact = make_pipeline(
+            device,
+            &pipeline_layout,
+            shaders::PARTICLE_SORT,
+            "particle_sort_compact_main",
+            "particle_sort_compact",
+            block_consts,
+            false,
+        );
+        // Dispatched FIRST each substep, before clear/count/compact in the per-substep
+        // sequence (not the once-per-frame sort sequence) — see active_block_swap_main's doc
+        // comment in particle_sort.wgsl for why.
+        let active_block_swap = make_pipeline(
+            device,
+            &pipeline_layout,
+            shaders::PARTICLE_SORT,
+            "active_block_swap_main",
+            "active_block_swap",
+            block_consts,
+            false,
+        );
         let particle_sort_scan = make_pipeline(
             device,
             &pipeline_layout,
             shaders::PARTICLE_SORT,
             "particle_sort_scan_main",
             "particle_sort_scan",
-            &[],
+            block_consts,
             true,
         );
         let particle_sort_scatter = make_pipeline(
@@ -188,7 +299,7 @@ impl SimPipelines {
             shaders::PARTICLE_SORT,
             "particle_sort_scatter_main",
             "particle_sort_scatter",
-            &[],
+            block_consts,
             false,
         );
         let grid_clear = make_pipeline(
@@ -197,7 +308,7 @@ impl SimPipelines {
             shaders::GRID_CLEAR,
             "grid_clear_main",
             "grid_clear",
-            &[],
+            block_consts,
             false,
         );
         let p2g = make_pipeline(
@@ -292,8 +403,10 @@ impl SimPipelines {
         Self {
             particle_sort_clear,
             particle_sort_count,
+            particle_sort_compact,
             particle_sort_scan,
             particle_sort_scatter,
+            active_block_swap,
             grid_clear,
             p2g,
             grid_update,
@@ -368,6 +481,26 @@ impl SimPipelines {
                 wgpu::BindGroupEntry {
                     binding: 6,
                     resource: buffers.block_counts.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: buffers.sleep_wake_params.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: buffers.active_block_ids.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: buffers.active_block_count.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: buffers.active_block_ids_prev.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: buffers.active_block_count_prev.as_entire_binding(),
                 },
             ],
         })

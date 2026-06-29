@@ -190,14 +190,14 @@ impl MaterialModel for NewtonianFluidMaterial {
 
     fn timestep_bound(
         &self,
-        particles: &Particles,
-        i: usize,
+        density: f32,
+        _hardening_scale: f32,
         cell_width: f32,
         material_cfl: f32,
         viscous_cfl: f32,
     ) -> f32 {
         const MIN_DENSITY_RATIO: f32 = 1.0e-6;
-        let density = particles.density[i].max(self.min_density);
+        let density = density.max(self.min_density);
         let ratio = (density / self.rest_density.max(self.min_density)).max(MIN_DENSITY_RATIO);
 
         let mut dt_bound = f32::INFINITY;

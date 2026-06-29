@@ -193,8 +193,8 @@ impl MaterialModel for GranularFluidMaterial {
 
     fn timestep_bound(
         &self,
-        particles: &Particles,
-        i: usize,
+        density: f32,
+        hardening_scale: f32,
         cell_width: f32,
         material_cfl: f32,
         _viscous_cfl: f32,
@@ -202,8 +202,8 @@ impl MaterialModel for GranularFluidMaterial {
         elastic_wave_dt(
             self.lambda,
             self.mu,
-            particles.hardening_scale[i],
-            particles.density[i],
+            hardening_scale,
+            density,
             MIN_J,
             cell_width,
             material_cfl,

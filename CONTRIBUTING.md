@@ -4,6 +4,12 @@ emerge is a 2D MLS-MPM continuum physics engine in pure Rust, built for real-tim
 
 ---
 
+## Issues
+
+Bug reports and questions are welcome via GitHub issues. This is a solo-maintained project — response time is best-effort, not guaranteed. Include a minimal repro (a failing test or example is ideal) where possible; it's the fastest path to a fix.
+
+---
+
 ## Quick start
 
 ```sh

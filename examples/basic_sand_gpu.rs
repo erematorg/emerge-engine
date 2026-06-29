@@ -25,6 +25,9 @@ const DT: f32 = 0.1;
 const MAT_LOOSE: u32 = 0;
 const MAT_DENSE: u32 = 1;
 const LABELS: &[(u32, &str)] = &[(MAT_LOOSE, "loose"), (MAT_DENSE, "dense")];
+// Real measured sand absorption (Sherman & Waite 1985, iron-oxide quartz sand) — same value
+// used for both materials since they're optically the same sand, just different friction angle.
+const SIGMA_SAND: [f32; 3] = [0.180, 0.220, 0.550];
 
 struct App {
     window: Option<Arc<Window>>,
@@ -64,6 +67,12 @@ fn make_sim_data(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) -> GpuSimul
         material_id: mat,
         precompute_initial_volumes: true,
         rng_seed: seed,
+        // A perfectly regular spawn lattice + quadratic B-spline MPM kernel is a textbook
+        // grid-crossing artifact: every spawn column stays a visually distinct streak forever,
+        // never mixing with its neighbors ("combed" look, confirmed via direct frame capture —
+        // 0.2 per jitter()'s own doc comment wasn't strong enough at this spawn density; 0.5
+        // fully breaks the lattice symmetry into a natural-looking granular pile).
+        position_jitter: 0.5,
         ..SpawnRegion::for_sim(&config)
     };
     let mut particles = build_particles(&config, spawn(Vec2::new(17.0, 40.0), MAT_LOOSE, 11));
@@ -71,8 +80,14 @@ fn make_sim_data(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) -> GpuSimul
         &config,
         spawn(Vec2::new(47.0, 40.0), MAT_DENSE, 22),
     ));
-    let mut registry = MaterialRegistry::with_default(Box::new(make_sand(5000.0, 3000.0, 20.0)));
-    registry.insert(MAT_DENSE, Box::new(make_sand(5000.0, 3000.0, 40.0)));
+    // lambda=2000, mu=3000 -> nu≈0.2 (the previous 5000/3000 implied nu≈0.31, above real dry
+    // sand's established range of 0.1-0.3 — see Drucker-Prager yield ratio (lambda+mu)/mu,
+    // which directly gates plastic yielding: a higher ratio resists granular flow more,
+    // producing the rigid "combed" look instead of a natural collapsing pile). Matches the
+    // validated nu=0.2 already used in tests/accuracy.rs's sand_angle_of_repose_is_physical
+    // and the canonical sparkl demo value it's calibrated against.
+    let mut registry = MaterialRegistry::with_default(Box::new(make_sand(2000.0, 3000.0, 20.0)));
+    registry.insert(MAT_DENSE, Box::new(make_sand(2000.0, 3000.0, 40.0)));
     GpuSimulation::with_device(device, queue, config, particles, registry)
 }
 
@@ -117,7 +132,9 @@ impl State {
         let sim = make_sim_data(Arc::new(device), Arc::new(queue));
         let mut renderer = Renderer::new(sim.device(), sim.particle_count(), fmt);
         renderer.set_camera(sim.queue(), GRID as u32, size.width, size.height, 0.6, true);
-        renderer.set_color_mode(ColorMode::ByMaterial);
+        renderer.set_color_mode(ColorMode::ByPhysics);
+        renderer.set_optical_params(MAT_LOOSE as usize, SIGMA_SAND);
+        renderer.set_optical_params(MAT_DENSE as usize, SIGMA_SAND);
         println!(
             "sand GPU: {} particles  |  LMB push  RMB pull  R reset  Q quit",
             sim.particle_count()

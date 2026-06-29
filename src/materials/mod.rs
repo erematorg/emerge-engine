@@ -17,7 +17,8 @@ pub mod viscoelastic;
 pub mod von_mises;
 
 pub use physical_props::{
-    Elastic, Elastoplastic, Fluid, FluidGranular, FromSI, PlasticityModel, Viscoelastic,
+    Elastic, Elastoplastic, Fluid, FluidGranular, FromSI, ParticleMass, PlasticityModel,
+    Viscoelastic,
 };
 
 pub use bingham::BinghamFluidMaterial;
@@ -99,10 +100,15 @@ pub trait MaterialModel: Send + Sync + core::fmt::Debug {
         particles.initial_volume[i]
     }
 
+    /// CFL timestep bound for one particle. Takes `density`/`hardening_scale` as plain
+    /// scalars rather than `&Particles, i: usize` — every implementation only ever reads
+    /// these two fields, both of which exist directly on `Particle` (AoS) too, so the CPU
+    /// (SoA) and GPU (AoS) CFL scans can both call this without either one needing the
+    /// other's storage representation.
     fn timestep_bound(
         &self,
-        _particles: &Particles,
-        _i: usize,
+        _density: f32,
+        _hardening_scale: f32,
         _cell_width: f32,
         _material_cfl: f32,
         _viscous_cfl: f32,
@@ -155,6 +161,20 @@ pub trait MaterialModel: Send + Sync + core::fmt::Debug {
     fn params(&self) -> MaterialParams {
         MaterialParams::default()
     }
+
+    /// Energy cost (J/kg, in whatever temperature unit `Particle::temperature` uses)
+    /// of transitioning INTO this material via `Simulation::phase_transition` /
+    /// `add_phase_rule`. Positive = endothermic (e.g. melting into a liquid — absorbs
+    /// energy, cooling the particle). Negative = exothermic (e.g. freezing into a
+    /// solid — releases energy, warming the particle). Default 0.0 = no energy cost
+    /// (existing behavior for every material, unchanged).
+    ///
+    /// CPU-only: applied in `Simulation::phase_transition`/`add_phase_rule` against
+    /// `ThermalDiffusion::heat_capacity` when a thermal model is configured. Has no
+    /// effect on `GpuSimulation::phase_transition`, which has no automatic phase rules.
+    fn latent_heat(&self) -> f32 {
+        0.0
+    }
 }
 
 /// Internal fallback used when no material is registered for a particle ID.
@@ -183,6 +203,12 @@ impl Elastic {
     /// regardless of `rho_kg_m3` (only `SimConfig::particle_mass`, one global value, is used).
     pub fn particle_mass(&self, spacing: f32, config: &crate::SimConfig) -> f32 {
         self.rho_kg_m3 * (spacing * config.dx_meters).powi(2)
+    }
+}
+
+impl ParticleMass for Elastic {
+    fn particle_mass(&self, spacing: f32, config: &crate::SimConfig) -> f32 {
+        self.particle_mass(spacing, config)
     }
 }
 
@@ -251,6 +277,12 @@ impl Elastoplastic {
     }
 }
 
+impl ParticleMass for Elastoplastic {
+    fn particle_mass(&self, spacing: f32, config: &crate::SimConfig) -> f32 {
+        self.particle_mass(spacing, config)
+    }
+}
+
 impl Viscoelastic {
     pub fn material(&self, config: &crate::SimConfig) -> Box<dyn MaterialModel> {
         Box::new(ViscoelasticMaterial::from_physical(self, config))
@@ -259,6 +291,12 @@ impl Viscoelastic {
     /// See `Elastic::particle_mass` — density lives in `self.elastic.rho_kg_m3`.
     pub fn particle_mass(&self, spacing: f32, config: &crate::SimConfig) -> f32 {
         self.elastic.particle_mass(spacing, config)
+    }
+}
+
+impl ParticleMass for Viscoelastic {
+    fn particle_mass(&self, spacing: f32, config: &crate::SimConfig) -> f32 {
+        self.particle_mass(spacing, config)
     }
 }
 
@@ -292,6 +330,12 @@ impl FluidGranular {
     }
 }
 
+impl ParticleMass for FluidGranular {
+    fn particle_mass(&self, spacing: f32, config: &crate::SimConfig) -> f32 {
+        self.particle_mass(spacing, config)
+    }
+}
+
 impl Fluid {
     /// `yield_stress_pa = None`  → `NewtonianFluidMaterial`
     /// `yield_stress_pa = Some(τ₀)` → `BinghamFluidMaterial`
@@ -320,5 +364,11 @@ impl Fluid {
     /// See `Elastic::particle_mass`.
     pub fn particle_mass(&self, spacing: f32, config: &crate::SimConfig) -> f32 {
         self.rho_kg_m3 * (spacing * config.dx_meters).powi(2)
+    }
+}
+
+impl ParticleMass for Fluid {
+    fn particle_mass(&self, spacing: f32, config: &crate::SimConfig) -> f32 {
+        self.particle_mass(spacing, config)
     }
 }

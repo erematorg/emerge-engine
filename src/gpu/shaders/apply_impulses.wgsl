@@ -31,7 +31,7 @@ struct Particle {
     activation:           f32,
     activation_dir:       vec2<f32>,
     muscle_group_id:      u32,
-    _pad:                 u32,
+    sleeping:             u32,
 }
 
 struct ImpulseEntry {
@@ -61,6 +61,7 @@ fn apply_impulses_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     var vel = particles[i].v;
     let pos = particles[i].x;
+    var touched = false;
 
     for (var k: u32 = 0u; k < impulse_params.count; k++) {
         let e     = impulse_params.entries[k];
@@ -73,6 +74,7 @@ fn apply_impulses_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             } else {
                 vel += e.force * falloff;
             }
+            touched = true;
         }
     }
 
@@ -82,4 +84,14 @@ fn apply_impulses_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     particles[i].v = vel;
+    // Wake on genuine disturbance — without this, a sleeping particle inside an
+    // impulse's radius gets a real velocity written but stays sleeping=1, so every
+    // other pass (p2g/g2p/particles_update/force_fields) keeps skipping it: the
+    // velocity sits inert (position never integrates) until it happens to wake on
+    // its own via a neighbor's grid activity, then suddenly resumes motion using
+    // this stale injected velocity — a surprising delayed "pop", not an immediate
+    // push. Same wake condition as everywhere else: a real disturbance clears it.
+    if touched && particles[i].sleeping != 0u {
+        particles[i].sleeping = 0u;
+    }
 }

@@ -164,8 +164,8 @@ impl MaterialModel for ViscoelasticMaterial {
 
     fn timestep_bound(
         &self,
-        particles: &Particles,
-        i: usize,
+        density: f32,
+        _hardening_scale: f32,
         cell_width: f32,
         material_cfl: f32,
         viscous_cfl: f32,
@@ -174,13 +174,13 @@ impl MaterialModel for ViscoelasticMaterial {
             self.lambda,
             self.mu,
             1.0,
-            particles.density[i],
+            density,
             1.0e-6,
             cell_width,
             material_cfl,
         );
         let viscous_dt = if self.viscosity > 0.0 {
-            let density = particles.density[i].max(1.0e-6);
+            let density = density.max(1.0e-6);
             let kinematic = self.viscosity / density;
             if kinematic > f32::EPSILON {
                 viscous_cfl * cell_width * cell_width / kinematic

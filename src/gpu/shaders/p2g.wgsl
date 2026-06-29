@@ -20,7 +20,7 @@ struct Particle {
     activation:           f32,
     activation_dir:       vec2<f32>,
     muscle_group_id:      u32,
-    _pad:                 u32,
+    sleeping:             u32,
 }
 
 struct MaterialParams {
@@ -58,6 +58,10 @@ struct StepParams {
     gravity:            vec2<f32>,
     boundary_thickness: u32,
     vel_limit:          f32,
+    sleep_threshold:    f32,
+    _pad0:              u32,
+    _pad1:              u32,
+    _pad2:              u32,
 }
 
 const MAX_MATERIALS:        u32 = {{MAX_MATERIALS}}u;
@@ -131,15 +135,13 @@ fn kirchhoff(p: Particle, mat: MaterialParams) -> mat2x2<f32> {
             let yield_s = mat.compression_limit; // Bingham τ₀; 0 for Newtonian
             if yield_s > 0.0 {
                 // Bingham: apparent viscosity = τ₀/γ̇ + µ. Skip deviatoric below plug threshold.
+                // γ̇ uses the deviatoric strain rate only — a yield criterion must not respond
+                // to pure volumetric expansion/compression, which isn't shear.
                 let dx = dev[0][0]; let dy = dev[1][1]; let dxy = dev[0][1];
                 let shear_rate = sqrt(max(0.5 * (dx*dx + dy*dy + 2.0*dxy*dxy), 0.0));
                 if shear_rate > 1e-4 {
                     let eta_app = yield_s / shear_rate + eff_visc;
-                    let tau_dev = dev * (eta_app * 0.5);
-                    let tx = tau_dev[0][0]; let ty = tau_dev[1][1]; let txy = tau_dev[0][1];
-                    if tx*tx + ty*ty + 2.0*txy*txy >= yield_s * yield_s * 0.5 {
-                        t = t + tau_dev;
-                    }
+                    t = t + dev * (eta_app * 0.5);
                 }
             } else {
                 t = t + eff_visc * dev;
@@ -268,6 +270,17 @@ fn p2g_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let res = step_params.grid_res;
     let dt  = step_params.dt;
     let mat = materials[p.material_id];
+
+    // Sleeping particles still scatter normally — their mass+stress is exactly what
+    // provides support to anything resting on top of them. Skipping P2G for sleeping
+    // particles (an earlier version of this code did) makes them invisible to the grid:
+    // an awake neighbor stacked on a sleeping one would suddenly find no support beneath
+    // it, generating permanent unresolvable jitter at every awake/asleep boundary — the
+    // pile could never fully settle. Frozen (x, v, F) means the SAME scatter contribution
+    // every substep, so this is deterministic, not wasted-but-harmless extra work: it's
+    // the actual support mechanism. The real savings are in g2p/particles_update/
+    // force_fields, which skip recomputing things that provably don't change for a
+    // particle whose state is frozen — not in skipping the scatter itself.
 
     // NaN position would corrupt the i32 atomics — skip silently.
     if !(dot(p.x, p.x) >= 0.0) { return; }

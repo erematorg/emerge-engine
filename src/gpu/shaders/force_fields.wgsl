@@ -27,7 +27,7 @@ struct Particle {
     activation:           f32,
     activation_dir:       vec2<f32>,
     muscle_group_id:      u32,
-    _pad:                 u32,       // total 112 bytes
+    sleeping:             u32,       // total 112 bytes
 }
 
 struct StepParams {
@@ -38,6 +38,10 @@ struct StepParams {
     gravity:            vec2<f32>,
     boundary_thickness: u32,
     vel_limit:          f32,
+    sleep_threshold:    f32,
+    _pad0:              u32,
+    _pad1:              u32,
+    _pad2:              u32,
 }
 
 // 48 bytes — matches GpuForceFieldEntry in src/gpu/mod.rs
@@ -59,8 +63,28 @@ struct ForceFieldsParams {
     entries: array<ForceFieldEntry, 16>,
 }
 
+// 80 bytes — matches GpuSleepWakeParams in src/gpu/mod.rs.
+// Minimal hook for LP's future chunk system: force-sleep/force-wake by user_tag,
+// independent of velocity. See sleep_tag/wake_tag doc comments on GpuSimulation.
+// Tags packed 4-per-vec4<u32> (8 tags = 2 vec4s) — a flat array<u32,8> would need
+// 16-byte-strided elements in uniform address space and waste 3x the space.
+struct SleepWakeParams {
+    sleep_count: u32,
+    wake_count:  u32,
+    _pad0:       u32,
+    _pad1:       u32,
+    sleep_tags:  array<vec4<u32>, 2>,
+    wake_tags:   array<vec4<u32>, 2>,
+}
+
+// Reads tag index i (0..7) out of a packed array<vec4<u32>, 2>.
+fn packed_tag(tags: array<vec4<u32>, 2>, i: u32) -> u32 {
+    return tags[i / 4u][i % 4u];
+}
+
 // ── Named constants ───────────────────────────────────────────────────────────
 override MAX_FORCE_FIELDS:       u32;
+override MAX_SLEEP_WAKE_TAGS:    u32;
 const FIELD_DISABLED:            u32 = 0u;
 const FIELD_GRAVITY_WELL:        u32 = 1u;
 const FIELD_COULOMB:             u32 = 2u;
@@ -78,6 +102,7 @@ const MASK_ALL:                  u32 = 0xFFFFFFFFu;
 @group(0) @binding(0) var<storage, read_write> particles:    array<Particle>;
 @group(0) @binding(3) var<uniform>             step_params:  StepParams;
 @group(0) @binding(4) var<uniform>             force_fields: ForceFieldsParams;
+@group(0) @binding(7) var<uniform>             sleep_wake:   SleepWakeParams;
 
 // Returns true if entry applies to the given material.
 fn material_matches(entry: ForceFieldEntry, material_id: u32) -> bool {
@@ -98,11 +123,35 @@ fn force_switch(dist: f32, cutoff: f32, switch_on: f32) -> f32 {
 fn force_fields_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p_idx = gid.x;
     if p_idx >= step_params.particle_count { return; }
-    if force_fields.count == 0u { return; }
 
     var p = particles[p_idx];
+
+    // Force-wake-by-tag: checked unconditionally (not just while currently sleeping),
+    // because the sleep_wake uniform stays loaded for every substep in this step_frame()
+    // call (uploaded once per frame — see GpuSimulation::step_frame), not just the one
+    // substep where the caller's wake_tag() takes effect. A tagged particle hasn't been
+    // given any real velocity by waking — it's still genuinely at rest — so without
+    // exempting it from the natural sleep-scoring below for the WHOLE frame (not just the
+    // substep where the flag flips), substep 2 onward would see near-zero velocity and
+    // immediately re-sleep it, undoing the wake before step_frame() ever returns.
+    // force_sleep_tag (checked last, below) still wins over this — a deliberate forced
+    // sleep beats a forced wake, same "last write wins" rule as any other conflict here.
+    var is_wake_tagged = false;
+    for (var i: u32 = 0u; i < sleep_wake.wake_count && i < MAX_SLEEP_WAKE_TAGS; i++) {
+        if p.user_tag == packed_tag(sleep_wake.wake_tags, i) { is_wake_tagged = true; }
+    }
+    if is_wake_tagged { p.sleeping = 0u; }
+
+    // Still-sleeping particles get no field forces, no velocity clamp, and no
+    // rescoring — frozen, same as CPU excluding them from the force-field loop
+    // entirely (`for i in 0..self.active_count`). No writeback needed: nothing changes.
+    if p.sleeping != 0u { return; }
+
     let dt = step_params.dt;
 
+    // force_fields.count == 0u is handled by the loop condition below (i < count
+    // is immediately false) — no need for an early return, since the velocity
+    // clamp and sleep-scoring after this loop must always run regardless.
     for (var i: u32 = 0u; i < force_fields.count && i < MAX_FORCE_FIELDS; i++) {
         let entry = force_fields.entries[i];
         if entry.field_type == FIELD_DISABLED { continue; }
@@ -235,6 +284,24 @@ fn force_fields_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let v_len = length(p.v);
     if v_len > step_params.vel_limit && v_len > FF_NUM_FLOOR {
         p.v = p.v * (step_params.vel_limit / v_len);
+    }
+
+    // Sleep scoring — mirrors src/solver/mod.rs (~lines 855-870) exactly, including the
+    // lack of a same-substep re-sleep guard (CPU doesn't have one either). Runs last per
+    // substep, after force fields, since a field can keep a particle that looks sleepy
+    // awake. No-op whenever sleep_threshold <= 0.0 (the SimConfig default). Skipped this
+    // substep if force-woken above — a force-woken particle hasn't been given any
+    // velocity, so without this guard it would immediately re-sleep here, undoing the
+    // wake before it's ever observed outside this function.
+    if !is_wake_tagged && step_params.sleep_threshold > 0.0 && p.activation == 0.0
+        && dot(p.v, p.v) < step_params.sleep_threshold * step_params.sleep_threshold {
+        p.sleeping = 1u;
+    }
+
+    // Force-sleep-by-tag: independent of velocity/activation, checked last so it wins
+    // over the velocity-based scoring above (a forced sleep is deliberate, not a guess).
+    for (var i: u32 = 0u; i < sleep_wake.sleep_count && i < MAX_SLEEP_WAKE_TAGS; i++) {
+        if p.user_tag == packed_tag(sleep_wake.sleep_tags, i) { p.sleeping = 1u; }
     }
 
     particles[p_idx] = p;
