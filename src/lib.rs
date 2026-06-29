@@ -72,8 +72,8 @@ pub use materials::{
     Elastoplastic, Fluid, FluidGranular, FromSI, GranularFluidMaterial, MAX_MATERIAL_SLOTS,
     MaterialModel, MaterialParams, MaterialRegistry, MuIRheologyMaterial, NaccMaterial,
     NeoHookeanMaterial, NewtonianFluidMaterial, ParticleMass, PlasticityModel, RankineMaterial,
-    StomakhinMaterial, Viscoelastic, ViscoelasticMaterial, VonMisesMaterial, gravity_to_grid,
-    lame_from_si, lame_from_young,
+    StomakhinMaterial, Viscoelastic, ViscoelasticMaterial, VonMisesMaterial, WithLatentHeat,
+    gravity_to_grid, lame_from_si, lame_from_young,
 };
 
 // Boundary conditions

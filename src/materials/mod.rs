@@ -177,6 +177,77 @@ pub trait MaterialModel: Send + Sync + core::fmt::Debug {
     }
 }
 
+/// Wraps any `MaterialModel` to give it a non-zero `latent_heat()` without writing a full
+/// delegating impl by hand — none of the 12 built-in materials expose a settable
+/// `latent_heat` field directly, since most users never need one.
+///
+/// ```rust,no_run
+/// # extern crate emerge_engine as emerge;
+/// # use emerge::{NewtonianFluidMaterial, WithLatentHeat};
+/// // Water absorbs 334 (sim-unit) energy per unit mass when transitioning into this material.
+/// let water = WithLatentHeat::new(NewtonianFluidMaterial::low_viscosity(1000.0, 1.0e5), 334.0);
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct WithLatentHeat<M> {
+    pub inner: M,
+    pub latent_heat: f32,
+}
+
+impl<M> WithLatentHeat<M> {
+    pub fn new(inner: M, latent_heat: f32) -> Self {
+        Self { inner, latent_heat }
+    }
+}
+
+impl<M: MaterialModel> MaterialModel for WithLatentHeat<M> {
+    fn constitutive_model(&self) -> ConstitutiveModel {
+        self.inner.constitutive_model()
+    }
+    fn kirchhoff_stress(&self, particles: &Particles, i: usize) -> Mat2 {
+        self.inner.kirchhoff_stress(particles, i)
+    }
+    fn stress_volume(&self, particles: &Particles, i: usize) -> f32 {
+        self.inner.stress_volume(particles, i)
+    }
+    fn timestep_bound(
+        &self,
+        density: f32,
+        hardening_scale: f32,
+        cell_width: f32,
+        material_cfl: f32,
+        viscous_cfl: f32,
+    ) -> f32 {
+        self.inner.timestep_bound(
+            density,
+            hardening_scale,
+            cell_width,
+            material_cfl,
+            viscous_cfl,
+        )
+    }
+    fn update_particle(&self, particles: &mut Particles, i: usize, dt: f32) {
+        self.inner.update_particle(particles, i, dt)
+    }
+    fn init_particle(&self, particle: &mut Particle) {
+        self.inner.init_particle(particle)
+    }
+    fn needs_cpu_update(&self) -> bool {
+        self.inner.needs_cpu_update()
+    }
+    fn needs_density_recompute(&self) -> bool {
+        self.inner.needs_density_recompute()
+    }
+    fn activation_scale(&self) -> f32 {
+        self.inner.activation_scale()
+    }
+    fn params(&self) -> MaterialParams {
+        self.inner.params()
+    }
+    fn latent_heat(&self) -> f32 {
+        self.latent_heat
+    }
+}
+
 /// Internal fallback used when no material is registered for a particle ID.
 /// Zero stress, no timestep constraint, no state updates.
 #[derive(Debug, Default, Clone, Copy)]

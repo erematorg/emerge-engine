@@ -116,6 +116,13 @@ Initial release.
   existing phase-rule users see no behavior change
   (`tests/solver.rs::phase_transition_applies_latent_heat_energy_debit`,
   `phase_transition_skips_latent_heat_without_thermal_model`).
+- `WithLatentHeat<M>`: wraps any `MaterialModel` to give it a non-zero
+  `latent_heat()` without writing a full delegating impl by hand — none of the
+  12 built-in materials expose a settable `latent_heat` field directly.
+  `examples/latent_heat.rs` demonstrates the full mechanism end-to-end (water
+  cooling below freezing transitions to ice via `add_phase_rule`; ice's
+  negative — exothermic — `latent_heat` produces a real, visible warm bump at
+  the moment of transition before the slab resumes cooling toward ambient).
 - `examples/stress_cfl_scan_50k.rs`: a live, vsync-paced example at the actual
   ~50k-particle / grid_res=320 LP target. Demonstrated a real, sustained
   60-66fps over 22,000+ frames after disabling an unused `readback_stride` for
