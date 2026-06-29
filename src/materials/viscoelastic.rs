@@ -123,14 +123,10 @@ impl MaterialModel for ViscoelasticMaterial {
         let d_dev = d - Mat2::from_diagonal(Vec2::splat(trace * 0.5));
         let viscous = self.viscosity * t_scale * d_dev;
 
-        // Active stress: isotropic contractile pressure proportional to activation.
-        let active = if self.active_stress_coeff != 0.0 {
-            particles.activation[i] * self.active_stress_coeff * Mat2::IDENTITY
-        } else {
-            Mat2::ZERO
-        };
-
-        elastic + viscous + active
+        // Active stress is NOT added here — `activation_scale()` below reports
+        // `active_stress_coeff` to the shared P2G path (`transfer::combined_kirchhoff_stress`),
+        // which applies it isotropically for this model. Adding it here too would double-count.
+        elastic + viscous
     }
 
     fn update_particle(&self, particles: &mut Particles, i: usize, dt: f32) {

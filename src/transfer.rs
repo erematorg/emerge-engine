@@ -3,8 +3,45 @@ use rayon::prelude::*;
 
 use crate::boundary::BoundaryCondition;
 use crate::materials::registry::MaterialRegistry;
+use crate::materials::{ConstitutiveModel, MaterialModel};
 use crate::solver::config::KERNEL_D_INVERSE;
 use crate::{grid::Grid, grid::kernel::quadratic_weights, particle::Particles};
+
+/// Elastic/plastic Kirchhoff stress plus the active-stress (muscle contraction) term, if any.
+///
+/// Single source of truth for "what stress does this particle contribute to P2G" — shared by
+/// `scatter_particles_to_grid` and tests, so the two can never drift apart. Mirrors the GPU
+/// shader's post-switch active-stress block in `p2g.wgsl` exactly: Viscoelastic uses an
+/// isotropic contractile term (matches its own Kelvin-Voigt formulation), every other elastic
+/// model uses the directional F·(n₀⊗n₀)·Fᵀ fiber form (follows material deformation).
+pub(crate) fn combined_kirchhoff_stress(
+    material: &dyn MaterialModel,
+    particles: &Particles,
+    i: usize,
+) -> Mat2 {
+    let tau = material.kirchhoff_stress(particles, i);
+    let coeff = material.activation_scale();
+    if particles.activation[i] <= 0.0 || coeff <= 0.0 {
+        return tau;
+    }
+    let isotropic = material.constitutive_model() == ConstitutiveModel::Viscoelastic;
+    let tau_active = if isotropic {
+        Mat2::from_diagonal(Vec2::splat(particles.activation[i] * coeff))
+    } else {
+        let n = particles.activation_dir[i];
+        let len_sq = n.dot(n);
+        if len_sq > f32::EPSILON {
+            let n0 = n / len_sq.sqrt();
+            let n_outer = Mat2::from_cols(n0 * n0.x, n0 * n0.y);
+            let a_mat = n_outer * (particles.activation[i] * coeff);
+            let f = particles.deformation_gradient[i];
+            f * a_mat * f.transpose()
+        } else {
+            Mat2::from_diagonal(Vec2::splat(particles.activation[i] * coeff))
+        }
+    };
+    tau + tau_active
+}
 
 /// P2G: scatter particle mass, momentum, and stress forces onto the grid (MLS-MPM, Hu 2018 §4).
 ///
@@ -43,24 +80,7 @@ pub fn scatter_particles_to_grid(
         let v_i = particles.v[i];
         let c_i = particles.velocity_gradient[i];
 
-        let tau = material.kirchhoff_stress(particles, i);
-        let coeff = material.activation_scale();
-        let stress = if particles.activation[i] > 0.0 && coeff > 0.0 {
-            let n = particles.activation_dir[i];
-            let len_sq = n.dot(n);
-            let tau_active = if len_sq > f32::EPSILON {
-                let n0 = n / len_sq.sqrt();
-                let n_outer = Mat2::from_cols(n0 * n0.x, n0 * n0.y);
-                let a_mat = n_outer * (particles.activation[i] * coeff);
-                let f = particles.deformation_gradient[i];
-                f * a_mat * f.transpose()
-            } else {
-                Mat2::from_diagonal(Vec2::splat(particles.activation[i] * coeff))
-            };
-            tau + tau_active
-        } else {
-            tau
-        };
+        let stress = combined_kirchhoff_stress(material, particles, i);
         let stress_coeff = -material.stress_volume(particles, i) * KERNEL_D_INVERSE * dt;
 
         let weights = quadratic_weights(x);
@@ -183,5 +203,108 @@ pub fn scatter_particle_mass(particles: &Particles, grid: &mut Grid, active_coun
                 grid.add_mass_momentum(cell_pos, weight * mass, Vec2::ZERO);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod activation_tests {
+    use super::combined_kirchhoff_stress;
+    use crate::materials::{NeoHookeanMaterial, ViscoelasticMaterial};
+    use crate::particle::{Particle, Particles};
+    use glam::{Mat2, Vec2};
+
+    fn particle_at_rest() -> Particle {
+        let mut p = Particle::zeroed();
+        p.mass = 1.0;
+        p.initial_volume = 1.0;
+        p.volume = 1.0;
+        p.density = 1.0;
+        p.deformation_gradient = Mat2::IDENTITY; // undeformed: passive elastic stress is exactly zero
+        p
+    }
+
+    /// Directional materials (everything except Viscoelastic): active stress follows the fiber
+    /// direction exactly — `activation * coeff` along the fiber axis, zero perpendicular to it.
+    #[test]
+    fn directional_active_stress_follows_fiber_axis() {
+        let mut mat = NeoHookeanMaterial::new(100.0, 200.0);
+        mat.active_stress_coeff = 10.0;
+        let mut p = particle_at_rest();
+        p.activation = 1.0;
+        p.activation_dir = Vec2::X;
+
+        let soa = Particles::from(vec![p]);
+        let tau = combined_kirchhoff_stress(&mat, &soa, 0);
+
+        assert!(
+            (tau.x_axis.x - 10.0).abs() < 1e-5,
+            "tau_xx should be activation*coeff=10: {tau:?}"
+        );
+        assert!(
+            tau.y_axis.y.abs() < 1e-5,
+            "tau_yy should stay ~0 (perpendicular to fiber): {tau:?}"
+        );
+    }
+
+    /// Viscoelastic uses an isotropic active term (matches its Kelvin-Voigt formulation and the
+    /// GPU shader's `model == 9u` special case) — equal on both diagonal axes, regardless of
+    /// `activation_dir`.
+    #[test]
+    fn viscoelastic_active_stress_is_isotropic() {
+        let mut mat = ViscoelasticMaterial::new(100.0, 200.0, 0.0);
+        mat.active_stress_coeff = 10.0;
+        let mut p = particle_at_rest();
+        p.activation = 1.0;
+        p.activation_dir = Vec2::X; // must NOT bias the result toward x for this material
+
+        let soa = Particles::from(vec![p]);
+        let tau = combined_kirchhoff_stress(&mat, &soa, 0);
+
+        assert!(
+            (tau.x_axis.x - 10.0).abs() < 1e-5,
+            "tau_xx should be activation*coeff=10: {tau:?}"
+        );
+        assert!(
+            (tau.y_axis.y - 10.0).abs() < 1e-5,
+            "tau_yy should equal tau_xx (isotropic, not directional): {tau:?}"
+        );
+    }
+
+    /// Regression: `ViscoelasticMaterial::kirchhoff_stress` used to add its own isotropic active
+    /// term directly AND report a non-zero `activation_scale()`, so the shared P2G path
+    /// (`combined_kirchhoff_stress`) added a second active term on top — silently doubling muscle
+    /// stress for any Viscoelastic creature body. Pin the total to exactly one contribution.
+    #[test]
+    fn viscoelastic_active_stress_is_not_double_counted() {
+        let mut mat = ViscoelasticMaterial::new(100.0, 200.0, 0.0);
+        mat.active_stress_coeff = 10.0;
+        let mut p = particle_at_rest();
+        p.activation = 1.0;
+        p.activation_dir = Vec2::X;
+
+        let soa = Particles::from(vec![p]);
+        let tau = combined_kirchhoff_stress(&mat, &soa, 0);
+        let expected_single = 10.0; // activation(1.0) * coeff(10.0), applied exactly once
+        assert!(
+            (tau.x_axis.x - expected_single).abs() < 1e-5,
+            "active stress must be applied exactly once, not doubled: tau_xx={}, expected={expected_single}",
+            tau.x_axis.x
+        );
+    }
+
+    #[test]
+    fn zero_activation_leaves_stress_unchanged() {
+        let mut mat = NeoHookeanMaterial::new(100.0, 200.0);
+        mat.active_stress_coeff = 10.0;
+        let mut p = particle_at_rest();
+        p.activation = 0.0; // off — must be a true no-op regardless of coeff
+        p.activation_dir = Vec2::X;
+
+        let soa = Particles::from(vec![p]);
+        let tau = combined_kirchhoff_stress(&mat, &soa, 0);
+        assert!(
+            tau.x_axis.x.abs() < 1e-6 && tau.y_axis.y.abs() < 1e-6,
+            "activation=0.0 must produce zero stress on an undeformed particle: {tau:?}"
+        );
     }
 }

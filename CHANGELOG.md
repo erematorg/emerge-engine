@@ -126,6 +126,27 @@ Initial release.
   (`tests/gpu.rs::gpu_relaxed_cfl_coefficient_stays_correct_50k_dpsand`).
   `SimConfig::material_cfl_coefficient`'s own default is unchanged at `0.5`.
 
+### Fixed
+- **`ViscoelasticMaterial` double-counted active (muscle) stress.** Its
+  `kirchhoff_stress` added an isotropic `activation * coeff * I` term directly,
+  but also reported a non-zero `activation_scale()`, so the shared P2G path
+  added a second active-stress contribution on top — silently doubling
+  contractile stress for any Viscoelastic creature body using `activation`.
+  Caught while auditing how solid the active-matter system actually is ahead
+  of LP's creature work, not by a failing test (none existed for this path
+  before). Fixed by extracting the active-stress combination into one shared
+  function, `transfer::combined_kirchhoff_stress`, used by both
+  `scatter_particles_to_grid` and the GPU-mirroring logic it's modeled on;
+  `ViscoelasticMaterial::kirchhoff_stress` no longer adds its own active term.
+  4 new regression tests pin the fix
+  (`transfer::activation_tests::{directional_active_stress_follows_fiber_axis,
+  viscoelastic_active_stress_is_isotropic,
+  viscoelastic_active_stress_is_not_double_counted,
+  zero_activation_leaves_stress_unchanged}`). All other materials were
+  unaffected — `ViscoelasticMaterial` was the only one implementing
+  `MaterialModel::kirchhoff_stress` that also touched `particles.activation`
+  directly.
+
 ### Known limitations
 - GPU sleep/wake doesn't shrink the actual dispatch size (same thread count every
   substep), and P2G now scatters for every particle regardless of sleep state
