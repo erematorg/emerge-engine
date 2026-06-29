@@ -154,6 +154,17 @@ Initial release.
   `MaterialModel::kirchhoff_stress` that also touched `particles.activation`
   directly.
 
+### Tests
+- `ChemotaxisField` and `BuoyancyField` had zero dedicated tests despite both
+  being real, used-in-doc-examples force fields — caught in the same
+  pre-LP audit as the active-stress bug above. Both checked out correct on
+  inspection and all 7 new tests pass without any code change: 4 for
+  `ChemotaxisField` (gradient-following direction, sign flip under negative
+  sensitivity, `material_filter`, `sync_from` layout compatibility with
+  `ScalarDiffusionField`), 3 for `BuoyancyField` (lighter floats up, denser
+  sinks slower than free fall, equal density hovers — the three regimes named
+  in its own doc comment).
+
 ### Known limitations
 - GPU sleep/wake doesn't shrink the actual dispatch size (same thread count every
   substep), and P2G now scatters for every particle regardless of sleep state

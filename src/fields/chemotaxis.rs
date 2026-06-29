@@ -126,3 +126,81 @@ impl Field for ChemotaxisField {
         self.sensitivity * self.gradient_at(ix, iy)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::particle::Particle;
+
+    const RES: usize = 8;
+
+    /// Linear ramp along x: phi[x*RES+y] = x. Gradient should point purely in +x, zero in y.
+    fn ramp_field() -> ChemotaxisField {
+        let mut field = ChemotaxisField::new(RES, 1.0);
+        for x in 0..RES {
+            for y in 0..RES {
+                field.phi[x * RES + y] = x as f32;
+            }
+        }
+        field
+    }
+
+    fn particle_at(x: f32, y: f32, material_id: u32) -> Particles {
+        let mut p = Particle::zeroed();
+        p.x = Vec2::new(x, y);
+        p.material_id = material_id;
+        Particles::from(vec![p])
+    }
+
+    #[test]
+    fn positive_sensitivity_attracts_up_the_gradient() {
+        let field = ramp_field();
+        let soa = particle_at(3.0, 4.0, 0);
+        let a = field.acceleration(&soa, 0);
+        assert!(
+            a.x > 0.0,
+            "should accelerate toward increasing phi (+x): {a:?}"
+        );
+        assert!(a.y.abs() < 1e-5, "ramp has no y-gradient: {a:?}");
+    }
+
+    #[test]
+    fn negative_sensitivity_repels_down_the_gradient() {
+        let mut field = ramp_field();
+        field.sensitivity = -1.0;
+        let soa = particle_at(3.0, 4.0, 0);
+        let a = field.acceleration(&soa, 0);
+        assert!(a.x < 0.0, "negative sensitivity must flip direction: {a:?}");
+    }
+
+    #[test]
+    fn material_filter_zeroes_non_matching_particles() {
+        let field = ramp_field().with_material_filter(7);
+        let matching = particle_at(3.0, 4.0, 7);
+        let other = particle_at(3.0, 4.0, 0);
+        assert!(
+            field.acceleration(&matching, 0).x > 0.0,
+            "filtered material should still feel the force"
+        );
+        assert_eq!(
+            field.acceleration(&other, 0),
+            Vec2::ZERO,
+            "non-matching material must get zero force"
+        );
+    }
+
+    #[test]
+    fn sync_from_matches_scalar_diffusion_field_layout() {
+        use crate::thermodynamics::{ScalarDiffusionConfig, ScalarDiffusionField};
+        let scalar = ScalarDiffusionField::new(
+            ScalarDiffusionConfig::default(),
+            |p: &Particle| p.temperature,
+            |p: &mut Particle, d: f32| p.temperature += d,
+            RES,
+        );
+        let mut field = ChemotaxisField::new(RES, 1.0);
+        // Must not panic on a real ScalarDiffusionField of matching grid_res (debug_assert
+        // in sync_from would catch a layout/size mismatch).
+        field.sync_from(&scalar);
+    }
+}

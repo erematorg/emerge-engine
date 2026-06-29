@@ -53,3 +53,58 @@ impl Field for BuoyancyField {
         -self.gravity * (self.fluid_density / rho)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::particle::Particle;
+
+    fn particle_with_density(rho: f32) -> Particles {
+        let mut p = Particle::zeroed();
+        p.density = rho;
+        Particles::from(vec![p])
+    }
+
+    /// Net acceleration (solver gravity + this field) for a particle of density `rho`,
+    /// per the field's own doc comment: g·(ρ_fluid/ρ − 1).
+    fn net_with_gravity(field: &BuoyancyField, gravity: Vec2, rho: f32) -> Vec2 {
+        let soa = particle_with_density(rho);
+        gravity + field.acceleration(&soa, 0)
+    }
+
+    #[test]
+    fn lighter_than_fluid_floats_up() {
+        let gravity = Vec2::new(0.0, -9.8);
+        let field = BuoyancyField::new(1000.0, gravity); // water
+        let net = net_with_gravity(&field, gravity, 600.0); // wood
+        assert!(net.y > 0.0, "wood in water must net upward: {net:?}");
+    }
+
+    #[test]
+    fn denser_than_fluid_sinks_slower_than_free_fall() {
+        let gravity = Vec2::new(0.0, -9.8);
+        let field = BuoyancyField::new(1000.0, gravity); // water
+        let net = net_with_gravity(&field, gravity, 7800.0); // steel
+        assert!(
+            net.y < 0.0,
+            "steel in water must still net downward: {net:?}"
+        );
+        assert!(
+            net.y > gravity.y,
+            "steel must sink slower than free fall: net={:.3} free_fall={:.3}",
+            net.y,
+            gravity.y
+        );
+    }
+
+    #[test]
+    fn matching_density_hovers() {
+        let gravity = Vec2::new(0.0, -9.8);
+        let field = BuoyancyField::new(1000.0, gravity);
+        let net = net_with_gravity(&field, gravity, 1000.0);
+        assert!(
+            net.length() < 1e-4,
+            "neutrally buoyant particle must have ~zero net acceleration: {net:?}"
+        );
+    }
+}
