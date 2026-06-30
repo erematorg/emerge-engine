@@ -8,13 +8,12 @@ edition = "2024"
 authors = ["Eremat"]
 license = "MIT OR Apache-2.0"
 description = "Real-time MLS-MPM continuum physics engine — fluids, granular, elastic solids, active matter."
-repository = "https://github.com/M1thieu/emerge"
+repository = "https://github.com/erematorg/emerge-engine"
 readme = "README.md"
 keywords = ["physics", "mpm", "simulation", "game", "continuum"]
 categories = ["game-engines", "simulation", "science"]
-# Internal design docs — not useful to consumers, and PLANNING_PROMPT.md names local
-# absolute paths from the author's machine.
-exclude = ["LP_MPM_SPEC.md", "PLANNING_PROMPT.md"]
+# Internal design doc, not useful to crates.io consumers.
+exclude = ["LP_MPM_SPEC.md"]
 
 [dependencies]
 glam = { version = "0.30", features = ["bytemuck"] }
