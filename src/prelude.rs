@@ -26,13 +26,19 @@ pub use crate::{
     // Diagnostics
     DiagnosticsRegistry,
     DruckerPragerMaterial,
+    // Physical property families + trait
+    Elastic,
+    Elastoplastic,
     // Force fields
     Field,
     // Runtime
     FixedStepConfig,
     FixedStepController,
 
+    Fluid,
+    FluidGranular,
     FrictionBoundary,
+    FromSI,
     GranularFluidMaterial,
     GravityWellField,
     HeightmapBoundary,
@@ -50,8 +56,10 @@ pub use crate::{
     NewtonianFluidMaterial,
     Particle,
     ParticleGroup,
+    ParticleMass,
     Particles,
 
+    PlasticityModel,
     PredictiveBoundary,
     RadialConfinementField,
     RankineMaterial,
@@ -74,8 +82,10 @@ pub use crate::{
     ThermalStatsPlugin,
     UniformElectricField,
 
+    Viscoelastic,
     ViscoelasticMaterial,
     VonMisesMaterial,
+    WithLatentHeat,
     // Particle construction helpers
     build_particles,
     collect_snapshot,

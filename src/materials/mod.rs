@@ -443,3 +443,76 @@ impl ParticleMass for Fluid {
         self.particle_mass(spacing, config)
     }
 }
+
+#[cfg(test)]
+mod particle_mass_tests {
+    use super::*;
+    use crate::{SimConfig, SpawnRegion};
+
+    fn earth_config() -> SimConfig {
+        SimConfig::earth(64, 0.01, 0.05)
+    }
+
+    /// mass_from(&props) == props.particle_mass(spacing) called directly — no duplication risk.
+    #[test]
+    fn mass_from_matches_direct_call() {
+        let config = earth_config();
+        let props = Elastic {
+            e_pa: 500.0,
+            nu: 0.45,
+            rho_kg_m3: 1000.0,
+        };
+        let spacing = 0.5_f32;
+        let region = SpawnRegion::for_sim(&config)
+            .spacing(spacing)
+            .mass_from(&props, &config);
+        let expected = props.particle_mass(spacing, &config);
+        assert!(
+            (region.mass_override.unwrap() - expected).abs() < 1e-9,
+            "mass_from result {:.6e} != direct call {:.6e}",
+            region.mass_override.unwrap(),
+            expected
+        );
+    }
+
+    /// All 5 property families implement ParticleMass identically.
+    #[test]
+    fn all_families_implement_particle_mass() {
+        let config = earth_config();
+        let spacing = 0.6_f32;
+        let expected_elastic = Elastic {
+            e_pa: 500.0,
+            nu: 0.45,
+            rho_kg_m3: 1000.0,
+        }
+        .particle_mass(spacing, &config);
+        let from_ep = Elastoplastic {
+            elastic: Elastic {
+                e_pa: 500.0,
+                nu: 0.45,
+                rho_kg_m3: 1000.0,
+            },
+            model: PlasticityModel::Snow,
+        }
+        .particle_mass(spacing, &config);
+        let from_ve = Viscoelastic {
+            elastic: Elastic {
+                e_pa: 500.0,
+                nu: 0.45,
+                rho_kg_m3: 1000.0,
+            },
+            eta_pa_s: 1.0,
+        }
+        .particle_mass(spacing, &config);
+        let from_fluid = Fluid {
+            rho_kg_m3: 1000.0,
+            eta_pa_s: 0.001,
+            bulk_modulus_pa: 2.2e9,
+            yield_stress_pa: None,
+        }
+        .particle_mass(spacing, &config);
+        assert!((from_ep - expected_elastic).abs() < 1e-9);
+        assert!((from_ve - expected_elastic).abs() < 1e-9);
+        assert!((from_fluid - expected_elastic).abs() < 1e-9);
+    }
+}

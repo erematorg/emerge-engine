@@ -4,9 +4,9 @@
 [![docs.rs](https://docs.rs/emerge-engine/badge.svg)](https://docs.rs/emerge-engine)
 [![license](https://img.shields.io/crates/l/emerge-engine.svg)](LICENSE-MIT)
 
-An MLS-MPM continuum solver (Hu et al. 2018). Fluids, sand, snow, elastic and plastic solids, one particle-grid transfer for all of them — no rigid bodies, no separate fluid/cloth/soft-body systems bolted together, just one method that handles all of it. Pure Rust on the CPU path; an optional wgpu backend runs the whole pipeline on GPU.
+An MLS-MPM continuum solver (Hu et al. 2018). Fluids, sand, snow, elastic and plastic solids, one particle-grid transfer for all of them no rigid bodies, no separate fluid/cloth/soft-body systems bolted together, just one method that handles all of it. Pure Rust on the CPU path; an optional wgpu backend runs the whole pipeline on GPU.
 
-Built for [Life's Progress](https://github.com/M1thieu/LP). Not a game engine — no ECS, no renderer, no game loop, no asset pipeline. It steps particles forward and answers queries about regions of space. Everything else is up to the caller.
+Built for [Life's Progress](https://github.com/erematorg/LP). Not a game engine no ECS, no renderer, no game loop, no asset pipeline. It steps particles forward and answers queries about regions of space. Everything else is up to the caller.
 
 ```toml
 [dependencies]
@@ -54,19 +54,19 @@ println!("avg speed: {:.3}", state.avg_speed);
 
 Twelve constitutive models, grouped by what they're actually for:
 
-**Elastic solids** — `NeoHookeanMaterial` (hyperelastic, finite-strain), `CorotatedMaterial` (stiffer, corotated-linear), `ViscoelasticMaterial` (Kelvin-Voigt spring+dashpot).
+**Elastic solids** `NeoHookeanMaterial` (hyperelastic, finite-strain), `CorotatedMaterial` (stiffer, corotated-linear), `ViscoelasticMaterial` (Kelvin-Voigt spring+dashpot).
 
-**Fluids** — `NewtonianFluidMaterial` (Tait EOS + viscosity), `BinghamFluidMaterial` (adds a yield stress — mud, not water). Both take a `surface_tension_coeff` for free.
+**Fluids** `NewtonianFluidMaterial` (Tait EOS + viscosity), `BinghamFluidMaterial` (adds a yield stress mud, not water). Both take a `surface_tension_coeff` for free.
 
-**Granular** — `StomakhinMaterial` (snow, SVD return-mapping with hardening), `DruckerPragerMaterial` and `MuIRheologyMaterial` (two different ways to get sand right — cone yield surface vs. rate-dependent µ(I) friction), `GranularFluidMaterial` (granular suspensions — Tait EOS plus corotated deviatoric plasticity).
+**Granular** `StomakhinMaterial` (snow, SVD return-mapping with hardening), `DruckerPragerMaterial` and `MuIRheologyMaterial` (two different ways to get sand right cone yield surface vs. rate-dependent µ(I) friction), `GranularFluidMaterial` (granular suspensions Tait EOS plus corotated deviatoric plasticity).
 
-**Plastic / failure** — `VonMisesMaterial` (ductile yield, J2 plasticity), `RankineMaterial` (brittle — tensile cutoff with damage softening), `NaccMaterial` (Cam-Clay critical-state soil mechanics).
+**Plastic / failure** `VonMisesMaterial` (ductile yield, J2 plasticity), `RankineMaterial` (brittle tensile cutoff with damage softening), `NaccMaterial` (Cam-Clay critical-state soil mechanics).
 
-Each one cites its source paper in the doc comment — see [Physics references](#physics-references) below.
+Each one cites its source paper in the doc comment see [Physics references](#physics-references) below.
 
 ## Features
 
-`gpu` ports the entire pipeline (P2G, grid update, G2P, every plasticity model) to WGSL compute. `render` adds an instanced particle debug renderer on top of `gpu`. `experimental` gates acoustics, electromagnetics, and information-theoretic measures — real code, just not part of the guaranteed API yet.
+`gpu` ports the entire pipeline (P2G, grid update, G2P, every plasticity model) to WGSL compute. `render` adds an instanced particle debug renderer on top of `gpu`. `experimental` gates acoustics, electromagnetics, and information-theoretic measures real code, just not part of the guaranteed API yet.
 
 ## Examples
 
@@ -81,7 +81,7 @@ cargo run --example basic_fluids_gpu   --features render
 ```
 
 All windowed examples (everything except `headless` and `validate_materials`) require
-`--features render` — they render via wgpu/winit directly, no Bevy.
+`--features render` they render via wgpu/winit directly, no Bevy.
 
 ## Physics references
 
