@@ -457,6 +457,17 @@ mod solver {
         /// Per-pass GPU timestamp profiling — see `enable_profiling()`. None unless explicitly
         /// turned on; zero cost to every other code path when not in use.
         profiling: Option<GpuProfiling>,
+        /// One bind group per `step_params_pool` slot, built once and reused by every
+        /// `step_frame()` call instead of being recreated per-substep-per-frame. At high
+        /// substep counts (LP's stiff-terrain scenes routinely need ~5-6k substeps/frame)
+        /// recreating thousands of bind groups every frame exhausted the GPU's descriptor
+        /// allocator within seconds (`wgpu error: Out of Memory` from `queue.submit`,
+        /// reported against LP's own scene 2026-07-01). The buffers a bind group points at
+        /// (`step_params_pool[i]`) never change identity after construction, only their
+        /// contents (rewritten every frame via `upload_step_params_at`) — so the bind group
+        /// itself can be built once and only needs rebuilding when `spawn_region`
+        /// reallocates `buffers.particles` (see `rebuild_bind_group_pool`).
+        bind_group_pool: Vec<wgpu::BindGroup>,
         /// CPU-side wall-clock breakdown of the last `step_frame()` call (cfl_scan_ns,
         /// encode_ns, submit_ns, readback_ns, total_ns) — `Instant::now()` calls are
         /// themselves nanosecond-cost, so these are always recorded, not gated behind
@@ -484,6 +495,20 @@ mod solver {
         resolve_buf: wgpu::Buffer,
         readback_buf: wgpu::Buffer,
         timestamp_period_ns: f32,
+    }
+
+    /// One bind group per `step_params_pool` slot -- see `GpuSimulation::bind_group_pool`'s
+    /// doc comment for why this is built once and reused rather than recreated per substep.
+    fn build_bind_group_pool(
+        device: &wgpu::Device,
+        pipelines: &SimPipelines,
+        buffers: &GpuBuffers,
+    ) -> Vec<wgpu::BindGroup> {
+        buffers
+            .step_params_pool
+            .iter()
+            .map(|step_params| pipelines.make_bind_group(device, buffers, step_params))
+            .collect()
     }
 
     impl GpuSimulation {
@@ -567,6 +592,15 @@ mod solver {
             buffers.upload_materials(&queue, &material_params);
 
             let pipelines = SimPipelines::new(&device);
+            // A zero-sized particle buffer (no initial particles -- e.g. LP constructs
+            // empty, then adds terrain/water/creature via spawn_region) fails bind group
+            // creation outright ("binding size is zero"). spawn_region already rebuilds
+            // this pool once real particles exist; skip the doomed eager build until then.
+            let bind_group_pool = if particle_count > 0 {
+                build_bind_group_pool(&device, &pipelines, &buffers)
+            } else {
+                Vec::new()
+            };
 
             Self {
                 device,
@@ -590,6 +624,7 @@ mod solver {
                 pending_readback: None,
                 profiling: None,
                 last_cpu_timings: (0.0, 0.0, 0.0, 0.0, 0.0),
+                bind_group_pool,
             }
         }
 
@@ -881,22 +916,17 @@ mod solver {
             self.pending_sleep_tags.clear();
             self.pending_wake_tags.clear();
 
-            // Upload step_params for each substep into its pool slot and build a bind group.
-            // All uploads happen before the command buffer executes — pool ensures each substep
-            // reads its own dt from a distinct buffer.
-            let bind_groups: Vec<wgpu::BindGroup> = sub_dts
-                .iter()
-                .enumerate()
-                .map(|(i, &sub_dt)| {
-                    let params = GpuStepParams::new(&step_config, sub_dt, self.particle_count);
-                    self.buffers.upload_step_params_at(&self.queue, i, &params);
-                    self.pipelines.make_bind_group(
-                        &self.device,
-                        &self.buffers,
-                        &self.buffers.step_params_pool[i],
-                    )
-                })
-                .collect();
+            // Upload step_params for each substep into its pool slot -- contents change every
+            // frame (adaptive dt), so this write can't be cached. The bind group pointing at
+            // that slot, however, only depends on buffer IDENTITY, not contents, so it's built
+            // once in `bind_group_pool` (see that field's doc comment) instead of recreated
+            // here every substep every frame -- doing so at LP's ~5-6k-substep-per-frame scale
+            // exhausted the GPU's descriptor allocator within seconds.
+            for (i, &sub_dt) in sub_dts.iter().enumerate() {
+                let params = GpuStepParams::new(&step_config, sub_dt, self.particle_count);
+                self.buffers.upload_step_params_at(&self.queue, i, &params);
+            }
+            let bind_groups = &self.bind_group_pool;
 
             // Encode everything into one command buffer — one GPU submit per frame.
             // Order: [apply_impulses?] → [particle_sort?] → substep_0 → … → substep_N
@@ -976,13 +1006,44 @@ mod solver {
                 pass.set_pipeline(&self.pipelines.particle_sort_scatter);
                 pass.dispatch_workgroups(particle_wg, 1, 1);
             }
-            for bg in &bind_groups {
-                self.encode_substep(&mut encoder, bg, grid_wg, particle_wg);
+            self.queue.submit(std::iter::once(encoder.finish()));
+
+            // Substeps are batched into multiple command buffers/submits instead of one --
+            // LP's stiff-terrain scenes (50 MPa sandy soil) routinely need several hundred
+            // substeps in a single frame, and encoding them all into one command buffer
+            // exhausted this GPU backend within seconds (`wgpu error: Out of Memory` from
+            // this same `queue.submit`, reported against LP's own scene 2026-07-01).
+            // Bisected empirically: 200 substeps in one submit reliably OOMs, 64 is stable
+            // (matches this engine's own tested default, see `max_substeps_per_step`'s doc
+            // comment) -- this is a real per-submit resource ceiling on the backend/driver
+            // actually exercised, not a value derived from any GPU spec, so a different
+            // backend may need a different number. Blocking between chunks is required too
+            // -- unblocked back-to-back submits queue up faster than the GPU drains them and
+            // hit the same OOM even with batching. Only blocks BETWEEN chunks, never after
+            // the last one -- typical scenes (well under 64 substeps/frame) produce exactly
+            // one chunk and pay zero extra sync cost, same as before this fix existed. Only
+            // LP's stiff-terrain scale (hundreds of substeps/frame) pays the blocking cost,
+            // and only for the chunks beyond the first.
+            const SUBSTEP_BATCH_SIZE: usize = 64;
+            let mut chunks = bind_groups[..sub_dts.len()]
+                .chunks(SUBSTEP_BATCH_SIZE)
+                .peekable();
+            while let Some(chunk) = chunks.next() {
+                let mut sub_encoder =
+                    self.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("mpm_substep_batch"),
+                        });
+                for bg in chunk {
+                    self.encode_substep(&mut sub_encoder, bg, grid_wg, particle_wg);
+                }
+                self.queue.submit(std::iter::once(sub_encoder.finish()));
+                if chunks.peek().is_some() {
+                    self.device.poll(wgpu::PollType::wait_indefinitely()).ok();
+                }
             }
             let encode_ns = encode_start.elapsed().as_secs_f32() * 1.0e9;
-            let submit_start = std::time::Instant::now();
-            self.queue.submit(std::iter::once(encoder.finish()));
-            let submit_ns = submit_start.elapsed().as_secs_f32() * 1.0e9;
+            let submit_ns = 0.0; // folded into encode_ns now that submits are batched per-chunk
 
             // Async GPU → CPU readback — never blocks the render thread.
             //
@@ -1384,6 +1445,10 @@ mod solver {
             self.particle_count = n;
             self.pending_readback = None; // old staging is gone
             self.buffers.upload_particles(&self.queue, &self.particles);
+            // buffers.particles was just reallocated above -- cached bind groups reference
+            // the old buffer object and would be stale (or invalid) without this.
+            self.bind_group_pool =
+                build_bind_group_pool(&self.device, &self.pipelines, &self.buffers);
             start..n
         }
 
@@ -1508,6 +1573,18 @@ mod solver {
                 .iter()
                 .filter(|p| p.material_id == material_id && (p.x - center).length_squared() <= r2)
                 .count()
+        }
+
+        /// Center of mass for particles in `range`. O(range.len()). GPU has no tag_index
+        /// like CPU `Simulation::group_centroid` -- `range` (from `spawn_region`'s return)
+        /// is the stable group identity here instead of a `u32` tag.
+        pub fn group_centroid(&self, range: std::ops::Range<usize>) -> glam::Vec2 {
+            let particles = &self.particles[range.clone()];
+            if particles.is_empty() {
+                return glam::Vec2::ZERO;
+            }
+            let sum: glam::Vec2 = particles.iter().map(|p| p.x).sum();
+            sum / range.len() as f32
         }
 
         /// Aggregate state for all particles of the given material.
