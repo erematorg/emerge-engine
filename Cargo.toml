@@ -114,3 +114,11 @@ required-features = ["render"]
 [[example]]
 name = "stress_cfl_scan_50k"
 required-features = ["render"]
+
+[[example]]
+name = "debug_lp_creature_stability_gpu"
+required-features = ["gpu"]
+
+[[example]]
+name = "debug_gpu_water_test"
+required-features = ["gpu"]
