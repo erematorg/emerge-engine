@@ -93,6 +93,7 @@ pub use crate::{
 
     lame_from_si,
     lame_from_young,
+    rankine_damage_estimate,
 };
 
 // Math types — re-exported so consumers don't need a separate glam dependency.

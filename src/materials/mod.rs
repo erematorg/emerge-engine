@@ -35,6 +35,7 @@ pub use sand_mui::MuIRheologyMaterial;
 pub use snow::StomakhinMaterial;
 pub use utils::{
     elastic_wave_dt, gravity_to_grid, lame_from_si, lame_from_young, polar_decomposition_2d,
+    rankine_damage_estimate,
 };
 pub use viscoelastic::ViscoelasticMaterial;
 pub use von_mises::VonMisesMaterial;

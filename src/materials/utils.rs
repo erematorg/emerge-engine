@@ -1,3 +1,4 @@
+use crate::materials::svd::svd2;
 use glam::{Mat2, Vec2};
 
 /// Floor applied to singular values before taking log — prevents ln(0).
@@ -41,6 +42,43 @@ pub(crate) fn stress_to_hencky(tau: Vec2, lambda: f32, mu: f32) -> Vec2 {
         (a * tau.x - lambda * tau.y) / det,
         (a * tau.y - lambda * tau.x) / det,
     )
+}
+
+/// Rankine (maximum principal stress) tensile-damage estimate -- the same failure
+/// criterion `RankineMaterial` uses internally (max principal Kirchhoff stress vs.
+/// an exponentially-softening tensile threshold), exposed as a standalone read-only
+/// analysis function so ANY material can track real structural damage without
+/// adopting Rankine's full constitutive/return-mapping model as its own stress
+/// response. Does not modify `deformation_gradient` -- purely observational, safe
+/// to call alongside a material's own (unrelated) `update_particle`, e.g. a
+/// muscle-actuated `NeoHookeanMaterial` that still needs a real damage/health
+/// signal without giving up its own stress model.
+///
+/// `lambda`/`mu` should be the SAME Lamé parameters the calling material already
+/// uses for its own elastic response -- this reads the real strain state via the
+/// same Hencky-strain path Rankine's own `update_particle` computes from, just
+/// without writing the projected state back into `F`.
+pub fn rankine_damage_estimate(
+    deformation_gradient: Mat2,
+    lambda: f32,
+    mu: f32,
+    tensile_strength: f32,
+    softening_rate: f32,
+    prior_damage: f32,
+) -> f32 {
+    let (_, sigma, _) = svd2(deformation_gradient);
+    let eps = hencky_strains(sigma);
+    let a = 2.0 * mu + lambda;
+    let tau = Vec2::new(a * eps.x + lambda * eps.y, lambda * eps.x + a * eps.y);
+
+    let t_eff = tensile_strength * (-softening_rate * prior_damage).exp();
+    let tau_proj = Vec2::new(tau.x.min(t_eff), tau.y.min(t_eff));
+    if tau_proj == tau {
+        return prior_damage; // within the tensile limit, no new damage
+    }
+
+    let eps_proj = stress_to_hencky(tau_proj, lambda, mu);
+    prior_damage + (eps - eps_proj).length()
 }
 
 /// 2D polar decomposition: returns the rotation R such that F = R·S.
@@ -160,4 +198,53 @@ pub fn lame_from_si(
 /// ```
 pub fn gravity_to_grid(g_si: glam::Vec2, dx_meters: f32, _dt_seconds: f32) -> glam::Vec2 {
     g_si / dx_meters
+}
+
+#[cfg(test)]
+mod rankine_damage_estimate_tests {
+    use super::*;
+
+    #[test]
+    fn no_damage_within_tensile_limit() {
+        let f = Mat2::from_cols(Vec2::new(1.01, 0.0), Vec2::new(0.0, 1.0));
+        let damage = rankine_damage_estimate(f, 1000.0, 1000.0, 1.0e6, 1.0, 0.0);
+        assert_eq!(
+            damage, 0.0,
+            "tiny strain must stay under a huge tensile threshold"
+        );
+    }
+
+    #[test]
+    fn damage_accumulates_past_tensile_limit() {
+        let f = Mat2::from_cols(Vec2::new(1.5, 0.0), Vec2::new(0.0, 1.0));
+        let damage = rankine_damage_estimate(f, 1000.0, 1000.0, 10.0, 1.0, 0.0);
+        assert!(
+            damage > 0.0,
+            "large tensile strain must accumulate real damage"
+        );
+    }
+
+    #[test]
+    fn damage_never_decreases_across_repeated_overload() {
+        let f = Mat2::from_cols(Vec2::new(1.5, 0.0), Vec2::new(0.0, 1.0));
+        let mut damage = 0.0;
+        for _ in 0..5 {
+            let next = rankine_damage_estimate(f, 1000.0, 1000.0, 10.0, 1.0, damage);
+            assert!(
+                next >= damage,
+                "damage must be monotonically non-decreasing"
+            );
+            damage = next;
+        }
+        assert!(damage > 0.0);
+    }
+
+    #[test]
+    fn does_not_mutate_deformation_gradient() {
+        // Purely observational -- caller's F is untouched, function only reads it.
+        let f = Mat2::from_cols(Vec2::new(1.5, 0.0), Vec2::new(0.0, 1.0));
+        let f_before = f;
+        let _ = rankine_damage_estimate(f, 1000.0, 1000.0, 10.0, 1.0, 0.0);
+        assert_eq!(f, f_before);
+    }
 }

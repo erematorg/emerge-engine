@@ -73,7 +73,7 @@ pub use materials::{
     MaterialModel, MaterialParams, MaterialRegistry, MuIRheologyMaterial, NaccMaterial,
     NeoHookeanMaterial, NewtonianFluidMaterial, ParticleMass, PlasticityModel, RankineMaterial,
     StomakhinMaterial, Viscoelastic, ViscoelasticMaterial, VonMisesMaterial, WithLatentHeat,
-    gravity_to_grid, lame_from_si, lame_from_young,
+    gravity_to_grid, lame_from_si, lame_from_young, rankine_damage_estimate,
 };
 
 // Boundary conditions
