@@ -106,3 +106,11 @@ required-features = ["render"]
 [[example]]
 name = "basic_creature"
 required-features = ["render"]
+
+[[example]]
+name = "stress_realtime_scaling"
+required-features = ["render"]
+
+[[example]]
+name = "stress_cfl_scan_50k"
+required-features = ["render"]
