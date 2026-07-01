@@ -244,8 +244,14 @@ pub(super) struct DuctileProps {
     pub yield_stress_pa: f32,
 }
 
+/// Real-unit properties for brittle/tensile-failure materials (`RankineMaterial`),
+/// and the source of correctly-scaled Lame/tensile-strength parameters for
+/// `rankine_damage_estimate` when a non-Rankine material still needs a real
+/// damage signal (construct a `RankineMaterial::from_physical(&props, &config)`
+/// and read its already-scaled `.lambda`/`.mu`/`.tensile_strength`/
+/// `.softening_rate` fields -- don't hand-scale a Pa value yourself).
 #[derive(Debug, Clone, Copy)]
-pub(super) struct BrittleProps {
+pub struct BrittleProps {
     pub elastic: Elastic,
     pub tensile_strength_pa: f32,
     pub softening_rate: f32,

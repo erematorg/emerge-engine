@@ -17,6 +17,7 @@ pub use crate::{
     BodyState,
     // Boundary conditions
     BoundaryCondition,
+    BrittleProps,
     BuoyancyField,
     ChemotaxisField,
     CorotatedMaterial,

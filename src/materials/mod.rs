@@ -17,8 +17,8 @@ pub mod viscoelastic;
 pub mod von_mises;
 
 pub use physical_props::{
-    Elastic, Elastoplastic, Fluid, FluidGranular, FromSI, ParticleMass, PlasticityModel,
-    Viscoelastic,
+    BrittleProps, Elastic, Elastoplastic, Fluid, FluidGranular, FromSI, ParticleMass,
+    PlasticityModel, Viscoelastic,
 };
 
 pub use bingham::BinghamFluidMaterial;
@@ -258,9 +258,7 @@ impl MaterialModel for FallbackMaterial {}
 
 // ── props.material(&config) — property-first material construction ─────────────
 
-use physical_props::{
-    BinghamProps, BrittleProps, DuctileProps, GranularProps, NewtonianFluid, SnowProps,
-};
+use physical_props::{BinghamProps, DuctileProps, GranularProps, NewtonianFluid, SnowProps};
 
 impl Elastic {
     /// Canonical model: `NeoHookeanMaterial` (Simo-Pister vol-dev split).
