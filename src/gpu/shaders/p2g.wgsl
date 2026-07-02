@@ -161,8 +161,13 @@ fn kirchhoff(p: Particle, mat: MaterialParams) -> mat2x2<f32> {
         }
         case 2u: { // NeoHookean — Simo-Pister vol-dev split
             let t_scale = 1.0 + mat.thermal_expansion * p.temperature;
-            let mu_e  = mat.mu * t_scale;
-            let lam_e = mat.lambda * t_scale;
+            // Damage softening: mu_eff = mu*exp(-rate*damage), same exponential form
+            // RankineMaterial uses for tensile strength (continuum damage mechanics).
+            // cohesion_coeff repurposed for damage_softening_rate (see elastic.rs
+            // params() -- documented reusable padding, zero for other materials).
+            let damage_scale = exp(-mat.cohesion_coeff * p.friction_hardening);
+            let mu_e  = mat.mu * t_scale * damage_scale;
+            let lam_e = mat.lambda * t_scale * damage_scale;
             let B     = F * transpose(F);
             let tr_B  = B[0][0] + B[1][1];
             let dev_B = B - (tr_B * 0.5) * I;

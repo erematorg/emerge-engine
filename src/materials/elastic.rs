@@ -24,6 +24,16 @@ pub struct NeoHookeanMaterial {
     /// Independent of elastic state — generates force even at rest.
     /// 0.0 = passive (default). Tune to be on the order of µ for visible locomotion.
     pub active_stress_coeff: f32,
+    /// Continuum damage softening rate — real mechanical consequence of accumulated
+    /// structural damage (`Particle::friction_hardening`, e.g. from
+    /// `rankine_damage_estimate`), not just a passive health readout. Effective
+    /// stiffness: µ_eff = µ·exp(−rate·damage), λ_eff = λ·exp(−rate·damage) — the
+    /// same exponential softening `RankineMaterial` uses for its own tensile
+    /// strength (continuum damage mechanics), applied here to elastic stiffness
+    /// instead. Damaged tissue gets progressively softer/weaker as a smooth,
+    /// continuous function of real accumulated strain — not a hard on/off failure
+    /// threshold. 0.0 = no damage coupling (default, unchanged behavior).
+    pub damage_softening_rate: f32,
 }
 
 impl NeoHookeanMaterial {
@@ -34,6 +44,7 @@ impl NeoHookeanMaterial {
             min_density: 1.0e-6,
             thermal_expansion: 0.0,
             active_stress_coeff: 0.0,
+            damage_softening_rate: 0.0,
         }
     }
 
@@ -67,8 +78,12 @@ impl MaterialModel for NeoHookeanMaterial {
 
         // Thermal modulus scaling: λ_eff = λ·(1 + α·T), same for µ.
         let t_scale = 1.0 + self.thermal_expansion * particles.temperature[i];
-        let mu = self.mu * t_scale;
-        let lambda = self.lambda * t_scale;
+        // Damage softening: µ_eff = µ·exp(−rate·damage), same exponential form
+        // RankineMaterial uses for tensile strength -- continuum damage mechanics,
+        // not a hand-picked curve. rate=0.0 (default) leaves this at 1.0, no-op.
+        let damage_scale = (-self.damage_softening_rate * particles.friction_hardening[i]).exp();
+        let mu = self.mu * t_scale * damage_scale;
+        let lambda = self.lambda * t_scale * damage_scale;
 
         // Simo-Pister volumetric-deviatoric split (Apache-2.0 reference: sparkl).
         // B = F·Fᵀ (left Cauchy-Green), d = 2 in 2D.
@@ -113,6 +128,9 @@ impl MaterialModel for NeoHookeanMaterial {
             mu: self.mu,
             thermal_expansion: self.thermal_expansion,
             active_stress_coeff: self.active_stress_coeff,
+            // cohesion_coeff is documented as reusable padding (Snow-only otherwise,
+            // zero for all other materials) -- repurposed here for damage_softening_rate.
+            cohesion_coeff: self.damage_softening_rate,
             ..Default::default()
         }
     }
@@ -134,5 +152,89 @@ impl MaterialModel for NeoHookeanMaterial {
             cell_width,
             material_cfl,
         )
+    }
+}
+
+#[cfg(test)]
+mod damage_softening_tests {
+    use super::*;
+    use crate::Particle;
+
+    fn particle_with(deformation_gradient: Mat2, friction_hardening: f32) -> Particles {
+        let mut particles = Particles::default();
+        particles.push(Particle {
+            x: glam::Vec2::ZERO,
+            v: glam::Vec2::ZERO,
+            velocity_gradient: Mat2::ZERO,
+            deformation_gradient,
+            mass: 1.0,
+            initial_volume: 1.0,
+            volume: 1.0,
+            density: 1.0,
+            material_id: 0,
+            plastic_volume_ratio: 1.0,
+            hardening_scale: 1.0,
+            friction_hardening,
+            log_volume_strain: 0.0,
+            temperature: 0.0,
+            user_tag: 0,
+            activation: 0.0,
+            activation_dir: glam::Vec2::ZERO,
+            muscle_group_id: 0,
+            sleeping: 0,
+        });
+        particles
+    }
+
+    #[test]
+    fn zero_softening_rate_matches_undamaged_stress() {
+        let f = Mat2::from_cols(glam::Vec2::new(1.3, 0.0), glam::Vec2::new(0.0, 1.1));
+        let mut mat = NeoHookeanMaterial::new(1000.0, 1000.0);
+        mat.damage_softening_rate = 0.0;
+
+        let undamaged = particle_with(f, 0.0);
+        let damaged = particle_with(f, 5.0);
+        let tau_undamaged = mat.kirchhoff_stress(&undamaged, 0);
+        let tau_damaged = mat.kirchhoff_stress(&damaged, 0);
+
+        assert_eq!(
+            tau_undamaged, tau_damaged,
+            "rate=0.0 must leave stress unaffected by damage (backward compatible default)"
+        );
+    }
+
+    #[test]
+    fn damage_softens_stress_magnitude() {
+        let f = Mat2::from_cols(glam::Vec2::new(1.3, 0.0), glam::Vec2::new(0.0, 1.1));
+        let mut mat = NeoHookeanMaterial::new(1000.0, 1000.0);
+        mat.damage_softening_rate = 0.5;
+
+        let healthy = particle_with(f, 0.0);
+        let damaged = particle_with(f, 3.0);
+        let tau_healthy = mat.kirchhoff_stress(&healthy, 0);
+        let tau_damaged = mat.kirchhoff_stress(&damaged, 0);
+
+        assert!(
+            tau_damaged.x_axis.length() < tau_healthy.x_axis.length(),
+            "damaged tissue must produce weaker stress for the same deformation: \
+             healthy={:?} damaged={:?}",
+            tau_healthy,
+            tau_damaged
+        );
+    }
+
+    #[test]
+    fn severe_damage_approaches_near_zero_stiffness() {
+        let f = Mat2::from_cols(glam::Vec2::new(1.3, 0.0), glam::Vec2::new(0.0, 1.1));
+        let mut mat = NeoHookeanMaterial::new(1000.0, 1000.0);
+        mat.damage_softening_rate = 1.0;
+
+        let severely_damaged = particle_with(f, 20.0); // exp(-20) ~ 2e-9, near-total loss
+        let tau = mat.kirchhoff_stress(&severely_damaged, 0);
+        assert!(
+            tau.x_axis.length() < 1.0e-3,
+            "severe damage must drive stiffness (and thus stress) toward zero, got {:?}",
+            tau
+        );
     }
 }
