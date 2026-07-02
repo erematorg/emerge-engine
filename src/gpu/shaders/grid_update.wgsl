@@ -32,7 +32,7 @@ struct ForceFieldsParams {
     entries: array<ForceFieldEntry, 16>,
 }
 
-const MASS_FLOOR:         f32 = 1e-10;
+const MASS_FLOOR:         f32 = 1e-4;
 const MASS_ATOMIC_SCALE:  f32 = 1000000.0;
 const MOM_ATOMIC_SCALE:   f32 = 100000.0;
 const CELL_CENTER_OFFSET: f32 = 0.5;
