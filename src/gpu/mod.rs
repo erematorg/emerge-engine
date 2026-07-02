@@ -628,8 +628,12 @@ mod solver {
             }
         }
 
-        /// Returns (cfl_scan_ns, encode_ns, submit_ns, readback_ns, total_ns) from the last
-        /// `step_frame()` call.
+        /// Returns (cfl_scan_ns, encode_ns, wait_ns, readback_ns, total_ns) from the last
+        /// `step_frame()` call. `encode_ns` is pure CPU-side command-building time (bind
+        /// group already cached, just recording dispatches); `wait_ns` (renamed from the
+        /// old always-zero `submit_ns` -- multi-chunk frames now really do block between
+        /// chunks) is time spent in `device.poll(wait_indefinitely())` between substep
+        /// batches, i.e. real GPU execution time for scenes needing >64 substeps/frame.
         pub fn last_cpu_timings_ns(&self) -> (f32, f32, f32, f32, f32) {
             self.last_cpu_timings
         }
@@ -864,7 +868,6 @@ mod solver {
             self.last_sub_dt = sub_dts.last().copied().unwrap_or(self.config.dt);
             self.frame_index += 1;
             let cfl_scan_ns = cfl_scan_start.elapsed().as_secs_f32() * 1.0e9;
-            let encode_start = std::time::Instant::now();
 
             // Sleep delay: a particle spawned at rest (v=0) satisfies any positive
             // sleep_threshold on its very first substep, before gravity has accelerated it
@@ -1028,7 +1031,13 @@ mod solver {
             let mut chunks = bind_groups[..sub_dts.len()]
                 .chunks(SUBSTEP_BATCH_SIZE)
                 .peekable();
+            // Split pure CPU command-building time from GPU-completion wait time --
+            // "encode_ns" previously bundled both under one name, hiding whether a slow
+            // step_frame() was a CPU-side encoding problem or genuinely GPU-execution-bound.
+            let mut pure_encode_ns = 0.0f32;
+            let mut wait_ns = 0.0f32;
             while let Some(chunk) = chunks.next() {
+                let chunk_encode_start = std::time::Instant::now();
                 let mut sub_encoder =
                     self.device
                         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1038,12 +1047,17 @@ mod solver {
                     self.encode_substep(&mut sub_encoder, bg, grid_wg, particle_wg);
                 }
                 self.queue.submit(std::iter::once(sub_encoder.finish()));
+                pure_encode_ns += chunk_encode_start.elapsed().as_secs_f32() * 1.0e9;
                 if chunks.peek().is_some() {
+                    let wait_start = std::time::Instant::now();
                     self.device.poll(wgpu::PollType::wait_indefinitely()).ok();
+                    wait_ns += wait_start.elapsed().as_secs_f32() * 1.0e9;
                 }
             }
-            let encode_ns = encode_start.elapsed().as_secs_f32() * 1.0e9;
-            let submit_ns = 0.0; // folded into encode_ns now that submits are batched per-chunk
+            let encode_ns = pure_encode_ns;
+            // Repurposed: real GPU-completion wait time between chunks, not always 0 --
+            // this IS where GPU execution time shows up for multi-chunk (>64 substep) frames.
+            let submit_ns = wait_ns;
 
             // Async GPU → CPU readback — never blocks the render thread.
             //
