@@ -160,6 +160,14 @@ fn kirchhoff(p: Particle, mat: MaterialParams) -> mat2x2<f32> {
             return t;
         }
         case 2u: { // NeoHookean — Simo-Pister vol-dev split
+            // CPU (elastic.rs) hard-zeroes stress for near-singular deformation
+            // (raw det(F) <= MIN_J) instead of dividing by the clamped floor --
+            // without this, GPU's shared `J = max(det2(F), NUM_FLOOR)` clamp let
+            // `mu_e / J` blow up to mu_e * 1e6 at the floor instead of returning
+            // zero like CPU does for the identical edge case.
+            if (det2(F) <= NUM_FLOOR) {
+                return mat2x2<f32>(vec2<f32>(0.0, 0.0), vec2<f32>(0.0, 0.0));
+            }
             let t_scale = 1.0 + mat.thermal_expansion * p.temperature;
             // Damage softening: mu_eff = mu*exp(-rate*damage), same exponential form
             // RankineMaterial uses for tensile strength (continuum damage mechanics).
