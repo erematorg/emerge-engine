@@ -126,3 +126,7 @@ required-features = ["gpu"]
 [[example]]
 name = "debug_gpu_active_blocks"
 required-features = ["gpu"]
+
+[[example]]
+name = "debug_gpu_water_trace"
+required-features = ["gpu"]
