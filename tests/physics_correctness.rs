@@ -1130,6 +1130,54 @@ fn count_near_matches_manual() {
     assert_eq!(api_count, manual_count);
 }
 
+/// `particles_knn` must return exactly the same k-nearest INDEX SET as a
+/// brute-force sort over every particle -- proves the geometric radius
+/// expansion doesn't miss a closer particle just outside its current search
+/// box. Query point is deliberately OFF the spawn's own symmetric center
+/// (32.0, 32.0): querying from dead center over a symmetric grid puts many
+/// particles at the exact same distance, making the k-th-nearest cutoff
+/// genuinely ambiguous (confirmed empirically -- an earlier version of this
+/// test queried from center and failed on a real tie at the boundary, not an
+/// algorithm bug). An off-center point makes distances generically distinct.
+#[test]
+fn particles_knn_matches_brute_force() {
+    let config = SimConfig::standard(64, 0.05, Vec2::ZERO);
+    let solver = Simulation::new(config, center_spawn(64, 8));
+
+    let center = Vec2::new(32.37, 31.82);
+    let k = 7; // Ballerini et al. 2008's real ~6-7 neighbor figure
+
+    let ps = solver.particles();
+    let mut brute: Vec<(usize, f32)> = (0..ps.len())
+        .map(|i| (i, (ps.x[i] - center).length_squared()))
+        .collect();
+    brute.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
+    let mut expected: Vec<usize> = brute.into_iter().take(k).map(|(i, _)| i).collect();
+    expected.sort_unstable();
+
+    let mut got = solver.particles_knn(center, k);
+    got.sort_unstable();
+    assert_eq!(
+        got, expected,
+        "particles_knn must match a brute-force k-nearest scan (same particle set)"
+    );
+}
+
+/// Requesting more neighbors than exist must return everything, not panic or loop forever.
+#[test]
+fn particles_knn_clamps_to_available_particle_count() {
+    let config = SimConfig::standard(64, 0.05, Vec2::ZERO);
+    let solver = Simulation::new(config, center_spawn(64, 8));
+
+    let total = solver.particles().len();
+    let got = solver.particles_knn(Vec2::splat(32.0), total + 1000);
+    assert_eq!(
+        got.len(),
+        total,
+        "requesting more neighbors than exist must return exactly all of them, not panic"
+    );
+}
+
 // ─── thermo-mechanical coupling (E(T)) ──────────────────────────────────────────
 //
 // `thermal_expansion` already existed on NeoHookean/Corotated/Viscoelastic and was already

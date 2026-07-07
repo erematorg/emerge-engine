@@ -580,6 +580,51 @@ impl Simulation {
             .count()
     }
 
+    /// Indices of the `k` active particles nearest to `center`, sorted by
+    /// distance ascending -- a real topological neighbor rule (Ballerini et al.
+    /// 2008, PNAS: real starling flocks track their ~6-7 nearest neighbors
+    /// regardless of physical distance, not everything within a fixed radius).
+    /// `particles_near`/`count_near` can't express this: a fixed radius pulls
+    /// in more neighbors in dense regions and fewer in sparse ones, exactly the
+    /// density-fragility topological neighbor rules are empirically shown to
+    /// avoid (the same paper found this rule is what makes real flocks robust
+    /// to predator-induced density changes).
+    ///
+    /// Exact, not approximate: expands the search radius geometrically until
+    /// at least `k` candidates are found within it, then returns the true `k`
+    /// closest by exact distance. Correctness relies on `SpatialHash::query`
+    /// returning every particle in the queried box, never a sample -- once `k`
+    /// candidates are confirmed within some radius R, the true k-nearest are
+    /// guaranteed to already be included, so sorting and truncating what's
+    /// been gathered is exact.
+    ///
+    /// Returns fewer than `k` if the active particle set itself has fewer.
+    pub fn particles_knn(&self, center: Vec2, k: usize) -> Vec<usize> {
+        if k == 0 || self.active_count == 0 {
+            return Vec::new();
+        }
+        let domain_diag =
+            self.config.grid_res as f32 * self.config.grid_cell_size * std::f32::consts::SQRT_2;
+        let mut radius = self.config.grid_cell_size * (k as f32).sqrt().max(1.0);
+        let mut candidates: Vec<(usize, f32)>;
+        loop {
+            let r2 = radius * radius;
+            candidates = self
+                .spatial_hash
+                .query(center, radius)
+                .map(|i| (i, (self.particles.x[i] - center).length_squared()))
+                .filter(|&(_, d2)| d2 <= r2)
+                .collect();
+            if candidates.len() >= k || radius >= domain_diag {
+                break;
+            }
+            radius *= 2.0;
+        }
+        candidates.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
+        candidates.truncate(k);
+        candidates.into_iter().map(|(i, _)| i).collect()
+    }
+
     /// Switch material for every particle where `predicate` returns true.
     ///
     /// After a transition involving fluid materials, call `recompute_initial_volumes()`

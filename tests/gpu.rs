@@ -48,6 +48,105 @@ mod gpu_tests {
         )
     }
 
+    /// `count_near`/`particles_near` now use an internal spatial hash instead of a
+    /// full linear scan (real perf fix, see Claude memory
+    /// `emerge_reference_audit` -- these were the only two of emerge's real
+    /// neighbor-query methods missing the spatial acceleration already proven in
+    /// `solver::Simulation`). This must return EXACTLY what a brute-force linear
+    /// scan over the real particle buffer would -- correctness first, speed
+    /// second.
+    #[test]
+    fn gpu_spatial_queries_match_brute_force_scan() {
+        if !gpu_available() {
+            return;
+        }
+        let config = small_config();
+        // Two disks of different materials, close enough that a real query radius
+        // spans both -- real multi-material scene, not a degenerate single-blob case.
+        let mut particles = spawn_disk(&config, Vec2::splat(10.0), 0);
+        particles.extend(spawn_disk(&config, Vec2::splat(14.0), 1));
+        let mut registry =
+            MaterialRegistry::with_default(Box::new(NeoHookeanMaterial::new(100.0, 50.0)));
+        // Second disk uses material_id 1 -- must be registered too, or `get`/
+        // `count_near` panic on an unregistered slot (real multi-material scene,
+        // not a degenerate single-material case, so both IDs need real materials).
+        registry.insert(1, Box::new(NeoHookeanMaterial::new(100.0, 50.0)));
+        let solver = block_on(GpuSimulation::new(config, particles, registry));
+
+        let center = Vec2::splat(12.0);
+        let radius = 6.0;
+        let r2 = radius * radius;
+
+        let expected_count_mat0 = solver
+            .particles()
+            .iter()
+            .filter(|p| p.material_id == 0 && (p.x - center).length_squared() <= r2)
+            .count();
+        assert_eq!(
+            solver.count_near(center, radius, 0),
+            expected_count_mat0,
+            "count_near must match a brute-force scan for material 0"
+        );
+
+        let mut expected_indices: Vec<usize> = solver
+            .particles()
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| (p.x - center).length_squared() <= r2)
+            .map(|(i, _)| i)
+            .collect();
+        let mut actual_indices: Vec<usize> = solver
+            .particles_near(center, radius)
+            .map(|(i, _)| i)
+            .collect();
+        expected_indices.sort_unstable();
+        actual_indices.sort_unstable();
+        assert_eq!(
+            actual_indices, expected_indices,
+            "particles_near must return exactly the same index set as a brute-force scan"
+        );
+    }
+
+    /// `particles_knn` (see `Simulation::particles_knn`, CPU side, for the full
+    /// rationale -- a real topological neighbor rule, Ballerini et al. 2008)
+    /// mirrored on the GPU backend must match a brute-force k-nearest scan.
+    /// Query point is off either disk's own center so no two particles land at
+    /// the exact same distance (a real tie right at the k-th cutoff is
+    /// genuinely ambiguous, not a bug -- see the CPU-side test's own note).
+    #[test]
+    fn gpu_particles_knn_matches_brute_force_scan() {
+        if !gpu_available() {
+            return;
+        }
+        let config = small_config();
+        let mut particles = spawn_disk(&config, Vec2::splat(10.0), 0);
+        particles.extend(spawn_disk(&config, Vec2::splat(14.0), 1));
+        let mut registry =
+            MaterialRegistry::with_default(Box::new(NeoHookeanMaterial::new(100.0, 50.0)));
+        registry.insert(1, Box::new(NeoHookeanMaterial::new(100.0, 50.0)));
+        let solver = block_on(GpuSimulation::new(config, particles, registry));
+
+        let center = Vec2::new(12.37, 11.82);
+        let k = 7;
+
+        let mut brute: Vec<(usize, f32)> = solver
+            .particles()
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (i, (p.x - center).length_squared()))
+            .collect();
+        brute.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
+        let mut expected: Vec<usize> = brute.into_iter().take(k).map(|(i, _)| i).collect();
+        expected.sort_unstable();
+
+        let mut got = solver.particles_knn(center, k);
+        got.sort_unstable();
+        assert_eq!(
+            got, expected,
+            "particles_knn must match a brute-force k-nearest scan (same particle set)"
+        );
+    }
+
     #[test]
     fn gpu_neohookean_stable() {
         if !gpu_available() {
@@ -67,6 +166,68 @@ mod gpu_tests {
             assert!(
                 p.deformation_gradient.determinant() > 0.0,
                 "gpu neo particle {i}: J collapsed"
+            );
+        }
+    }
+
+    /// `sync_particle_ranges_blocking` must return exactly what a full
+    /// `sync_particles_blocking` would for the same indices -- the whole point of the
+    /// partial-readback path is to be cheaper, never to be a different (approximate or
+    /// stale) answer. Spawns two disjoint disks (two "creature" ranges in a scene that
+    /// also has other particles between/around them, closer to LP's real terrain+water+
+    /// creatures layout than a single contiguous spawn would be), steps real physics,
+    /// then compares a partial sync of both ranges against a full sync of the same
+    /// particles.
+    #[test]
+    fn gpu_partial_range_readback_matches_full_readback() {
+        if !gpu_available() {
+            return;
+        }
+        let config = small_config();
+        let mut particles = spawn_disk(&config, Vec2::splat(10.0), 0);
+        let range_a = 0..particles.len();
+        let middle = spawn_disk(&config, Vec2::splat(16.0), 0);
+        let offset = particles.len();
+        particles.extend(middle);
+        let range_b_start = particles.len();
+        let range_b_particles = spawn_disk(&config, Vec2::splat(22.0), 0);
+        particles.extend(range_b_particles.clone());
+        let range_b = range_b_start..particles.len();
+        let _ = offset;
+
+        let registry =
+            MaterialRegistry::with_default(Box::new(NeoHookeanMaterial::new(100.0, 50.0)));
+        let mut solver = block_on(GpuSimulation::new(config, particles, registry));
+        for _ in 0..15 {
+            solver.step_frame();
+        }
+
+        let ranges = [range_a.clone(), range_b.clone()];
+        solver.sync_particle_ranges_blocking(&ranges);
+        let partial_a = solver.particles()[range_a.clone()].to_vec();
+        let partial_b = solver.particles()[range_b.clone()].to_vec();
+
+        solver.sync_particles_blocking();
+        let full_a = solver.particles()[range_a].to_vec();
+        let full_b = solver.particles()[range_b].to_vec();
+
+        assert_eq!(
+            partial_a.len(),
+            full_a.len(),
+            "partial range A must cover the same particle count"
+        );
+        for (i, (p, f)) in partial_a.iter().zip(&full_a).enumerate() {
+            assert_eq!(p.x, f.x, "range A particle {i}: position mismatch");
+            assert_eq!(
+                p.deformation_gradient, f.deformation_gradient,
+                "range A particle {i}: deformation gradient mismatch"
+            );
+        }
+        for (i, (p, f)) in partial_b.iter().zip(&full_b).enumerate() {
+            assert_eq!(p.x, f.x, "range B particle {i}: position mismatch");
+            assert_eq!(
+                p.deformation_gradient, f.deformation_gradient,
+                "range B particle {i}: deformation gradient mismatch"
             );
         }
     }

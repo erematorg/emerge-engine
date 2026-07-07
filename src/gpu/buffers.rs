@@ -286,6 +286,64 @@ impl GpuBuffers {
         flag
     }
 
+    /// Blocking GPU → CPU readback of specific particle index ranges only — e.g. a
+    /// handful of live creatures scattered through a much larger terrain/water
+    /// buffer, where reading the WHOLE buffer every frame (via `readback_blocking`)
+    /// would stall on copying/mapping particles the caller doesn't even need this
+    /// frame. All ranges are copied within a SINGLE encoder/submit/poll (batched,
+    /// not one blocking round-trip per range — the per-call CPU↔GPU synchronization
+    /// overhead, not just data volume, is what makes repeated small blocking
+    /// readbacks expensive in practice). Returns one `Vec<Particle>` per input
+    /// range, same order, each sized `range.len()`.
+    ///
+    /// Panics if the combined byte size of all ranges exceeds the readback staging
+    /// buffer's capacity (sized for the full particle count at construction, so any
+    /// subset always fits).
+    pub fn readback_ranges_blocking(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        ranges: &[std::ops::Range<usize>],
+    ) -> Vec<Vec<Particle>> {
+        let particle_size = mem::size_of::<Particle>() as u64;
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("mpm_readback_ranges_blocking"),
+        });
+        let mut staging_offset = 0u64;
+        let mut spans = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            let byte_count = (range.len() as u64) * particle_size;
+            encoder.copy_buffer_to_buffer(
+                &self.particles,
+                (range.start as u64) * particle_size,
+                &self.readback_staging,
+                staging_offset,
+                byte_count,
+            );
+            spans.push((staging_offset, byte_count));
+            staging_offset += byte_count;
+        }
+        queue.submit(std::iter::once(encoder.finish()));
+        device.poll(wgpu::PollType::wait_indefinitely()).ok();
+
+        let total_bytes = staging_offset;
+        let slice = self.readback_staging.slice(..total_bytes.max(1));
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::PollType::wait_indefinitely()).ok();
+        let mapped = slice.get_mapped_range();
+        let results = spans
+            .iter()
+            .map(|&(offset, len)| {
+                let start = offset as usize;
+                let end = start + len as usize;
+                bytemuck::cast_slice::<u8, Particle>(&mapped[start..end]).to_vec()
+            })
+            .collect();
+        drop(mapped);
+        self.readback_staging.unmap();
+        results
+    }
+
     /// Blocking GPU → CPU readback. Submits copy, waits for GPU idle, maps, returns particles.
     /// Stalls the CPU until the GPU completes all in-flight work — only call from tests or
     /// parity-mode helpers, never from the render/game loop.
@@ -388,5 +446,21 @@ impl GpuBuffers {
         drop(mapped);
         self.readback_staging.unmap();
         particles
+    }
+
+    /// Release a FAILED readback's mapping without extracting data (there's nothing
+    /// valid to read on `Err`). Real bug this closes (found 2026-07-05, see project
+    /// memory): `map_async`'s callback firing at all -- Ok OR Err -- means wgpu
+    /// considers the buffer mapped; only `finish_readback`/this function's call to
+    /// `unmap()` releases that state. The old code only ever unmapped on the Ok path,
+    /// so a single `Err` (rare on fast hardware, far more likely on a slow/software
+    /// backend where async completion timing differs) left the staging buffer
+    /// permanently mapped -- silently disabling every future readback for the rest of
+    /// the run, then panicking ("Buffer is already mapped") the next time anything
+    /// tried to map it again (reproduced locally forcing a software WARP-style
+    /// adapter; plausibly the same root cause behind emerge issue #10's
+    /// STATUS_STACK_BUFFER_OVERRUN on CI, manifesting differently per-driver).
+    pub fn abandon_readback(&self) {
+        self.readback_staging.unmap();
     }
 }
