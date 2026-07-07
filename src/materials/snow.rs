@@ -210,3 +210,108 @@ impl MaterialModel for StomakhinMaterial {
         )
     }
 }
+
+#[cfg(test)]
+mod analytical_validation_tests {
+    use super::*;
+
+    fn particle_with(f: Mat2, hardening_scale: f32, plastic_volume_ratio: f32) -> Particles {
+        let mut p = Particle::zeroed();
+        p.deformation_gradient = f;
+        p.mass = 1.0;
+        p.initial_volume = 1.0;
+        p.hardening_scale = hardening_scale;
+        p.plastic_volume_ratio = plastic_volume_ratio;
+        Particles::from(vec![p])
+    }
+
+    /// **Small-strain limit must recover exact linear elasticity.** Snow's
+    /// elastic stress formula is IDENTICAL to `CorotatedMaterial`'s (same
+    /// documented reference, Stomakhin 2013 eq 5-8), just scaled by the
+    /// hardening factor `h` -- at `h=1.0` (undamaged/uncompressed default),
+    /// the same small-strain-recovers-Hooke's-law argument applies directly
+    /// (see `corotated.rs`'s own test of the same claim). `StomakhinMaterial`
+    /// had zero test comparing it to any analytical result before this.
+    #[test]
+    fn small_strain_matches_hookes_law_at_unit_hardening() {
+        let lambda = 1000.0;
+        let mu = 800.0;
+        let mat = StomakhinMaterial::new(lambda, mu, 10.0, 0.025, 0.0075, 0.6, 20.0);
+
+        let delta = 1.0e-4_f32;
+        let e = Mat2::from_diagonal(Vec2::new(1.0, -0.4));
+        let f = Mat2::IDENTITY + delta * e;
+
+        let particles = particle_with(f, 1.0, 1.0);
+        let tau = mat.kirchhoff_stress(&particles, 0);
+
+        let eps = delta * e;
+        let tr_eps = eps.x_axis.x + eps.y_axis.y;
+        let predicted = Mat2::from_diagonal(Vec2::splat(lambda * tr_eps)) + 2.0 * mu * eps;
+
+        let diff = tau - predicted;
+        let err = (diff.x_axis.length_squared() + diff.y_axis.length_squared()).sqrt();
+        let scale = (predicted.x_axis.length_squared() + predicted.y_axis.length_squared()).sqrt();
+        assert!(
+            err / scale < 1.0e-3,
+            "small-strain snow stress (h=1.0) should match linear elasticity: \
+             predicted={predicted:?} actual={tau:?} relative_err={:.2e}",
+            err / scale
+        );
+    }
+
+    /// **SVD-clamp plasticity must match its own documented bounds exactly.**
+    /// Unlike the strain-space return mappings in sand/rankine/von_mises, this
+    /// plasticity is a DIRECT clamp on singular values -- a marginal test here
+    /// is a straightforward, exact check: a singular value just inside
+    /// [1-theta_c, 1+theta_s] must pass through unchanged; one just outside
+    /// must clamp EXACTLY to the boundary.
+    #[test]
+    fn singular_value_marginally_inside_compression_limit_is_unclamped() {
+        let mat = StomakhinMaterial::new(1000.0, 800.0, 10.0, 0.025, 0.0075, 0.6, 20.0);
+        let sigma_x = 1.0 - 0.99 * mat.compression_limit; // just inside the floor
+        let f = Mat2::from_diagonal(Vec2::new(sigma_x, 1.0));
+        let mut particles = particle_with(f, 1.0, 1.0);
+        mat.update_particle(&mut particles, 0, 1.0);
+        let f_after = particles.deformation_gradient[0];
+        assert!(
+            (f_after.x_axis.x - sigma_x).abs() < 1.0e-5,
+            "singular value inside the compression limit must pass through unchanged: \
+             expected {sigma_x}, got {}",
+            f_after.x_axis.x
+        );
+        assert_eq!(
+            particles.plastic_volume_ratio[0], 1.0,
+            "Jp must not change on a purely elastic step"
+        );
+    }
+
+    #[test]
+    fn singular_value_beyond_compression_limit_clamps_exactly_to_the_boundary() {
+        let mat = StomakhinMaterial::new(1000.0, 800.0, 10.0, 0.025, 0.0075, 0.6, 20.0);
+        let sigma_x = 1.0 - 1.5 * mat.compression_limit; // comfortably beyond the floor
+        let f = Mat2::from_diagonal(Vec2::new(sigma_x, 1.0));
+        let mut particles = particle_with(f, 1.0, 1.0);
+        mat.update_particle(&mut particles, 0, 1.0);
+        let f_after = particles.deformation_gradient[0];
+
+        let expected_clamped = 1.0 - mat.compression_limit;
+        assert!(
+            (f_after.x_axis.x - expected_clamped).abs() < 1.0e-5,
+            "singular value beyond the compression limit must clamp EXACTLY to \
+             1-compression_limit={expected_clamped}, got {}",
+            f_after.x_axis.x
+        );
+
+        // Real, exact analytical claim: Jp_new = Jp_old * (sigma.x*sigma.y) /
+        // (sigma_c.x*sigma_c.y) -- with sigma.y=1 unclamped, this reduces to
+        // Jp_new = sigma_x / expected_clamped exactly.
+        let expected_jp = sigma_x / expected_clamped;
+        assert!(
+            (particles.plastic_volume_ratio[0] - expected_jp).abs() < 1.0e-5,
+            "Jp should update EXACTLY per its own documented formula: expected \
+             {expected_jp}, got {}",
+            particles.plastic_volume_ratio[0]
+        );
+    }
+}

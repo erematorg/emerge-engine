@@ -83,7 +83,8 @@ pub enum PlasticityModel {
         dilatancy_angle_deg: f32,
     },
 
-    /// µ(I)-rheology rate-dependent granular flow (Blatny DPMui).
+    /// µ(I)-rheology rate-dependent granular flow (Cicoira et al. DPMui, see
+    /// `MuIRheologyMaterial`'s own doc for the full, corrected citation).
     /// Better for dense granular at high shear rates. CPU-only.
     /// → `MuIRheologyMaterial`
     GranularRateDependent {

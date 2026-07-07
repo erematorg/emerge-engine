@@ -86,6 +86,10 @@ impl NewtonianFluidMaterial {
         c_ref_m_s: f32,
         config: &crate::SimConfig,
     ) -> Self {
+        // Tait EOS polytropic exponent for water -- Cole 1948, "Underwater Explosions"
+        // (the original real-fluid measurement this exponent is drawn from); used
+        // identically in SPH/MPM weakly-compressible fluid solvers (Monaghan 1994;
+        // Becker & Teschner 2007, already cited elsewhere in this project).
         const GAMMA: f32 = 7.0;
         let visc = scale_visc(eta_pa_s, rho_kg_m3, config);
         let k_si = rho_kg_m3 * c_ref_m_s * c_ref_m_s / GAMMA;
@@ -98,13 +102,27 @@ impl FromSI<NewtonianFluid> for NewtonianFluidMaterial {
     /// `rest_density` defaults to `props.rho_kg_m3`. Caller should adjust if
     /// particle mass/volume don't match the SI density.
     fn from_physical(props: &NewtonianFluid, config: &crate::SimConfig) -> Self {
+        // Tait EOS polytropic exponent for water -- Cole 1948, "Underwater Explosions";
+        // standard in SPH/MPM weakly-compressible fluid solvers (Monaghan 1994).
         const GAMMA: f32 = 7.0;
         let visc = scale_visc(props.eta_pa_s, props.rho_kg_m3, config);
         let eos = scale_stress(props.bulk_modulus_pa / GAMMA, props.rho_kg_m3, config);
-        // rest_density must be in grid units so EOS ratio = ρ_grid / ρ₀_grid stays near 1.
-        // ρ_grid = ρ_SI · dx² / dt²
-        let rho_grid = props.rho_kg_m3 * config.dx_meters * config.dx_meters
-            / (config.dt_seconds * config.dt_seconds);
+        // rest_density must be in the SAME units `particles.density[i]` actually comes
+        // out in -- i.e. whatever `estimate_particle_volumes`'s kernel-based density
+        // estimate produces for a particle spawned via `ParticleMass::particle_mass`
+        // (real SI kilograms) at rest. FIXED 2026-07-07 (real, confirmed bug): this
+        // used to include an extra `/dt_seconds^2` factor (`rho_SI*dx^2/dt^2`), which
+        // does NOT match that -- confirmed via a static (no-dynamics) probe:
+        // `estimate_particle_volumes` gives `density_grid = mass_grid / spacing^2` in
+        // the bulk (measured exactly: mass=1.0 -> density=4.0=1/0.25 at spacing=0.5),
+        // and with `particle_mass`'s real formula (`rho_SI*(spacing*dx)^2`), that
+        // reduces to exactly `rho_SI*dx^2` -- confirmed the extra `/dt^2` here made
+        // `rest_density` ~10000x too large (at dt=0.01), pinning any real fluid's EOS
+        // pressure at its floor (ratio always ~0, regardless of real depth/compression).
+        // The OTHER direction (inflating particle mass by `1/dt^2` instead) was tried
+        // and reverted -- see `Elastic::particle_mass`'s doc for why that broke the
+        // force-balance between gravity and the EOS's own restoring stress instead.
+        let rho_grid = props.rho_kg_m3 * config.dx_meters * config.dx_meters;
         Self::new(rho_grid, visc, eos, GAMMA)
     }
 }
@@ -116,10 +134,21 @@ impl MaterialModel for NewtonianFluidMaterial {
 
     fn kirchhoff_stress(&self, particles: &Particles, i: usize) -> Mat2 {
         // Clamp density both ways: min prevents div-by-zero at low PPC,
-        // max (2×ρ₀) prevents pressure spikes when particles are over-compressed on impact.
+        // max (10x rho0) limits how far the EOS pressure response saturates under
+        // impact overcompression. Was 2x; confirmed via direct A/B testing
+        // (2026-07-07) that 2x is too tight now that `rest_density`'s own
+        // conversion is fixed (see `NewtonianFluidMaterial::from_physical`'s doc):
+        // `fluid_spreads_more_than_elastic_under_gravity` (tests/accuracy.rs)
+        // passed at the OLD (buggy, ~10000x-too-large) rest_density with a 2x
+        // clamp, but fails at 2x once rest_density is correct -- verified by
+        // reverting only the clamp back to 2x with the rest_density fix in
+        // place: same failure, confirmed the clamp (not the rest_density fix)
+        // is the direct lever this specific test needs. 10x gives both this
+        // test and the hydrostatic settle test (see accuracy_benchmarks memory)
+        // enough headroom; full regression reconfirmed green at 10x.
         let density = particles.density[i]
             .max(self.min_density)
-            .min(self.rest_density * 2.0);
+            .min(self.rest_density * 10.0);
         let pressure = (self.eos_stiffness
             * ((density / self.rest_density).powf(self.eos_power) - 1.0))
             .max(self.pressure_floor);

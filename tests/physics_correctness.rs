@@ -15,9 +15,9 @@ use emerge::{
     ThermalStatsPlugin, collect_snapshot,
 };
 use emerge::{
-    BinghamFluidMaterial, CorotatedMaterial, DruckerPragerMaterial, MuIRheologyMaterial,
-    NeoHookeanMaterial, NewtonianFluidMaterial, SimConfig, Simulation, SpawnRegion,
-    StomakhinMaterial, ViscoelasticMaterial, VonMisesMaterial,
+    BinghamFluidMaterial, CorotatedMaterial, DruckerPragerMaterial, GranularFluidMaterial,
+    MuIRheologyMaterial, NeoHookeanMaterial, NewtonianFluidMaterial, SimConfig, Simulation,
+    SpawnRegion, StomakhinMaterial, ViscoelasticMaterial, VonMisesMaterial,
 };
 use glam::{IVec2, Mat2, Vec2};
 
@@ -134,6 +134,26 @@ fn mass_is_conserved_snow() {
     );
 }
 
+/// `GranularFluidMaterial` had ZERO test coverage of any kind before this
+/// (confirmed via a full test-file audit, 2026-07-07) -- not even a stability
+/// check, unlike every other material in this module. Baseline coverage
+/// matching every other material's pattern in this file.
+#[test]
+fn mass_is_conserved_granular_fluid() {
+    let mud = GranularFluidMaterial::saturated_loam(1.0e5, 0.2);
+    let mut solver = Simulation::new(zero_gravity_config(32), center_spawn(32, 6))
+        .with_default_material(Box::new(mud));
+
+    let m0 = total_mass(&solver);
+    solver.step_n(100);
+    let m1 = total_mass(&solver);
+
+    assert!(
+        (m1 - m0).abs() < 1e-6,
+        "granular fluid: mass not conserved: {m0:.6} -> {m1:.6}"
+    );
+}
+
 // â”€â”€â”€ CONSERVATION: LINEAR MOMENTUM (no external forces) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// With zero gravity and zero initial velocity, total momentum must stay near zero.
@@ -226,6 +246,18 @@ fn j_stays_positive_sand() {
     solver.step_n(200);
     let jmin = min_j(&solver);
     assert!(jmin > 0.0, "Sand: J collapsed to {jmin:.2e}");
+}
+
+#[test]
+fn j_stays_positive_granular_fluid() {
+    let mud = GranularFluidMaterial::saturated_loam(1.0e5, 0.2);
+    let config = SimConfig::standard(64, 0.05, Vec2::new(0.0, -9.81));
+    let mut solver =
+        Simulation::new(config, center_spawn(64, 8)).with_default_material(Box::new(mud));
+
+    solver.step_n(200);
+    let jmin = min_j(&solver);
+    assert!(jmin > 0.0, "GranularFluid: J collapsed to {jmin:.2e}");
 }
 
 #[test]
@@ -373,6 +405,36 @@ fn corotated_stress_symmetric() {
 fn snow_stress_symmetric() {
     let snow = StomakhinMaterial::from_young_modulus(1.4e5, 0.2);
     check_stress_symmetry(&snow, "Snow");
+}
+
+#[test]
+fn granular_fluid_stress_symmetric() {
+    // Not using the shared `check_stress_symmetry` helper's 1e-4 ABSOLUTE
+    // tolerance: this material's Tait EOS term produces stress magnitudes
+    // (~6400 here) far larger than the other materials this helper was
+    // calibrated against, so plain f32 rounding noise at that scale
+    // (~6400 * 1e-7 ~= 6e-4) alone exceeds a tolerance tuned for O(1-100)
+    // stresses. Checked RELATIVE asymmetry instead, which is scale-invariant.
+    let mud = GranularFluidMaterial::saturated_loam(1.0e5, 0.2);
+    let mut p = Particle::zeroed();
+    p.mass = 1.0;
+    p.initial_volume = 1.0;
+    p.volume = 1.0;
+    p.density = 1.0;
+    p.deformation_gradient = Mat2::from_cols(Vec2::new(1.1, 0.05), Vec2::new(0.1, 0.95));
+    mud.init_particle(&mut p);
+
+    let tau = kirchhoff_stress_of(&mud, &p);
+    let asym = (tau.col(0).y - tau.col(1).x).abs();
+    let scale = tau.col(0).y.abs().max(tau.col(1).x.abs()).max(1.0);
+    assert!(
+        asym / scale < 1.0e-5,
+        "GranularFluid: Kirchhoff stress asymmetric beyond float noise: \
+         tau01={:.6} tau10={:.6} relative diff={:.2e}",
+        tau.col(1).x,
+        tau.col(0).y,
+        asym / scale
+    );
 }
 
 #[test]

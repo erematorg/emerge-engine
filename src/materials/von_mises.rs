@@ -170,3 +170,129 @@ impl MaterialModel for VonMisesMaterial {
         )
     }
 }
+
+#[cfg(test)]
+mod marginal_yield_tests {
+    use super::*;
+    use crate::Particle;
+
+    /// Isolates whether `update_particle`'s return mapping matches the material's
+    /// OWN documented yield criterion (`2*mu*|dev(eps)| <= yield_stress`) exactly,
+    /// bypassing MPM's grid/transfer pipeline entirely -- same discipline as
+    /// `sand.rs::marginal_yield_tests`, which this engine's own citation audit
+    /// (2026-07-07) confirmed is the right pattern for verifying a plasticity
+    /// return-mapping against its own analytical yield surface. `VonMisesMaterial`
+    /// had ZERO test comparing it to any analytical result before this (only a
+    /// loose stress-stays-bounded overshoot check existed).
+    fn run_one_step(mat: &VonMisesMaterial, sigma: Vec2, kappa: f32) -> (Vec2, f32) {
+        let mut p = Particle::zeroed();
+        p.deformation_gradient = Mat2::from_cols(Vec2::new(sigma.x, 0.0), Vec2::new(0.0, sigma.y));
+        p.mass = 1.0;
+        p.initial_volume = 1.0;
+        p.friction_hardening = kappa;
+        let mut particles = Particles::from(vec![p]);
+        mat.update_particle(&mut particles, 0, 1.0);
+        let f = particles.deformation_gradient[0];
+        (
+            Vec2::new(f.x_axis.x, f.y_axis.y),
+            particles.friction_hardening[0],
+        )
+    }
+
+    /// Maps a TARGET `dev_norm` (the code's own L2-norm convention,
+    /// `dev.length()` for `dev=(eps1-tr/2, eps2-tr/2)`) to the per-component
+    /// magnitude `d` needed so that constructing `eps=(tr/2+d, tr/2-d)`
+    /// actually produces that `dev_norm` exactly: `dev=(d,-d)`, so
+    /// `dev.length() = d*sqrt(2)`, i.e. `d = dev_norm/sqrt(2)`.
+    fn per_component_d_for_target_dev_norm(target_dev_norm: f32) -> f32 {
+        target_dev_norm / std::f32::consts::SQRT_2
+    }
+
+    #[test]
+    fn marginal_state_at_yield_stress_does_not_yield() {
+        let mat = VonMisesMaterial::new(2000.0, 3000.0, 100.0);
+        // dev_norm exactly AT the yield threshold: 2*mu*dev_norm = yield_stress
+        // => dev_norm = yield_stress / (2*mu). Comfortably inside (99% of it).
+        let target_dev_norm = 0.99 * mat.yield_stress / (2.0 * mat.mu);
+        let d = per_component_d_for_target_dev_norm(target_dev_norm);
+        let trace = 0.0; // pure deviatoric, no volumetric strain
+        let eps1 = trace * 0.5 + d;
+        let eps2 = trace * 0.5 - d;
+        let sigma = Vec2::new(eps1.exp(), eps2.exp());
+
+        let (sigma_after, kappa_after) = run_one_step(&mat, sigma, 0.0);
+        assert!(
+            (sigma_after - sigma).length() < 1.0e-4,
+            "state inside the yield surface should stay elastic (no change): \
+             sigma={sigma:?} sigma_after={sigma_after:?}"
+        );
+        assert_eq!(
+            kappa_after, 0.0,
+            "kappa must not accumulate on an elastic step"
+        );
+    }
+
+    #[test]
+    fn marginal_state_beyond_yield_stress_projects_exactly_to_the_yield_surface() {
+        let mat = VonMisesMaterial::new(2000.0, 3000.0, 100.0);
+        // Comfortably OUTSIDE: 150% of the yield threshold.
+        let target_dev_norm = 1.5 * mat.yield_stress / (2.0 * mat.mu);
+        let d = per_component_d_for_target_dev_norm(target_dev_norm);
+        let trace = 0.4; // nonzero volumetric strain -- must be preserved exactly
+        let eps1 = trace * 0.5 + d;
+        let eps2 = trace * 0.5 - d;
+        let sigma = Vec2::new(eps1.exp(), eps2.exp());
+
+        let (sigma_after, kappa_after) = run_one_step(&mat, sigma, 0.0);
+
+        // Real, exact analytical claim: the projected state's dev_norm must equal
+        // EXACTLY yield_stress/(2*mu) (perfect plasticity, no hardening here) --
+        // not just "less than before." Computed the SAME way the material's own
+        // code does (L2 norm of the deviatoric vector), not a per-component value.
+        let eps_after = crate::materials::utils::hencky_strains(sigma_after);
+        let tr_after = eps_after.x + eps_after.y;
+        let dev_after_vec = eps_after - Vec2::splat(tr_after * 0.5);
+        let dev_after = dev_after_vec.length();
+        let expected_dev = mat.yield_stress / (2.0 * mat.mu);
+        assert!(
+            (dev_after - expected_dev).abs() < 1.0e-4,
+            "projected deviatoric strain should land EXACTLY on the yield surface \
+             (dev_norm = yield_stress/(2*mu) = {expected_dev:.6}), got {dev_after:.6}"
+        );
+
+        // Volumetric (trace) strain must be preserved exactly -- incompressible
+        // plastic flow assumption, a real documented claim of this material.
+        assert!(
+            (tr_after - trace).abs() < 1.0e-4,
+            "plastic flow must preserve volumetric strain exactly: expected trace={trace}, \
+             got {tr_after}"
+        );
+
+        assert!(kappa_after > 0.0, "kappa must accumulate on a plastic step");
+    }
+
+    #[test]
+    fn hardening_raises_the_effective_yield_surface() {
+        // With hardening_modulus > 0, a state that would yield at kappa=0 should
+        // require LESS additional plastic strain once kappa has already
+        // accumulated (softer transition) -- real, checkable monotonic claim.
+        let mat = VonMisesMaterial::with_hardening(2000.0, 3000.0, 100.0, 500.0);
+        let target_dev_norm = 1.5 * mat.yield_stress / (2.0 * mat.mu);
+        let d = per_component_d_for_target_dev_norm(target_dev_norm);
+        let sigma = Vec2::new(d.exp(), (-d).exp());
+
+        let (_, kappa_from_zero) = run_one_step(&mat, sigma, 0.0);
+        let (_, kappa_from_existing) = run_one_step(&mat, sigma, 1.0);
+
+        // Effective yield stress is HIGHER when kappa is already 1.0 (hardening),
+        // so the SAME trial state should trigger a SMALLER incremental gamma.
+        let gamma_from_zero = kappa_from_zero - 0.0;
+        let gamma_from_existing = kappa_from_existing - 1.0;
+        assert!(
+            gamma_from_existing < gamma_from_zero,
+            "hardening should shrink the plastic strain increment for the same trial \
+             state once kappa has already accumulated: gamma(kappa=0)={gamma_from_zero:.6} \
+             gamma(kappa=1)={gamma_from_existing:.6}"
+        );
+    }
+}

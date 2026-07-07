@@ -189,3 +189,123 @@ impl MaterialModel for ViscoelasticMaterial {
         elastic_dt.min(viscous_dt)
     }
 }
+
+#[cfg(test)]
+mod analytical_validation_tests {
+    use super::*;
+    use crate::Particle;
+
+    fn particle_with(f: Mat2, velocity_gradient: Mat2) -> Particles {
+        let mut p = Particle::zeroed();
+        p.deformation_gradient = f;
+        p.velocity_gradient = velocity_gradient;
+        p.mass = 1.0;
+        p.initial_volume = 1.0;
+        Particles::from(vec![p])
+    }
+
+    /// **Small-strain elastic limit must recover exact linear elasticity.**
+    /// This material's elastic term is `mu*(F*F^T-I) + lambda*ln(J)*I` -- the
+    /// SAME "simple" NeoHookean form as `NeoHookeanMaterial`'s own module-level
+    /// doc comment describes (that material's actual CODE was later changed to
+    /// a plane-strain vol-dev split, `k=lambda+mu`, but its top-of-file doc
+    /// comment was never updated to match -- a separate, minor stale-doc
+    /// finding, not touched here). For F=I+delta*E (E symmetric), this
+    /// linearizes to the STANDARD textbook form `2*mu*eps + lambda*tr(eps)*I`
+    /// (same as `CorotatedMaterial`'s own verified small-strain limit, NOT the
+    /// `k=lambda+mu` substitution NeoHookeanMaterial's split form needs).
+    /// `ViscoelasticMaterial` had zero test comparing it to any analytical
+    /// result before this.
+    #[test]
+    fn small_strain_elastic_term_matches_hookes_law_at_zero_strain_rate() {
+        let lambda = 1000.0;
+        let mu = 800.0;
+        let mat = ViscoelasticMaterial::new(lambda, mu, 50.0);
+
+        let delta = 1.0e-4_f32;
+        let e = Mat2::from_diagonal(Vec2::new(1.0, -0.4));
+        let f = Mat2::IDENTITY + delta * e;
+
+        let particles = particle_with(f, Mat2::ZERO); // zero strain rate -- no viscous term
+        let tau = mat.kirchhoff_stress(&particles, 0);
+
+        let eps = delta * e;
+        let tr_eps = eps.x_axis.x + eps.y_axis.y;
+        let predicted = Mat2::from_diagonal(Vec2::splat(lambda * tr_eps)) + 2.0 * mu * eps;
+
+        let diff = tau - predicted;
+        let err = (diff.x_axis.length_squared() + diff.y_axis.length_squared()).sqrt();
+        let scale = (predicted.x_axis.length_squared() + predicted.y_axis.length_squared()).sqrt();
+        assert!(
+            err / scale < 1.0e-3,
+            "small-strain viscoelastic elastic term should match linear elasticity: \
+             predicted={predicted:?} actual={tau:?} relative_err={:.2e}",
+            err / scale
+        );
+    }
+
+    /// **Kelvin-Voigt dashpot term must be EXACTLY `eta*D_dev`** -- this term is
+    /// linear in the velocity gradient by construction (no approximation
+    /// involved, unlike the elastic term's hyperelastic nonlinearity), so this
+    /// should match to full floating-point precision, not just approximately.
+    #[test]
+    fn viscous_term_matches_eta_times_deviatoric_strain_rate_exactly() {
+        let eta = 50.0;
+        let mat = ViscoelasticMaterial::new(1000.0, 800.0, eta);
+
+        // Pure shear strain rate C = [[0, g], [g, 0]] -- already symmetric and
+        // traceless, so D=C and D_dev=D exactly (same derivation as Bingham's
+        // own analytical test).
+        let g = 3.0_f32;
+        let c = Mat2::from_cols(Vec2::new(0.0, g), Vec2::new(g, 0.0));
+        // F=I (zero elastic contribution: mu*(I-I)+lambda*ln(1)*I = 0), isolating
+        // the viscous term entirely.
+        let particles = particle_with(Mat2::IDENTITY, c);
+        let tau = mat.kirchhoff_stress(&particles, 0);
+
+        let predicted = eta * c; // D_dev = C exactly for this pure-shear C
+        let diff = tau - predicted;
+        let err = (diff.x_axis.length_squared() + diff.y_axis.length_squared()).sqrt();
+        assert!(
+            err < 1.0e-4,
+            "viscous term should match eta*D_dev exactly (F=I isolates it from \
+             the elastic term): predicted={predicted:?} actual={tau:?}"
+        );
+    }
+
+    /// Real, checkable claim: elastic and viscous contributions are additive
+    /// (Kelvin-Voigt = spring + dashpot IN PARALLEL) -- stress at a state with
+    /// both nonzero strain AND nonzero strain rate must equal the sum of each
+    /// computed independently, not some coupled/nonlinear combination.
+    #[test]
+    fn elastic_and_viscous_contributions_are_additive() {
+        let lambda = 1000.0;
+        let mu = 800.0;
+        let eta = 50.0;
+        let mat = ViscoelasticMaterial::new(lambda, mu, eta);
+
+        let delta = 0.02_f32; // real (not infinitesimal) strain -- exact formula, no linearization needed
+        let e = Mat2::from_diagonal(Vec2::new(1.0, -0.3));
+        let f = Mat2::IDENTITY + delta * e;
+        let g = 4.0_f32;
+        let c = Mat2::from_cols(Vec2::new(0.0, g), Vec2::new(g, 0.0));
+
+        let combined = particle_with(f, c);
+        let elastic_only = particle_with(f, Mat2::ZERO);
+        let viscous_only = particle_with(Mat2::IDENTITY, c);
+
+        let tau_combined = mat.kirchhoff_stress(&combined, 0);
+        let tau_elastic = mat.kirchhoff_stress(&elastic_only, 0);
+        let tau_viscous = mat.kirchhoff_stress(&viscous_only, 0);
+
+        let diff = tau_combined - (tau_elastic + tau_viscous);
+        let err = (diff.x_axis.length_squared() + diff.y_axis.length_squared()).sqrt();
+        assert!(
+            err < 1.0e-3,
+            "elastic and viscous contributions must be exactly additive (parallel \
+             Kelvin-Voigt, not a coupled model): combined={tau_combined:?} \
+             elastic+viscous={:?}",
+            tau_elastic + tau_viscous
+        );
+    }
+}

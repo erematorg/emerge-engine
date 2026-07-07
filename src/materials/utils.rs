@@ -10,6 +10,44 @@ pub(crate) const LOG_CLAMP: f32 = 1e-10;
 /// All materials clamp J ≥ MIN_J after projection.
 pub(crate) const MIN_J: f32 = 1e-6;
 
+/// Floor on Rankine's exponentially-softened effective tensile strength, as a
+/// fraction of the virgin `tensile_strength`. Without this floor, `t_eff` decays
+/// toward zero as damage grows, so ANY sustained cyclic stress eventually exceeds
+/// it every step by a growing margin -- an unbounded damage ratchet with no
+/// resting state (found 2026-07-06: LP's real 2D bulk-modulus fix raised
+/// settling strain just enough to cross this for the first time; traced to
+/// unbounded growth over 1200 steps, no plateau, no numerical blowup in
+/// velocity -- the damage accumulator itself was the runaway, not the physics).
+/// Real quasi-brittle/ductile damage models retain nonzero residual capacity
+/// after yield rather than decaying to zero (Lemaitre & Chaboche, "Mechanics of
+/// Solid Materials," 1990 -- continuum damage mechanics caps effective
+/// stiffness/strength at a small nonzero residual specifically to keep the
+/// damage variable bounded under sustained loading). 5% is a conservative
+/// residual: still lets damage climb substantially before saturating, but
+/// guarantees a stress level cyclic loading can eventually stay under.
+pub(crate) const RANKINE_MIN_RESIDUAL_TENSILE_FRACTION: f32 = 0.05;
+
+/// Damage value at which `t_eff` has already reached its residual floor -- i.e.
+/// `tensile_strength * exp(-softening_rate * d) == tensile_strength * RESIDUAL_FRACTION`,
+/// solved for d. Past this point, MORE damage would not lower `t_eff` any further
+/// (it's already floored), so there is nothing left for the number to usefully
+/// track: sustained cyclic loading that exceeds even the residual strength would
+/// otherwise still accumulate damage forever, linearly, once the floor was hit --
+/// the floor alone stops the exponential runaway but not an unbounded linear
+/// climb. Clamping `prior_damage` at this saturation point is a no-op on future
+/// stress behavior (t_eff there is identical to t_eff at any higher damage value)
+/// and gives the accumulator a real rupture point instead of an arbitrary cutoff.
+/// `softening_rate <= 0` means no softening at all (hard cutoff, doc'd on
+/// `RankineMaterial::softening_rate`) -- saturation point is +infinity, i.e. no cap.
+#[inline]
+pub(crate) fn rankine_damage_saturation_point(softening_rate: f32) -> f32 {
+    if softening_rate <= 0.0 {
+        f32::INFINITY
+    } else {
+        -RANKINE_MIN_RESIDUAL_TENSILE_FRACTION.ln() / softening_rate
+    }
+}
+
 /// Compute Hencky (logarithmic) strains from SVD singular values.
 ///
 /// ε_i = ln(|σ_i|), clamped above 1e-10 to avoid ln(0).
@@ -71,14 +109,15 @@ pub fn rankine_damage_estimate(
     let a = 2.0 * mu + lambda;
     let tau = Vec2::new(a * eps.x + lambda * eps.y, lambda * eps.x + a * eps.y);
 
-    let t_eff = tensile_strength * (-softening_rate * prior_damage).exp();
+    let t_eff = (tensile_strength * (-softening_rate * prior_damage).exp())
+        .max(tensile_strength * RANKINE_MIN_RESIDUAL_TENSILE_FRACTION);
     let tau_proj = Vec2::new(tau.x.min(t_eff), tau.y.min(t_eff));
     if tau_proj == tau {
         return prior_damage; // within the tensile limit, no new damage
     }
 
     let eps_proj = stress_to_hencky(tau_proj, lambda, mu);
-    prior_damage + (eps - eps_proj).length()
+    (prior_damage + (eps - eps_proj).length()).min(rankine_damage_saturation_point(softening_rate))
 }
 
 /// 2D polar decomposition: returns the rotation R such that F = R·S.
