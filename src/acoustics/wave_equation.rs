@@ -9,7 +9,10 @@
 //!
 //! # Stability
 //! Check `is_stable()` before running — the Courant condition c·dt·√(1/dx² + 1/dy²) ≤ 1
-//! must hold or the simulation will diverge.
+//! must hold or the simulation will diverge (Courant, Friedrichs & Lewy 1928,
+//! "Über die partiellen Differenzengleichungen der mathematischen Physik" —
+//! the original real derivation of this stability bound for explicit FD wave
+//! schemes, still the standard reference cited for it today).
 //!
 //! # Reference
 //! Ported from `crates/energy/src/waves/wave_equation.rs`.

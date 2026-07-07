@@ -10,7 +10,10 @@
 //!
 //! Barnes-Hut approximation: treat a cluster of bodies as a single body at their
 //! center of mass when the cluster is "far enough" away — width/distance < θ (theta).
-//! θ = 0.5 is the standard trade-off (Springel 2005); lower is more accurate, higher is faster.
+//! θ = 0.5 is a common Barnes-Hut trade-off value in practice (e.g. GADGET-2's
+//! default region uses values in this neighborhood, Springel 2005, MNRAS
+//! 364:1105 — not independently confirmed as a specific universal default
+//! from that paper itself); lower is more accurate, higher is faster.
 //!
 //! # Reference
 //! Barnes & Hut 1986 (Nature). Ported from `crates/forces/src/core/gravity_math.rs`,
@@ -284,7 +287,7 @@ impl Quadtree {
 /// - `gravitational_constant`: G in simulation units. Tune to your scale.
 /// - `softening`: Plummer ε (grid cells). Prevents divergence as r→0. Typ. 0.5–2.0.
 /// - `theta`: Barnes-Hut opening angle. Must be in (0, 1].
-///   0.5 = standard trade-off (Springel 2005); lower = more accurate; higher = faster.
+///   0.5 = a common trade-off value in practice; lower = more accurate; higher = faster.
 pub struct NBodyGravityField {
     pub gravitational_constant: f32,
     pub softening: f32,
@@ -311,7 +314,7 @@ impl NBodyGravityField {
         assert!(
             theta > 0.0 && theta <= 1.0,
             "theta must be in (0, 1]; got {theta}. \
-             0.5 is the standard Barnes-Hut trade-off (Springel 2005)."
+             0.5 is a common Barnes-Hut trade-off value in practice."
         );
         Self {
             gravitational_constant,
