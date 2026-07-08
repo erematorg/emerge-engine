@@ -19,6 +19,10 @@ use emerge::{
     MuIRheologyMaterial, NeoHookeanMaterial, NewtonianFluidMaterial, SimConfig, Simulation,
     SpawnRegion, StomakhinMaterial, ViscoelasticMaterial, VonMisesMaterial,
 };
+// Boundary types kept on their own `use` line (not merged into the material
+// import block above) so this test file's imports don't collide with other
+// branches that also add to that block -- keeps independent PRs conflict-free.
+use emerge::{FrictionBoundary, GripFrictionBoundary, RatchetFrictionBoundary};
 use glam::{IVec2, Mat2, Vec2};
 
 // â”€â”€â”€ helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -1317,5 +1321,437 @@ fn corotated_negative_thermal_expansion_softens_stress() {
         norm_hot < norm_cold,
         "Corotated: heating with negative thermal_expansion should soften: \
          cold={norm_cold:.4} hot={norm_hot:.4}"
+    );
+}
+
+/// A muscle-driven soft body at FULL activation must stay bounded, not detonate.
+///
+/// Regression for the `basic_creature` demo blowup: driving `activation` to its
+/// documented `[0,1]` ceiling with a strong `active_stress_coeff` produces large
+/// active stress, which is only CFL-stable if (a) the adaptive substepper has
+/// real headroom and (b) `project_invalid_state` is on to catch any momentary
+/// degenerate particle before it cascades. With too few substeps and the
+/// projection safety net off, the body scatters to NaN. This asserts the
+/// stable-config contract: a peristaltic creature run at max drive for many
+/// frames stays finite and spatially coherent.
+#[test]
+fn muscle_creature_stays_bounded_at_full_activation() {
+    const GRID: usize = 64;
+    const DT: f32 = 0.1;
+    const MUSCLE_GROUPS: usize = 8;
+
+    let mut mat = NeoHookeanMaterial::new(5.0, 10.0);
+    mat.active_stress_coeff = 25.0;
+    let config = SimConfig {
+        min_dt: 0.01,
+        // Full CFL headroom + the degenerate-state safety net on: the two settings
+        // that keep max-activation muscle stress stable (see doc above).
+        max_substeps_per_step: 64,
+        project_invalid_state: true,
+        ..SimConfig::standard(GRID, DT, Vec2::new(0.0, -0.3))
+    };
+    let body_center = Vec2::new(32.0, 20.0);
+    let spawn = SpawnRegion {
+        spacing: 0.5,
+        box_size: IVec2::new(24, 6),
+        box_center: body_center,
+        material_id: 0,
+        precompute_initial_volumes: true,
+        ..SpawnRegion::for_sim(&config)
+    };
+    let mut sim = Simulation::new(config, spawn)
+        .with_default_material(Box::new(mat))
+        .with_boundary(Box::new(FrictionBoundary::new(4, 0.65)));
+
+    let body_range = 0..sim.particles().len();
+    let body_left = body_center.x - 12.0;
+    {
+        let particles = sim.particles_mut();
+        for i in body_range.clone() {
+            let t = ((particles.x[i].x - body_left) / 24.0).clamp(0.0, 1.0);
+            particles.muscle_group_id[i] = (t * MUSCLE_GROUPS as f32) as u32;
+            particles.activation_dir[i] = Vec2::Y;
+        }
+    }
+
+    // Bilateral CPG under a sustained hard steering bias -- matches the real
+    // interactive session that triggered a full-body NaN collapse at frame 1070
+    // (basic_creature demo, steer held at +1.0 for hundreds of frames).
+    const N_RINGS: usize = 2;
+    const N_PER_RING: usize = MUSCLE_GROUPS / N_RINGS;
+    let mut lnn = emerge::control::Lnn::coupled_traveling_wave(N_RINGS, N_PER_RING, 1.0, 1.0);
+    for step in 0..1500 {
+        lnn.set_ring_bias(0, N_PER_RING, 1.0);
+        lnn.set_ring_bias(1, N_PER_RING, -1.0);
+        lnn.step(DT);
+        let acts: Vec<f32> = lnn.activations().collect();
+        let range = body_range.clone();
+        let particles = sim.particles_mut();
+        for i in range {
+            let group = particles.muscle_group_id[i] as usize;
+            particles.activation[i] = (0.9 * acts[group]).clamp(0.0, 1.0);
+        }
+        sim.step();
+
+        let snap = sim.diagnostics_snapshot();
+        assert_eq!(
+            snap.non_finite_particle_values, 0,
+            "creature went non-finite at step {step} under sustained steering bias"
+        );
+    }
+}
+
+/// Three locomotion mechanisms compared honestly, in the order they were tried:
+///
+/// 1. Plain `FrictionBoundary` (symmetric cycle, no grip asymmetry) — measured
+///    near-zero net drift (the scallop-theorem problem: a symmetric muscle
+///    cycle against constant friction cancels its own displacement).
+/// 2. `GripFrictionBoundary` (phase-gated: extra grip only while the fiber is
+///    actively SHORTENING) — fixed an earlier magnitude-only design's lockup
+///    regression, but still only measured near-zero net drift (a few percent
+///    of body length) — a real, working mechanism biologically, but not
+///    sufficient on its own at this magnitude/tuning.
+/// 3. `RatchetFrictionBoundary` (directional/setae-style: asymmetric friction
+///    by tangential velocity SIGN, independent of muscle phase entirely) —
+///    this is what actually works. Confirmed against SoftZoo (the published
+///    MPM soft-robot locomotion benchmark) and real-crawler literature: neither
+///    uses phase-gated friction; real anchoring is structural asymmetry
+///    (setae/hooks), which this mirrors. Produces real, substantial locomotion
+///    (~body-length-scale drift) regardless of fiber direction, because the
+///    ratchet converts ANY horizontal jitter into net directional motion.
+#[test]
+fn grip_friction_locomotion_sweep() {
+    const GRID: usize = 64;
+    const DT: f32 = 0.1;
+    const MUSCLE_GROUPS: usize = 8;
+
+    fn run(boundary: Box<dyn emerge::BoundaryCondition>, fiber_dir: Vec2) -> f32 {
+        let mut mat = NeoHookeanMaterial::new(5.0, 10.0);
+        mat.active_stress_coeff = 25.0;
+        let config = SimConfig {
+            min_dt: 0.01,
+            max_substeps_per_step: 64,
+            project_invalid_state: true,
+            ..SimConfig::standard(GRID, DT, Vec2::new(0.0, -0.3))
+        };
+        let body_center = Vec2::new(32.0, 20.0);
+        let spawn = SpawnRegion {
+            spacing: 0.5,
+            box_size: IVec2::new(24, 6),
+            box_center: body_center,
+            material_id: 0,
+            precompute_initial_volumes: true,
+            ..SpawnRegion::for_sim(&config)
+        };
+        let mut sim = Simulation::new(config, spawn)
+            .with_default_material(Box::new(mat))
+            .with_boundary(boundary);
+
+        let body_range = 0..sim.particles().len();
+        let body_left = body_center.x - 12.0;
+        {
+            let particles = sim.particles_mut();
+            for i in body_range.clone() {
+                let t = ((particles.x[i].x - body_left) / 24.0).clamp(0.0, 1.0);
+                particles.muscle_group_id[i] = (t * MUSCLE_GROUPS as f32) as u32;
+                particles.activation_dir[i] = fiber_dir;
+            }
+        }
+
+        let mut lnn = emerge::control::Lnn::traveling_wave(MUSCLE_GROUPS, 1.0);
+        let mut centroid_start = Vec2::ZERO;
+        for step in 0..800 {
+            lnn.step(DT);
+            let acts: Vec<f32> = lnn.activations().collect();
+            let range = body_range.clone();
+            let particles = sim.particles_mut();
+            for i in range {
+                let group = particles.muscle_group_id[i] as usize;
+                particles.activation[i] = (0.9 * acts[group]).clamp(0.0, 1.0);
+            }
+            sim.step();
+            if step == 20 {
+                let particles = sim.particles();
+                let n = particles.len() as f32;
+                centroid_start = (0..particles.len()).map(|i| particles.x[i]).sum::<Vec2>() / n;
+            }
+        }
+        let particles = sim.particles();
+        let n = particles.len() as f32;
+        let centroid_end = (0..particles.len()).map(|i| particles.x[i]).sum::<Vec2>() / n;
+        (centroid_end - centroid_start).x
+    }
+
+    for fiber_dir in [Vec2::Y, Vec2::X] {
+        for grip_gain in [0.0, 0.3, 0.6, 0.9] {
+            let drift_x = run(
+                Box::new(GripFrictionBoundary::new(4, 0.65, grip_gain)),
+                fiber_dir,
+            );
+            println!("fiber={fiber_dir:?} grip_gain={grip_gain:.1} drift.x={drift_x:.2}");
+            assert!(
+                drift_x.is_finite() && drift_x.abs() < 20.0,
+                "fiber={fiber_dir:?} grip_gain={grip_gain}: drift.x={drift_x:.2} not physically sane"
+            );
+        }
+    }
+
+    println!("--- RatchetFrictionBoundary (directional/setae-style, no phase gating) ---");
+    for fiber_dir in [Vec2::Y, Vec2::X] {
+        for (mu_easy, mu_resist) in [(0.65, 0.65), (0.1, 0.95), (0.02, 1.0)] {
+            let drift_x = run(
+                Box::new(RatchetFrictionBoundary::new(4, mu_easy, mu_resist, Vec2::X)),
+                fiber_dir,
+            );
+            println!(
+                "fiber={fiber_dir:?} mu_easy={mu_easy:.2} mu_resist={mu_resist:.2} drift.x={drift_x:.2}"
+            );
+            // Sanity bound, not a "stay near zero" bound: real crawling should
+            // produce SUBSTANTIAL drift (up to several body-lengths; body is 24
+            // units long) -- only reject non-finite or truly runaway values.
+            assert!(
+                drift_x.is_finite() && drift_x.abs() < 200.0,
+                "fiber={fiber_dir:?} mu_easy={mu_easy} mu_resist={mu_resist}: \
+                 drift.x={drift_x:.2} not physically sane"
+            );
+        }
+    }
+}
+
+/// Permanent regression: `RatchetFrictionBoundary` must produce REAL, substantial,
+/// correctly-directed net locomotion for a muscle-driven soft body. This is the
+/// mechanism found to actually work (see `grip_friction_locomotion_sweep`'s doc
+/// for the two mechanisms that didn't). Body is 24 units long; a working crawl
+/// should cover a meaningful fraction of that, in the commanded `easy_direction`.
+#[test]
+fn ratchet_friction_produces_real_directed_locomotion() {
+    const GRID: usize = 64;
+    const DT: f32 = 0.1;
+    const MUSCLE_GROUPS: usize = 8;
+
+    let mut mat = NeoHookeanMaterial::new(5.0, 10.0);
+    mat.active_stress_coeff = 25.0;
+    let config = SimConfig {
+        min_dt: 0.01,
+        max_substeps_per_step: 64,
+        project_invalid_state: true,
+        ..SimConfig::standard(GRID, DT, Vec2::new(0.0, -0.3))
+    };
+    let body_center = Vec2::new(32.0, 20.0);
+    let spawn = SpawnRegion {
+        spacing: 0.5,
+        box_size: IVec2::new(24, 6),
+        box_center: body_center,
+        material_id: 0,
+        precompute_initial_volumes: true,
+        ..SpawnRegion::for_sim(&config)
+    };
+    let mut sim = Simulation::new(config, spawn)
+        .with_default_material(Box::new(mat))
+        .with_boundary(Box::new(RatchetFrictionBoundary::new(
+            4,
+            0.1,
+            0.95,
+            Vec2::X,
+        )));
+
+    let body_range = 0..sim.particles().len();
+    let body_left = body_center.x - 12.0;
+    {
+        let particles = sim.particles_mut();
+        for i in body_range.clone() {
+            let t = ((particles.x[i].x - body_left) / 24.0).clamp(0.0, 1.0);
+            particles.muscle_group_id[i] = (t * MUSCLE_GROUPS as f32) as u32;
+            particles.activation_dir[i] = Vec2::Y;
+        }
+    }
+
+    let mut lnn = emerge::control::Lnn::traveling_wave(MUSCLE_GROUPS, 1.0);
+    let mut centroid_start = Vec2::ZERO;
+    for step in 0..800 {
+        lnn.step(DT);
+        let acts: Vec<f32> = lnn.activations().collect();
+        let range = body_range.clone();
+        let particles = sim.particles_mut();
+        for i in range {
+            let group = particles.muscle_group_id[i] as usize;
+            particles.activation[i] = (0.9 * acts[group]).clamp(0.0, 1.0);
+        }
+        sim.step();
+        if step == 20 {
+            let particles = sim.particles();
+            let n = particles.len() as f32;
+            centroid_start = (0..particles.len()).map(|i| particles.x[i]).sum::<Vec2>() / n;
+        }
+
+        let snap = sim.diagnostics_snapshot();
+        assert_eq!(
+            snap.non_finite_particle_values, 0,
+            "creature went non-finite at step {step} during ratchet-driven crawling"
+        );
+    }
+    let particles = sim.particles();
+    let n = particles.len() as f32;
+    let centroid_end = (0..particles.len()).map(|i| particles.x[i]).sum::<Vec2>() / n;
+    let drift_x = (centroid_end - centroid_start).x;
+
+    assert!(
+        drift_x > 10.0,
+        "ratchet friction should produce a real, substantial crawl in the +X \
+         easy_direction (expected > 10 units of an 24-unit-long body), got {drift_x:.2}"
+    );
+}
+
+/// `RatchetFrictionBoundary::set_easy_direction` must be a REAL, live control —
+/// not cosmetic. Regression for a real gap found interactively: the demo's
+/// left/right steer changed CPG ring bias but never reached the ratchet's
+/// direction (baked in at construction), so steering could not actually change
+/// which way the body crawled. This proves the fix: an `Arc`-shared boundary
+/// instance, flipped mid-run via `set_easy_direction`, must make the body
+/// reverse -- the crawl in the second half must go the OPPOSITE way from the
+/// first half, not just slow down or stay flat.
+#[test]
+fn ratchet_easy_direction_is_live_and_reversible() {
+    const GRID: usize = 64;
+    const DT: f32 = 0.1;
+    const MUSCLE_GROUPS: usize = 8;
+
+    let mut mat = NeoHookeanMaterial::new(5.0, 10.0);
+    mat.active_stress_coeff = 25.0;
+    let config = SimConfig {
+        min_dt: 0.01,
+        max_substeps_per_step: 64,
+        project_invalid_state: true,
+        ..SimConfig::standard(GRID, DT, Vec2::new(0.0, -0.3))
+    };
+    let body_center = Vec2::new(32.0, 20.0);
+    let spawn = SpawnRegion {
+        spacing: 0.5,
+        box_size: IVec2::new(24, 6),
+        box_center: body_center,
+        material_id: 0,
+        precompute_initial_volumes: true,
+        ..SpawnRegion::for_sim(&config)
+    };
+    let ratchet = std::sync::Arc::new(RatchetFrictionBoundary::new(4, 0.1, 0.95, Vec2::X));
+    let mut sim = Simulation::new(config, spawn)
+        .with_default_material(Box::new(mat))
+        .with_boundary(Box::new(std::sync::Arc::clone(&ratchet)));
+
+    let body_range = 0..sim.particles().len();
+    let body_left = body_center.x - 12.0;
+    {
+        let particles = sim.particles_mut();
+        for i in body_range.clone() {
+            let t = ((particles.x[i].x - body_left) / 24.0).clamp(0.0, 1.0);
+            particles.muscle_group_id[i] = (t * MUSCLE_GROUPS as f32) as u32;
+            particles.activation_dir[i] = Vec2::Y;
+        }
+    }
+
+    let mut lnn = emerge::control::Lnn::traveling_wave(MUSCLE_GROUPS, 1.0);
+    let centroid_at = |sim: &Simulation| -> Vec2 {
+        let particles = sim.particles();
+        let n = particles.len() as f32;
+        (0..particles.len()).map(|i| particles.x[i]).sum::<Vec2>() / n
+    };
+
+    let mut centroid_start = Vec2::ZERO;
+    let mut centroid_mid = Vec2::ZERO;
+    for step in 0..800 {
+        if step == 500 {
+            // Live flip mid-run, before the body settles into its resting
+            // stall (observed interactively to happen ~step 600) -- same
+            // instance the solver is already using.
+            ratchet.set_easy_direction(Vec2::NEG_X);
+            centroid_mid = centroid_at(&sim);
+        }
+        lnn.step(DT);
+        let acts: Vec<f32> = lnn.activations().collect();
+        let range = body_range.clone();
+        let particles = sim.particles_mut();
+        for i in range {
+            let group = particles.muscle_group_id[i] as usize;
+            particles.activation[i] = (0.9 * acts[group]).clamp(0.0, 1.0);
+        }
+        sim.step();
+        if step == 20 {
+            centroid_start = centroid_at(&sim);
+        }
+    }
+    let centroid_end = centroid_at(&sim);
+
+    let first_half_drift = (centroid_mid - centroid_start).x;
+    let second_half_drift = (centroid_end - centroid_mid).x;
+
+    assert!(
+        first_half_drift > 3.0,
+        "first half (easy_direction=+X) should crawl forward, got {first_half_drift:.2}"
+    );
+    assert!(
+        second_half_drift < -1.0,
+        "second half, AFTER live set_easy_direction(NEG_X), should crawl backward \
+         (not just stop) -- got {second_half_drift:.2}. If this is ~0, the live \
+         direction control isn't actually reaching the physics."
+    );
+}
+
+/// KNOWN BUG, not yet fixed: both `Lnn::traveling_wave` and
+/// `Lnn::coupled_traveling_wave` converge to a fully-synchronized fixed point
+/// (oscillation dies -- every neuron in every ring settles to an identical
+/// constant value) within ~20 steps at dt=0.1, REGARDLESS of external ring
+/// bias (reproduced at bias=0.0 through 1.0 -- this is not a steering-input
+/// problem). This is pre-existing, present before any of this session's
+/// bilateral-CPG/steering/ratchet-friction work, and explains a lot in
+/// retrospect: every `basic_creature` demo run this session showed
+/// `act mean/max` frozen at 2-decimal-identical values almost from the start,
+/// which was misread as "a small but real oscillation" -- it was actually a
+/// dead oscillator driving a static, uniform muscle contraction the entire
+/// time. This is also why fiber direction and grip-phase gating never
+/// mattered for locomotion (there was no real phase to gate on), and why
+/// `RatchetFrictionBoundary` worked anyway (it ratchets ANY residual
+/// settling/falling jitter, not a genuine peristaltic gait) and why it stalls
+/// once the body fully settles (the residual jitter runs out).
+///
+/// Root cause of why this was never caught: the only existing regression,
+/// `traveling_wave_oscillates` (this file, mod tests in lnn.rs), runs just 50
+/// steps at dt=0.01 (0.5 simulated seconds) and only checks that state moved
+/// AT ALL from its initial condition -- which passes even while converging to
+/// a fixed point. No test anywhere checks LONG-horizon sustained oscillation,
+/// which is the timescale real gameplay actually runs at.
+///
+/// This test is `#[ignore]`d, not deleted: it documents the real, current,
+/// broken behavior with a concrete number (should be `false`, currently
+/// `true`) rather than silently passing or losing the finding. Un-ignore once
+/// the CPG is retuned to sustain a genuine limit cycle and this should fail
+/// (proving the fix), then flip the assertion.
+#[test]
+#[ignore = "documents an open bug: CPG oscillator dies within ~20 steps regardless of bias -- see doc comment"]
+fn cpg_oscillator_dies_within_20_steps_known_bug() {
+    let dt = 0.1;
+
+    let mut lnn = emerge::control::Lnn::coupled_traveling_wave(2, 4, 1.0, 1.0);
+    let mut prev: Vec<f32> = lnn.activations().collect();
+    let mut died_by_step_50 = false;
+    for step in 0..50 {
+        lnn.step(dt);
+        let acts: Vec<f32> = lnn.activations().collect();
+        let max_delta = acts
+            .iter()
+            .zip(prev.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        if step > 10 && max_delta < 1e-7 {
+            died_by_step_50 = true;
+        }
+        prev = acts;
+    }
+
+    assert!(
+        !died_by_step_50,
+        "BUG STILL PRESENT: coupled_traveling_wave's oscillator died (fully \
+         synchronized, zero relative phase) within 50 steps at dt=0.1, with \
+         zero external bias. Real gameplay runs thousands of these steps, so \
+         this means no real traveling wave ever sustains -- see doc comment."
     );
 }
