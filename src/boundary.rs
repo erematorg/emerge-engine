@@ -294,3 +294,115 @@ fn clamp_position_inside_grid(thickness: usize, position: Vec2, grid_res: usize)
     let max = grid_res.saturating_sub(thickness) as f32;
     position.clamp(Vec2::splat(min), Vec2::splat(max))
 }
+
+#[cfg(test)]
+mod boundary_physics_tests {
+    use super::*;
+
+    /// The defining property of a frictionless slip wall: tangential velocity
+    /// passes through completely UNCHANGED (only the inward normal component
+    /// is blocked). No existing test checked this precisely -- only whole-
+    /// simulation "particles stay inside the domain" tests exist, which don't
+    /// isolate this specific claim.
+    #[test]
+    fn slip_wall_preserves_tangential_velocity_exactly() {
+        // x=0 (left wall zone), y=32 (mid-grid, clear of every other wall) --
+        // isolates the left wall's check alone, avoids corner-cell double-hits.
+        let mut v = Vec2::new(-3.0, 7.5); // moving into the wall, tangential=7.5
+        apply_slip_wall_velocity(2, /* cell_index for x=0,y=32 */ 32, 64, &mut v);
+        assert_eq!(
+            v.y, 7.5,
+            "tangential (Y) component must pass through exactly unchanged"
+        );
+        assert!(
+            v.x >= 0.0,
+            "inward (X) component must be blocked (>= 0, not still negative)"
+        );
+    }
+
+    /// Outward-moving velocity (already leaving the wall) must be completely
+    /// untouched by a slip wall -- "no-penetration" only blocks entry, it must
+    /// never resist or clamp an escaping particle's velocity.
+    #[test]
+    fn slip_wall_does_not_touch_outward_velocity() {
+        // x=0 (left wall zone), y=32 (mid-grid, clear of every other wall) --
+        // isolates the left wall's check alone, avoids corner-cell double-hits.
+        let mut v = Vec2::new(4.0, -2.0); // moving AWAY from the left wall
+        apply_slip_wall_velocity(2, /* cell_index for x=0,y=32 */ 32, 64, &mut v);
+        assert_eq!(
+            v,
+            Vec2::new(4.0, -2.0),
+            "outward velocity must be completely untouched"
+        );
+    }
+
+    /// mu=0 must behave IDENTICALLY to a pure slip wall -- FrictionBoundary's own
+    /// doc comment claims this ("friction_coefficient = 0.0 -> pure slip (same as
+    /// SlipBoundary)") but nothing verified it precisely until now.
+    #[test]
+    fn coulomb_wall_at_zero_friction_matches_pure_slip() {
+        let mut v_friction = Vec2::new(-3.0, 7.5);
+        apply_coulomb_wall(&mut v_friction, Vec2::X, 0.0);
+
+        let mut v_slip = Vec2::new(-3.0, 7.5);
+        apply_slip_wall_velocity(2, 0, 64, &mut v_slip);
+
+        assert_eq!(
+            v_friction.y, v_slip.y,
+            "mu=0 tangential result must match pure slip exactly"
+        );
+        assert_eq!(
+            v_friction.x, 0.0,
+            "normal component always fully zeroed on impact"
+        );
+    }
+
+    /// Real Coulomb friction law: tangential speed is reduced by EXACTLY
+    /// mu * |v_normal| (not more, not less), direction preserved -- this is the
+    /// actual physical law (friction force proportional to normal force), not
+    /// just "friction slows things down somewhat."
+    #[test]
+    fn coulomb_wall_reduces_tangential_speed_by_exactly_mu_times_normal_speed() {
+        let v_n = 4.0_f32; // normal speed into the wall
+        let v_t = 10.0_f32; // tangential speed
+        let mu = 0.3_f32;
+        let mut v = Vec2::new(-v_n, v_t);
+        apply_coulomb_wall(&mut v, Vec2::X, mu);
+
+        let expected_v_t = v_t - mu * v_n; // = 10.0 - 1.2 = 8.8
+        assert!(
+            (v.y - expected_v_t).abs() < 1.0e-5,
+            "tangential speed after friction should be exactly v_t - mu*v_n = {expected_v_t}, got {}",
+            v.y
+        );
+        assert_eq!(v.x, 0.0, "normal component always fully zeroed on impact");
+    }
+
+    /// Real Coulomb friction can only decelerate, never reverse direction --
+    /// once tangential speed would go negative, it clamps to exactly zero
+    /// (a particle can't be pushed backward by its own friction).
+    #[test]
+    fn coulomb_wall_never_reverses_tangential_direction() {
+        let mut v = Vec2::new(-10.0, 2.0); // huge normal speed, tiny tangential
+        apply_coulomb_wall(&mut v, Vec2::X, 0.9); // friction_impulse = 9.0 > v_t=2.0
+        assert_eq!(
+            v,
+            Vec2::ZERO,
+            "when friction impulse exceeds tangential speed, result must be exactly zero, \
+             never a reversed/negative tangential velocity"
+        );
+    }
+
+    /// Outward-moving velocity must be completely untouched by Coulomb friction
+    /// too, same as the slip wall -- friction only applies to genuine impacts.
+    #[test]
+    fn coulomb_wall_does_not_touch_outward_velocity() {
+        let mut v = Vec2::new(4.0, -2.0); // moving away from the wall
+        apply_coulomb_wall(&mut v, Vec2::X, 0.9);
+        assert_eq!(
+            v,
+            Vec2::new(4.0, -2.0),
+            "outward velocity must be completely untouched"
+        );
+    }
+}

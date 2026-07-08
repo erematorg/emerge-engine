@@ -124,3 +124,122 @@ impl MaterialModel for CorotatedMaterial {
         )
     }
 }
+
+#[cfg(test)]
+mod small_strain_linear_elasticity_tests {
+    use super::*;
+    use glam::Vec2;
+
+    /// **Small-strain limit must recover exact linear elasticity (Hooke's law).**
+    ///
+    /// `CorotatedMaterial` had zero test comparing it to any measured/analytical
+    /// result (confirmed via a full test-file audit, 2026-07-07). For a
+    /// SYMMETRIC small strain F=I+delta*E (E symmetric, no rotation), the polar
+    /// decomposition's rotation R is EXACTLY I (not just to leading order --
+    /// `polar_decomposition_2d`'s own formula gives y=F10-F01=delta(E10-E01)=0
+    /// exactly when E is symmetric, so R=I for any delta, not an approximation).
+    /// This makes the leading-order linearization of tau=2*mu*(F-R)*F^T +
+    /// lambda*(J-1)*J*I reduce to EXACTLY tau = 2*mu*eps + lambda*tr(eps)*I
+    /// (eps=delta*E) -- the textbook linear-elasticity form directly, no
+    /// plane-strain k=lambda+mu correction needed (unlike NeoHookean's
+    /// vol-dev split form -- Corotated already IS linear elasticity, just
+    /// extended to finite rotation).
+    fn particle_with_f(f: Mat2) -> Particles {
+        let mut particles = Particles::default();
+        particles.push(Particle {
+            x: Vec2::ZERO,
+            v: Vec2::ZERO,
+            velocity_gradient: Mat2::ZERO,
+            deformation_gradient: f,
+            mass: 1.0,
+            initial_volume: 1.0,
+            volume: 1.0,
+            density: 1.0,
+            material_id: 0,
+            plastic_volume_ratio: 1.0,
+            hardening_scale: 1.0,
+            friction_hardening: 0.0,
+            log_volume_strain: 0.0,
+            temperature: 0.0,
+            user_tag: 0,
+            activation: 0.0,
+            activation_dir: Vec2::ZERO,
+            muscle_group_id: 0,
+            sleeping: 0,
+        });
+        particles
+    }
+
+    fn linear_elastic_prediction(lambda: f32, mu: f32, eps: Mat2) -> Mat2 {
+        let tr_eps = eps.x_axis.x + eps.y_axis.y;
+        Mat2::from_diagonal(Vec2::splat(lambda * tr_eps)) + 2.0 * mu * eps
+    }
+
+    #[test]
+    fn small_uniaxial_strain_matches_hookes_law() {
+        let lambda = 1000.0;
+        let mu = 800.0;
+        let mat = CorotatedMaterial::new(lambda, mu);
+
+        let delta = 1.0e-4_f32;
+        let e = Mat2::from_diagonal(Vec2::new(1.0, 0.0));
+        let f = Mat2::IDENTITY + delta * e;
+
+        let particles = particle_with_f(f);
+        let tau = mat.kirchhoff_stress(&particles, 0);
+        let predicted = linear_elastic_prediction(lambda, mu, delta * e);
+
+        let diff = tau - predicted;
+        let err = (diff.x_axis.length_squared() + diff.y_axis.length_squared()).sqrt();
+        let scale = (predicted.x_axis.length_squared() + predicted.y_axis.length_squared()).sqrt();
+        assert!(
+            err / scale < 1.0e-3,
+            "small-strain Corotated stress should match linear elasticity to O(delta^2): \
+             predicted={predicted:?} actual={tau:?} relative_err={:.2e}",
+            err / scale
+        );
+    }
+
+    #[test]
+    fn small_shear_strain_matches_hookes_law() {
+        let lambda = 500.0;
+        let mu = 1200.0;
+        let mat = CorotatedMaterial::new(lambda, mu);
+
+        let delta = 1.0e-4_f32;
+        let e = Mat2::from_cols(Vec2::new(0.0, 1.0), Vec2::new(1.0, 0.0));
+        let f = Mat2::IDENTITY + delta * e;
+
+        let particles = particle_with_f(f);
+        let tau = mat.kirchhoff_stress(&particles, 0);
+        let predicted = linear_elastic_prediction(lambda, mu, delta * e);
+
+        let diff = tau - predicted;
+        let err = (diff.x_axis.length_squared() + diff.y_axis.length_squared()).sqrt();
+        let scale = (predicted.x_axis.length_squared() + predicted.y_axis.length_squared()).sqrt();
+        assert!(
+            err / scale < 1.0e-3,
+            "small-strain Corotated shear stress should match linear elasticity to O(delta^2): \
+             predicted={predicted:?} actual={tau:?} relative_err={:.2e}",
+            err / scale
+        );
+    }
+
+    /// Real, exact property (not an approximation): for symmetric F, the
+    /// rotation R from polar decomposition must be EXACTLY identity, at any
+    /// strain magnitude (not just small) -- this is what makes Corotated
+    /// reduce cleanly to linear elasticity for pure-strain (no-rotation)
+    /// deformations. Checked directly, independent of the Hooke's-law tests
+    /// above.
+    #[test]
+    fn symmetric_deformation_gradient_has_exact_identity_rotation() {
+        let e = Mat2::from_cols(Vec2::new(0.3, -0.15), Vec2::new(-0.15, 0.6)); // symmetric, large
+        let f = Mat2::IDENTITY + e;
+        let r = polar_decomposition_2d(f);
+        assert!(
+            (r - Mat2::IDENTITY).x_axis.length() < 1.0e-6
+                && (r - Mat2::IDENTITY).y_axis.length() < 1.0e-6,
+            "symmetric F must give EXACTLY R=I, got {r:?}"
+        );
+    }
+}

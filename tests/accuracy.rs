@@ -63,6 +63,14 @@ fn measure_pile_shape(xs: &[Vec2], floor: f32) -> PileShape {
 /// "collapse dynamics overshoot" (known to lower 2D-MPM repose) from a real
 /// under-friction in the DP return mapping / φ(q) hardening (which starts at 25° at q=0).
 /// `#[ignore]` keeps the suite green while recording the real expected value below.
+///
+/// CROSS-CHECKED ON GPU (2026-07-07, see `tests/gpu.rs::gpu_sand_angle_of_repose_is_physical`):
+/// GPU gives 12.1°, essentially identical to this CPU result -- unlike the
+/// Lajeunesse runout gap (which turned out to be a CPU-specific numerical
+/// artifact, resolved via `cohesion` on CPU but genuinely NOT needed on GPU,
+/// see `sand_column_collapse_runout_matches_lajeunesse_scaling`'s doc), this
+/// repose-angle gap reproduces cross-platform. It is real physics/model
+/// behavior, not a numerics quirk of either solver.
 #[ignore = "accuracy gap under investigation: observed ~12° vs expected 30-35° — do not tune to pass"]
 #[test]
 fn sand_angle_of_repose_is_physical() {
@@ -705,6 +713,199 @@ fn earth_gravity_freefall_velocity_matches_gt() {
     assert!(
         (mean_vy - v_expected_grid).abs() < tol,
         "freefall velocity mismatch: expected {v_expected_grid:.6} cells/step, got {mean_vy:.6}"
+    );
+}
+
+/// **Hydrostatic pressure profile** — a column of real water at rest under gravity
+/// must develop pressure p(depth) = ρ·g·depth (Pascal's law), the most basic real
+/// fluid benchmark there is. `NewtonianFluidMaterial` had zero IRL-quantitative
+/// validation before this (only a qualitative "fluid spreads more than elastic"
+/// check existed) despite being LP's actual water material.
+///
+/// Real water via `Fluid` (LP's own property-struct path, not a hand-tuned test
+/// constant): ρ=1000 kg/m³, η=0.001 Pa·s, weakly-compressible EOS
+/// (bulk_modulus_pa=2.25e5, matching LP's own `WATER_PROPS` choice and its real
+/// justification -- see LP's `world::materials` doc, Becker & Teschner 2007
+/// weakly-compressible practice). Settles under `SimConfig::earth`'s real g=9.81
+/// for long enough that the EOS-driven pressure buildup reaches quasi-equilibrium
+/// (unlike sand's plastic ratchet, a fluid's pressure response to local density is
+/// direct and fast, not history-dependent).
+///
+/// Expected pressure is converted through the SAME `config.stress_from_si` the
+/// material's own `FromSI` impl uses internally (not an independent guess at the
+/// grid-unit scale) -- this checks the material's OWN claimed physics against a
+/// real analytical law, not two independently-invented unit systems.
+/// OPEN FINDING (2026-07-07): building this benchmark found and fixed two real,
+/// confirmed structural bugs on the way to a genuine hydrostatic-pressure test:
+///
+/// 1. `rest_density`'s SI-to-grid conversion (`FromSI<NewtonianFluid>`, and the
+///    equivalent in Bingham/GranularFluid) had an erroneous extra
+///    `/dt_seconds^2` factor, making it ~10000x too large at LP's grid scale.
+///    This pinned any real EOS fluid's pressure at its floor permanently,
+///    regardless of depth/compression (density/rest_density ratio was always
+///    near zero). FIXED: dropped the factor -- confirmed via a static
+///    (no-dynamics) density probe that `rho_SI*dx_meters^2` (no `/dt^2`) is
+///    the value `estimate_particle_volumes`'s kernel-based density estimate
+///    actually produces for a particle spawned via `ParticleMass::particle_mass`.
+///    (A different fix -- inflating `particle_mass` by `1/dt^2` instead -- was
+///    tried first and reverted after reading `transfer.rs::scatter_particles_to_grid`
+///    directly: it broke the force-balance between gravity and the EOS's own
+///    restoring stress instead, since gravity's momentum term and the grid mass
+///    accumulator both scale with particle mass but the stress-based momentum
+///    term does not.)
+/// 2. Once `rest_density` was corrected (much smaller), the acoustic CFL bound
+///    (`c^2 ~ eos_stiffness/rest_density`) got much stricter, and the default
+///    `min_dt` floor was too coarse to represent it -- causing genuine,
+///    non-decaying velocity oscillation (max_speed staying at 150-700 cells/s
+///    indefinitely, confirmed NOT explained by `max_substeps_per_step`: identical
+///    output at both 256 and 8000). FIXED: lowered `min_dt` to 1e-7 for this test.
+///
+/// Together these turned a catastrophic, permanent pancake collapse (density
+/// spiking to 2850-6072x rest_density, confirmed resolution-independent across
+/// both a dropped column and a gentle layer-by-layer pour) into genuine,
+/// converging settling: density plateaus at ~1.3x rest_density with velocity
+/// properly decaying to near-zero (see the settle trace in this fix's
+/// changelog) -- a real, substantial improvement, not a cosmetic one.
+///
+/// STILL OPEN: ~1.3x rest_density is still noticeably more compression than
+/// real hydrostatic equilibrium needs at this shallow depth (~1.003x, by direct
+/// calculation) -- and because this EOS is a 7th-power law, that residual
+/// overshoot inflates measured pressure by ~500x versus the naive rho*g*h
+/// prediction. Both a long-horizon settle trace (5000 steps) and a taller/
+/// heavier poured column were tried; density keeps slowly approaching 1.0 but
+/// doesn't fully arrive in a practical number of steps, and a taller pour
+/// needs proportionally finer `min_dt` (expensive: 30+ min/iteration at this
+/// scale). The real remaining fix is almost certainly proper geostatic
+/// pre-stress initialization (start particles at their equilibrium compression
+/// instead of settling dynamically from an unstressed F=I spawn) -- a genuine,
+/// separate, bounded piece of work, not a quick follow-on.
+///
+/// Even the qualitative "pressure trends upward with depth" claim doesn't hold
+/// cleanly at this test's practical scale: the real rho*g*h signal across a
+/// shallow ~3-cell depth range is tiny (~0.3 grid units total), and is
+/// completely swamped by particle-level noise riding on top of the ~1.3x
+/// systematic overshoot (measured pressure noise band ~100-400 grid units,
+/// over 100x the real signal). `#[ignore]`d honestly rather than asserting
+/// something not actually demonstrated -- same discipline as the sand
+/// repose-angle gaps in this file.
+#[ignore = "density settles at ~1.3x rest_density (not the ~1.003x real hydrostatic \
+            equilibrium needs), and this EOS's 7th-power nonlinearity amplifies that into \
+            ~500x pressure overshoot -- real, needs geostatic pre-stress init, not a quick \
+            fix. See doc comment for the two real bugs already found+fixed along the way \
+            (rest_density's erroneous /dt^2 factor, min_dt too coarse for the corrected CFL)."]
+#[test]
+fn hydrostatic_pressure_matches_rho_g_h() {
+    let dx_m = 0.01_f32;
+    let dt_s = 0.01_f32;
+    const GRID_RES: usize = 64;
+    let config = SimConfig {
+        max_substeps_per_step: 8000,
+        min_dt: 1.0e-7,
+        ..SimConfig::earth(GRID_RES, dx_m, dt_s)
+    };
+
+    // Real weakly-compressible water, matching LP's own `WATER_PROPS` choice
+    // (see LP's world::materials doc) -- no artificial softening needed now
+    // that `particle_mass` is correctly scaled (see its 2026-07-07 fix doc).
+    let water = emerge::Fluid {
+        rho_kg_m3: 1000.0,
+        eta_pa_s: 0.001,
+        bulk_modulus_pa: 2.25e5,
+        yield_stress_pa: None,
+    };
+
+    // Single modest block, not a tall multi-layer pour: proven stable and
+    // properly-converging at this scale (see `diag_long_settle_density_creep`,
+    // 2026-07-07 -- real velocity decay to near-zero, density settling near
+    // rest_density, not the catastrophic pancaking a taller/heavier pour
+    // triggers at this same `min_dt`). A taller pour needs a correspondingly
+    // finer `min_dt` (the real CFL requirement gets stricter as more weight
+    // stacks up) -- kept modest here to stay in the fast, confirmed-stable
+    // regime rather than re-discovering that tuning empirically at 30+
+    // minutes per iteration.
+    let width = GRID_RES as i32 - 6; // nearly fills the domain -- no room to spread sideways
+    let spawn = SpawnRegion {
+        spacing: 0.5,
+        box_size: glam::IVec2::new(width, 6),
+        box_center: glam::Vec2::new(GRID_RES as f32 * 0.5, 5.0),
+        precompute_initial_volumes: true,
+        mass_override: Some(water.particle_mass(0.5, &config)),
+        ..SpawnRegion::for_sim(&config)
+    };
+    let mut solver = Simulation::new(config, spawn)
+        .with_default_material(water.material(&config))
+        .with_boundary(Box::new(FrictionBoundary::new(2, 0.3)));
+
+    solver.step_n(3000); // matches the settle horizon confirmed to converge during this fix's investigation
+
+    let particles = solver.particles();
+    let max_y = particles.x.iter().map(|p| p.y).fold(f32::MIN, f32::max);
+    let mean_density: f32 = particles.density.iter().sum::<f32>() / particles.density.len() as f32;
+    let max_speed = particles
+        .v
+        .iter()
+        .map(|v| v.length())
+        .fold(0.0f32, f32::max);
+    println!(
+        "SETTLED: n={} max_y={max_y:.3} mean_density={mean_density:.2} max_speed={max_speed:.3}",
+        particles.len()
+    );
+
+    // Sample particles at several depths, compare measured pressure (from the
+    // material's own kirchhoff_stress, -trace/2 in 2D isotropic stress) against
+    // the real analytical p = rho*g*depth, converted through the same
+    // non-dimensionalization `NewtonianFluidMaterial::from_physical` used.
+    let g_si = 9.81_f32;
+    let mat = water.material(&config); // same deterministic construction as the sim used (SimConfig is Copy)
+
+    let mut checked = 0;
+    let mut max_rel_err = 0.0f32;
+    let mut by_depth: Vec<(f32, f32, f32)> = Vec::new(); // (depth_cells, expected, measured)
+    for i in 0..particles.len() {
+        let depth_cells = max_y - particles.x[i].y;
+        if depth_cells < 3.0 {
+            continue; // skip the free surface (real pressure ~0 there, noisy relative error)
+        }
+        let depth_m = depth_cells * dx_m;
+        let p_expected_pa = water.rho_kg_m3 * g_si * depth_m;
+        let p_expected_grid = config.stress_from_si(p_expected_pa, water.rho_kg_m3);
+
+        let soa = Particles::from(vec![particles.get(i)]);
+        let tau = mat.kirchhoff_stress(&soa, 0);
+        let p_measured_grid = -(tau.col(0).x + tau.col(1).y) * 0.5;
+        by_depth.push((depth_cells, p_expected_grid, p_measured_grid));
+
+        if p_expected_grid > 1.0 {
+            let rel_err = (p_measured_grid - p_expected_grid).abs() / p_expected_grid;
+            max_rel_err = max_rel_err.max(rel_err);
+            checked += 1;
+        }
+    }
+
+    by_depth.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    println!("── HYDROSTATIC PRESSURE (rho*g*h) ──");
+    println!("  particles checked (depth >= 3 cells) = {checked}");
+    println!(
+        "  max relative error vs rho*g*h        = {:.1}%",
+        max_rel_err * 100.0
+    );
+    println!("  depth(cells) | expected(grid) | measured(grid)");
+    for chunk_idx in 0..10 {
+        let idx = (chunk_idx * (by_depth.len() - 1)) / 9;
+        let (d, e, m) = by_depth[idx];
+        println!("  {d:8.2}     | {e:10.2}     | {m:10.2}");
+    }
+
+    // Real, qualitative check that survives even with the known density-overshoot
+    // gap documented above: pressure must still trend upward with depth (the
+    // actual rho*g*h SHAPE), not be flat/random. The absolute magnitude match is
+    // the still-open part (see #[ignore] reason).
+    let first_third = by_depth[by_depth.len() / 6].2;
+    let last_third = by_depth[5 * by_depth.len() / 6].2;
+    assert!(
+        last_third > first_third,
+        "pressure should still trend upward with depth even with the known \
+         magnitude gap: shallow={first_third:.2} deep={last_third:.2}"
     );
 }
 

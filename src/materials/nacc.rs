@@ -34,10 +34,18 @@ use crate::particle::{Particle, Particles};
 pub struct NaccMaterial {
     /// Shear modulus µ.
     pub mu: f32,
-    /// Bulk modulus κ. Note: λ (Lamé) = κ − 2µ/3.
+    /// Bulk modulus κ. Note: λ (Lamé) = κ − µ (2D plane-strain relation --
+    /// fixed 2026-07-06, was the 3D κ=λ+2µ/3 relation; see `timestep_bound`
+    /// and `params()` below, which already correctly invert as λ=κ−µ).
     pub kappa: f32,
     /// Friction slope M — controls yield surface width in q direction.
-    /// Related to friction angle φ: M = (6 sin φ)/(3 − sin φ) · √((6−d)/2) in 2D.
+    /// Related to friction angle φ (sparkl's `NaccPlasticity::new`, general-d form:
+    /// M = √(2/3)·2·sin φ/(3−sin φ)·d/√(2/(6−d))): in 2D (d=2) this reduces to
+    /// M = (8/√3)·sin φ/(3−sin φ) ≈ 4.619·sin φ/(3−sin φ). Not called by any
+    /// constructor here (presets pass M directly) -- informational only. A
+    /// previous version of this comment used the 3D-style `6 sin φ/(3−sin φ)·
+    /// √((6−d)/2)` form, which is ~1.84x too large at d=2; fixed 2026-07-07
+    /// after cross-checking sparkl's actual source (not just its doc).
     /// Typical: 1.0–2.0.
     pub friction: f32,
     /// Cohesion (beta β) — shifts yield surface min tip.
@@ -74,28 +82,40 @@ impl NaccMaterial {
         hardening_factor: f32,
     ) -> Self {
         let (lambda, mu) = lame_from_young(young_modulus, poisson_ratio);
-        let kappa = lambda + (2.0 / 3.0) * mu;
+        // 2D plane-strain bulk modulus (kappa = lambda + mu, not the 3D
+        // lambda + 2*mu/3 an earlier version used to match sparkl -- see
+        // elastic.rs's ConstitutiveModel impl for the full derivation/fix note).
+        let kappa = lambda + mu;
         Self::new(mu, kappa, friction, cohesion, hardening_factor)
     }
 
     /// Saturated soft clay: M=1.2, β=0, ξ=2 (Klar 2016 soft clay params).
     pub fn soft_clay(young_modulus: f32, poisson_ratio: f32) -> Self {
         let (lambda, mu) = lame_from_young(young_modulus, poisson_ratio);
-        let kappa = lambda + (2.0 / 3.0) * mu;
+        // 2D plane-strain bulk modulus (kappa = lambda + mu, not the 3D
+        // lambda + 2*mu/3 an earlier version used to match sparkl -- see
+        // elastic.rs's ConstitutiveModel impl for the full derivation/fix note).
+        let kappa = lambda + mu;
         Self::new(mu, kappa, 1.2, 0.0, 2.0)
     }
 
     /// Wet compressed soil (paddy field, river bank): M=1.0, β=0, ξ=3.
     pub fn wet_soil(young_modulus: f32, poisson_ratio: f32) -> Self {
         let (lambda, mu) = lame_from_young(young_modulus, poisson_ratio);
-        let kappa = lambda + (2.0 / 3.0) * mu;
+        // 2D plane-strain bulk modulus (kappa = lambda + mu, not the 3D
+        // lambda + 2*mu/3 an earlier version used to match sparkl -- see
+        // elastic.rs's ConstitutiveModel impl for the full derivation/fix note).
+        let kappa = lambda + mu;
         Self::new(mu, kappa, 1.0, 0.0, 3.0)
     }
 
     /// High critical-slope, low hardening: M=1.5, β=0, ξ=1. Soft material under large compression.
     pub fn low_hardening(young_modulus: f32, poisson_ratio: f32) -> Self {
         let (lambda, mu) = lame_from_young(young_modulus, poisson_ratio);
-        let kappa = lambda + (2.0 / 3.0) * mu;
+        // 2D plane-strain bulk modulus (kappa = lambda + mu, not the 3D
+        // lambda + 2*mu/3 an earlier version used to match sparkl -- see
+        // elastic.rs's ConstitutiveModel impl for the full derivation/fix note).
+        let kappa = lambda + mu;
         Self::new(mu, kappa, 1.5, 0.0, 1.0)
     }
 
@@ -217,7 +237,7 @@ impl MaterialModel for NaccMaterial {
         let f = particles.deformation_gradient[i];
         let j = f.determinant().max(MIN_J);
 
-        // NeoHookean Simo-Pister vol-dev split, with κ = λ + 2µ/3.
+        // NeoHookean Simo-Pister vol-dev split, with κ = λ + µ (2D plane-strain).
         let b = f * f.transpose();
         let tr_b = b.x_axis.x + b.y_axis.y;
         let dev_b = b - Mat2::from_diagonal(Vec2::splat(tr_b * 0.5));
@@ -264,7 +284,8 @@ impl MaterialModel for NaccMaterial {
         material_cfl: f32,
         _viscous_cfl: f32,
     ) -> f32 {
-        let lambda = self.kappa - (2.0 / 3.0) * self.mu;
+        // Inverse of the 2D plane-strain relation kappa = lambda + mu.
+        let lambda = self.kappa - self.mu;
         elastic_wave_dt(
             lambda,
             self.mu,
@@ -277,9 +298,10 @@ impl MaterialModel for NaccMaterial {
     }
 
     fn params(&self) -> MaterialParams {
-        // GPU uses NeoHookean stress (model 2) with λ = κ − 2µ/3, µ = µ.
+        // GPU uses NeoHookean stress (model 2) with λ = κ − µ, µ = µ.
         // Plasticity runs CPU-only via needs_cpu_update=true.
-        let lambda = self.kappa - (2.0 / 3.0) * self.mu;
+        // Inverse of the 2D plane-strain relation kappa = lambda + mu.
+        let lambda = self.kappa - self.mu;
         MaterialParams {
             model: ConstitutiveModel::NeoHookean as u32,
             lambda,
@@ -289,5 +311,92 @@ impl MaterialModel for NaccMaterial {
             stretch_limit: self.friction,     // M
             ..Default::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod marginal_yield_tests {
+    use super::*;
+
+    /// Real pressure computed from a deformation gradient the SAME way
+    /// `project`'s own trial-pressure formula does (`p = -kappa/2*(J-1/J)*J`),
+    /// used to verify the projected state lands where the material's own
+    /// documented cap formula (`j_n1 = sqrt(-2*p0/kappa+1)`) analytically
+    /// predicts -- not just "less than before."
+    fn pressure_from_j(kappa: f32, j: f32) -> f32 {
+        let psi_kappa = kappa * 0.5 * (j - j.recip());
+        -psi_kappa * j
+    }
+
+    /// **Case A (compression cap) must project EXACTLY to p=p0.** Hand-derived:
+    /// substituting `j_n1^2 = -2*p0/kappa+1` into the pressure formula
+    /// `p=-kappa/2*(J^2-1)` gives `p=-kappa/2*(-2*p0/kappa) = p0` exactly, an
+    /// identity independent of any specific numeric values. `NaccMaterial` had
+    /// zero test comparing its return mapping to any analytical prediction
+    /// before this (only a stability check existed).
+    #[test]
+    fn compression_cap_projects_exactly_to_p0() {
+        let mat = NaccMaterial::new(3000.0, 2000.0, 1.2, 0.0, 0.0); // hardening off: p0 fixed
+        let alpha = 0.0;
+        let p0 = mat.kappa * 1.0e-5; // hardening_factor=0 -> sinh(0)=0 -> p0 = kappa*1e-5
+
+        // Isotropic compression well past p0: small uniform J << 1.
+        let j_trial = 0.5_f32;
+        let f = Mat2::from_diagonal(Vec2::splat(j_trial.sqrt()));
+        let p_trial = pressure_from_j(mat.kappa, j_trial);
+        assert!(
+            p_trial > p0,
+            "test setup must genuinely be past the cap: p_trial={p_trial} p0={p0}"
+        );
+
+        let (f_after, _alpha_after) = mat.project(f, alpha);
+        let j_after = f_after.determinant();
+        let p_after = pressure_from_j(mat.kappa, j_after);
+
+        assert!(
+            (p_after - p0).abs() < 1.0e-2,
+            "compression-cap projection should land EXACTLY at p=p0={p0:.6}, got {p_after:.6}"
+        );
+    }
+
+    /// A trial state comfortably INSIDE the yield ellipse (real confining
+    /// pressure PLUS a small shear perturbation) must leave the deformation
+    /// gradient completely unchanged.
+    ///
+    /// Two earlier versions of this test failed, for genuinely informative
+    /// reasons (not test-tooling bugs):
+    /// 1. `hardening_factor=0` gives `p0=kappa*1e-5` regardless of alpha (xi=0
+    ///    zeroes the sinh term unconditionally) -- a vanishingly small elastic
+    ///    region where any real strain immediately exceeds the cap. No real
+    ///    preset in this file ever uses hardening_factor=0.
+    /// 2. Even with hardening on and a large p0, a PURE shear perturbation at
+    ///    near-zero volumetric strain (p_tr~0) still yielded. This is REAL,
+    ///    physically-correct behavior, not a bug: with cohesion (beta) = 0,
+    ///    the ellipse's y1 term is `M^2*(p_tr+beta*p0)*(p_tr-p0)`, and at
+    ///    p_tr=0/beta=0 this is exactly 0 regardless of how large p0 is --
+    ///    a cohesionless material genuinely has ~zero elastic shear capacity
+    ///    at zero confining pressure (real critical-state soil mechanics:
+    ///    frictional materials can't resist shear without confinement). The
+    ///    fix is testing what the model actually claims: shear WITH real
+    ///    confining pressure present, not shear alone.
+    #[test]
+    fn small_elastic_strain_is_not_projected() {
+        let mat = NaccMaterial::new(3000.0, 2000.0, 1.2, 0.0, 2.0);
+        let alpha = -1.0; // real pre-consolidation, gives a meaningfully large p0
+        // Real isotropic confining compression (sv=0.999 each way, giving
+        // p_tr~4.0, comfortably inside p0~7254) PLUS a tiny shear on top --
+        // this is the physically meaningful "small elastic strain" case: real
+        // confining pressure present, not shear at zero pressure.
+        let f = Mat2::from_diagonal(Vec2::new(0.99895, 0.99905));
+        let (f_after, alpha_after) = mat.project(f, alpha);
+        assert!(
+            (f_after - f).x_axis.length() < 1.0e-6 && (f_after - f).y_axis.length() < 1.0e-6,
+            "small elastic strain (with real confining pressure) must not be projected: \
+             f={f:?} f_after={f_after:?}"
+        );
+        assert_eq!(
+            alpha_after, alpha,
+            "alpha must not change on an elastic step"
+        );
     }
 }

@@ -126,12 +126,17 @@ impl BinghamFluidMaterial {
 
 impl FromSI<BinghamProps> for BinghamFluidMaterial {
     fn from_physical(props: &BinghamProps, config: &crate::SimConfig) -> Self {
+        // Tait EOS polytropic exponent -- Cole 1948, "Underwater Explosions"; standard
+        // in SPH/MPM weakly-compressible fluid solvers (Monaghan 1994). Applies to the
+        // volumetric/EOS part of a Bingham fluid same as any other weakly-compressible
+        // liquid; the yield-stress physics (tau0 below) is separate and unaffected.
         const GAMMA: f32 = 7.0;
         let visc = scale_visc(props.eta_pa_s, props.rho_kg_m3, config);
         let tau0 = scale_stress(props.yield_stress_pa, props.rho_kg_m3, config);
         let eos = scale_stress(props.bulk_modulus_pa / GAMMA, props.rho_kg_m3, config);
-        let rho_grid = props.rho_kg_m3 * config.dx_meters * config.dx_meters
-            / (config.dt_seconds * config.dt_seconds);
+        // See `NewtonianFluidMaterial::from_physical`'s fix doc (2026-07-07) -- rest_density
+        // must match `particles.density[i]`'s real units, not an extra `/dt_seconds^2`.
+        let rho_grid = props.rho_kg_m3 * config.dx_meters * config.dx_meters;
         Self::new(rho_grid, visc, eos, GAMMA, tau0)
     }
 }
@@ -142,8 +147,19 @@ impl MaterialModel for BinghamFluidMaterial {
     }
 
     fn kirchhoff_stress(&self, particles: &Particles, i: usize) -> Mat2 {
-        // Pressure from Tait EOS (same as NewtonianFluid)
-        let density = particles.density[i].max(self.min_density);
+        // Pressure from Tait EOS (same as NewtonianFluid). Clamp density both
+        // ways, matching `NewtonianFluidMaterial::kirchhoff_stress` exactly:
+        // min prevents div-by-zero at low PPC, max (2x rho0) limits how far
+        // the EOS pressure response saturates under impact overcompression.
+        // FIXED 2026-07-07 (real, found via audit): this material was missing
+        // the upper clamp entirely despite sharing the identical Tait EOS
+        // formula with NewtonianFluidMaterial (which has it) -- an unbounded
+        // EOS pressure spike under violent compression is the same real risk
+        // here. Matches NewtonianFluid's 2x (see that file's doc for the real
+        // A/B-tested reason 2x, not a looser value, is correct).
+        let density = particles.density[i]
+            .max(self.min_density)
+            .min(self.rest_density * 2.0);
         let pressure = (self.eos_stiffness
             * ((density / self.rest_density).powf(self.eos_power) - 1.0))
             .max(self.pressure_floor);
@@ -229,5 +245,76 @@ impl MaterialModel for BinghamFluidMaterial {
 
     fn needs_density_recompute(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod analytical_validation_tests {
+    use super::*;
+
+    /// **Deviatoric stress must match the Bingham formula exactly** (Bingham
+    /// 1916: below yield, rigid plug/zero stress; above yield, Newtonian with
+    /// apparent viscosity `tau0/shear_rate + eta`). `BinghamFluidMaterial` had
+    /// zero test comparing its deviatoric response to this analytical formula
+    /// directly (only whole-simulation stability checks existed).
+    #[test]
+    fn below_critical_shear_rate_gives_zero_deviatoric_stress() {
+        let mat = BinghamFluidMaterial::new(1000.0, 0.5, 5000.0, 7.0, 100.0);
+        // A tiny, sub-critical shear rate: pure shear C with a small magnitude.
+        let c = Mat2::from_cols(Vec2::new(0.0, 1.0e-6), Vec2::new(1.0e-6, 0.0));
+        let tau = mat.deviatoric_stress(c);
+        assert_eq!(
+            tau,
+            Mat2::ZERO,
+            "sub-critical shear rate must give exactly zero deviatoric stress (rigid plug)"
+        );
+    }
+
+    #[test]
+    fn above_yield_matches_bingham_formula_exactly() {
+        let mat = BinghamFluidMaterial::new(1000.0, 0.5, 5000.0, 7.0, 100.0);
+        // Pure shear strain rate: C = [[0, g], [g, 0]] gives D=C (already symmetric),
+        // D_dev=D (already traceless), d_xx=d_yy=0, d_xy=g, d_sq=2*g^2,
+        // shear_rate=sqrt(2*2*g^2)=2*g (real, hand-derivable from the formula).
+        let g = 5.0_f32;
+        let c = Mat2::from_cols(Vec2::new(0.0, g), Vec2::new(g, 0.0));
+        let tau = mat.deviatoric_stress(c);
+
+        let shear_rate = 2.0 * g;
+        let eta_app = mat.yield_stress / shear_rate + mat.dynamic_viscosity;
+        let d_dev = Mat2::from_cols(Vec2::new(0.0, g), Vec2::new(g, 0.0)); // D_dev = D here
+        let predicted = d_dev * eta_app;
+
+        let diff = tau - predicted;
+        let err = (diff.x_axis.length_squared() + diff.y_axis.length_squared()).sqrt();
+        assert!(
+            err < 1.0e-3,
+            "above-yield deviatoric stress should match tau0/gamma_dot+eta exactly: \
+             predicted={predicted:?} actual={tau:?}"
+        );
+    }
+
+    /// Real, checkable monotonic claim: apparent viscosity (and thus deviatoric
+    /// stress magnitude at a FIXED shear rate) must DECREASE as shear rate
+    /// increases -- shear-thinning behavior intrinsic to the Bingham model
+    /// (tau0/gamma_dot term shrinks as gamma_dot grows), not an assumption.
+    #[test]
+    fn apparent_viscosity_decreases_as_shear_rate_increases() {
+        let mat = BinghamFluidMaterial::new(1000.0, 0.5, 5000.0, 7.0, 100.0);
+        let tau_slow =
+            mat.deviatoric_stress(Mat2::from_cols(Vec2::new(0.0, 1.0), Vec2::new(1.0, 0.0)));
+        let tau_fast =
+            mat.deviatoric_stress(Mat2::from_cols(Vec2::new(0.0, 10.0), Vec2::new(10.0, 0.0)));
+
+        // Stress DOES grow with shear rate overall (more strain rate -> more
+        // stress), but the EFFECTIVE viscosity (stress/shear_rate) must shrink --
+        // check the ratio, not the raw magnitude.
+        let eff_visc_slow = tau_slow.x_axis.y / 2.0; // shear_rate=2*g=2 here
+        let eff_visc_fast = tau_fast.x_axis.y / 20.0; // shear_rate=2*g=20 here
+        assert!(
+            eff_visc_fast < eff_visc_slow,
+            "apparent viscosity must decrease as shear rate increases (shear-thinning): \
+             slow={eff_visc_slow:.4} fast={eff_visc_fast:.4}"
+        );
     }
 }

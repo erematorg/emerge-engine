@@ -179,7 +179,10 @@ fn kirchhoff(p: Particle, mat: MaterialParams) -> mat2x2<f32> {
             let B     = F * transpose(F);
             let tr_B  = B[0][0] + B[1][1];
             let dev_B = B - (tr_B * 0.5) * I;
-            let k     = (2.0 / 3.0) * mu_e + lam_e;
+            // 2D plane-strain bulk modulus (k = lam_e + mu_e, not the 3D
+            // relation this used to mirror -- see elastic.rs's Rust-side fix
+            // for the full derivation; CPU and GPU must match exactly here).
+            let k     = lam_e + mu_e;
             tau = (mu_e / J) * dev_B + (k * 0.5 * (J * J - 1.0)) * I;
         }
         case 3u, 4u, 5u, 6u, 7u, 8u: { // Corotated / Snow / DP / VonMises / Rankine / SandMuI

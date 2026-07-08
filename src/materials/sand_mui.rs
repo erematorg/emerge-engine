@@ -8,7 +8,7 @@ use crate::materials::utils::{
 use crate::materials::{ConstitutiveModel, MaterialModel, MaterialParams};
 use crate::particle::{Particle, Particles};
 
-/// µ(I)-rheology sand — rate-dependent Drucker-Prager (Blatny / matter "DPMui").
+/// µ(I)-rheology sand — rate-dependent Drucker-Prager (Cicoira et al. / matter "DPMui").
 ///
 /// Extends plain Drucker-Prager by making the friction coefficient pressure- and
 /// rate-dependent via the inertial number I = γ̇·d/√(p/ρₛ):
@@ -32,7 +32,12 @@ use crate::particle::{Particle, Particles};
 /// `Particle::friction_hardening` is repurposed to store the current µ(I) value,
 /// useful for visualising the local flow regime (µ₁ = quasi-static, µ₂ = rapid).
 ///
-/// Reference: Blatny 2022, Blatny et al. 2021; matter/src/simulation/plasticity.cpp DPMui.
+/// Reference: Cicoira, Blatny, Li, Trottet & Gaume 2022, "Towards a predictive
+/// multi-phase model for alpine mass movements and process cascades," Engineering
+/// Geology 310:106866 (Blatny is a co-author, not first author -- an earlier
+/// version of this comment misattributed it); the µ(I) functional form itself
+/// traces to Jop, Forterre & Pouliquen 2006, Nature 441:727-730. Also:
+/// matter/src/simulation/plasticity.cpp DPMui.
 /// Canonical parameters: µ₁=tan(20.9°), µ₂=tan(32.8°), I₀=0.279, d=1mm, ρₛ=2500 kg/m³
 /// → Q = 0.279 / (0.001 · √2500) ≈ 5.58.
 #[derive(Debug, Clone, Copy)]
@@ -239,5 +244,158 @@ impl MaterialModel for MuIRheologyMaterial {
 
     fn needs_cpu_update(&self) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod marginal_yield_tests {
+    use super::*;
+
+    fn run_one_step(mat: &MuIRheologyMaterial, sigma: Vec2, dt: f32) -> (Vec2, f32) {
+        let mut p = Particle::zeroed();
+        p.deformation_gradient = Mat2::from_cols(Vec2::new(sigma.x, 0.0), Vec2::new(0.0, sigma.y));
+        p.mass = 1.0;
+        p.initial_volume = 1.0;
+        mat.init_particle(&mut p);
+        let mut particles = Particles::from(vec![p]);
+        mat.update_particle(&mut particles, 0, dt);
+        let f = particles.deformation_gradient[0];
+        (
+            Vec2::new(f.x_axis.x, f.y_axis.y),
+            particles.friction_hardening[0],
+        )
+    }
+
+    /// **Tension cutoff**: `p_trial <= 0` (net expansion/tension) must project
+    /// EXACTLY to identity (real dry granular material has no tensile
+    /// strength) and reset friction_hardening to mu_static. `MuIRheologyMaterial`
+    /// had zero test comparing its return mapping to any analytical claim
+    /// before this (only a bound-check on friction_hardening's own range
+    /// existed, self-referential to the material's own configured values).
+    #[test]
+    fn tension_projects_exactly_to_identity() {
+        let mat = MuIRheologyMaterial::new(2000.0, 3000.0);
+        let sigma = Vec2::new(1.05, 1.02); // net expansion -- p_trial < 0
+        let (sigma_after, mu_after) = run_one_step(&mat, sigma, 0.1);
+        assert!(
+            (sigma_after - Vec2::ONE).length() < 1.0e-5,
+            "tension (p_trial<=0) must project exactly to identity, got {sigma_after:?}"
+        );
+        assert_eq!(
+            mu_after, mat.mu_static,
+            "tension resets friction_hardening to mu_static"
+        );
+    }
+
+    /// **Marginal state at the quasi-static yield surface (q=mu_static*p) must
+    /// stay elastic.** Comfortably inside (99%).
+    #[test]
+    fn marginal_state_at_quasistatic_yield_does_not_flow() {
+        let mat = MuIRheologyMaterial::new(2000.0, 3000.0);
+        // eps.y=0, so p_trial=-k_2d*eps.x, q_trial=sqrt(2)*mu*|dev|=sqrt(2)*mu*|eps.x/2|.
+        // Solve eps.x (negative, compressive) for q_trial = 0.99*mu_static*p_trial.
+        let k_2d = mat.lambda + mat.mu;
+        // p_trial = -k_2d*eps.x (eps.x negative -> p_trial positive)
+        // q_trial = sqrt(2)*mu*(|eps.x|/2) = mu*|eps.x|/sqrt(2)
+        // Set q_trial = 0.99*mu_static*p_trial and solve for eps.x < 0:
+        // mu*(-eps.x)/sqrt(2) = 0.99*mu_static*(-k_2d*eps.x)
+        // mu/sqrt(2) = 0.99*mu_static*k_2d  <-- this doesn't depend on eps.x's magnitude,
+        // it's a RATIO condition -- so scale eps.x arbitrarily small and check the ratio
+        // holds by construction via direct sigma construction instead.
+        let eps_x = -0.01_f32;
+        let p_trial = -k_2d * eps_x;
+        let target_q = 0.99 * mat.mu_static * p_trial;
+        // q_trial = mu*|eps.x|/sqrt(2) is FIXED by eps_x and mu -- to hit an
+        // arbitrary target_q instead, construct eps.y independently: dev_norm
+        // needed = target_q/(sqrt(2)*mu), then eps.y = tr - eps.x where
+        // tr = 2*dev_norm_signed... simplest: solve eps.y directly from
+        // dev = (eps.x-eps.y)/2 (for this 2-component system, dev_norm=|eps.x-eps.y|/sqrt(2)).
+        let dev_norm_needed = target_q / (std::f32::consts::SQRT_2 * mat.mu);
+        // dev = eps - tr/2 * I; for eps=(ex,ey), dev.x=(ex-ey)/2, dev.y=(ey-ex)/2,
+        // dev_norm = |ex-ey|/sqrt(2). Solve ey given ex and desired dev_norm:
+        let ex = eps_x;
+        let ey = ex - dev_norm_needed * std::f32::consts::SQRT_2;
+        let sigma = Vec2::new(ex.exp(), ey.exp());
+
+        let (sigma_after, mu_after) = run_one_step(&mat, sigma, 0.1);
+        assert!(
+            (sigma_after - sigma).length() < 1.0e-4,
+            "state inside the quasi-static yield surface should stay elastic: \
+             sigma={sigma:?} sigma_after={sigma_after:?}"
+        );
+        assert_eq!(
+            mu_after, mat.mu_static,
+            "mu must stay at mu_static on an elastic step"
+        );
+    }
+
+    /// **Beyond yield: the analytically-solved `gamma_dot` must be a genuine
+    /// root of the material's own documented quadratic** `a*g^2+b*g+c=0`
+    /// (checked by direct substitution, not just trusted from the derivation).
+    #[test]
+    fn gamma_dot_is_a_real_root_of_its_own_quadratic() {
+        let mat = MuIRheologyMaterial::new(2000.0, 3000.0);
+        let dt = 0.1_f32;
+        // Comfortably past yield: NET COMPRESSION (tr<0, real p_trial>0) plus
+        // enough shear to exceed mu_static*p_trial. First version used
+        // eps_x=-0.05,eps_y=0.05 (zero net trace), which hit the p_trial<=0
+        // tension-cutoff branch instead of real yield -- fixed by using
+        // asymmetric values with genuine net compression.
+        let eps_x = -0.08_f32;
+        let eps_y = 0.02_f32;
+        let sigma = Vec2::new(eps_x.exp(), eps_y.exp());
+
+        let mut p = Particle::zeroed();
+        p.deformation_gradient = Mat2::from_cols(Vec2::new(sigma.x, 0.0), Vec2::new(0.0, sigma.y));
+        p.mass = 1.0;
+        p.initial_volume = 1.0;
+        mat.init_particle(&mut p);
+        let mut particles = Particles::from(vec![p]);
+        mat.update_particle(&mut particles, 0, dt);
+
+        // Recompute a, b, c the SAME way `update_particle` does, to verify the
+        // ACTUAL solved gamma_dot (recovered from the friction_hardening
+        // output + the known mu(I) formula) satisfies a*g^2+b*g+c=0.
+        let f_trial = Mat2::from_cols(Vec2::new(sigma.x, 0.0), Vec2::new(0.0, sigma.y));
+        let (_, sigma_svd, _) = svd2(f_trial);
+        let eps = hencky_strains(sigma_svd);
+        let tr = eps.x + eps.y;
+        let k_2d = mat.lambda + mat.mu;
+        let p_trial = -k_2d * tr;
+        let dev = eps - Vec2::splat(tr * 0.5);
+        let dev_norm = dev.length();
+        let q_trial = std::f32::consts::SQRT_2 * mat.mu * dev_norm;
+        let q_yield = mat.mu_static * p_trial;
+        let delta_q = q_trial - q_yield;
+        let sqrt_p = p_trial.sqrt();
+        let a = mat.mu * dt;
+        let b = p_trial * (mat.mu_dynamic - mat.mu_static) + a * mat.inertial_q * sqrt_p - delta_q;
+        let c = -delta_q * mat.inertial_q * sqrt_p;
+
+        // Recover gamma_dot from the OUTPUT mu_i via the documented formula:
+        // mu_i = mu_static + (mu_dynamic-mu_static)/(Q*sqrt_p/gamma_dot + 1)
+        // => Q*sqrt_p/gamma_dot = (mu_dynamic-mu_static)/(mu_i-mu_static) - 1
+        let mu_i = particles.friction_hardening[0];
+        assert!(
+            mu_i > mat.mu_static,
+            "beyond yield, mu_i must exceed mu_static"
+        );
+        let denom = (mat.mu_dynamic - mat.mu_static) / (mu_i - mat.mu_static) - 1.0;
+        let gamma_dot_recovered = mat.inertial_q * sqrt_p / denom;
+
+        let residual = a * gamma_dot_recovered * gamma_dot_recovered + b * gamma_dot_recovered + c;
+        // RELATIVE tolerance: a/b/c here are O(1e2-1e4), so a fixed absolute
+        // tolerance is meaningless -- compare against the largest term's scale.
+        let scale = (a * gamma_dot_recovered * gamma_dot_recovered)
+            .abs()
+            .max((b * gamma_dot_recovered).abs())
+            .max(c.abs());
+        assert!(
+            residual.abs() / scale < 1.0e-3,
+            "recovered gamma_dot={gamma_dot_recovered:.6} should satisfy the material's \
+             own quadratic a*g^2+b*g+c=0 (a={a:.4} b={b:.4} c={c:.4}), residual={residual:.6} \
+             relative={:.2e}",
+            residual.abs() / scale
+        );
     }
 }
