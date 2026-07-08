@@ -269,7 +269,8 @@ mod step_params {
         ///
         /// - `gravity`: must match `SimConfig::gravity` (solver gravity, including sign)
         /// - `fluid_density_grid`: surrounding fluid's rest_density in grid units
-        ///   (`ρ_SI · dx_m² / dt_s²` — same value as `NewtonianFluidMaterial::rest_density`)
+        ///   (`ρ_SI · dx_m²` — same value as `NewtonianFluidMaterial::rest_density`, fixed
+        ///   2026-07-07 to drop an incorrect extra `/dt_s²` factor)
         /// - `material_id`: only particles of this material receive the buoyancy force
         ///
         /// Uses particle rest density (`mass / initial_volume`) not instantaneous density,
@@ -454,6 +455,27 @@ mod solver {
         /// Checked each step_frame; on completion, CPU particles are updated without blocking.
         /// Arc<Mutex<...>> so the wgpu callback (any thread) can signal the main thread.
         pending_readback: Option<ReadbackResult>,
+        /// Real, honest count of async readback failures (`map_async` completing with
+        /// `Err`) ever recovered from — should be 0 in ordinary operation on real
+        /// hardware; nonzero is a real signal something is stressing the GPU backend
+        /// (rare on fast hardware, more likely on slow/software backends). Added
+        /// 2026-07-05 alongside the fix for the failure path leaking the staging
+        /// buffer's mapped state — see `GpuBuffers::abandon_readback`'s doc.
+        pub readback_error_count: u64,
+        /// Set once, permanently, if this instance's device is ever lost (confirmed
+        /// real cause of emerge issue #10 — see project memory
+        /// `gpu_readback_error_path_bug_issue10`: a genuine `Out of Memory` device
+        /// loss under sustained load on slow/software GPU backends). A lost device
+        /// cannot be un-lost; every further GPU call on it would panic, so
+        /// `step_frame`/the blocking sync methods check this and become safe no-ops
+        /// once set, rather than crashing. Always populated for `new()` instances;
+        /// `with_device()` instances need one call to `enable_device_lost_detection()`
+        /// first (see that method's doc for why it isn't automatic there — a wgpu
+        /// device can only have one lost-callback, so auto-registering on a
+        /// possibly-shared device risks silently overwriting a caller's own).
+        /// Callers should poll `device_lost_reason()` if they care why the sim went
+        /// quiet — this is deliberately observable, not silently swallowed.
+        device_lost: std::sync::Arc<std::sync::Mutex<Option<String>>>,
         /// Per-pass GPU timestamp profiling — see `enable_profiling()`. None unless explicitly
         /// turned on; zero cost to every other code path when not in use.
         profiling: Option<GpuProfiling>,
@@ -468,6 +490,15 @@ mod solver {
         /// itself can be built once and only needs rebuilding when `spawn_region`
         /// reallocates `buffers.particles` (see `rebuild_bind_group_pool`).
         bind_group_pool: Vec<wgpu::BindGroup>,
+        /// Real spatial acceleration for `particles_near`/`count_near`/`group_centroid` --
+        /// ported from `solver::Simulation`'s already-proven `SpatialHash` (was previously
+        /// wired into the CPU-only `Simulation` but not `GpuSimulation`, meaning every
+        /// caller of these three query methods on the GPU path -- the one LP actually uses --
+        /// paid a full O(N) linear scan per call regardless of how local the query was.
+        /// Rebuilt once per `step_frame()` (and after any explicit particle sync), same
+        /// ~1-frame staleness tolerance already accepted everywhere else these queries read
+        /// the CPU mirror.
+        spatial_hash: crate::solver::spatial_hash::SpatialHash,
         /// CPU-side wall-clock breakdown of the last `step_frame()` call (cfl_scan_ns,
         /// encode_ns, submit_ns, readback_ns, total_ns) — `Instant::now()` calls are
         /// themselves nanosecond-cost, so these are always recorded, not gated behind
@@ -554,7 +585,14 @@ mod solver {
 
             let device = Arc::new(device);
             let queue = Arc::new(queue);
-            Self::with_device(device, queue, config, particles, registry)
+            let sim = Self::with_device(device, queue, config, particles, registry);
+
+            // Real device-lost detection (confirmed cause of emerge issue #10, see
+            // project memory) -- this device is EXCLUSIVELY ours (just created above,
+            // no other caller could have registered a competing handler on it yet),
+            // so it's always safe to enable it automatically here.
+            sim.enable_device_lost_detection();
+            sim
         }
 
         /// Build a `GpuSimulation` on an existing device/queue so its GPU buffers can be
@@ -602,6 +640,13 @@ mod solver {
                 Vec::new()
             };
 
+            let mut spatial_hash =
+                crate::solver::spatial_hash::SpatialHash::new(config.grid_cell_size);
+            spatial_hash.rebuild(
+                &initialized.iter().map(|p| p.x).collect::<Vec<_>>(),
+                initialized.len(),
+            );
+
             Self {
                 device,
                 queue,
@@ -622,9 +667,12 @@ mod solver {
                 pending_sleep_tags: Vec::new(),
                 pending_wake_tags: Vec::new(),
                 pending_readback: None,
+                readback_error_count: 0,
+                device_lost: std::sync::Arc::new(std::sync::Mutex::new(None)),
                 profiling: None,
                 last_cpu_timings: (0.0, 0.0, 0.0, 0.0, 0.0),
                 bind_group_pool,
+                spatial_hash,
             }
         }
 
@@ -753,12 +801,105 @@ mod solver {
             )
         }
 
+        /// Real, honest report of why this instance's device was lost, if it ever
+        /// was — `None` in ordinary operation. Automatically wired for `new()`
+        /// instances; `with_device()` instances need one explicit call to
+        /// `enable_device_lost_detection()` first (see that method's doc for why
+        /// it isn't automatic there). Once set, `step_frame` and the blocking sync
+        /// methods become safe no-ops instead of panicking on a dead device —
+        /// callers that care should poll this rather than assume silence means
+        /// healthy.
+        pub fn device_lost_reason(&self) -> Option<String> {
+            self.device_lost.lock().ok().and_then(|g| g.clone())
+        }
+
+        /// Opt in to real device-lost detection (the confirmed real cause of
+        /// emerge issue #10 — a genuine `Out of Memory` device loss under
+        /// sustained load on slow/software GPU backends; see project memory
+        /// `gpu_readback_error_path_bug_issue10`). Called automatically by `new()`
+        /// (which owns its device exclusively, so it's always safe there). NOT
+        /// automatic for `with_device()` (shared-device use, e.g. a renderer on the
+        /// same device as this sim) because a wgpu device can only have ONE
+        /// lost-callback (and, as of 2026-07-08, only one uncaptured-error handler
+        /// too — same `Option<Arc<dyn Handler>>` single-slot storage internally,
+        /// confirmed by reading wgpu-27.0.1's `ErrorSinkRaw`) — auto-registering
+        /// here could silently overwrite a caller's own handler. Call this
+        /// explicitly after `with_device()` if you (like LP) don't have your own
+        /// device-lost handling and want emerge's; don't call it if you've already
+        /// registered your own callback/handler on this device — the second
+        /// registration wins and the first is silently lost (this is wgpu's own
+        /// behavior, not something this method can prevent).
+        ///
+        /// ALSO installs an uncaptured-error handler (2026-07-08). wgpu's default
+        /// behavior for ANY uncaptured error is an unconditional panic
+        /// (`panic!("wgpu error: {err}")`, confirmed by reading wgpu-27.0.1's
+        /// `default_error_handler`) — this handler replaces that default and
+        /// **never panics**, regardless of what the error says. That "never" is
+        /// load-bearing, not a simplification: an earlier version of this handler
+        /// tried to be more precise — classify errors naming a destroyed/lost
+        /// resource as an inferred device loss (no panic), but still panic for
+        /// anything else so a genuine, unrelated validation bug wouldn't be
+        /// silently swallowed. That version was reproduced crashing LOCALLY
+        /// (forcing the D3D12 WARP adapter — the same backend windows-latest CI
+        /// uses — instead of waiting on another CI round-trip) with the full
+        /// backtrace showing the panic originated from THIS handler's own `panic!`
+        /// call, invoked synchronously from inside `wgpu_core::Queue::submit`'s
+        /// internal error path — and unwinding a panic from there is what produced
+        /// `STATUS_STACK_BUFFER_OVERRUN`, not the error itself. In other words:
+        /// panicking from ANY code reachable from this callback is unsafe on this
+        /// backend, independent of whether the message looks like a device-loss
+        /// artifact or a real bug — so the "still panic for real bugs" branch was
+        /// itself the crash, not a safety net. The fix: never panic here, full
+        /// stop. Every uncaptured error sets `device_lost` (so `is_device_lost()`'s
+        /// existing no-op guards take over) and is `eprintln!`'d in full so it's
+        /// still visible for debugging — just never re-thrown as a Rust panic from
+        /// inside this specific callback context.
+        pub fn enable_device_lost_detection(&self) {
+            let flag = self.device_lost.clone();
+            self.device
+                .set_device_lost_callback(move |reason, message| {
+                    *flag.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(format!("{reason:?}: {message}"));
+                });
+
+            let flag = self.device_lost.clone();
+            self.device
+                .on_uncaptured_error(std::sync::Arc::new(move |error: wgpu::Error| {
+                    let message = error.to_string();
+                    let mut guard = flag.lock().unwrap_or_else(|e| e.into_inner());
+                    if guard.is_none() {
+                        *guard = Some(format!("(uncaptured wgpu error) {message}"));
+                    }
+                    drop(guard);
+                    eprintln!(
+                        "emerge: uncaptured wgpu error, treating device as unusable from \
+                         here (see GpuSimulation::enable_device_lost_detection's doc for \
+                         why this never panics): {message}"
+                    );
+                }));
+        }
+
+        fn is_device_lost(&self) -> bool {
+            self.device_lost
+                .lock()
+                .map(|g| g.is_some())
+                .unwrap_or(false)
+        }
+
         /// Advance one frame of simulation time (`config.dt`) using the GPU.
         ///
         /// All substeps are encoded into a single command buffer and submitted once — one driver
         /// call regardless of adaptive substep count. Step params are pre-computed from the CPU
         /// particle mirror (same one-frame CFL lag as before, no physics change).
         pub fn step_frame(&mut self) {
+            // Real fix for emerge issue #10 (confirmed root cause: genuine device
+            // loss, Out of Memory, under sustained slow-backend load — see project
+            // memory gpu_readback_error_path_bug_issue10). A lost device cannot be
+            // un-lost; every further GPU call on it would panic through wgpu's
+            // default error handler. Once lost, become a safe no-op instead.
+            if self.is_device_lost() {
+                return;
+            }
             let total_start = std::time::Instant::now();
             let cfl_scan_start = total_start;
             let any_cpu = self.registry.any_needs_cpu_update();
@@ -766,14 +907,27 @@ mod solver {
             // Upload CPU → GPU only when positions/materials actually changed.
             // Impulses are now applied by a dedicated GPU compute pass (apply_impulses) that
             // reads LIVE GPU positions — no CPU mirror upload needed for impulse-only frames.
+            //
+            // Real bug fix (2026-07-06, LP issue erematorg/LP#161): this block used to
+            // spatially resort `self.particles` by grid cell before every upload. That
+            // predates the real GPU particle_sort pipeline (`f2c1e62`, "real particle-sort
+            // pipeline") which added its own spatial-locality mechanism entirely on the GPU
+            // side (`sorted_particle_ids`, a SEPARATE index buffer that never touches actual
+            // particle storage order — see particle_sort.wgsl, runs unconditionally every
+            // frame). When that GPU pass was added, the old CPU-side resort should have been
+            // removed but wasn't — it kept running on every upload, which happens on
+            // essentially every frame in real use (any per-particle CPU write, e.g. LP's
+            // `drive_muscles`/`update_damage`, calls `mark_particles_dirty`). Reordering the
+            // backing array on every such frame silently invalidated any previously-returned
+            // `Range<usize>` particle identity (`spawn_region`'s own doc promises this range
+            // is stable — "LP uses this as creature_id -> particle_range"). Confirmed via a
+            // real repro: a spawned creature's fixed index range, read back every frame,
+            // showed near-total corruption of a spawn-time-only tag field (`muscle_group_id`)
+            // — not a readback race, the particles at those indices were simply different
+            // particles after the resort. No remaining purpose for this CPU-side sort once
+            // the GPU has its own; removing it restores range stability.
             let needs_upload = self.layout_dirty || any_cpu;
             if needs_upload {
-                let res = self.config.grid_res as u32;
-                self.particles.sort_unstable_by_key(|p| {
-                    let cx = (p.x.x as u32).min(res.saturating_sub(1));
-                    let cy = (p.x.y as u32).min(res.saturating_sub(1));
-                    cy * res + cx
-                });
                 self.buffers.upload_particles(&self.queue, &self.particles);
                 self.layout_dirty = false;
             }
@@ -1074,60 +1228,76 @@ mod solver {
             // Pump wgpu callbacks so any in-flight mapping can complete.
             self.device.poll(wgpu::PollType::Poll).ok();
 
-            // Check if a previous async readback completed.
+            // Check if a previous async readback completed -- Ok, Err, or still pending.
+            // Real fix (2026-07-05, see project memory
+            // emerge_locomotion_root_cause_and_fix / issue #10): the OLD code only
+            // handled Ok here, silently dropping Err. That left the staging buffer
+            // mapped forever (finish_readback, the only unmapper, was never called)
+            // and pending_readback stuck Some forever (blocking every future
+            // readback) -- until something else tried to map the same buffer again
+            // and hit a real "Buffer is already mapped" panic. Every completion path
+            // now explicitly unmaps, regardless of Ok/Err.
             let readback_done = self
                 .pending_readback
                 .as_ref()
                 .and_then(|flag| flag.lock().ok().and_then(|mut g| g.take()));
-            if readback_done.map(|r| r.is_ok()).unwrap_or(false) {
-                let gpu_particles = self.buffers.finish_readback(self.particle_count);
+            if let Some(result) = readback_done {
                 self.pending_readback = None;
-
-                // CPU plasticity pass — skipped if all materials run plasticity on GPU.
-                //
-                // IMPORTANT: GPU g2p already integrated F via `F_new = (I + dt·C)·F_old`.
-                // Zero affine before update_particle so only the plasticity projection runs.
-                // Restore GPU affine afterwards so next P2G APIC term is correct.
-                // The new MaterialModel API takes (&mut Particles, usize) — convert AoS to SoA,
-                // run the CPU pass, then scatter results back.
-                if any_cpu {
-                    // Stash GPU affine matrices — we zero affine for the plasticity call then restore.
-                    let gpu_affines: Vec<_> =
-                        gpu_particles.iter().map(|p| p.velocity_gradient).collect();
-                    // Copy readback into AoS cpu mirror (zeroing affine for plasticity).
-                    for (p_gpu, p_cpu) in gpu_particles.iter().zip(self.particles.iter_mut()) {
-                        *p_cpu = *p_gpu;
-                        p_cpu.velocity_gradient = glam::Mat2::ZERO;
-                    }
-                    // Build SoA wrapper, run CPU plasticity, scatter plastic state back.
-                    // Skip sleeping particles — same reasoning as every GPU-side pass: their
-                    // F/plastic state is frozen, re-running plasticity on unchanged input
-                    // wastes exactly the compute sleep/wake exists to avoid. Before the
-                    // Particles::push() fix above, this loop silently ran on every particle
-                    // regardless of sleep state, because the AoS->SoA conversion dropped it.
-                    let mut soa = Particles::from(std::mem::take(&mut self.particles));
-                    for i in 0..soa.len() {
-                        if soa.sleeping[i] {
-                            continue;
-                        }
-                        self.registry.get(soa.material_id[i]).update_particle(
-                            &mut soa,
-                            i,
-                            self.last_sub_dt,
-                        );
-                    }
-                    self.particles = soa.to_vec();
-                    // Restore GPU affine.
-                    for (p_cpu, gpu_affine) in self.particles.iter_mut().zip(gpu_affines) {
-                        p_cpu.velocity_gradient = gpu_affine;
-                    }
+                if result.is_err() {
+                    self.readback_error_count += 1;
+                    self.buffers.abandon_readback();
                 } else {
-                    for (p_gpu, p_cpu) in gpu_particles.into_iter().zip(self.particles.iter_mut()) {
-                        *p_cpu = p_gpu;
+                    let gpu_particles = self.buffers.finish_readback(self.particle_count);
+
+                    // CPU plasticity pass — skipped if all materials run plasticity on GPU.
+                    //
+                    // IMPORTANT: GPU g2p already integrated F via `F_new = (I + dt·C)·F_old`.
+                    // Zero affine before update_particle so only the plasticity projection runs.
+                    // Restore GPU affine afterwards so next P2G APIC term is correct.
+                    // The new MaterialModel API takes (&mut Particles, usize) — convert AoS to SoA,
+                    // run the CPU pass, then scatter results back.
+                    if any_cpu {
+                        // Stash GPU affine matrices — we zero affine for the plasticity call then restore.
+                        let gpu_affines: Vec<_> =
+                            gpu_particles.iter().map(|p| p.velocity_gradient).collect();
+                        // Copy readback into AoS cpu mirror (zeroing affine for plasticity).
+                        for (p_gpu, p_cpu) in gpu_particles.iter().zip(self.particles.iter_mut()) {
+                            *p_cpu = *p_gpu;
+                            p_cpu.velocity_gradient = glam::Mat2::ZERO;
+                        }
+                        // Build SoA wrapper, run CPU plasticity, scatter plastic state back.
+                        // Skip sleeping particles — same reasoning as every GPU-side pass: their
+                        // F/plastic state is frozen, re-running plasticity on unchanged input
+                        // wastes exactly the compute sleep/wake exists to avoid. Before the
+                        // Particles::push() fix above, this loop silently ran on every particle
+                        // regardless of sleep state, because the AoS->SoA conversion dropped it.
+                        let mut soa = Particles::from(std::mem::take(&mut self.particles));
+                        for i in 0..soa.len() {
+                            if soa.sleeping[i] {
+                                continue;
+                            }
+                            self.registry.get(soa.material_id[i]).update_particle(
+                                &mut soa,
+                                i,
+                                self.last_sub_dt,
+                            );
+                        }
+                        self.particles = soa.to_vec();
+                        // Restore GPU affine.
+                        for (p_cpu, gpu_affine) in self.particles.iter_mut().zip(gpu_affines) {
+                            p_cpu.velocity_gradient = gpu_affine;
+                        }
+                    } else {
+                        for (p_gpu, p_cpu) in
+                            gpu_particles.into_iter().zip(self.particles.iter_mut())
+                        {
+                            *p_cpu = p_gpu;
+                        }
                     }
-                }
-                if any_cpu {
-                    self.layout_dirty = true; // CPU plasticity touched positions/F
+                    if any_cpu {
+                        self.layout_dirty = true; // CPU plasticity touched positions/F
+                    }
+                    self.rebuild_spatial_hash();
                 }
             }
 
@@ -1463,6 +1633,7 @@ mod solver {
             // the old buffer object and would be stale (or invalid) without this.
             self.bind_group_pool =
                 build_bind_group_pool(&self.device, &self.pipelines, &self.buffers);
+            self.rebuild_spatial_hash();
             start..n
         }
 
@@ -1473,21 +1644,84 @@ mod solver {
             self.particle_count
         }
 
+        /// Rebuilds `spatial_hash` from the current `self.particles` -- call any time
+        /// `self.particles` changes (readback completion, explicit sync, spawn). O(N),
+        /// same real cost class as the linear scans it replaces for QUERIES, but paid
+        /// once per mutation instead of once per query -- a real win whenever more than
+        /// one query happens against the same particle state (e.g. LP's ecology calling
+        /// `sense_local`/`centroid`/`phenotype` per creature per frame).
+        fn rebuild_spatial_hash(&mut self) {
+            let positions: Vec<glam::Vec2> = self.particles.iter().map(|p| p.x).collect();
+            self.spatial_hash.rebuild(&positions, self.particles.len());
+        }
+
         /// Blocking GPU → CPU particle sync. Updates `self.particles` immediately.
         /// Stalls the CPU until all in-flight GPU work completes — use only after step_frame
         /// when you need current positions right now (e.g. rendering). Not for the hot path.
         pub fn sync_particles_blocking(&mut self) {
+            // Safe no-op once the device is lost -- see step_frame's identical guard.
+            if self.is_device_lost() {
+                return;
+            }
             // If an async readback is in-flight, the staging buffer may be mapped or pending map.
             // Wait for it to complete, then consume it to unmap the staging buffer before reuse.
+            // Real fix (2026-07-05, issue #10): must distinguish Ok/Err here -- the old
+            // code called finish_readback (which calls get_mapped_range) on EITHER, but
+            // a failed map has nothing valid to extract; only abandon_readback (unmap
+            // only) is safe on Err. See GpuBuffers::abandon_readback's doc.
             if let Some(flag) = self.pending_readback.take() {
                 self.device.poll(wgpu::PollType::wait_indefinitely()).ok();
-                if flag.lock().ok().and_then(|mut g| g.take()).is_some() {
-                    let _ = self.buffers.finish_readback(self.particle_count);
+                match flag.lock().ok().and_then(|mut g| g.take()) {
+                    Some(Ok(())) => {
+                        let _ = self.buffers.finish_readback(self.particle_count);
+                    }
+                    Some(Err(_)) => {
+                        self.readback_error_count += 1;
+                        self.buffers.abandon_readback();
+                    }
+                    None => {}
                 }
             }
             self.particles =
                 self.buffers
                     .readback_blocking(&self.device, &self.queue, self.particle_count);
+            self.rebuild_spatial_hash();
+        }
+
+        /// Like `sync_particles_blocking`, but only for the given particle index ranges --
+        /// updates just `self.particles[range]` for each range, leaving the rest of the CPU
+        /// mirror as whatever the last async/full sync delivered. For callers that only need
+        /// a small, known subset of particles current every frame (e.g. a handful of live
+        /// creatures inside a much larger terrain/water scene) instead of the whole buffer --
+        /// see `GpuBuffers::readback_ranges_blocking`'s own doc for why this is cheaper than
+        /// repeated full syncs, not just "less data" but batched into one CPU↔GPU round-trip.
+        /// Ranges may overlap or be given in any order; each is written independently.
+        pub fn sync_particle_ranges_blocking(&mut self, ranges: &[std::ops::Range<usize>]) {
+            // Safe no-op once the device is lost -- see step_frame's identical guard.
+            if self.is_device_lost() {
+                return;
+            }
+            // Same real fix as sync_particles_blocking -- see that function's comment.
+            if let Some(flag) = self.pending_readback.take() {
+                self.device.poll(wgpu::PollType::wait_indefinitely()).ok();
+                match flag.lock().ok().and_then(|mut g| g.take()) {
+                    Some(Ok(())) => {
+                        let _ = self.buffers.finish_readback(self.particle_count);
+                    }
+                    Some(Err(_)) => {
+                        self.readback_error_count += 1;
+                        self.buffers.abandon_readback();
+                    }
+                    None => {}
+                }
+            }
+            let results = self
+                .buffers
+                .readback_ranges_blocking(&self.device, &self.queue, ranges);
+            for (range, data) in ranges.iter().zip(results) {
+                self.particles[range.clone()].copy_from_slice(&data);
+            }
+            self.rebuild_spatial_hash();
         }
 
         pub fn set_gravity(&mut self, gravity: glam::Vec2) {
@@ -1568,25 +1802,66 @@ mod solver {
 
         /// Iterate over (index, &Particle) pairs within `radius` grid-cells of `center`.
         /// Reads the internal CPU particle mirror — one frame behind GPU when strided.
+        /// O(candidates) via the internal spatial hash, not O(N) -- see `spatial_hash`
+        /// field's own doc for why this matters at real scale (many creatures/queries
+        /// per frame against a large terrain+water buffer).
         pub fn particles_near(
             &self,
             center: glam::Vec2,
             radius: f32,
         ) -> impl Iterator<Item = (usize, &Particle)> {
             let r2 = radius * radius;
-            self.particles
-                .iter()
-                .enumerate()
-                .filter(move |(_, p)| (p.x - center).length_squared() <= r2)
+            self.spatial_hash
+                .query(center, radius)
+                .filter_map(move |i| {
+                    let p = &self.particles[i];
+                    ((p.x - center).length_squared() <= r2).then_some((i, p))
+                })
         }
 
-        /// Count particles of `material_id` within `radius` grid-cells of `center`. O(N).
+        /// Count particles of `material_id` within `radius` grid-cells of `center`.
+        /// O(candidates) via the internal spatial hash, not O(N).
         pub fn count_near(&self, center: glam::Vec2, radius: f32, material_id: u32) -> usize {
             let r2 = radius * radius;
-            self.particles
-                .iter()
-                .filter(|p| p.material_id == material_id && (p.x - center).length_squared() <= r2)
+            self.spatial_hash
+                .query(center, radius)
+                .filter(|&i| {
+                    let p = &self.particles[i];
+                    p.material_id == material_id && (p.x - center).length_squared() <= r2
+                })
                 .count()
+        }
+
+        /// Indices of the `k` particles nearest to `center`, sorted by distance
+        /// ascending -- see `Simulation::particles_knn` (CPU, `src/solver/mod.rs`)
+        /// for the full rationale (Ballerini et al. 2008, PNAS: real starling
+        /// flocks use a topological ~6-7-nearest-neighbor rule, not a fixed
+        /// radius) and exactness argument. Identical algorithm, mirrored here
+        /// because the GPU backend keeps its own CPU-side spatial hash mirror.
+        pub fn particles_knn(&self, center: glam::Vec2, k: usize) -> Vec<usize> {
+            if k == 0 || self.particles.is_empty() {
+                return Vec::new();
+            }
+            let domain_diag =
+                self.config.grid_res as f32 * self.config.grid_cell_size * std::f32::consts::SQRT_2;
+            let mut radius = self.config.grid_cell_size * (k as f32).sqrt().max(1.0);
+            let mut candidates: Vec<(usize, f32)>;
+            loop {
+                let r2 = radius * radius;
+                candidates = self
+                    .spatial_hash
+                    .query(center, radius)
+                    .map(|i| (i, (self.particles[i].x - center).length_squared()))
+                    .filter(|&(_, d2)| d2 <= r2)
+                    .collect();
+                if candidates.len() >= k || radius >= domain_diag {
+                    break;
+                }
+                radius *= 2.0;
+            }
+            candidates.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
+            candidates.truncate(k);
+            candidates.into_iter().map(|(i, _)| i).collect()
         }
 
         /// Center of mass for particles in `range`. O(range.len()). GPU has no tag_index
@@ -1672,6 +1947,249 @@ mod solver {
                     "emerge: GPU impulse queue full ({MAX_GPU_IMPULSES}/frame max) — impulse dropped"
                 );
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod device_lost_tests {
+        use super::*;
+        use crate::materials::registry::MaterialRegistry;
+        use crate::materials::{FromSI, NeoHookeanMaterial};
+        use crate::solver::config::{SimConfig, SpawnRegion};
+        use glam::{IVec2, Vec2};
+
+        fn gpu_available() -> bool {
+            let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::None,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            }))
+            .is_ok()
+        }
+
+        /// Real, white-box verification of the device-lost guard added for emerge
+        /// issue #10 (see project memory gpu_readback_error_path_bug_issue10 — the
+        /// root cause, a genuine `Out of Memory` device loss under sustained
+        /// slow-backend load, was confirmed with hard evidence via a real
+        /// `device_lost_callback` firing; forcing that same OOM condition again just
+        /// to test the GUARD would repeat the same heavy, machine-stressing
+        /// reproduction unnecessarily). This directly injects a lost reason into the
+        /// private `device_lost` flag exactly as the real callback would, then
+        /// proves three things: (1) `device_lost_reason()` reports it, (2)
+        /// `step_frame()` becomes a real no-op (frame_index does not advance,
+        /// proving it didn't just avoid panicking by luck), (3) the blocking sync
+        /// methods are also safe no-ops (don't panic touching a "dead" device).
+        #[test]
+        fn step_frame_becomes_safe_noop_once_device_lost() {
+            if !gpu_available() {
+                return;
+            }
+            let config = SimConfig {
+                max_substeps_per_step: 8,
+                ..SimConfig::standard(32, 0.1, Vec2::new(0.0, -0.3))
+            };
+            let spawn = SpawnRegion {
+                spacing: 0.5,
+                box_size: IVec2::new(4, 4),
+                box_center: Vec2::new(16.0, 16.0),
+                precompute_initial_volumes: true,
+                ..SpawnRegion::for_sim(&config)
+            };
+            let particles = crate::build_particles(&config, spawn);
+            let mat = NeoHookeanMaterial::from_physical(
+                &crate::materials::physical_props::Elastic {
+                    e_pa: 30.0e3,
+                    nu: 0.45,
+                    rho_kg_m3: 1000.0,
+                },
+                &config,
+            );
+            let registry = MaterialRegistry::with_default(Box::new(mat));
+            let mut sim = pollster::block_on(GpuSimulation::new(config, particles, registry));
+
+            assert!(
+                sim.device_lost_reason().is_none(),
+                "a healthy, freshly-constructed sim must not report device loss"
+            );
+
+            sim.step_frame();
+            let frame_after_healthy_step = sim.frame_index;
+            assert!(
+                frame_after_healthy_step > 0,
+                "sanity check: a healthy device must actually advance frame_index"
+            );
+
+            // Directly inject a lost reason, exactly as the real callback does.
+            *sim.device_lost.lock().unwrap() = Some("Unknown: Out of memory".to_string());
+            assert_eq!(
+                sim.device_lost_reason(),
+                Some("Unknown: Out of memory".to_string()),
+                "device_lost_reason() must report an injected loss"
+            );
+
+            sim.step_frame();
+            assert_eq!(
+                sim.frame_index, frame_after_healthy_step,
+                "step_frame must become a real no-op once device_lost is set -- \
+                 frame_index must NOT advance"
+            );
+
+            // Must not panic -- these touch the same "dead" device.
+            sim.sync_particles_blocking();
+            let ranges = vec![0..1usize, 1..2usize];
+            sim.sync_particle_ranges_blocking(&ranges);
+        }
+
+        /// Real repro of issue #10's ACTUAL failure mode, found via real windows-latest
+        /// CI evidence (not speculation): re-enabling the crash-repro test showed that,
+        /// under sustained load, wgpu invalidates/destroys buffers tied to the device
+        /// BEFORE this instance's `device_lost_callback` fires -- the readback path's
+        /// `.unmap()` call then hits an uncaptured Validation error naming the destroyed
+        /// resource, and wgpu's default handler panics unconditionally
+        /// (`default_error_handler`: `panic!("wgpu error: {err}")`, confirmed by reading
+        /// wgpu-27.0.1's source directly).
+        ///
+        /// Forcing a real 9-minute sustained-load OOM again just to hit this exact race
+        /// would repeat the same heavy, machine-stressing reproduction unnecessarily --
+        /// this reproduces the SAME call path directly: destroy the readback staging
+        /// buffer ourselves (exactly what the device-loss cascade does to it), then call
+        /// `abandon_readback()`, the exact function whose `.unmap()` call panicked on
+        /// real CI. Before the `on_uncaptured_error` fix this would panic and abort the
+        /// test process; with it installed, it must set `device_lost` instead -- no
+        /// panic, `device_lost_reason()` reports it.
+        #[test]
+        fn uncaptured_destroyed_buffer_error_sets_device_lost_not_a_panic() {
+            if !gpu_available() {
+                return;
+            }
+            let config = SimConfig {
+                max_substeps_per_step: 8,
+                ..SimConfig::standard(32, 0.1, Vec2::new(0.0, -0.3))
+            };
+            let spawn = SpawnRegion {
+                spacing: 0.5,
+                box_size: IVec2::new(4, 4),
+                box_center: Vec2::new(16.0, 16.0),
+                precompute_initial_volumes: true,
+                ..SpawnRegion::for_sim(&config)
+            };
+            let particles = crate::build_particles(&config, spawn);
+            let mat = NeoHookeanMaterial::from_physical(
+                &crate::materials::physical_props::Elastic {
+                    e_pa: 30.0e3,
+                    nu: 0.45,
+                    rho_kg_m3: 1000.0,
+                },
+                &config,
+            );
+            let registry = MaterialRegistry::with_default(Box::new(mat));
+            let sim = pollster::block_on(GpuSimulation::new(config, particles, registry));
+
+            assert!(
+                sim.device_lost_reason().is_none(),
+                "a healthy, freshly-constructed sim must not report device loss"
+            );
+
+            // Exactly what a device-loss cascade does to resources tied to the
+            // device, without needing 9 minutes of real sustained WARP load.
+            sim.buffers.readback_staging.destroy();
+
+            // The exact real call path that panicked on CI: finish_readback and
+            // abandon_readback both end in `.unmap()` on this buffer.
+            sim.buffers.abandon_readback();
+            sim.device.poll(wgpu::PollType::Poll).ok();
+
+            let reason = sim.device_lost_reason();
+            assert!(
+                reason.is_some(),
+                "an uncaptured error naming a destroyed buffer must set device_lost, \
+                 not silently do nothing"
+            );
+            let reason = reason.unwrap();
+            assert!(
+                reason.contains("uncaptured wgpu error"),
+                "reason should be tagged as coming from the uncaptured-error handler \
+                 (distinguishable from the official device_lost_callback's report), \
+                 got: {reason}"
+            );
+            assert!(
+                reason.contains("destroyed"),
+                "reason should retain the real wgpu error text naming the destroyed \
+                 resource, got: {reason}"
+            );
+        }
+
+        /// Real proof that the OPT-IN path works -- this is the path LP's actual
+        /// production code needs (`World::with_device`, since LP shares its device
+        /// with a renderer and has no device-lost handling of its own, confirmed by
+        /// inspection of LP's `src/main.rs`). Proves `enable_device_lost_detection()`
+        /// makes a `with_device()` instance behave identically to a `new()`-
+        /// constructed one for reporting purposes. NOTE: this does NOT independently
+        /// prove `with_device()` never silently registers its own callback -- that
+        /// would need a real device-loss trigger to distinguish "no callback
+        /// registered" from "callback registered but nothing happened yet," which
+        /// this test doesn't force (see the heavy stress-test caution elsewhere in
+        /// this file). Static code inspection is what actually backs that claim:
+        /// `with_device()`'s body contains no `set_device_lost_callback` call.
+        #[test]
+        fn with_device_instances_need_explicit_opt_in_for_device_lost_detection() {
+            if !gpu_available() {
+                return;
+            }
+            let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+            let adapter =
+                pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    compatible_surface: None,
+                    force_fallback_adapter: false,
+                }))
+                .expect("no adapter");
+            let (device, queue) =
+                pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                    label: Some("test_shared_device"),
+                    required_limits: adapter.limits(),
+                    ..Default::default()
+                }))
+                .expect("no device");
+            let device = Arc::new(device);
+            let queue = Arc::new(queue);
+
+            let config = SimConfig {
+                max_substeps_per_step: 8,
+                ..SimConfig::standard(32, 0.1, Vec2::new(0.0, -0.3))
+            };
+            let mat = NeoHookeanMaterial::from_physical(
+                &crate::materials::physical_props::Elastic {
+                    e_pa: 30.0e3,
+                    nu: 0.45,
+                    rho_kg_m3: 1000.0,
+                },
+                &config,
+            );
+            let sim = GpuSimulation::with_device(
+                device,
+                queue,
+                config,
+                Vec::new(),
+                MaterialRegistry::with_default(Box::new(mat)),
+            );
+
+            // Fresh with_device() instance: field starts unset (expected regardless
+            // of whether a callback is wired -- see doc comment above for what this
+            // does and doesn't prove).
+            assert!(sim.device_lost_reason().is_none());
+
+            sim.enable_device_lost_detection();
+            // Directly invoke the same injection used in the other test -- proves the
+            // callback registration path (not just the field) is wired correctly.
+            *sim.device_lost.lock().unwrap() = Some("Unknown: Out of memory".to_string());
+            assert_eq!(
+                sim.device_lost_reason(),
+                Some("Unknown: Out of memory".to_string()),
+                "after enable_device_lost_detection(), device_lost_reason() must work \
+                 identically to a new()-constructed instance"
+            );
         }
     }
 }

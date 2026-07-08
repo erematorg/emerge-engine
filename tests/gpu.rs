@@ -48,6 +48,105 @@ mod gpu_tests {
         )
     }
 
+    /// `count_near`/`particles_near` now use an internal spatial hash instead of a
+    /// full linear scan (real perf fix, see Claude memory
+    /// `emerge_reference_audit` -- these were the only two of emerge's real
+    /// neighbor-query methods missing the spatial acceleration already proven in
+    /// `solver::Simulation`). This must return EXACTLY what a brute-force linear
+    /// scan over the real particle buffer would -- correctness first, speed
+    /// second.
+    #[test]
+    fn gpu_spatial_queries_match_brute_force_scan() {
+        if !gpu_available() {
+            return;
+        }
+        let config = small_config();
+        // Two disks of different materials, close enough that a real query radius
+        // spans both -- real multi-material scene, not a degenerate single-blob case.
+        let mut particles = spawn_disk(&config, Vec2::splat(10.0), 0);
+        particles.extend(spawn_disk(&config, Vec2::splat(14.0), 1));
+        let mut registry =
+            MaterialRegistry::with_default(Box::new(NeoHookeanMaterial::new(100.0, 50.0)));
+        // Second disk uses material_id 1 -- must be registered too, or `get`/
+        // `count_near` panic on an unregistered slot (real multi-material scene,
+        // not a degenerate single-material case, so both IDs need real materials).
+        registry.insert(1, Box::new(NeoHookeanMaterial::new(100.0, 50.0)));
+        let solver = block_on(GpuSimulation::new(config, particles, registry));
+
+        let center = Vec2::splat(12.0);
+        let radius = 6.0;
+        let r2 = radius * radius;
+
+        let expected_count_mat0 = solver
+            .particles()
+            .iter()
+            .filter(|p| p.material_id == 0 && (p.x - center).length_squared() <= r2)
+            .count();
+        assert_eq!(
+            solver.count_near(center, radius, 0),
+            expected_count_mat0,
+            "count_near must match a brute-force scan for material 0"
+        );
+
+        let mut expected_indices: Vec<usize> = solver
+            .particles()
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| (p.x - center).length_squared() <= r2)
+            .map(|(i, _)| i)
+            .collect();
+        let mut actual_indices: Vec<usize> = solver
+            .particles_near(center, radius)
+            .map(|(i, _)| i)
+            .collect();
+        expected_indices.sort_unstable();
+        actual_indices.sort_unstable();
+        assert_eq!(
+            actual_indices, expected_indices,
+            "particles_near must return exactly the same index set as a brute-force scan"
+        );
+    }
+
+    /// `particles_knn` (see `Simulation::particles_knn`, CPU side, for the full
+    /// rationale -- a real topological neighbor rule, Ballerini et al. 2008)
+    /// mirrored on the GPU backend must match a brute-force k-nearest scan.
+    /// Query point is off either disk's own center so no two particles land at
+    /// the exact same distance (a real tie right at the k-th cutoff is
+    /// genuinely ambiguous, not a bug -- see the CPU-side test's own note).
+    #[test]
+    fn gpu_particles_knn_matches_brute_force_scan() {
+        if !gpu_available() {
+            return;
+        }
+        let config = small_config();
+        let mut particles = spawn_disk(&config, Vec2::splat(10.0), 0);
+        particles.extend(spawn_disk(&config, Vec2::splat(14.0), 1));
+        let mut registry =
+            MaterialRegistry::with_default(Box::new(NeoHookeanMaterial::new(100.0, 50.0)));
+        registry.insert(1, Box::new(NeoHookeanMaterial::new(100.0, 50.0)));
+        let solver = block_on(GpuSimulation::new(config, particles, registry));
+
+        let center = Vec2::new(12.37, 11.82);
+        let k = 7;
+
+        let mut brute: Vec<(usize, f32)> = solver
+            .particles()
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (i, (p.x - center).length_squared()))
+            .collect();
+        brute.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
+        let mut expected: Vec<usize> = brute.into_iter().take(k).map(|(i, _)| i).collect();
+        expected.sort_unstable();
+
+        let mut got = solver.particles_knn(center, k);
+        got.sort_unstable();
+        assert_eq!(
+            got, expected,
+            "particles_knn must match a brute-force k-nearest scan (same particle set)"
+        );
+    }
+
     #[test]
     fn gpu_neohookean_stable() {
         if !gpu_available() {
@@ -67,6 +166,134 @@ mod gpu_tests {
             assert!(
                 p.deformation_gradient.determinant() > 0.0,
                 "gpu neo particle {i}: J collapsed"
+            );
+        }
+    }
+
+    /// `sync_particle_ranges_blocking` must return exactly what a full
+    /// `sync_particles_blocking` would for the same indices -- the whole point of the
+    /// partial-readback path is to be cheaper, never to be a different (approximate or
+    /// stale) answer. Spawns two disjoint disks (two "creature" ranges in a scene that
+    /// also has other particles between/around them, closer to LP's real terrain+water+
+    /// creatures layout than a single contiguous spawn would be), steps real physics,
+    /// then compares a partial sync of both ranges against a full sync of the same
+    /// particles.
+    #[test]
+    fn gpu_partial_range_readback_matches_full_readback() {
+        if !gpu_available() {
+            return;
+        }
+        let config = small_config();
+        let mut particles = spawn_disk(&config, Vec2::splat(10.0), 0);
+        let range_a = 0..particles.len();
+        let middle = spawn_disk(&config, Vec2::splat(16.0), 0);
+        let offset = particles.len();
+        particles.extend(middle);
+        let range_b_start = particles.len();
+        let range_b_particles = spawn_disk(&config, Vec2::splat(22.0), 0);
+        particles.extend(range_b_particles.clone());
+        let range_b = range_b_start..particles.len();
+        let _ = offset;
+
+        let registry =
+            MaterialRegistry::with_default(Box::new(NeoHookeanMaterial::new(100.0, 50.0)));
+        let mut solver = block_on(GpuSimulation::new(config, particles, registry));
+        for _ in 0..15 {
+            solver.step_frame();
+        }
+
+        let ranges = [range_a.clone(), range_b.clone()];
+        solver.sync_particle_ranges_blocking(&ranges);
+        let partial_a = solver.particles()[range_a.clone()].to_vec();
+        let partial_b = solver.particles()[range_b.clone()].to_vec();
+
+        solver.sync_particles_blocking();
+        let full_a = solver.particles()[range_a].to_vec();
+        let full_b = solver.particles()[range_b].to_vec();
+
+        assert_eq!(
+            partial_a.len(),
+            full_a.len(),
+            "partial range A must cover the same particle count"
+        );
+        for (i, (p, f)) in partial_a.iter().zip(&full_a).enumerate() {
+            assert_eq!(p.x, f.x, "range A particle {i}: position mismatch");
+            assert_eq!(
+                p.deformation_gradient, f.deformation_gradient,
+                "range A particle {i}: deformation gradient mismatch"
+            );
+        }
+        for (i, (p, f)) in partial_b.iter().zip(&full_b).enumerate() {
+            assert_eq!(p.x, f.x, "range B particle {i}: position mismatch");
+            assert_eq!(
+                p.deformation_gradient, f.deformation_gradient,
+                "range B particle {i}: deformation gradient mismatch"
+            );
+        }
+    }
+
+    /// Regression for LP issue erematorg/LP#161: `step_frame`'s upload path used to
+    /// spatially resort `self.particles` by grid cell before every dirty upload,
+    /// silently invalidating any previously-returned `Range<usize>` particle
+    /// identity -- `spawn_region`'s own doc promises this range is stable ("LP
+    /// uses this as creature_id -> particle_range"). That predates and duplicates
+    /// the GPU's own `particle_sort` pipeline (a separate index buffer that never
+    /// touches particle storage order), so the CPU-side resort was removed.
+    ///
+    /// Proves the fix directly rather than trusting the removal was safe: tags a
+    /// "creature" particle range with a distinct spawn-time-only marker per
+    /// particle (`muscle_group_id = local index`), then repeatedly calls
+    /// `mark_particles_dirty()` before `step_frame()` every frame -- the exact
+    /// real-world trigger (LP calls this every frame via `drive_muscles`/
+    /// `update_damage`). After many such frames, the range must still map
+    /// index-for-index to the same tags; any silent reorder shows up as a
+    /// duplicate or out-of-place tag rather than a vague "something looked wrong."
+    #[test]
+    fn gpu_particle_identity_stable_across_repeated_dirty_uploads() {
+        if !gpu_available() {
+            return;
+        }
+        let config = small_config();
+        let mut particles = spawn_disk(&config, Vec2::splat(10.0), 0); // "terrain"
+        let creature_start = particles.len();
+        let mut creature = spawn_disk(&config, Vec2::splat(22.0), 0);
+        assert!(
+            creature.len() >= 8,
+            "test needs a real multi-particle creature range to detect reordering, got {}",
+            creature.len()
+        );
+        for (i, p) in creature.iter_mut().enumerate() {
+            p.muscle_group_id = i as u32;
+        }
+        let creature_len = creature.len();
+        particles.extend(creature);
+        let creature_range = creature_start..creature_start + creature_len;
+
+        let registry =
+            MaterialRegistry::with_default(Box::new(NeoHookeanMaterial::new(100.0, 50.0)));
+        let mut solver = block_on(GpuSimulation::new(config, particles, registry));
+
+        for _ in 0..60 {
+            solver.mark_particles_dirty();
+            solver.step_frame();
+        }
+        solver.sync_particles_blocking();
+
+        let creature_particles = &solver.particles()[creature_range.clone()];
+        assert_eq!(
+            creature_particles.len(),
+            creature_len,
+            "creature range length changed across repeated dirty uploads -- \
+             range/identity stability broken"
+        );
+        for (local_i, p) in creature_particles.iter().enumerate() {
+            assert_eq!(
+                p.muscle_group_id, local_i as u32,
+                "particle at creature_range local index {local_i} has muscle_group_id \
+                 {} (expected {local_i}) -- particle identity was NOT stable across \
+                 repeated dirty uploads; this is exactly the LP#161 regression \
+                 (a spatial resort silently reordering the backing array)",
+                p.muscle_group_id
             );
         }
     }
@@ -139,9 +366,37 @@ mod gpu_tests {
     /// the accumulated plastic shear-strain norm and is expected to keep growing slowly
     /// under sustained load; this only checks it stays bounded by `q_max` and finite, not
     /// that it stops moving.
+    ///
+    /// RE-`#[ignore]`d 2026-07-08 after a full investigation cycle, with the honest
+    /// final picture (see issue #10 for the complete evidence trail):
+    ///
+    /// - The DETERMINISTIC emerge-side crash path IS fixed: under sustained WARP
+    ///   load, wgpu genuinely loses the device (~step 2500-3000, reproduced locally
+    ///   via the forced-WARP repro at the end of this module), and the old code
+    ///   panicked from inside wgpu's own `Queue::submit` error path — unwinding
+    ///   there is what produced `STATUS_STACK_BUFFER_OVERRUN`. Fixed by the
+    ///   never-panic uncaptured-error handler (see
+    ///   `GpuSimulation::enable_device_lost_detection`'s doc); covered by unit
+    ///   tests plus the `#[ignore]`d 10-minute local WARP repro, which survived all
+    ///   7500 steps through a real mid-run device loss.
+    ///
+    /// - What REMAINS is wgpu/WARP-internal and nondeterministic: on identical
+    ///   code, this test passed one windows-latest run (28942784771, 14m48s) and
+    ///   then died on the next (28947240097, abnormal exit code 2173 — not a Rust
+    ///   panic, not the old stack-overrun) after the only change was moving an
+    ///   ignored test within this file. Post-device-loss teardown inside the
+    ///   driver stack can still terminate the process through paths application
+    ///   code cannot intercept. One green run was NOT proof; treating it as such
+    ///   was the earlier mistake this doc corrects.
+    ///
+    /// Run manually on real hardware (passes in ~25s on a real GPU) or via the
+    /// forced-WARP repro when investigating; not CI-gating until the residual
+    /// WARP-internal instability is resolved (likely upstream).
     #[test]
-    #[ignore = "crashes windows-latest with STATUS_STACK_BUFFER_OVERRUN after ~7500 steps -- \
-                real correctness test, NOT a perf skip, root cause not yet found -- see #10"]
+    #[ignore = "windows-latest WARP: post-device-loss teardown inside wgpu/WARP can still \
+                kill the process nondeterministically (passed one CI run, died exit 2173 \
+                the next, identical code) -- emerge-side crash path IS fixed and covered \
+                by unit tests + the forced-WARP repro; see issue #10"]
     fn gpu_sand_q_stays_bounded_once_settled() {
         if !gpu_available() {
             return;
@@ -1852,5 +2107,106 @@ mod gpu_tests {
         );
         assert_eq!(config.dx_meters, 0.01);
         assert_eq!(config.dt_seconds, 0.05);
+    }
+
+    /// Forces the D3D12 WARP (software) adapter -- the same backend windows-latest
+    /// CI uses (real hardware GPUs don't hit this, confirmed: the equivalent scene
+    /// ran clean on a real AMD GPU) -- instead of whatever real GPU this machine
+    /// has. Lets any contributor on any Windows dev machine reproduce issue #10's
+    /// class of sustained-load device-loss bug locally, without needing a CI
+    /// round-trip (~10-15min each) to iterate.
+    fn warp_available() -> bool {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::DX12,
+            ..Default::default()
+        });
+        block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::None,
+            compatible_surface: None,
+            force_fallback_adapter: true,
+        }))
+        .is_ok()
+    }
+
+    /// The real, complete local reproduction of issue #10's actual failure mode
+    /// (found 2026-07-08 by forcing WARP locally rather than guessing from CI logs
+    /// alone): running this exact scene for 7500 steps against forced WARP
+    /// triggers a genuine sustained-load device loss around step ~2500-3000 (a
+    /// real `Buffer ... has been destroyed` uncaptured error, then shortly after
+    /// the official "Device is lost" callback) -- not a hypothetical, an actually
+    /// observed real event on this exact backend. This directly proves
+    /// `enable_device_lost_detection`'s uncaptured-error handler (see its doc for
+    /// why it must never panic, found via this exact test crashing with
+    /// `STATUS_STACK_BUFFER_OVERRUN` when an earlier version of that handler still
+    /// panicked for "unrecognized" errors) carries the simulation through the loss
+    /// gracefully: all 7500 steps complete, no crash, no panic, `step_frame`
+    /// becomes a real no-op once the loss is detected.
+    ///
+    /// `#[ignore]`d: takes ~10 minutes even locally (genuine sustained load is the
+    /// point) and needs a Windows machine with D3D12 available -- run manually
+    /// (`cargo test --features gpu --test gpu -- --ignored warp_repro`) when
+    /// investigating WARP/sustained-load GPU issues, not routine CI.
+    #[test]
+    #[ignore = "~10min real sustained-load repro against forced D3D12 WARP -- run \
+                manually when investigating GPU device-loss issues, see doc comment"]
+    fn warp_repro_gpu_sand_q_stays_bounded_once_settled() {
+        if !warp_available() {
+            eprintln!("SKIPPED: no D3D12 WARP adapter available on this machine");
+            return;
+        }
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::DX12,
+            ..Default::default()
+        });
+        let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::None,
+            compatible_surface: None,
+            force_fallback_adapter: true,
+        }))
+        .expect("WARP adapter");
+        eprintln!("WARP adapter info: {:?}", adapter.get_info());
+        let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("warp_repro_device"),
+            required_limits: adapter.limits(),
+            ..Default::default()
+        }))
+        .expect("WARP device");
+        let device = std::sync::Arc::new(device);
+        let queue = std::sync::Arc::new(queue);
+
+        const GRID_RES: usize = 64;
+        let config = SimConfig {
+            boundary_thickness: 3,
+            max_substeps_per_step: 12,
+            gravity: Vec2::new(0.0, -0.3),
+            ..SimConfig::earth(GRID_RES, 0.01, 0.1)
+        };
+        let spawn = SpawnRegion {
+            spacing: 0.5,
+            box_size: glam::IVec2::new(18, 14),
+            box_center: Vec2::new(32.0, 40.0),
+            precompute_initial_volumes: true,
+            position_jitter: 0.5,
+            rng_seed: 11,
+            ..SpawnRegion::for_sim(&config)
+        };
+        let particles = build_particles(&config, spawn);
+        let mut sand = DruckerPragerMaterial::new(2000.0, 3000.0);
+        sand.friction_angle = 20.0f32.to_radians();
+        let registry = MaterialRegistry::with_default(Box::new(sand));
+        let mut solver = GpuSimulation::with_device(device, queue, config, particles, registry);
+        solver.enable_device_lost_detection();
+
+        for step in 0..7500 {
+            solver.step_frame();
+            if step % 500 == 0 {
+                eprintln!(
+                    "step {step}: device_lost_reason={:?}",
+                    solver.device_lost_reason()
+                );
+            }
+        }
+        solver.sync_particles_blocking();
+        eprintln!("completed all 7500 steps without a crash or panic");
     }
 }
