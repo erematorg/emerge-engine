@@ -474,19 +474,15 @@ mod gpu_tests {
     /// out as the explanation here (re-ran the CPU test with a frictionless
     /// `SlipBoundary` instead of `FrictionBoundary`: identical 1.50x ratio --
     /// the column never reaches the domain wall in this test either way).
-    /// `#[ignore]`d 2026-07-08 (real CI evidence, run 28945815883): on
-    /// windows-latest's software D3D12 WARP backend, this test's ~1500 sustained
-    /// steps trigger a mid-run async-readback `map_async` Err, and WITHOUT the
-    /// readback-Err-leak fix (which lives in PR #16, not this branch) the staging
-    /// buffer is left permanently mapped -- the next map then panics with
-    /// "Buffer is already mapped" (0..57344 vs 0..0, the exact leak signature).
-    /// Passes on real GPUs (local AMD) and on ubuntu's lavapipe; this is a real
-    /// merge-order dependency between two open PRs, not a physics failure.
-    /// Un-ignore in a follow-up once PR #16 (readback Err handling + never-panic
-    /// uncaptured-error handler, issue #10) has merged.
+    /// Was briefly `#[ignore]`d 2026-07-08 while #14 and #16 were separate open
+    /// PRs: on windows-latest's software D3D12 WARP backend, this test's ~1500
+    /// sustained steps trigger a mid-run async-readback `map_async` Err, and
+    /// without #16's readback-Err-leak fix (`GpuBuffers::abandon_readback`) the
+    /// staging buffer was left permanently mapped -- the next map panicked with
+    /// "Buffer is already mapped" (real CI evidence, run 28945815883). A
+    /// merge-order dependency, not a physics failure; re-enabled now that both
+    /// PRs are merged and the fix is present on this branch.
     #[test]
-    #[ignore = "windows-latest WARP: sustained-load readback-Err leak panics without \
-                PR #16's fix -- real cross-PR dependency, un-ignore after #16 merges"]
     fn gpu_sand_column_collapse_runout_matches_lajeunesse_scaling() {
         if !gpu_available() {
             return;
@@ -562,14 +558,11 @@ mod gpu_tests {
     /// CPU-only repose-angle gap also happens to not apply on GPU -- not
     /// assuming it, measuring it, same discipline as every other benchmark in
     /// this file.
-    /// `#[ignore]`d 2026-07-08 for the same real reason as
-    /// `gpu_sand_column_collapse_runout_matches_lajeunesse_scaling` directly above
-    /// (windows-latest WARP sustained-load readback-Err leak, fixed in PR #16, a
-    /// real merge-order dependency -- see that test's doc for the full evidence).
-    /// Un-ignore both together once #16 has merged.
+    /// (Was briefly `#[ignore]`d 2026-07-08 alongside
+    /// `gpu_sand_column_collapse_runout_matches_lajeunesse_scaling` above --
+    /// same WARP readback-Err-leak merge-order dependency, see that test's doc;
+    /// re-enabled together now that the fix is present on this branch.)
     #[test]
-    #[ignore = "windows-latest WARP: sustained-load readback-Err leak panics without \
-                PR #16's fix -- real cross-PR dependency, un-ignore after #16 merges"]
     fn gpu_sand_angle_of_repose_is_physical() {
         if !gpu_available() {
             return;
