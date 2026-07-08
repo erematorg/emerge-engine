@@ -367,19 +367,36 @@ mod gpu_tests {
     /// under sustained load; this only checks it stays bounded by `q_max` and finite, not
     /// that it stops moving.
     ///
-    /// UN-IGNORED 2026-07-08 (was `#[ignore]`d citing issue #10: crashed windows-latest
-    /// with STATUS_STACK_BUFFER_OVERRUN after ~7500 steps on the CI runner's software
-    /// WARP adapter). This PR adds device-lost handling for a *plausibly* related root
-    /// cause (OOM-triggered device loss under sustained load on slow/software backends —
-    /// see `GpuSimulation::enable_device_lost_detection`'s doc) but that link was never
-    /// proven, only hedged as "plausible" in-code. Passed clean locally (7500 steps,
-    /// ~25s, no crash) on a real AMD GPU -- NOT the WARP backend the original crash
-    /// needs, so that local pass proves nothing about #10 specifically. Re-enabling here
-    /// so CI's actual windows-latest/WARP runner gives a real answer instead of guessing:
-    /// if this PR's CI run passes, that's real evidence #10 is fixed (re-ignore is wrong
-    /// at that point, close #10); if it still crashes, at least it's an isolated,
-    /// reproducible signal on a fresh code state rather than a stale 2026-07-01 trace.
+    /// RE-`#[ignore]`d 2026-07-08 after a full investigation cycle, with the honest
+    /// final picture (see issue #10 for the complete evidence trail):
+    ///
+    /// - The DETERMINISTIC emerge-side crash path IS fixed: under sustained WARP
+    ///   load, wgpu genuinely loses the device (~step 2500-3000, reproduced locally
+    ///   via the forced-WARP repro at the end of this module), and the old code
+    ///   panicked from inside wgpu's own `Queue::submit` error path — unwinding
+    ///   there is what produced `STATUS_STACK_BUFFER_OVERRUN`. Fixed by the
+    ///   never-panic uncaptured-error handler (see
+    ///   `GpuSimulation::enable_device_lost_detection`'s doc); covered by unit
+    ///   tests plus the `#[ignore]`d 10-minute local WARP repro, which survived all
+    ///   7500 steps through a real mid-run device loss.
+    ///
+    /// - What REMAINS is wgpu/WARP-internal and nondeterministic: on identical
+    ///   code, this test passed one windows-latest run (28942784771, 14m48s) and
+    ///   then died on the next (28947240097, abnormal exit code 2173 — not a Rust
+    ///   panic, not the old stack-overrun) after the only change was moving an
+    ///   ignored test within this file. Post-device-loss teardown inside the
+    ///   driver stack can still terminate the process through paths application
+    ///   code cannot intercept. One green run was NOT proof; treating it as such
+    ///   was the earlier mistake this doc corrects.
+    ///
+    /// Run manually on real hardware (passes in ~25s on a real GPU) or via the
+    /// forced-WARP repro when investigating; not CI-gating until the residual
+    /// WARP-internal instability is resolved (likely upstream).
     #[test]
+    #[ignore = "windows-latest WARP: post-device-loss teardown inside wgpu/WARP can still \
+                kill the process nondeterministically (passed one CI run, died exit 2173 \
+                the next, identical code) -- emerge-side crash path IS fixed and covered \
+                by unit tests + the forced-WARP repro; see issue #10"]
     fn gpu_sand_q_stays_bounded_once_settled() {
         if !gpu_available() {
             return;
