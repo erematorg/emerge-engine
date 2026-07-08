@@ -430,107 +430,6 @@ mod gpu_tests {
         }
     }
 
-    /// Forces the D3D12 WARP (software) adapter -- the same backend windows-latest
-    /// CI uses (real hardware GPUs don't hit this, confirmed: the equivalent scene
-    /// ran clean on a real AMD GPU) -- instead of whatever real GPU this machine
-    /// has. Lets any contributor on any Windows dev machine reproduce issue #10's
-    /// class of sustained-load device-loss bug locally, without needing a CI
-    /// round-trip (~10-15min each) to iterate.
-    fn warp_available() -> bool {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::DX12,
-            ..Default::default()
-        });
-        block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::None,
-            compatible_surface: None,
-            force_fallback_adapter: true,
-        }))
-        .is_ok()
-    }
-
-    /// The real, complete local reproduction of issue #10's actual failure mode
-    /// (found 2026-07-08 by forcing WARP locally rather than guessing from CI logs
-    /// alone): running this exact scene for 7500 steps against forced WARP
-    /// triggers a genuine sustained-load device loss around step ~2500-3000 (a
-    /// real `Buffer ... has been destroyed` uncaptured error, then shortly after
-    /// the official "Device is lost" callback) -- not a hypothetical, an actually
-    /// observed real event on this exact backend. This directly proves
-    /// `enable_device_lost_detection`'s uncaptured-error handler (see its doc for
-    /// why it must never panic, found via this exact test crashing with
-    /// `STATUS_STACK_BUFFER_OVERRUN` when an earlier version of that handler still
-    /// panicked for "unrecognized" errors) carries the simulation through the loss
-    /// gracefully: all 7500 steps complete, no crash, no panic, `step_frame`
-    /// becomes a real no-op once the loss is detected.
-    ///
-    /// `#[ignore]`d: takes ~10 minutes even locally (genuine sustained load is the
-    /// point) and needs a Windows machine with D3D12 available -- run manually
-    /// (`cargo test --features gpu --test gpu -- --ignored warp_repro`) when
-    /// investigating WARP/sustained-load GPU issues, not routine CI.
-    #[test]
-    #[ignore = "~10min real sustained-load repro against forced D3D12 WARP -- run \
-                manually when investigating GPU device-loss issues, see doc comment"]
-    fn warp_repro_gpu_sand_q_stays_bounded_once_settled() {
-        if !warp_available() {
-            eprintln!("SKIPPED: no D3D12 WARP adapter available on this machine");
-            return;
-        }
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::DX12,
-            ..Default::default()
-        });
-        let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::None,
-            compatible_surface: None,
-            force_fallback_adapter: true,
-        }))
-        .expect("WARP adapter");
-        eprintln!("WARP adapter info: {:?}", adapter.get_info());
-        let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("warp_repro_device"),
-            required_limits: adapter.limits(),
-            ..Default::default()
-        }))
-        .expect("WARP device");
-        let device = std::sync::Arc::new(device);
-        let queue = std::sync::Arc::new(queue);
-
-        const GRID_RES: usize = 64;
-        let config = SimConfig {
-            boundary_thickness: 3,
-            max_substeps_per_step: 12,
-            gravity: Vec2::new(0.0, -0.3),
-            ..SimConfig::earth(GRID_RES, 0.01, 0.1)
-        };
-        let spawn = SpawnRegion {
-            spacing: 0.5,
-            box_size: glam::IVec2::new(18, 14),
-            box_center: Vec2::new(32.0, 40.0),
-            precompute_initial_volumes: true,
-            position_jitter: 0.5,
-            rng_seed: 11,
-            ..SpawnRegion::for_sim(&config)
-        };
-        let particles = build_particles(&config, spawn);
-        let mut sand = DruckerPragerMaterial::new(2000.0, 3000.0);
-        sand.friction_angle = 20.0f32.to_radians();
-        let registry = MaterialRegistry::with_default(Box::new(sand));
-        let mut solver = GpuSimulation::with_device(device, queue, config, particles, registry);
-        solver.enable_device_lost_detection();
-
-        for step in 0..7500 {
-            solver.step_frame();
-            if step % 500 == 0 {
-                eprintln!(
-                    "step {step}: device_lost_reason={:?}",
-                    solver.device_lost_reason()
-                );
-            }
-        }
-        solver.sync_particles_blocking();
-        eprintln!("completed all 7500 steps without a crash or panic");
-    }
-
     #[test]
     fn gpu_fluid_stable() {
         if !gpu_available() {
@@ -2191,5 +2090,106 @@ mod gpu_tests {
         );
         assert_eq!(config.dx_meters, 0.01);
         assert_eq!(config.dt_seconds, 0.05);
+    }
+
+    /// Forces the D3D12 WARP (software) adapter -- the same backend windows-latest
+    /// CI uses (real hardware GPUs don't hit this, confirmed: the equivalent scene
+    /// ran clean on a real AMD GPU) -- instead of whatever real GPU this machine
+    /// has. Lets any contributor on any Windows dev machine reproduce issue #10's
+    /// class of sustained-load device-loss bug locally, without needing a CI
+    /// round-trip (~10-15min each) to iterate.
+    fn warp_available() -> bool {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::DX12,
+            ..Default::default()
+        });
+        block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::None,
+            compatible_surface: None,
+            force_fallback_adapter: true,
+        }))
+        .is_ok()
+    }
+
+    /// The real, complete local reproduction of issue #10's actual failure mode
+    /// (found 2026-07-08 by forcing WARP locally rather than guessing from CI logs
+    /// alone): running this exact scene for 7500 steps against forced WARP
+    /// triggers a genuine sustained-load device loss around step ~2500-3000 (a
+    /// real `Buffer ... has been destroyed` uncaptured error, then shortly after
+    /// the official "Device is lost" callback) -- not a hypothetical, an actually
+    /// observed real event on this exact backend. This directly proves
+    /// `enable_device_lost_detection`'s uncaptured-error handler (see its doc for
+    /// why it must never panic, found via this exact test crashing with
+    /// `STATUS_STACK_BUFFER_OVERRUN` when an earlier version of that handler still
+    /// panicked for "unrecognized" errors) carries the simulation through the loss
+    /// gracefully: all 7500 steps complete, no crash, no panic, `step_frame`
+    /// becomes a real no-op once the loss is detected.
+    ///
+    /// `#[ignore]`d: takes ~10 minutes even locally (genuine sustained load is the
+    /// point) and needs a Windows machine with D3D12 available -- run manually
+    /// (`cargo test --features gpu --test gpu -- --ignored warp_repro`) when
+    /// investigating WARP/sustained-load GPU issues, not routine CI.
+    #[test]
+    #[ignore = "~10min real sustained-load repro against forced D3D12 WARP -- run \
+                manually when investigating GPU device-loss issues, see doc comment"]
+    fn warp_repro_gpu_sand_q_stays_bounded_once_settled() {
+        if !warp_available() {
+            eprintln!("SKIPPED: no D3D12 WARP adapter available on this machine");
+            return;
+        }
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::DX12,
+            ..Default::default()
+        });
+        let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::None,
+            compatible_surface: None,
+            force_fallback_adapter: true,
+        }))
+        .expect("WARP adapter");
+        eprintln!("WARP adapter info: {:?}", adapter.get_info());
+        let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("warp_repro_device"),
+            required_limits: adapter.limits(),
+            ..Default::default()
+        }))
+        .expect("WARP device");
+        let device = std::sync::Arc::new(device);
+        let queue = std::sync::Arc::new(queue);
+
+        const GRID_RES: usize = 64;
+        let config = SimConfig {
+            boundary_thickness: 3,
+            max_substeps_per_step: 12,
+            gravity: Vec2::new(0.0, -0.3),
+            ..SimConfig::earth(GRID_RES, 0.01, 0.1)
+        };
+        let spawn = SpawnRegion {
+            spacing: 0.5,
+            box_size: glam::IVec2::new(18, 14),
+            box_center: Vec2::new(32.0, 40.0),
+            precompute_initial_volumes: true,
+            position_jitter: 0.5,
+            rng_seed: 11,
+            ..SpawnRegion::for_sim(&config)
+        };
+        let particles = build_particles(&config, spawn);
+        let mut sand = DruckerPragerMaterial::new(2000.0, 3000.0);
+        sand.friction_angle = 20.0f32.to_radians();
+        let registry = MaterialRegistry::with_default(Box::new(sand));
+        let mut solver = GpuSimulation::with_device(device, queue, config, particles, registry);
+        solver.enable_device_lost_detection();
+
+        for step in 0..7500 {
+            solver.step_frame();
+            if step % 500 == 0 {
+                eprintln!(
+                    "step {step}: device_lost_reason={:?}",
+                    solver.device_lost_reason()
+                );
+            }
+        }
+        solver.sync_particles_blocking();
+        eprintln!("completed all 7500 steps without a crash or panic");
     }
 }
