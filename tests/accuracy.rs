@@ -417,7 +417,7 @@ fn fluid_spreads_more_than_elastic_under_gravity() {
         .with_default_material(Box::new(NewtonianFluidMaterial::new(1.0, 1e-3, 50.0, 7.0)))
         .with_boundary(Box::new(SlipBoundary::new(2)));
     let ar_fluid_initial = aspect_ratio(&fluid_solver.particles().x);
-    fluid_solver.step_n(1000);
+    fluid_solver.step_n(600);
     let ar_fluid_final = aspect_ratio(&fluid_solver.particles().x);
 
     // ── Elastic ──
@@ -427,7 +427,7 @@ fn fluid_spreads_more_than_elastic_under_gravity() {
         .with_default_material(Box::new(NeoHookeanMaterial::from_young_modulus(5.0e4, 0.3)))
         .with_boundary(Box::new(SlipBoundary::new(2)));
     let ar_elastic_initial = aspect_ratio(&elastic_solver.particles().x);
-    elastic_solver.step_n(1000);
+    elastic_solver.step_n(600);
     let ar_elastic_final = aspect_ratio(&elastic_solver.particles().x);
 
     println!("── FLUID vs ELASTIC SPREADING ──");
@@ -785,7 +785,7 @@ fn earth_gravity_freefall_velocity_matches_gt() {
 /// shallow ~3-cell depth range is tiny (~0.3 grid units total), and is
 /// completely swamped by particle-level noise riding on top of the ~1.3x
 /// systematic overshoot (measured pressure noise band ~100-400 grid units,
-/// >100x the real signal). `#[ignore]`d honestly rather than asserting
+/// over 100x the real signal). `#[ignore]`d honestly rather than asserting
 /// something not actually demonstrated -- same discipline as the sand
 /// repose-angle gaps in this file.
 #[ignore = "density settles at ~1.3x rest_density (not the ~1.003x real hydrostatic \

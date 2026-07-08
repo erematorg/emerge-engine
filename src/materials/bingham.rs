@@ -149,17 +149,17 @@ impl MaterialModel for BinghamFluidMaterial {
     fn kirchhoff_stress(&self, particles: &Particles, i: usize) -> Mat2 {
         // Pressure from Tait EOS (same as NewtonianFluid). Clamp density both
         // ways, matching `NewtonianFluidMaterial::kirchhoff_stress` exactly:
-        // min prevents div-by-zero at low PPC, max (10x rho0) limits how far
+        // min prevents div-by-zero at low PPC, max (2x rho0) limits how far
         // the EOS pressure response saturates under impact overcompression.
         // FIXED 2026-07-07 (real, found via audit): this material was missing
         // the upper clamp entirely despite sharing the identical Tait EOS
-        // formula with NewtonianFluidMaterial (which has it, confirmed
-        // necessary there via direct A/B testing against
-        // `fluid_spreads_more_than_elastic_under_gravity`) -- an unbounded EOS
-        // pressure spike under violent compression is the same real risk here.
+        // formula with NewtonianFluidMaterial (which has it) -- an unbounded
+        // EOS pressure spike under violent compression is the same real risk
+        // here. Matches NewtonianFluid's 2x (see that file's doc for the real
+        // A/B-tested reason 2x, not a looser value, is correct).
         let density = particles.density[i]
             .max(self.min_density)
-            .min(self.rest_density * 10.0);
+            .min(self.rest_density * 2.0);
         let pressure = (self.eos_stiffness
             * ((density / self.rest_density).powf(self.eos_power) - 1.0))
             .max(self.pressure_floor);

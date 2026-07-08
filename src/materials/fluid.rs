@@ -134,21 +134,29 @@ impl MaterialModel for NewtonianFluidMaterial {
 
     fn kirchhoff_stress(&self, particles: &Particles, i: usize) -> Mat2 {
         // Clamp density both ways: min prevents div-by-zero at low PPC,
-        // max (10x rho0) limits how far the EOS pressure response saturates under
-        // impact overcompression. Was 2x; confirmed via direct A/B testing
-        // (2026-07-07) that 2x is too tight now that `rest_density`'s own
-        // conversion is fixed (see `NewtonianFluidMaterial::from_physical`'s doc):
-        // `fluid_spreads_more_than_elastic_under_gravity` (tests/accuracy.rs)
-        // passed at the OLD (buggy, ~10000x-too-large) rest_density with a 2x
-        // clamp, but fails at 2x once rest_density is correct -- verified by
-        // reverting only the clamp back to 2x with the rest_density fix in
-        // place: same failure, confirmed the clamp (not the rest_density fix)
-        // is the direct lever this specific test needs. 10x gives both this
-        // test and the hydrostatic settle test (see accuracy_benchmarks memory)
-        // enough headroom; full regression reconfirmed green at 10x.
+        // max (2x rho0) limits how far the EOS pressure response saturates under
+        // impact overcompression.
+        //
+        // CORRECTED 2026-07-08: an earlier version of this comment claimed 2x was
+        // "too tight now that rest_density's conversion is fixed" and bumped this
+        // to 10x. That was wrong -- caught by running the full test suite through
+        // GitHub CI rather than trusting a prior local pass: `10x` makes
+        // `fluid_spreads_more_than_elastic_under_gravity` (tests/accuracy.rs) FAIL
+        // outright (measured: ar stays at 1.000, no spreading at all), while `2x`
+        // reproduces `origin/main`'s own known-good result exactly (ar 1.000 ->
+        // 1.001). The earlier reasoning's premise doesn't even apply to that test:
+        // it constructs `NewtonianFluidMaterial::new(...)` directly, never going
+        // through `from_physical`'s SI-to-grid `rest_density` conversion at all --
+        // so "once rest_density is correct" was describing a code path this test
+        // doesn't exercise. (Separately: the `hydrostatic_pressure_matches_rho_g_h`
+        // test's own real, still-open ~1.3x-density/~500x-pressure overshoot gap is
+        // unaffected by this clamp either way -- 1.3x never reaches a 2x ceiling in
+        // the first place, confirmed by re-running it at 2x: same failure signature,
+        // same magnitude, not the lever for that test's real problem -- see that
+        // test's own doc for the actual fix needed there, geostatic pre-stress init.)
         let density = particles.density[i]
             .max(self.min_density)
-            .min(self.rest_density * 10.0);
+            .min(self.rest_density * 2.0);
         let pressure = (self.eos_stiffness
             * ((density / self.rest_density).powf(self.eos_power) - 1.0))
             .max(self.pressure_floor);
