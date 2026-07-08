@@ -232,6 +232,72 @@ mod gpu_tests {
         }
     }
 
+    /// Regression for LP issue erematorg/LP#161: `step_frame`'s upload path used to
+    /// spatially resort `self.particles` by grid cell before every dirty upload,
+    /// silently invalidating any previously-returned `Range<usize>` particle
+    /// identity -- `spawn_region`'s own doc promises this range is stable ("LP
+    /// uses this as creature_id -> particle_range"). That predates and duplicates
+    /// the GPU's own `particle_sort` pipeline (a separate index buffer that never
+    /// touches particle storage order), so the CPU-side resort was removed.
+    ///
+    /// Proves the fix directly rather than trusting the removal was safe: tags a
+    /// "creature" particle range with a distinct spawn-time-only marker per
+    /// particle (`muscle_group_id = local index`), then repeatedly calls
+    /// `mark_particles_dirty()` before `step_frame()` every frame -- the exact
+    /// real-world trigger (LP calls this every frame via `drive_muscles`/
+    /// `update_damage`). After many such frames, the range must still map
+    /// index-for-index to the same tags; any silent reorder shows up as a
+    /// duplicate or out-of-place tag rather than a vague "something looked wrong."
+    #[test]
+    fn gpu_particle_identity_stable_across_repeated_dirty_uploads() {
+        if !gpu_available() {
+            return;
+        }
+        let config = small_config();
+        let mut particles = spawn_disk(&config, Vec2::splat(10.0), 0); // "terrain"
+        let creature_start = particles.len();
+        let mut creature = spawn_disk(&config, Vec2::splat(22.0), 0);
+        assert!(
+            creature.len() >= 8,
+            "test needs a real multi-particle creature range to detect reordering, got {}",
+            creature.len()
+        );
+        for (i, p) in creature.iter_mut().enumerate() {
+            p.muscle_group_id = i as u32;
+        }
+        let creature_len = creature.len();
+        particles.extend(creature);
+        let creature_range = creature_start..creature_start + creature_len;
+
+        let registry =
+            MaterialRegistry::with_default(Box::new(NeoHookeanMaterial::new(100.0, 50.0)));
+        let mut solver = block_on(GpuSimulation::new(config, particles, registry));
+
+        for _ in 0..60 {
+            solver.mark_particles_dirty();
+            solver.step_frame();
+        }
+        solver.sync_particles_blocking();
+
+        let creature_particles = &solver.particles()[creature_range.clone()];
+        assert_eq!(
+            creature_particles.len(),
+            creature_len,
+            "creature range length changed across repeated dirty uploads -- \
+             range/identity stability broken"
+        );
+        for (local_i, p) in creature_particles.iter().enumerate() {
+            assert_eq!(
+                p.muscle_group_id, local_i as u32,
+                "particle at creature_range local index {local_i} has muscle_group_id \
+                 {} (expected {local_i}) -- particle identity was NOT stable across \
+                 repeated dirty uploads; this is exactly the LP#161 regression \
+                 (a spatial resort silently reordering the backing array)",
+                p.muscle_group_id
+            );
+        }
+    }
+
     /// Parity smoke test: `thermal_expansion` (CPU formula verified in
     /// tests/physics_correctness.rs) uses the identical `t_scale = 1.0 + thermal_expansion *
     /// temperature` formula in p2g.wgsl — this just confirms the GPU path doesn't crash or
