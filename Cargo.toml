@@ -23,7 +23,9 @@ wgpu = { version = "27", optional = true }
 
 [features]
 default = []
-# GPU compute: 7-pass wgpu pipeline. All plasticity (Snow SVD, DP, VonMises) runs on GPU.
+# GPU compute: 11-pass wgpu pipeline (5 sort/active-block passes once per frame,
+# 6 per substep -- see ARCHITECTURE.md §5). Plasticity runs on GPU for every
+# material except NACC, which is CPU-only (issue #5).
 gpu = ["dep:wgpu"]
 # Standalone debug renderer: instanced particle draw via wgpu. Requires gpu.
 render = ["gpu"]
@@ -114,19 +116,3 @@ required-features = ["render"]
 [[example]]
 name = "stress_cfl_scan_50k"
 required-features = ["render"]
-
-[[example]]
-name = "debug_lp_creature_stability_gpu"
-required-features = ["gpu"]
-
-[[example]]
-name = "debug_gpu_water_test"
-required-features = ["gpu"]
-
-[[example]]
-name = "debug_gpu_active_blocks"
-required-features = ["gpu"]
-
-[[example]]
-name = "debug_gpu_water_trace"
-required-features = ["gpu"]

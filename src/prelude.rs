@@ -42,6 +42,10 @@ pub use crate::{
     FromSI,
     GranularFluidMaterial,
     GravityWellField,
+    // Directional/phase-gated grip boundaries (shipped with the ratchet
+    // locomotion work) -- were missing from the prelude despite its own doc
+    // claiming full boundary-condition coverage; fixed 2026-07-08.
+    GripFrictionBoundary,
     HeightmapBoundary,
 
     // Creature locomotion controller
@@ -64,6 +68,7 @@ pub use crate::{
     PredictiveBoundary,
     RadialConfinementField,
     RankineMaterial,
+    RatchetFrictionBoundary,
     RollingPlugin,
     ScalarDiffusionConfig,
     ScalarDiffusionField,
