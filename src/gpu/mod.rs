@@ -830,27 +830,30 @@ mod solver {
         /// registration wins and the first is silently lost (this is wgpu's own
         /// behavior, not something this method can prevent).
         ///
-        /// ALSO installs an uncaptured-error handler (2026-07-08, real CI evidence
-        /// from issue #10): wgpu's default behavior for ANY uncaptured error is an
-        /// unconditional panic (`panic!("wgpu error: {err}")`, confirmed by reading
-        /// wgpu-27.0.1's `default_error_handler`). Re-enabling issue #10's
-        /// crash-repro test on real windows-latest CI showed the actual failure
-        /// mode: under sustained load, wgpu-core evidently invalidates/destroys
-        /// buffers tied to the device before this instance's `device_lost_callback`
-        /// gets to fire — the readback path's `.unmap()` call (`finish_readback`/
-        /// `abandon_readback`) then hits an uncaptured Validation error naming a
-        /// destroyed resource, panicking through wgpu's default handler even though
-        /// this is precisely the class of failure `device_lost_reason()`/the
-        /// `is_device_lost()` no-op guards already exist to handle gracefully — the
-        /// callback simply hadn't caught up yet. This handler treats ONLY errors
-        /// whose message names a destroyed/lost resource as an *inferred* device
-        /// loss (sets the same `device_lost` flag, tagged so it's distinguishable
-        /// from the official callback's report, and does NOT panic for those);
-        /// any other uncaptured error — a genuine validation bug unrelated to
-        /// device loss — still panics, unchanged from wgpu's default. This
-        /// distinction matters: turning this into a blanket "swallow every GPU
-        /// error" handler would hide real bugs, not just this one known failure
-        /// mode.
+        /// ALSO installs an uncaptured-error handler (2026-07-08). wgpu's default
+        /// behavior for ANY uncaptured error is an unconditional panic
+        /// (`panic!("wgpu error: {err}")`, confirmed by reading wgpu-27.0.1's
+        /// `default_error_handler`) — this handler replaces that default and
+        /// **never panics**, regardless of what the error says. That "never" is
+        /// load-bearing, not a simplification: an earlier version of this handler
+        /// tried to be more precise — classify errors naming a destroyed/lost
+        /// resource as an inferred device loss (no panic), but still panic for
+        /// anything else so a genuine, unrelated validation bug wouldn't be
+        /// silently swallowed. That version was reproduced crashing LOCALLY
+        /// (forcing the D3D12 WARP adapter — the same backend windows-latest CI
+        /// uses — instead of waiting on another CI round-trip) with the full
+        /// backtrace showing the panic originated from THIS handler's own `panic!`
+        /// call, invoked synchronously from inside `wgpu_core::Queue::submit`'s
+        /// internal error path — and unwinding a panic from there is what produced
+        /// `STATUS_STACK_BUFFER_OVERRUN`, not the error itself. In other words:
+        /// panicking from ANY code reachable from this callback is unsafe on this
+        /// backend, independent of whether the message looks like a device-loss
+        /// artifact or a real bug — so the "still panic for real bugs" branch was
+        /// itself the crash, not a safety net. The fix: never panic here, full
+        /// stop. Every uncaptured error sets `device_lost` (so `is_device_lost()`'s
+        /// existing no-op guards take over) and is `eprintln!`'d in full so it's
+        /// still visible for debugging — just never re-thrown as a Rust panic from
+        /// inside this specific callback context.
         pub fn enable_device_lost_detection(&self) {
             let flag = self.device_lost.clone();
             self.device
@@ -863,23 +866,16 @@ mod solver {
             self.device
                 .on_uncaptured_error(std::sync::Arc::new(move |error: wgpu::Error| {
                     let message = error.to_string();
-                    let is_post_loss_artifact = message.contains("has been destroyed")
-                        || message.contains("Device is lost")
-                        || message.contains("device is lost");
-                    if is_post_loss_artifact {
-                        let mut guard = flag.lock().unwrap_or_else(|e| e.into_inner());
-                        if guard.is_none() {
-                            *guard = Some(format!("(inferred from uncaptured error) {message}"));
-                        }
-                        drop(guard);
-                        eprintln!(
-                            "emerge: GPU device treated as lost after an uncaptured error \
-                             naming a destroyed/lost resource (see \
-                             GpuSimulation::enable_device_lost_detection's doc): {message}"
-                        );
-                    } else {
-                        panic!("wgpu uncaptured error (not device-loss-related): {message}");
+                    let mut guard = flag.lock().unwrap_or_else(|e| e.into_inner());
+                    if guard.is_none() {
+                        *guard = Some(format!("(uncaptured wgpu error) {message}"));
                     }
+                    drop(guard);
+                    eprintln!(
+                        "emerge: uncaptured wgpu error, treating device as unusable from \
+                         here (see GpuSimulation::enable_device_lost_detection's doc for \
+                         why this never panics): {message}"
+                    );
                 }));
         }
 
@@ -2060,10 +2056,10 @@ mod solver {
         /// buffer ourselves (exactly what the device-loss cascade does to it), then call
         /// `abandon_readback()`, the exact function whose `.unmap()` call panicked on
         /// real CI. Before the `on_uncaptured_error` fix this would panic and abort the
-        /// test process; with it installed, it must be classified as an inferred device
-        /// loss instead -- no panic, `device_lost_reason()` reports it.
+        /// test process; with it installed, it must set `device_lost` instead -- no
+        /// panic, `device_lost_reason()` reports it.
         #[test]
-        fn uncaptured_destroyed_buffer_error_is_inferred_device_loss_not_a_panic() {
+        fn uncaptured_destroyed_buffer_error_sets_device_lost_not_a_panic() {
             if !gpu_available() {
                 return;
             }
@@ -2107,14 +2103,15 @@ mod solver {
             let reason = sim.device_lost_reason();
             assert!(
                 reason.is_some(),
-                "an uncaptured error naming a destroyed buffer must be treated as an \
-                 inferred device loss, not silently ignored"
+                "an uncaptured error naming a destroyed buffer must set device_lost, \
+                 not silently do nothing"
             );
             let reason = reason.unwrap();
             assert!(
-                reason.contains("inferred from uncaptured error"),
-                "reason should be tagged as inferred (distinguishable from the official \
-                 device_lost_callback's report), got: {reason}"
+                reason.contains("uncaptured wgpu error"),
+                "reason should be tagged as coming from the uncaptured-error handler \
+                 (distinguishable from the official device_lost_callback's report), \
+                 got: {reason}"
             );
             assert!(
                 reason.contains("destroyed"),
