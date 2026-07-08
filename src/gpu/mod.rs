@@ -820,12 +820,37 @@ mod solver {
         /// (which owns its device exclusively, so it's always safe there). NOT
         /// automatic for `with_device()` (shared-device use, e.g. a renderer on the
         /// same device as this sim) because a wgpu device can only have ONE
-        /// lost-callback — auto-registering here could silently overwrite a
-        /// caller's own handler. Call this explicitly after `with_device()` if you
-        /// (like LP) don't have your own device-lost handling and want emerge's;
-        /// don't call it if you've already registered your own callback on this
-        /// device — the second registration wins and the first is silently lost
-        /// (this is wgpu's own behavior, not something this method can prevent).
+        /// lost-callback (and, as of 2026-07-08, only one uncaptured-error handler
+        /// too — same `Option<Arc<dyn Handler>>` single-slot storage internally,
+        /// confirmed by reading wgpu-27.0.1's `ErrorSinkRaw`) — auto-registering
+        /// here could silently overwrite a caller's own handler. Call this
+        /// explicitly after `with_device()` if you (like LP) don't have your own
+        /// device-lost handling and want emerge's; don't call it if you've already
+        /// registered your own callback/handler on this device — the second
+        /// registration wins and the first is silently lost (this is wgpu's own
+        /// behavior, not something this method can prevent).
+        ///
+        /// ALSO installs an uncaptured-error handler (2026-07-08, real CI evidence
+        /// from issue #10): wgpu's default behavior for ANY uncaptured error is an
+        /// unconditional panic (`panic!("wgpu error: {err}")`, confirmed by reading
+        /// wgpu-27.0.1's `default_error_handler`). Re-enabling issue #10's
+        /// crash-repro test on real windows-latest CI showed the actual failure
+        /// mode: under sustained load, wgpu-core evidently invalidates/destroys
+        /// buffers tied to the device before this instance's `device_lost_callback`
+        /// gets to fire — the readback path's `.unmap()` call (`finish_readback`/
+        /// `abandon_readback`) then hits an uncaptured Validation error naming a
+        /// destroyed resource, panicking through wgpu's default handler even though
+        /// this is precisely the class of failure `device_lost_reason()`/the
+        /// `is_device_lost()` no-op guards already exist to handle gracefully — the
+        /// callback simply hadn't caught up yet. This handler treats ONLY errors
+        /// whose message names a destroyed/lost resource as an *inferred* device
+        /// loss (sets the same `device_lost` flag, tagged so it's distinguishable
+        /// from the official callback's report, and does NOT panic for those);
+        /// any other uncaptured error — a genuine validation bug unrelated to
+        /// device loss — still panics, unchanged from wgpu's default. This
+        /// distinction matters: turning this into a blanket "swallow every GPU
+        /// error" handler would hide real bugs, not just this one known failure
+        /// mode.
         pub fn enable_device_lost_detection(&self) {
             let flag = self.device_lost.clone();
             self.device
@@ -833,6 +858,29 @@ mod solver {
                     *flag.lock().unwrap_or_else(|e| e.into_inner()) =
                         Some(format!("{reason:?}: {message}"));
                 });
+
+            let flag = self.device_lost.clone();
+            self.device
+                .on_uncaptured_error(std::sync::Arc::new(move |error: wgpu::Error| {
+                    let message = error.to_string();
+                    let is_post_loss_artifact = message.contains("has been destroyed")
+                        || message.contains("Device is lost")
+                        || message.contains("device is lost");
+                    if is_post_loss_artifact {
+                        let mut guard = flag.lock().unwrap_or_else(|e| e.into_inner());
+                        if guard.is_none() {
+                            *guard = Some(format!("(inferred from uncaptured error) {message}"));
+                        }
+                        drop(guard);
+                        eprintln!(
+                            "emerge: GPU device treated as lost after an uncaptured error \
+                             naming a destroyed/lost resource (see \
+                             GpuSimulation::enable_device_lost_detection's doc): {message}"
+                        );
+                    } else {
+                        panic!("wgpu uncaptured error (not device-loss-related): {message}");
+                    }
+                }));
         }
 
         fn is_device_lost(&self) -> bool {
@@ -1995,6 +2043,84 @@ mod solver {
             sim.sync_particles_blocking();
             let ranges = vec![0..1usize, 1..2usize];
             sim.sync_particle_ranges_blocking(&ranges);
+        }
+
+        /// Real repro of issue #10's ACTUAL failure mode, found via real windows-latest
+        /// CI evidence (not speculation): re-enabling the crash-repro test showed that,
+        /// under sustained load, wgpu invalidates/destroys buffers tied to the device
+        /// BEFORE this instance's `device_lost_callback` fires -- the readback path's
+        /// `.unmap()` call then hits an uncaptured Validation error naming the destroyed
+        /// resource, and wgpu's default handler panics unconditionally
+        /// (`default_error_handler`: `panic!("wgpu error: {err}")`, confirmed by reading
+        /// wgpu-27.0.1's source directly).
+        ///
+        /// Forcing a real 9-minute sustained-load OOM again just to hit this exact race
+        /// would repeat the same heavy, machine-stressing reproduction unnecessarily --
+        /// this reproduces the SAME call path directly: destroy the readback staging
+        /// buffer ourselves (exactly what the device-loss cascade does to it), then call
+        /// `abandon_readback()`, the exact function whose `.unmap()` call panicked on
+        /// real CI. Before the `on_uncaptured_error` fix this would panic and abort the
+        /// test process; with it installed, it must be classified as an inferred device
+        /// loss instead -- no panic, `device_lost_reason()` reports it.
+        #[test]
+        fn uncaptured_destroyed_buffer_error_is_inferred_device_loss_not_a_panic() {
+            if !gpu_available() {
+                return;
+            }
+            let config = SimConfig {
+                max_substeps_per_step: 8,
+                ..SimConfig::standard(32, 0.1, Vec2::new(0.0, -0.3))
+            };
+            let spawn = SpawnRegion {
+                spacing: 0.5,
+                box_size: IVec2::new(4, 4),
+                box_center: Vec2::new(16.0, 16.0),
+                precompute_initial_volumes: true,
+                ..SpawnRegion::for_sim(&config)
+            };
+            let particles = crate::build_particles(&config, spawn);
+            let mat = NeoHookeanMaterial::from_physical(
+                &crate::materials::physical_props::Elastic {
+                    e_pa: 30.0e3,
+                    nu: 0.45,
+                    rho_kg_m3: 1000.0,
+                },
+                &config,
+            );
+            let registry = MaterialRegistry::with_default(Box::new(mat));
+            let sim = pollster::block_on(GpuSimulation::new(config, particles, registry));
+
+            assert!(
+                sim.device_lost_reason().is_none(),
+                "a healthy, freshly-constructed sim must not report device loss"
+            );
+
+            // Exactly what a device-loss cascade does to resources tied to the
+            // device, without needing 9 minutes of real sustained WARP load.
+            sim.buffers.readback_staging.destroy();
+
+            // The exact real call path that panicked on CI: finish_readback and
+            // abandon_readback both end in `.unmap()` on this buffer.
+            sim.buffers.abandon_readback();
+            sim.device.poll(wgpu::PollType::Poll).ok();
+
+            let reason = sim.device_lost_reason();
+            assert!(
+                reason.is_some(),
+                "an uncaptured error naming a destroyed buffer must be treated as an \
+                 inferred device loss, not silently ignored"
+            );
+            let reason = reason.unwrap();
+            assert!(
+                reason.contains("inferred from uncaptured error"),
+                "reason should be tagged as inferred (distinguishable from the official \
+                 device_lost_callback's report), got: {reason}"
+            );
+            assert!(
+                reason.contains("destroyed"),
+                "reason should retain the real wgpu error text naming the destroyed \
+                 resource, got: {reason}"
+            );
         }
 
         /// Real proof that the OPT-IN path works -- this is the path LP's actual
