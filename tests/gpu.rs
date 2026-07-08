@@ -474,19 +474,21 @@ mod gpu_tests {
     /// out as the explanation here (re-ran the CPU test with a frictionless
     /// `SlipBoundary` instead of `FrictionBoundary`: identical 1.50x ratio --
     /// the column never reaches the domain wall in this test either way).
-    /// `#[ignore]`d 2026-07-08 (real CI evidence, run 28945815883): on
-    /// windows-latest's software D3D12 WARP backend, this test's ~1500 sustained
-    /// steps trigger a mid-run async-readback `map_async` Err, and WITHOUT the
-    /// readback-Err-leak fix (which lives in PR #16, not this branch) the staging
-    /// buffer is left permanently mapped -- the next map then panics with
-    /// "Buffer is already mapped" (0..57344 vs 0..0, the exact leak signature).
-    /// Passes on real GPUs (local AMD) and on ubuntu's lavapipe; this is a real
-    /// merge-order dependency between two open PRs, not a physics failure.
-    /// Un-ignore in a follow-up once PR #16 (readback Err handling + never-panic
-    /// uncaptured-error handler, issue #10) has merged.
+    /// `#[ignore]`d for CI, permanently, with two rounds of real evidence:
+    /// 1. While #14/#16 were separate PRs, this test's sustained WARP run hit the
+    ///    readback-Err leak (fixed in #16, "Buffer is already mapped", run
+    ///    28945815883) -- a merge-order dependency, resolved by merging both.
+    /// 2. Re-enabled after both merged to let CI give the real verdict (run
+    ///    28954055245): windows-latest DIED after 56 minutes -- not a test
+    ///    failure, the hosted runner itself lost contact ("starves it for
+    ///    CPU/Memory" per GitHub's own annotation). A BIG_GRID=192 sand collapse
+    ///    on the software WARP rasterizer starves the whole VM. Final verdict:
+    ///    this benchmark is real-hardware-only (passes in normal time on a real
+    ///    GPU and on ubuntu's lavapipe); do NOT re-enable on windows CI.
     #[test]
-    #[ignore = "windows-latest WARP: sustained-load readback-Err leak panics without \
-                PR #16's fix -- real cross-PR dependency, un-ignore after #16 merges"]
+    #[ignore = "real-hardware-only benchmark: starves windows-latest's WARP runner to \
+                death (56min then runner lost, run 28954055245) -- run manually on a \
+                real GPU, see doc comment for the full evidence trail"]
     fn gpu_sand_column_collapse_runout_matches_lajeunesse_scaling() {
         if !gpu_available() {
             return;
@@ -562,14 +564,15 @@ mod gpu_tests {
     /// CPU-only repose-angle gap also happens to not apply on GPU -- not
     /// assuming it, measuring it, same discipline as every other benchmark in
     /// this file.
-    /// `#[ignore]`d 2026-07-08 for the same real reason as
-    /// `gpu_sand_column_collapse_runout_matches_lajeunesse_scaling` directly above
-    /// (windows-latest WARP sustained-load readback-Err leak, fixed in PR #16, a
-    /// real merge-order dependency -- see that test's doc for the full evidence).
-    /// Un-ignore both together once #16 has merged.
+    /// (`#[ignore]`d for CI alongside
+    /// `gpu_sand_column_collapse_runout_matches_lajeunesse_scaling` above -- same
+    /// final verdict, see that test's doc for the full two-round evidence trail:
+    /// sustained WARP runs starve the windows-latest runner to death. Real-
+    /// hardware-only benchmark; run manually.)
     #[test]
-    #[ignore = "windows-latest WARP: sustained-load readback-Err leak panics without \
-                PR #16's fix -- real cross-PR dependency, un-ignore after #16 merges"]
+    #[ignore = "real-hardware-only benchmark: starves windows-latest's WARP runner to \
+                death alongside its sibling above (run 28954055245) -- run manually on \
+                a real GPU"]
     fn gpu_sand_angle_of_repose_is_physical() {
         if !gpu_available() {
             return;
