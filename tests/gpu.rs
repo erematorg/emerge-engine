@@ -300,9 +300,20 @@ mod gpu_tests {
     /// the accumulated plastic shear-strain norm and is expected to keep growing slowly
     /// under sustained load; this only checks it stays bounded by `q_max` and finite, not
     /// that it stops moving.
+    ///
+    /// UN-IGNORED 2026-07-08 (was `#[ignore]`d citing issue #10: crashed windows-latest
+    /// with STATUS_STACK_BUFFER_OVERRUN after ~7500 steps on the CI runner's software
+    /// WARP adapter). This PR adds device-lost handling for a *plausibly* related root
+    /// cause (OOM-triggered device loss under sustained load on slow/software backends —
+    /// see `GpuSimulation::enable_device_lost_detection`'s doc) but that link was never
+    /// proven, only hedged as "plausible" in-code. Passed clean locally (7500 steps,
+    /// ~25s, no crash) on a real AMD GPU -- NOT the WARP backend the original crash
+    /// needs, so that local pass proves nothing about #10 specifically. Re-enabling here
+    /// so CI's actual windows-latest/WARP runner gives a real answer instead of guessing:
+    /// if this PR's CI run passes, that's real evidence #10 is fixed (re-ignore is wrong
+    /// at that point, close #10); if it still crashes, at least it's an isolated,
+    /// reproducible signal on a fresh code state rather than a stale 2026-07-01 trace.
     #[test]
-    #[ignore = "crashes windows-latest with STATUS_STACK_BUFFER_OVERRUN after ~7500 steps -- \
-                real correctness test, NOT a perf skip, root cause not yet found -- see #10"]
     fn gpu_sand_q_stays_bounded_once_settled() {
         if !gpu_available() {
             return;
