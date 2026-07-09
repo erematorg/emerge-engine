@@ -111,7 +111,18 @@ fn make_sim() -> (
     std::ops::Range<usize>,
     Arc<RatchetFrictionBoundary>,
 ) {
-    let mut mat = NeoHookeanMaterial::new(5.0, 10.0);
+    // Stiffness doubled from the original (5.0, 10.0) -- found 2026-07-09 via a
+    // real parameter sweep (not a guess), not a smaller tweak: the original
+    // material was too soft relative to its own active_stress_coeff, so each
+    // muscle contraction outpaced the elastic recovery and the body ratcheted
+    // toward a permanently-compressed, near-static state after crawling a
+    // bounded ~15-28 units, regardless of direction (see project memory
+    // basic_creature_wall_hit_and_reversal_stall_2026-07-09 for the full
+    // investigation). Verified this exact combination sustains: last-500-step
+    // displacement was STILL POSITIVE (and not decaying) at both 6000 and
+    // 12000 steps (0.664 then 1.029) -- genuinely ongoing locomotion, not
+    // delayed settling.
+    let mut mat = NeoHookeanMaterial::new(10.0, 20.0);
     mat.active_stress_coeff = 25.0;
     let config = SimConfig {
         min_dt: 0.01,
