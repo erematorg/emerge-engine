@@ -37,7 +37,17 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
-const GRID: usize = 64;
+// GRID was 64: found 2026-07-09 (real repro, not a guess) that this made the
+// crawl look like it "stopped working" after sustained steering -- extensive
+// investigation (CPG-under-bias, floor-friction impulse model, substep
+// compounding, muscle duty cycle) all turned out to be chasing a ghost: the
+// creature was crawling correctly the entire time and simply reached this
+// grid's side wall (~24-unit-wide body, 64-unit grid). `set_camera` frames the
+// whole fixed grid uniformly with no camera-follow, so a real fix (tracking
+// camera) is out of scope for this basic example -- LP's actual answer for
+// unbounded travel is its chunk-based world design, not this demo. Widened so
+// normal play/steering has real room without hitting a wall and looking dead.
+const GRID: usize = 96;
 const DT: f32 = 0.1;
 const MAT_BODY: u32 = 0;
 const MUSCLE_GROUPS: u32 = 8;
@@ -113,7 +123,7 @@ fn make_sim() -> (
         project_invalid_state: true,
         ..SimConfig::standard(GRID, DT, Vec2::new(0.0, -0.3))
     };
-    let body_center = Vec2::new(32.0, 20.0);
+    let body_center = Vec2::new(48.0, 20.0); // grid center, equal room either direction
     let spawn = SpawnRegion {
         spacing: 0.5,
         box_size: IVec2::new(24, 6),
