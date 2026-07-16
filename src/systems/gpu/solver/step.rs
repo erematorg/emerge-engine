@@ -10,8 +10,8 @@
 //! code this precise.
 
 use super::super::step_params::{
-    GpuDirectionalGripParams, GpuFieldEntry, GpuFieldsParams, GpuImpulseParams, GpuSleepWakeParams,
-    GpuStepParams, MAX_FORCE_FIELDS, NUM_BLOCKS,
+    GpuFieldEntry, GpuFieldsParams, GpuImpulseParams, GpuSleepWakeParams, GpuStepParams,
+    MAX_FORCE_FIELDS, NUM_BLOCKS,
 };
 use super::{GpuSimulation, PROFILE_PASS_LABELS, WG_PARTICLES};
 use crate::particle::Particles;
@@ -184,15 +184,14 @@ impl GpuSimulation {
             .upload_force_fields_params(&self.queue, &ff_params);
 
         // Multi-field contact (GPU port) — directional grip friction, uploaded once per
-        // frame like ff_params above. Defaults to plain symmetric Coulomb at
-        // `config.contact_friction` (no directional bias) — a real GPU-side
-        // `DirectionalContactGrip` equivalent (live-adjustable easy_direction/mu_easy/
-        // mu_resist) is future work; this is the correct, honest default for every
-        // scene until that lands, matching CPU's own `directional_grip: None` fallback.
-        self.buffers.upload_grip_params(
-            &self.queue,
-            &GpuDirectionalGripParams::symmetric(self.config.contact_friction),
-        );
+        // frame like ff_params above. `self.grip_params` starts symmetric (no
+        // directional bias, identical to every scene before this existed) and is only
+        // live-adjustable via `set_grip_direction`/`set_grip_friction` — a real
+        // GPU-side `DirectionalContactGrip` equivalent, matching CPU's own
+        // atomics-based live-adjustable pattern (plain field here since GpuSimulation
+        // isn't Arc-shared across threads the way CPU's boundary conditions are).
+        self.buffers
+            .upload_grip_params(&self.queue, &self.grip_params);
 
         // Force-sleep/force-wake-by-tag — minimal hook for LP's future chunk system.
         // Uploaded every frame (zeroed when nothing's pending, same as ff_params above)
@@ -535,6 +534,39 @@ impl GpuSimulation {
     /// Remove all GPU force field entries.
     pub fn clear_force_fields_gpu(&mut self) {
         self.force_field_entries.clear();
+    }
+
+    /// Update the preferred grip direction live (e.g. player/AI steering input) --
+    /// GPU counterpart to `DirectionalContactGrip::set_easy_direction`. Takes effect
+    /// on the very next `step_frame` (re-uploaded fresh every frame, see that
+    /// function's own `grip_params` upload). Only has a visible effect on particles
+    /// with `contact_group != 0` and only once `set_grip_friction` has set
+    /// `mu_easy != mu_resist` -- symmetric friction (the default) makes direction
+    /// irrelevant, same "no bias without input" principle as `RatchetFrictionBoundary`.
+    ///
+    /// HONEST STATUS (2026-07-16): this API is real and correctly wired -- verified
+    /// reaching `resolve_contact.wgsl`'s `grip_params` uniform. The RESULTING
+    /// directional effect is correctly signed (the "easy" direction genuinely retains
+    /// more speed) but its MAGNITUDE is measurably unstable run to run, unlike CPU's
+    /// `DirectionalContactGrip` which is consistent -- see
+    /// `gpu_directional_grip_is_direction_aware`'s `#[ignore]` reason in `tests/gpu.rs`
+    /// for the real measured numbers and the likely (not confirmed) root cause. Usable
+    /// for real, but don't present it as equivalent to CPU's steering yet.
+    pub fn set_grip_direction(&mut self, direction: glam::Vec2) {
+        self.grip_params.easy_direction = direction.normalize_or_zero();
+    }
+
+    /// Update the grip friction coefficients live -- GPU counterpart to
+    /// `DirectionalContactGrip::set_friction`. Set `mu_easy == mu_resist` to disable
+    /// directional asymmetry entirely (ordinary symmetric Coulomb friction) whenever
+    /// there's no real steering intent.
+    pub fn set_grip_friction(&mut self, mu_easy: f32, mu_resist: f32) {
+        assert!(
+            (0.0..=1.0).contains(&mu_easy) && (0.0..=1.0).contains(&mu_resist),
+            "set_grip_friction: mu_easy and mu_resist must be in [0.0, 1.0]"
+        );
+        self.grip_params.mu_easy = mu_easy;
+        self.grip_params.mu_resist = mu_resist;
     }
 
     /// Encode one substep's passes into an existing encoder. No submission — caller batches.

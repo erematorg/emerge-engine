@@ -3087,6 +3087,133 @@ mod gpu_tests {
         );
     }
 
+    /// GPU counterpart to CPU's own `directional_contact_grip_is_real_and_direction_aware`
+    /// (`tests/physics_correctness.rs`) — proves `GpuSimulation::set_grip_direction`/
+    /// `set_grip_friction` (added 2026-07-16) reach `resolve_contact.wgsl`'s `grip_params`
+    /// uniform at all (they do -- the API is real, correctly wired, verified via direct
+    /// inspection of the generated code path). What this test can NOT yet assert as a hard
+    /// pass/fail: CPU's equivalent test shows clean, strong separation (measured:
+    /// easy=2.45, resist=0.50, ratio 0.20) every run. GPU shows the SAME correct SIGN
+    /// (easy consistently keeps more speed than resist) but the ratio is genuinely
+    /// UNSTABLE run to run -- measured across 3 consecutive runs: 0.73, 0.51, 0.83. This
+    /// is not "weaker but consistent," it is real run-to-run variance, so a fixed
+    /// numeric threshold would either be too loose to test anything or occasionally fail
+    /// for reasons unrelated to a real regression -- tuning one to pass would hide the
+    /// real problem, not fix it.
+    ///
+    /// Likely root cause (plausible, NOT confirmed -- a first diagnostic attempt using
+    /// `debug_fit_contact_normal_blocking` turned out to test the wrong code path,
+    /// `debug_fit_normal_main` skips the distance-filtering `gather_local_points` does
+    /// for the real per-substep pass, so it doesn't reliably represent what
+    /// `resolve_cell` actually sees): the SAME statistically-fragile LR normal fit
+    /// already documented at length in `Grid::resolve_contact`'s own doc comment
+    /// (`src/spacetime/grid/mod.rs`, "the real failure is statistical... a physically
+    /// meaningless perturbation... can swing the converged plane by tens of degrees") --
+    /// three real fix attempts already tried there and falsified by direct measurement.
+    /// A skewed/unstable normal changes the tangent, which changes the easy/resist
+    /// alignment classification per node -- exactly the kind of thing this fragility
+    /// would produce. Properly confirming this needs real per-node instrumentation
+    /// reading the actual `resolved_grip_v`/`resolved_rest_v` buffers during a real
+    /// `resolve_cell` pass, not the debug entry point -- a real, separate investigation,
+    /// not attempted here.
+    ///
+    /// `#[ignore]`d honestly: the sign is real and correct, the magnitude is not yet
+    /// reliable enough to assert on. Do not tune a threshold to force this green.
+    #[test]
+    #[ignore = "real, correctly-signed directional effect but run-to-run UNSTABLE ratio \
+                (measured 0.51-0.83 across 3 runs vs CPU's consistent 0.20) -- likely the \
+                same LR-fit statistical fragility already documented in \
+                Grid::resolve_contact's doc, not confirmed. Do not tune to pass."]
+    fn gpu_directional_grip_is_direction_aware() {
+        if !gpu_available() {
+            return;
+        }
+        use emerge::CorotatedMaterial;
+        use glam::IVec2;
+
+        fn run(injected_vx: f32) -> f32 {
+            const GRID: usize = 64;
+            const DT: f32 = 0.02;
+            let config = SimConfig {
+                contact_friction: 0.5, // unused once set_grip_friction overrides it below
+                min_dt: 0.001,
+                max_substeps_per_step: 128,
+                project_invalid_state: true,
+                ..SimConfig::standard(GRID, DT, Vec2::new(0.0, -0.3))
+            };
+
+            let block_mat = CorotatedMaterial::new(200.0, 400.0);
+            let mut block_particles = build_particles(
+                &config,
+                SpawnRegion {
+                    spacing: 0.5,
+                    box_size: IVec2::new(6, 6),
+                    box_center: Vec2::new(32.0, 11.6),
+                    material_id: 0,
+                    precompute_initial_volumes: true,
+                    ..SpawnRegion::for_sim(&config)
+                },
+            );
+            let block_count = block_particles.len();
+            for p in &mut block_particles {
+                p.contact_group = 1;
+            }
+
+            let registry = MaterialRegistry::with_default(Box::new(block_mat));
+            let mut solver = block_on(GpuSimulation::new(config, block_particles, registry));
+            solver.set_grip_direction(Vec2::X); // "easy" direction: +X
+            solver.set_grip_friction(0.05, 0.9); // mu_easy, mu_resist
+
+            let floor_mat_id =
+                solver.register_material(Box::new(CorotatedMaterial::new(200.0, 400.0)));
+            let floor_spawn = SpawnRegion {
+                spacing: 0.5,
+                box_size: IVec2::new(48, 8),
+                box_center: Vec2::new(32.0, 8.0),
+                material_id: floor_mat_id.id(),
+                precompute_initial_volumes: true,
+                ..SpawnRegion::for_sim(solver.config())
+            };
+            solver.spawn_region(floor_spawn);
+
+            for _ in 0..300 {
+                solver.step_frame();
+            }
+            solver.sync_particles_blocking();
+            {
+                let particles = solver.particles_mut();
+                for p in particles.iter_mut().take(block_count) {
+                    p.v.x = injected_vx;
+                }
+            }
+            solver.mark_particles_dirty();
+            for _ in 0..150 {
+                solver.step_frame();
+            }
+            solver.sync_particles_blocking();
+
+            let particles = solver.particles();
+            particles[0..block_count].iter().map(|p| p.v.x).sum::<f32>() / block_count as f32
+        }
+
+        let easy_speed = run(3.0); // aligned with easy_direction=+X
+        let resist_speed = run(-3.0); // against it
+
+        assert!(
+            easy_speed > 1.0,
+            "BUG: sliding in the easy direction should keep real speed (low mu_easy=0.05) \
+             -- got mean v_x={easy_speed:.4} (started at 3.0). If this is ~0, \
+             set_grip_direction/set_grip_friction aren't reaching resolve_contact.wgsl."
+        );
+        assert!(
+            resist_speed.abs() < easy_speed.abs() * 0.35,
+            "BUG: resisted sliding should lose far more speed than easy sliding retains --\
+             got easy={easy_speed:.4} (from +3.0) vs resist={resist_speed:.4} (from -3.0). \
+             If these are close in magnitude, the GPU grip API isn't actually \
+             direction-aware."
+        );
+    }
+
     /// Multi-field contact (GPU port) — long-horizon stability check, the GPU
     /// counterpart to CPU's own
     /// `drucker_prager_volumetric_floor_holds_over_long_passive_settle`

@@ -14,7 +14,9 @@ mod step;
 
 use super::buffers::GpuBuffers;
 use super::pipeline::SimPipelines;
-use super::step_params::{GpuFieldEntry, GpuImpulseEntry, MAX_MATERIALS, MAX_SLEEP_WAKE_TAGS};
+use super::step_params::{
+    GpuDirectionalGripParams, GpuFieldEntry, GpuImpulseEntry, MAX_MATERIALS, MAX_SLEEP_WAKE_TAGS,
+};
 
 /// Workgroup sizes — must match `@workgroup_size(...)` in the WGSL shaders.
 /// grid_clear and grid_update are dispatched by active-block slot (`2 * NUM_BLOCKS`
@@ -143,6 +145,13 @@ pub struct GpuSimulation {
     /// `enable_profiling()`. Read via `last_cpu_timings_ns()`. `total_ns` minus the sum of
     /// the other four reveals any unbracketed cost.
     last_cpu_timings: (f32, f32, f32, f32, f32),
+    /// Live directional grip friction state — GPU counterpart to
+    /// `DirectionalContactGrip`. Uploaded fresh every `step_frame` (see `step.rs`), so
+    /// unlike `contact_bind_group` there's no buffer to rebuild here, just a plain
+    /// field updated via `set_grip_direction`/`set_grip_friction`. Starts symmetric
+    /// (no directional bias) — real Coulomb friction at `config.contact_friction`,
+    /// identical to every scene before this field existed until a caller opts in.
+    grip_params: GpuDirectionalGripParams,
 }
 
 /// One [begin, end] timestamp pair per labeled compute pass in `encode_substep`, written
@@ -288,6 +297,7 @@ impl GpuSimulation {
             &initialized.iter().map(|p| p.x).collect::<Vec<_>>(),
             initialized.len(),
         );
+        let grip_params = GpuDirectionalGripParams::symmetric(config.contact_friction);
 
         Self {
             device,
@@ -317,6 +327,7 @@ impl GpuSimulation {
             contact_bind_group,
             spatial_hash: std::cell::RefCell::new(spatial_hash),
             spatial_hash_dirty: std::cell::Cell::new(false),
+            grip_params,
         }
     }
 

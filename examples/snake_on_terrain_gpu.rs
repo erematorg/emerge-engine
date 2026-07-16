@@ -245,7 +245,7 @@ impl State {
         renderer.set_camera(sim.queue(), GRID as u32, size.width, size.height, 0.6, true);
         renderer.set_color_mode(ColorMode::ByMaterial);
         println!(
-            "snake_on_terrain_gpu: {} particles ({} snake)  |  up/down wave speed  Space pause  R reset  Q quit  (no steering yet -- GPU directional grip not built)",
+            "snake_on_terrain_gpu: {} particles ({} snake)  |  up/down wave speed  Space pause  R reset  Q quit  (steering API now exists -- GpuSimulation::set_grip_direction/set_grip_friction -- but the underlying directional effect is measurably unstable run to run, not wired into this demo yet; see gpu_directional_grip_is_direction_aware's #[ignore] reason)",
             sim.particle_count(),
             snake_range.len()
         );
