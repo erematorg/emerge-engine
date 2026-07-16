@@ -29,12 +29,25 @@ use super::{BoundaryCondition, apply_coulomb_wall, clamp_position_inside_grid};
 #[derive(Debug)]
 pub struct RatchetFrictionBoundary {
     pub thickness: usize,
-    /// Coulomb coefficient when floor-tangential velocity aligns with `easy_direction`.
-    pub mu_easy: f32,
-    /// Coulomb coefficient when it opposes `easy_direction` — the "anchor" side.
-    pub mu_resist: f32,
     easy_dir_x_bits: std::sync::atomic::AtomicU32,
     easy_dir_y_bits: std::sync::atomic::AtomicU32,
+    // Real bug found live, 2026-07-13: `mu_easy`/`mu_resist` used to be plain,
+    // construction-only f32 fields -- meaning the ratchet's directional
+    // asymmetry was ALWAYS active, even while a player provided zero steering
+    // input. Combined with ordinary passive settling jitter (a body dropped
+    // under gravity always wobbles a little while it settles), the ratchet
+    // converted that jitter into a real, substantial (~18-unit) crawl BEFORE
+    // any muscle activation ever ran -- confirmed via a real headless log
+    // showing `act mean=0.00 max=0.00` (activation genuinely zero, an earlier
+    // fix already gated it correctly) while drift still reached +18 units.
+    // Real fix: make friction live-adjustable via atomics, same pattern as
+    // `easy_direction` below, so the caller can set mu_easy==mu_resist
+    // (symmetric, no ratchet effect at all) whenever there's no real steering
+    // intent, and restore the real asymmetric values only while actively
+    // steered -- matching the same "no bias without input" principle
+    // `set_easy_direction`'s own doc already establishes for direction.
+    mu_easy_bits: std::sync::atomic::AtomicU32,
+    mu_resist_bits: std::sync::atomic::AtomicU32,
 }
 
 impl RatchetFrictionBoundary {
@@ -46,10 +59,10 @@ impl RatchetFrictionBoundary {
         let d = easy_direction.normalize_or_zero();
         Self {
             thickness,
-            mu_easy,
-            mu_resist,
             easy_dir_x_bits: std::sync::atomic::AtomicU32::new(d.x.to_bits()),
             easy_dir_y_bits: std::sync::atomic::AtomicU32::new(d.y.to_bits()),
+            mu_easy_bits: std::sync::atomic::AtomicU32::new(mu_easy.to_bits()),
+            mu_resist_bits: std::sync::atomic::AtomicU32::new(mu_resist.to_bits()),
         }
     }
 
@@ -62,6 +75,33 @@ impl RatchetFrictionBoundary {
             .store(d.x.to_bits(), std::sync::atomic::Ordering::Relaxed);
         self.easy_dir_y_bits
             .store(d.y.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Update the ratchet's own friction coefficients live. Set `mu_easy ==
+    /// mu_resist` to disable the directional asymmetry entirely (ordinary
+    /// symmetric Coulomb friction, no ratchet effect) when there's no real
+    /// steering intent, so passive settling jitter can't be converted into an
+    /// unsolicited directional crawl. Takes effect on the very next substep.
+    pub fn set_friction(&self, mu_easy: f32, mu_resist: f32) {
+        assert!(
+            (0.0..=1.0).contains(&mu_easy) && (0.0..=1.0).contains(&mu_resist),
+            "mu_easy and mu_resist must be in [0.0, 1.0]"
+        );
+        self.mu_easy_bits
+            .store(mu_easy.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        self.mu_resist_bits
+            .store(mu_resist.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn mu_easy(&self) -> f32 {
+        f32::from_bits(self.mu_easy_bits.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    fn mu_resist(&self) -> f32 {
+        f32::from_bits(
+            self.mu_resist_bits
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     fn easy_direction(&self) -> Vec2 {
@@ -88,7 +128,7 @@ impl BoundaryCondition for RatchetFrictionBoundary {
         // Side and ceiling walls: plain symmetric slip+friction, same as
         // FrictionBoundary — the ratchet only applies to the floor, where a
         // resting/crawling body actually spends its contact time.
-        let mu_side = 0.5 * (self.mu_easy + self.mu_resist);
+        let mu_side = 0.5 * (self.mu_easy() + self.mu_resist());
         if x < t {
             apply_coulomb_wall(velocity, Vec2::X, mu_side);
         }
@@ -108,9 +148,9 @@ impl BoundaryCondition for RatchetFrictionBoundary {
                 let tangential = velocity.x;
                 let aligned = tangential * easy_direction.x >= 0.0;
                 let mu = if aligned {
-                    self.mu_easy
+                    self.mu_easy()
                 } else {
-                    self.mu_resist
+                    self.mu_resist()
                 };
                 apply_coulomb_wall(velocity, Vec2::Y, mu);
             }
