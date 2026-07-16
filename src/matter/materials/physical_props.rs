@@ -151,6 +151,18 @@ pub struct FluidGranular {
 
 impl FluidGranular {
     /// Saturated loam — yields easily, flows slowly under sustained load.
+    ///
+    /// HONEST DISCLOSURE (audit 2026-07-17, same finding as `GranularFluidMaterial`'s
+    /// own presets in `granular_fluid.rs`): `scale_lame`/`scale_stress` below DO
+    /// perform a real, dimensionally-consistent SI-to-grid-unit conversion (same
+    /// pattern already verified for `NewtonianFluidMaterial`), so the MECHANISM here is
+    /// sound. But these specific SI values (`rho_kg_m3`, `bulk_modulus_pa`, `e_pa`,
+    /// `compression_limit` etc.) are not tied to any specific real measurement/paper —
+    /// `rho_kg_m3=1800`/`e_pa=5e3` are plausible ballpark figures for real wet loam, not
+    /// verified against one. Presenting them in real SI units carries a stronger
+    /// implicit "this is measured" claim than a dimensionless test parameter would, so
+    /// this needs the same honest flag: real conversion math, unverified specific
+    /// numbers, not yet a literature-sourced material.
     pub fn saturated_loam() -> Self {
         Self {
             rho_kg_m3: 1800.0,
@@ -164,6 +176,9 @@ impl FluidGranular {
     }
 
     /// Consolidated clay — stiffer shear, slow plastic creep.
+    ///
+    /// Same honest disclosure as `saturated_loam` above: real conversion mechanism,
+    /// unverified specific SI values.
     pub fn consolidated_clay() -> Self {
         Self {
             rho_kg_m3: 2000.0,
@@ -177,6 +192,11 @@ impl FluidGranular {
     }
 
     /// Cytoplasmic matrix — very soft elastic, near-fluid, large yield surface.
+    ///
+    /// Same honest disclosure as `saturated_loam` above: real conversion mechanism,
+    /// unverified specific SI values (though `e_pa=500` is at least in the right real
+    /// ballpark per AFM cytoplasm-stiffness literature -- not yet tied to a specific
+    /// paper).
     pub fn cytoplasmic() -> Self {
         Self {
             rho_kg_m3: 1050.0,
