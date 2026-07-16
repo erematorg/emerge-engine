@@ -116,6 +116,7 @@ pub mod field_type {
     pub const UNIFORM_ELECTRIC: u32 = 5;
     pub const BUOYANCY: u32 = 6;
     pub const LINEAR_DRAG: u32 = 7;
+    pub const SPATIAL_DRAG_CYLINDER: u32 = 8;
 }
 
 /// One GPU force-field entry — 48 bytes, 16-byte aligned.
@@ -308,6 +309,40 @@ impl GpuFieldEntry {
         p[2] = drag_coefficient;
         Self {
             field_type: field_type::LINEAR_DRAG,
+            material_mask,
+            _pad: [0; 2],
+            params: p,
+        }
+    }
+
+    /// Spatially-varying wind/current drag: same `a = k·(target(x) − v)` mechanism as
+    /// `linear_drag`, but `target` is sampled from the real, exact closed-form solution
+    /// for 2D potential flow around a circular cylinder (uniform stream + doublet
+    /// superposition — see CPU's `SpatialDragField`/its test module doc for the derivation
+    /// and citations). WGSL has no function pointers, so unlike CPU's generic
+    /// `target_velocity_fn: fn(Vec2) -> Vec2`, this GPU port bakes this ONE specific
+    /// analytic formula into its own field-type case in `force_fields.wgsl` — the real,
+    /// disclosed trade-off of porting a fn-pointer-based mechanism to a shader.
+    ///
+    /// - `cylinder_center`: the flow singularity's position, in grid coordinates
+    /// - `free_stream_u`: undisturbed flow speed far from the cylinder (+X direction)
+    /// - `radius`: cylinder radius `a` (the doublet strength is `U·a²`)
+    /// - `drag_coefficient`: same relaxation rate `k` as `linear_drag`
+    pub fn spatial_drag_potential_flow_cylinder(
+        cylinder_center: glam::Vec2,
+        free_stream_u: f32,
+        radius: f32,
+        drag_coefficient: f32,
+        material_mask: u32,
+    ) -> Self {
+        let mut p = [0f32; 8];
+        p[0] = cylinder_center.x;
+        p[1] = cylinder_center.y;
+        p[2] = free_stream_u;
+        p[3] = radius;
+        p[4] = drag_coefficient;
+        Self {
+            field_type: field_type::SPATIAL_DRAG_CYLINDER,
             material_mask,
             _pad: [0; 2],
             params: p,

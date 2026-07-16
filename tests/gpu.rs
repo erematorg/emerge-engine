@@ -314,6 +314,79 @@ mod gpu_tests {
         );
     }
 
+    /// GPU port of the potential-flow-around-a-cylinder `SpatialDragField` (CPU:
+    /// `tests/solver.rs`'s `potential_flow_*`/`spatial_drag_field_*` tests) -- see
+    /// `GpuFieldEntry::spatial_drag_potential_flow_cylinder`'s doc for why the formula is
+    /// baked directly into `force_fields.wgsl` rather than staying generic (WGSL has no
+    /// function pointers). Particles are spawned FAR from the cylinder (r >> a), where the
+    /// real closed-form solution's own asymptotic property means the target velocity
+    /// reduces to the plain free-stream `(U, 0)` -- same exponential-relaxation check and
+    /// tolerance as `gpu_linear_drag_field_matches_analytical_relaxation` above, proving
+    /// the WGSL port is wired correctly without needing a full near-field comparison.
+    #[test]
+    fn gpu_spatial_drag_cylinder_matches_free_stream_far_from_cylinder() {
+        if !gpu_available() {
+            return;
+        }
+        let cylinder_center = Vec2::new(8.0, 16.0);
+        let free_stream_u = 3.0_f32;
+        let radius = 1.0_f32; // small relative to the spawn distance below
+        let k = 2.0_f32;
+        const DT: f32 = 0.1;
+        let config = SimConfig {
+            max_substeps_per_step: 16,
+            ..SimConfig::standard(48, DT, Vec2::ZERO)
+        };
+        // Spawned far downstream-ish of the cylinder (dx=24 >> radius=1) so the real
+        // potential-flow solution is already ~free-stream at this distance.
+        let particles = build_particles(
+            &config,
+            SpawnRegion {
+                spacing: 0.5,
+                box_size: glam::IVec2::new(8, 8),
+                box_center: Vec2::new(32.0, 16.0),
+                material_id: 0,
+                precompute_initial_volumes: true,
+                ..SpawnRegion::for_sim(&config)
+            },
+        );
+        let registry =
+            MaterialRegistry::with_default(Box::new(NeoHookeanMaterial::new(10.0, 20.0)));
+        let mut solver = block_on(GpuSimulation::new(config, particles, registry));
+        solver.add_force_field_gpu(
+            emerge::gpu::GpuFieldEntry::spatial_drag_potential_flow_cylinder(
+                cylinder_center,
+                free_stream_u,
+                radius,
+                k,
+                emerge::gpu::GpuFieldEntry::ALL_MATERIALS,
+            ),
+        );
+
+        const STEPS: usize = 10;
+        for _ in 0..STEPS {
+            solver.step_frame();
+        }
+        solver.sync_particles_blocking();
+        let elapsed = STEPS as f32 * DT;
+
+        let particles = solver.particles();
+        let avg_v: Vec2 = particles.iter().map(|p| p.v).sum::<Vec2>() / particles.len() as f32;
+        let expected = Vec2::new(free_stream_u, 0.0) * (1.0 - (-k * elapsed).exp());
+
+        println!(
+            "gpu_spatial_drag_cylinder_matches_free_stream_far_from_cylinder: avg_v={avg_v:?} expected={expected:?}"
+        );
+        assert!(avg_v.is_finite(), "non-finite velocity: {avg_v:?}");
+        let rel_err = (avg_v - expected).length() / expected.length().max(1e-3);
+        assert!(
+            rel_err < 0.15,
+            "GPU SpatialDragField (cylinder) velocity far from the cylinder should match the \
+             analytical free-stream exponential relaxation: avg_v={avg_v:?} \
+             expected={expected:?} rel_err={rel_err:.3}"
+        );
+    }
+
     /// `sync_particle_ranges_blocking` must return exactly what a full
     /// `sync_particles_blocking` would for the same indices -- the whole point of the
     /// partial-readback path is to be cheaper, never to be a different (approximate or

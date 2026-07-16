@@ -96,6 +96,7 @@ const FIELD_RADIAL_CONFINEMENT:  u32 = 4u;
 const FIELD_UNIFORM_ELECTRIC:    u32 = 5u;
 const FIELD_BUOYANCY:            u32 = 6u;
 const FIELD_LINEAR_DRAG:         u32 = 7u;
+const FIELD_SPATIAL_DRAG_CYLINDER: u32 = 8u;
 // Prevent divide-by-near-zero in softened potentials.
 const FF_NUM_FLOOR:              f32 = 1e-10;
 // Prevent a = F/m overflow when mass is negligible.
@@ -290,6 +291,30 @@ fn force_fields_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let target_v = vec2<f32>(entry.params01.x, entry.params01.y);
                 let k         = entry.params01.z;
                 p.v += k * (target_v - p.v) * dt;
+            }
+            case FIELD_SPATIAL_DRAG_CYLINDER: {
+                // Same drag mechanism as FIELD_LINEAR_DRAG, but the target flow velocity
+                // is sampled fresh from position -- the real, exact closed-form solution
+                // for 2D potential flow around a circular cylinder (uniform stream +
+                // doublet superposition). See GpuFieldEntry::spatial_drag_potential_flow_
+                // cylinder's doc for why this ONE analytic formula is baked in here
+                // (WGSL has no function pointers, unlike CPU's generic fn-pointer field).
+                // params01 = (cylinder_center_x, cylinder_center_y, free_stream_u, radius)
+                // params45 = (drag_coefficient, _, _, _)
+                let center  = vec2<f32>(entry.params01.x, entry.params01.y);
+                let u_inf   = entry.params01.z;
+                let a       = entry.params01.w;
+                let k       = entry.params45.x;
+                let rel = p.x - center;
+                let r2 = dot(rel, rel);
+                if r2 > 1e-6 {
+                    let a2 = a * a;
+                    let target_v = vec2<f32>(
+                        u_inf * (1.0 - a2 * (rel.x * rel.x - rel.y * rel.y) / (r2 * r2)),
+                        -2.0 * u_inf * a2 * rel.x * rel.y / (r2 * r2)
+                    );
+                    p.v += k * (target_v - p.v) * dt;
+                }
             }
             default: {}
         }
