@@ -21,7 +21,7 @@ use std::mem;
 
 use super::step_params::{
     ContactDebugParams, GpuDirectionalGripParams, GpuFieldsParams, GpuImpulseParams,
-    GpuSleepWakeParams, GpuStepParams, MAX_CONTACT_POINTS_PER_BLOCK, NUM_BLOCKS,
+    GpuSleepWakeParams, GpuStepParams, GpuThermalParams, MAX_CONTACT_POINTS_PER_BLOCK, NUM_BLOCKS,
 };
 use crate::materials::MaterialParams;
 use crate::particle::Particle;
@@ -151,6 +151,20 @@ pub struct GpuBuffers {
     pub resolved_rest_v: wgpu::Buffer,
     /// Directional grip friction params — see `GpuDirectionalGripParams`' own doc.
     pub grip_params: wgpu::Buffer,
+    /// Day-night/ambient thermal diffusion (GPU port) — real config uniform, see
+    /// `GpuThermalParams`' own doc. Always uploaded (disabled by default), same
+    /// always-present-but-cheap-when-unused pattern as `grip_params`.
+    pub thermal_params: wgpu::Buffer,
+    /// Thermal scratch: Σ(w·mass) per cell, cleared+rebuilt every substep by the
+    /// thermal P2G pass — dense `grid_res²` f32, mirrors CPU `ThermalDiffusion::
+    /// grid_mass`.
+    pub thermal_mass: wgpu::Buffer,
+    /// Thermal scratch: normalized T_old per cell (needed for the G2P delta gather,
+    /// `T_new − T_old`) — dense `grid_res²` f32, mirrors CPU's `grid_temp`.
+    pub thermal_temp_old: wgpu::Buffer,
+    /// Thermal scratch, dual-use like CPU's own `grid_work`: P2G scatter accumulator
+    /// first, then overwritten with the post-Laplacian `T_new` — dense `grid_res²` f32.
+    pub thermal_work: wgpu::Buffer,
 }
 
 impl GpuBuffers {
@@ -333,6 +347,33 @@ impl GpuBuffers {
             mapped_at_creation: false,
         });
 
+        // Day-night/ambient thermal diffusion (GPU port) — see field docs above.
+        let thermal_params = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mpm_thermal_params"),
+            size: mem::size_of::<GpuThermalParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let thermal_scalar_bytes = (grid_res * grid_res * mem::size_of::<f32>()) as u64;
+        let thermal_mass = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mpm_thermal_mass"),
+            size: thermal_scalar_bytes,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let thermal_temp_old = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mpm_thermal_temp_old"),
+            size: thermal_scalar_bytes,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let thermal_work = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mpm_thermal_work"),
+            size: thermal_scalar_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
         Self {
             particles,
             grid,
@@ -356,6 +397,10 @@ impl GpuBuffers {
             resolved_grip_v,
             resolved_rest_v,
             grip_params,
+            thermal_params,
+            thermal_mass,
+            thermal_temp_old,
+            thermal_work,
         }
     }
 
@@ -393,6 +438,10 @@ impl GpuBuffers {
     /// Upload directional grip friction params — see `GpuDirectionalGripParams`' doc.
     pub fn upload_grip_params(&self, queue: &wgpu::Queue, params: &GpuDirectionalGripParams) {
         queue.write_buffer(&self.grip_params, 0, bytemuck::bytes_of(params));
+    }
+
+    pub fn upload_thermal_params(&self, queue: &wgpu::Queue, params: &GpuThermalParams) {
+        queue.write_buffer(&self.thermal_params, 0, bytemuck::bytes_of(params));
     }
 
     /// Begin an async GPU → CPU readback. Non-blocking — returns a shared flag set when done.

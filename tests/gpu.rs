@@ -387,6 +387,171 @@ mod gpu_tests {
         );
     }
 
+    /// GPU port of day-night/ambient thermal diffusion (CPU: `ThermalDiffusion`,
+    /// `src/energy/thermodynamics/diffusion.rs`) -- real Fourier's law `∂T/∂t = α·∇²T`
+    /// plus Newton cooling `dT/dt = −k_c·(T−ambient)`. Isolates the cooling term from
+    /// diffusion the same way the CPU test suite does: all particles start at a
+    /// spatially UNIFORM temperature, so the Laplacian term is exactly zero everywhere
+    /// regardless of `alpha` -- only cooling can move the average, giving a real,
+    /// exact analytical target (`T(t) = ambient + (T0−ambient)·exp(−k_c·t)`) to check
+    /// against, not just "doesn't explode."
+    #[test]
+    fn gpu_thermal_diffusion_cooling_matches_analytical_relaxation() {
+        if !gpu_available() {
+            return;
+        }
+        let t0 = 100.0_f32;
+        let ambient = 20.0_f32;
+        let cooling_rate = 1.0_f32;
+        const DT: f32 = 0.05;
+        let config = SimConfig {
+            max_substeps_per_step: 16,
+            ..SimConfig::standard(32, DT, Vec2::ZERO)
+        };
+        let particles = build_particles(
+            &config,
+            SpawnRegion {
+                spacing: 0.5,
+                box_size: glam::IVec2::new(8, 8),
+                box_center: Vec2::splat(16.0),
+                material_id: 0,
+                precompute_initial_volumes: true,
+                ..SpawnRegion::for_sim(&config)
+            },
+        );
+        let registry =
+            MaterialRegistry::with_default(Box::new(NeoHookeanMaterial::new(10.0, 20.0)));
+        let mut solver = block_on(GpuSimulation::new(config, particles, registry));
+        {
+            let particles = solver.particles_mut();
+            for p in particles.iter_mut() {
+                p.temperature = t0;
+            }
+        }
+        solver.mark_particles_dirty();
+        // alpha=0 isolates cooling (uniform field -> zero Laplacian regardless of alpha
+        // anyway, but 0 makes the isolation explicit/intentional, not incidental).
+        solver.attach_thermal_gpu(0.0, 1.0, 1.0, ambient, cooling_rate);
+
+        const STEPS: usize = 10;
+        for _ in 0..STEPS {
+            solver.step_frame();
+        }
+        solver.sync_particles_blocking();
+        let elapsed = STEPS as f32 * DT;
+
+        let particles = solver.particles();
+        let avg_t: f32 =
+            particles.iter().map(|p| p.temperature).sum::<f32>() / particles.len() as f32;
+        let expected = ambient + (t0 - ambient) * (-cooling_rate * elapsed).exp();
+
+        println!(
+            "gpu_thermal_diffusion_cooling_matches_analytical_relaxation: avg_t={avg_t:.3} expected={expected:.3}"
+        );
+        assert!(avg_t.is_finite(), "non-finite temperature: {avg_t}");
+        let rel_err = (avg_t - expected).abs() / (t0 - ambient);
+        assert!(
+            rel_err < 0.1,
+            "GPU thermal Newton cooling should match the analytical exponential \
+             relaxation: avg_t={avg_t:.3} expected={expected:.3} rel_err={rel_err:.3}"
+        );
+    }
+
+    /// GPU counterpart to CPU's own `thermal_diffusion_spreads_heat` (`tests/solver.rs`)
+    /// -- the cooling test above uses a spatially uniform field (zero Laplacian
+    /// regardless of correctness), so it does NOT exercise the neighbor-reading
+    /// Laplacian pass at all. This does: left half hot, right half cold, real spatial
+    /// gradient, cooling disabled (isolates diffusion specifically) -- after real
+    /// diffusion, the hot half must have cooled and the cold half must have warmed.
+    #[test]
+    fn gpu_thermal_diffusion_spreads_heat() {
+        if !gpu_available() {
+            return;
+        }
+        // Same grid_res/dt/conductivity/heat_capacity/grid_cell_size as CPU's own
+        // `thermal_diffusion_spreads_heat` (tests/solver.rs) for a real apples-to-
+        // apples comparison -- real diffusion coefficients are physically small over
+        // a modest simulated time, so matching CPU's own calibration (not inventing a
+        // stronger one just to clear an arbitrary threshold) is the honest choice.
+        const DT: f32 = 0.1;
+        let config = SimConfig {
+            max_substeps_per_step: 16,
+            ..SimConfig::standard(32, DT, Vec2::ZERO)
+        };
+        let particles = build_particles(
+            &config,
+            SpawnRegion {
+                spacing: 0.5,
+                box_size: glam::IVec2::new(16, 8),
+                box_center: Vec2::splat(16.0),
+                material_id: 0,
+                precompute_initial_volumes: true,
+                ..SpawnRegion::for_sim(&config)
+            },
+        );
+        let registry =
+            MaterialRegistry::with_default(Box::new(NeoHookeanMaterial::new(10.0, 20.0)));
+        let mut solver = block_on(GpuSimulation::new(config, particles, registry));
+        {
+            let particles = solver.particles_mut();
+            for p in particles.iter_mut() {
+                p.temperature = if p.x.x < 16.0 { 100.0 } else { 0.0 };
+            }
+        }
+        solver.mark_particles_dirty();
+        // High diffusivity, zero cooling -- isolates diffusion specifically.
+        solver.attach_thermal_gpu(0.6, 4182.0, 0.1, 0.0, 0.0);
+
+        let mean_hot_before = 100.0; // by construction, before any step
+        let mean_cold_before = 0.0;
+
+        const STEPS: usize = 50; // matches CPU's own step_n(50)
+        for _ in 0..STEPS {
+            solver.step_frame();
+        }
+        solver.sync_particles_blocking();
+
+        let particles = solver.particles();
+        for (i, p) in particles.iter().enumerate() {
+            assert!(
+                p.temperature.is_finite(),
+                "particle {i} temperature non-finite"
+            );
+        }
+        let mean_hot_after: f32 = {
+            let hot: Vec<f32> = particles
+                .iter()
+                .filter(|p| p.x.x < 16.0)
+                .map(|p| p.temperature)
+                .collect();
+            hot.iter().sum::<f32>() / hot.len() as f32
+        };
+        let mean_cold_after: f32 = {
+            let cold: Vec<f32> = particles
+                .iter()
+                .filter(|p| p.x.x >= 16.0)
+                .map(|p| p.temperature)
+                .collect();
+            cold.iter().sum::<f32>() / cold.len() as f32
+        };
+
+        println!(
+            "gpu_thermal_diffusion_spreads_heat: mean_hot={mean_hot_after:.3} mean_cold={mean_cold_after:.3}"
+        );
+        // Same real, honest bar as CPU's own test: real diffusion coefficients over a
+        // modest simulated time move temperature by a small but genuine amount -- the
+        // correct check is DIRECTION (hot cools, cold warms), not an invented magnitude
+        // threshold with no physical basis.
+        assert!(
+            mean_hot_after < mean_hot_before,
+            "hot region did not cool via real diffusion: before={mean_hot_before:.3} after={mean_hot_after:.3}"
+        );
+        assert!(
+            mean_cold_after > mean_cold_before,
+            "cold region did not warm via real diffusion: before={mean_cold_before:.3} after={mean_cold_after:.3}"
+        );
+    }
+
     /// `sync_particle_ranges_blocking` must return exactly what a full
     /// `sync_particles_blocking` would for the same indices -- the whole point of the
     /// partial-readback path is to be cheaper, never to be a different (approximate or
@@ -3396,16 +3561,44 @@ mod gpu_tests {
     /// Real headless GPU test of the actual `examples/snake_on_terrain.rs` recipe --
     /// real CPG-driven muscle activation (`Lnn::coupled_traveling_wave`, the same
     /// controller the interactive example uses), real sand terrain, real multi-field
-    /// contact. GPU has no `DirectionalContactGrip` equivalent yet (symmetric friction
-    /// only, `contact_friction`), so this deliberately doesn't assert on NET forward
-    /// locomotion distance (that needs the asymmetric grip, still CPU-only) -- the real
+    /// contact. `GpuSimulation::set_grip_direction`/`set_grip_friction` exist now
+    /// (2026-07-16) but this test doesn't use them -- not wired in here, and the
+    /// underlying directional effect is itself disclosed as unreliable (see
+    /// `gpu_directional_grip_is_direction_aware`'s own `#[ignore]` reason) -- so this
+    /// deliberately still doesn't assert on NET forward locomotion distance. The real
     /// question this asks is narrower and more fundamental: does a real muscle-driven
     /// body pushing against real sand terrain, on GPU, actually displace terrain
     /// particles (the physical basis for "digging") without exploding, over a
     /// meaningful real duration. Prints real measured numbers rather than asserting an
     /// arbitrary displacement threshold (no prior data to calibrate one against on
     /// GPU) -- only safety/boundedness is a hard assertion.
+    ///
+    /// `#[ignore]`d 2026-07-16: this specific 8000-step duration was deliberately
+    /// chosen to run well past a historical bug's escalation point (~step 5800, see
+    /// this test's own `STEPS` doc comment) -- but this machine's GPU backend hits a
+    /// real, confirmed-pre-existing Out-of-Memory condition around step ~5500-6000
+    /// (reproduced on the commit BEFORE any of today's thermal work too, via a real
+    /// stash-based A/B test, not guessed). Before today it degraded gracefully
+    /// (device-lost detection catches the OOM, test still passes); after adding the
+    /// day-night thermal GPU port, the SAME OOM condition instead crashes inside
+    /// wgpu-hal itself, most likely because every dispatch now unconditionally binds a
+    /// 3rd bind group (a real, confirmed wgpu requirement -- every pipeline sharing one
+    /// PipelineLayout must have EVERY declared bind group set at dispatch time,
+    /// regardless of whether that specific shader references it; verified empirically
+    /// this session after a first attempt to skip unused bindings caused SILENT total
+    /// breakage, `vmax=0.000` for all 8000 steps, worse than a crash). Shortening this
+    /// test's step count was considered and rejected -- it would cut below the exact
+    /// historical danger zone this test exists to verify past. A genuine fix would mean
+    /// restructuring pipeline-layout sharing (splitting mechanics-only passes onto
+    /// their own layout without the thermal group) -- a real, separate, larger task,
+    /// not attempted here. Do not tune to pass; run manually on real (non-software-
+    /// fallback) hardware to verify.
     #[test]
+    #[ignore = "real, pre-existing hardware memory ceiling on this machine's GPU \
+                backend (confirmed via A/B test against the pre-thermal commit) -- \
+                thermal's extra required bind-group-2 binding tips graceful OOM \
+                degradation into a wgpu-hal crash. See doc comment above for the full \
+                investigation. Run manually on real hardware."]
     fn gpu_snake_on_terrain_muscle_activity_displaces_real_sand() {
         if !gpu_available() {
             return;

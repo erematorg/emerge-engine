@@ -512,3 +512,39 @@ impl GpuDirectionalGripParams {
 }
 
 const _: () = assert!(core::mem::size_of::<GpuDirectionalGripParams>() == 16);
+
+/// Grid-based Fourier heat diffusion — GPU mirror of `ThermalDiffusion`/`ThermalConfig`
+/// (`src/energy/thermodynamics/diffusion.rs`). Implements the same real PDE:
+/// `∂T/∂t = α·∇²T` (Fourier's law) plus Newton cooling `dT/dt = −k_c·(T−ambient)`.
+/// `dt` itself is NOT stored here — the thermal pass reads `step_params.dt` (group 0)
+/// directly, since substep `dt` is already the single source of truth uploaded there
+/// every substep; duplicating it here would risk the two going out of sync.
+/// `enabled == 0` skips all 4 thermal passes entirely (see `contact_active`'s identical
+/// gate-when-unused pattern) — every scene that never attaches thermal pays nothing.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuThermalParams {
+    /// Thermal diffusivity α = k / (c_p · dx²), grid-units²/s — see
+    /// `ThermalConfig::alpha_grid`'s own doc for the real derivation/units.
+    pub alpha: f32,
+    /// Ambient/boundary temperature — empty cells and Newton cooling both relax toward this.
+    pub ambient: f32,
+    /// Newton cooling rate k_c, 1/s. 0.0 = no cooling (adiabatic walls).
+    pub cooling_rate: f32,
+    /// 0 = no thermal system attached (default, every existing scene) — skips all 4
+    /// thermal passes. 1 = attached and active.
+    pub enabled: u32,
+}
+
+impl GpuThermalParams {
+    pub fn disabled() -> Self {
+        Self {
+            alpha: 0.0,
+            ambient: 0.0,
+            cooling_rate: 0.0,
+            enabled: 0,
+        }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<GpuThermalParams>() == 16);

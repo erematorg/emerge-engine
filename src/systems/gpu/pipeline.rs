@@ -109,10 +109,22 @@ pub struct SimPipelines {
     /// after grid_update, before g2p. See `resolve_contact.wgsl`'s `resolve_contact_main`
     /// doc.
     pub resolve_contact: wgpu::ComputePipeline,
+    /// Day-night/ambient thermal diffusion (GPU port) — 4 passes mirroring CPU's own
+    /// `ThermalDiffusion::apply` stages exactly: clear scratch, P2G scalar scatter,
+    /// normalize+Laplacian+Newton-cooling, G2P delta-gather. Dispatched over the WHOLE
+    /// dense grid every substep when enabled (no active-block optimization -- matches
+    /// CPU's own unconditional-dense-grid behavior, real but bounded scope).
+    pub thermal_clear: wgpu::ComputePipeline,
+    pub thermal_p2g: wgpu::ComputePipeline,
+    pub thermal_normalize_laplacian: wgpu::ComputePipeline,
+    pub thermal_g2p: wgpu::ComputePipeline,
     pub bind_group_layout: wgpu::BindGroupLayout,
     /// Group 1 — contact subsystem, see the module doc comment above for why this is a
     /// second layout rather than more entries in `bind_group_layout`.
     pub contact_bind_group_layout: wgpu::BindGroupLayout,
+    /// Group 2 — thermal subsystem, see its own creation site doc for why this is a
+    /// third layout.
+    pub thermal_bind_group_layout: wgpu::BindGroupLayout,
     /// Separate layout for apply_impulses — only needs particles + impulse_params.
     pub impulse_bind_group_layout: wgpu::BindGroupLayout,
 }
@@ -214,9 +226,37 @@ impl SimPipelines {
                 ],
             });
 
+        // Group 2 — day-night/ambient thermal diffusion (GPU port, 2026-07-16). A real,
+        // separate group rather than squeezing into group 0 (already at 8/8 storage,
+        // zero headroom, per that group's own doc) or group 1 (wrong category — thermal
+        // has nothing to do with contact). 3 storage + 1 uniform, well under the
+        // baseline limit. Bindings 20-23, continuing the flat numbering the split
+        // already established.
+        let thermal_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("mpm_thermal_bind_group_layout"),
+                entries: &[
+                    // 20: thermal_params — GpuThermalParams (alpha, ambient, cooling_rate,
+                    // enabled).
+                    uniform_entry(20),
+                    // 21: thermal_mass — Σ(w·mass) per cell, dense grid_res² f32.
+                    storage_entry(21),
+                    // 22: thermal_temp_old — normalized T_old per cell, needed for the G2P
+                    // delta gather.
+                    storage_entry(22),
+                    // 23: thermal_work — dual-use: P2G scatter accumulator, then post-
+                    // Laplacian T_new.
+                    storage_entry(23),
+                ],
+            });
+
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("mpm_pipeline_layout"),
-            bind_group_layouts: &[&bind_group_layout, &contact_bind_group_layout],
+            bind_group_layouts: &[
+                &bind_group_layout,
+                &contact_bind_group_layout,
+                &thermal_bind_group_layout,
+            ],
             push_constant_ranges: &[],
         });
 
@@ -427,6 +467,44 @@ impl SimPipelines {
             false,
         );
 
+        // Day-night/ambient thermal diffusion (GPU port) -- 4 passes, see field docs.
+        let thermal_clear = make_pipeline(
+            device,
+            &pipeline_layout,
+            shaders::THERMAL,
+            "thermal_clear_main",
+            "thermal_clear",
+            &[],
+            false,
+        );
+        let thermal_p2g = make_pipeline(
+            device,
+            &pipeline_layout,
+            shaders::THERMAL,
+            "thermal_p2g_main",
+            "thermal_p2g",
+            &[],
+            false,
+        );
+        let thermal_normalize_laplacian = make_pipeline(
+            device,
+            &pipeline_layout,
+            shaders::THERMAL,
+            "thermal_normalize_laplacian_main",
+            "thermal_normalize_laplacian",
+            &[],
+            false,
+        );
+        let thermal_g2p = make_pipeline(
+            device,
+            &pipeline_layout,
+            shaders::THERMAL,
+            "thermal_g2p_main",
+            "thermal_g2p",
+            &[],
+            false,
+        );
+
         Self {
             particle_sort_clear,
             particle_sort_count,
@@ -444,8 +522,13 @@ impl SimPipelines {
             apply_impulses,
             debug_fit_normal,
             resolve_contact,
+            thermal_clear,
+            thermal_p2g,
+            thermal_normalize_laplacian,
+            thermal_g2p,
             bind_group_layout,
             contact_bind_group_layout,
+            thermal_bind_group_layout,
             impulse_bind_group_layout,
         }
     }
@@ -582,6 +665,39 @@ impl SimPipelines {
                 wgpu::BindGroupEntry {
                     binding: 19,
                     resource: buffers.grip_params.as_entire_binding(),
+                },
+            ],
+        })
+    }
+
+    /// Build the group-2 (thermal subsystem) bind group. Same "built once, never
+    /// rebuilt" shape as `make_contact_bind_group` -- none of these buffers are
+    /// particle-count-scaled (all fixed `grid_res²`-sized), so `spawn_region`
+    /// reallocating `buffers.particles` never invalidates it.
+    pub fn make_thermal_bind_group(
+        &self,
+        device: &wgpu::Device,
+        buffers: &GpuBuffers,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mpm_thermal_bind_group"),
+            layout: &self.thermal_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 20,
+                    resource: buffers.thermal_params.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 21,
+                    resource: buffers.thermal_mass.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 22,
+                    resource: buffers.thermal_temp_old.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 23,
+                    resource: buffers.thermal_work.as_entire_binding(),
                 },
             ],
         })

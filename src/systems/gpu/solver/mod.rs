@@ -15,7 +15,8 @@ mod step;
 use super::buffers::GpuBuffers;
 use super::pipeline::SimPipelines;
 use super::step_params::{
-    GpuDirectionalGripParams, GpuFieldEntry, GpuImpulseEntry, MAX_MATERIALS, MAX_SLEEP_WAKE_TAGS,
+    GpuDirectionalGripParams, GpuFieldEntry, GpuImpulseEntry, GpuThermalParams, MAX_MATERIALS,
+    MAX_SLEEP_WAKE_TAGS,
 };
 
 /// Workgroup sizes — must match `@workgroup_size(...)` in the WGSL shaders.
@@ -112,6 +113,13 @@ pub struct GpuSimulation {
     /// `SimPipelines::make_contact_bind_group`'s doc for why it never needs rebuilding
     /// the way `bind_group_pool` does.
     contact_bind_group: wgpu::BindGroup,
+    /// Group 2 (thermal subsystem) bind group — same "built once" shape as
+    /// `contact_bind_group`, see `SimPipelines::make_thermal_bind_group`'s doc.
+    thermal_bind_group: wgpu::BindGroup,
+    /// Live day-night/ambient thermal diffusion state — `enabled: 0` (default) skips
+    /// all 4 thermal passes entirely, every existing scene pays nothing. Set via
+    /// `attach_thermal_gpu`/`set_thermal_ambient`.
+    thermal_params: GpuThermalParams,
     /// Real spatial acceleration for `particles_near`/`count_near`/`group_centroid` --
     /// ported from `solver::Simulation`'s already-proven `SpatialHash` (was previously
     /// wired into the CPU-only `Simulation` but not `GpuSimulation`, meaning every
@@ -291,6 +299,9 @@ impl GpuSimulation {
         // Contact group's buffers are all fixed grid_res²-sized, never reallocated by
         // spawn_region -- safe to build unconditionally, unlike bind_group_pool above.
         let contact_bind_group = pipelines.make_contact_bind_group(&device, &buffers);
+        // Thermal group's buffers are also all fixed grid_res²-sized -- same reasoning.
+        let thermal_bind_group = pipelines.make_thermal_bind_group(&device, &buffers);
+        let thermal_params = GpuThermalParams::disabled();
 
         let mut spatial_hash = crate::solver::spatial_hash::SpatialHash::new(config.grid_cell_size);
         spatial_hash.rebuild(
@@ -325,6 +336,8 @@ impl GpuSimulation {
             last_cpu_timings: (0.0, 0.0, 0.0, 0.0, 0.0),
             bind_group_pool,
             contact_bind_group,
+            thermal_bind_group,
+            thermal_params,
             spatial_hash: std::cell::RefCell::new(spatial_hash),
             spatial_hash_dirty: std::cell::Cell::new(false),
             grip_params,

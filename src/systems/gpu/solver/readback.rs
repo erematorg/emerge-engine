@@ -149,6 +149,7 @@ impl GpuSimulation {
             pass.set_pipeline(&self.pipelines.debug_fit_normal);
             pass.set_bind_group(0, &bg, &[]);
             pass.set_bind_group(1, &self.contact_bind_group, &[]);
+            pass.set_bind_group(2, &self.thermal_bind_group, &[]);
             pass.dispatch_workgroups(1, 1, 1);
         }
         self.queue.submit(std::iter::once(encoder.finish()));

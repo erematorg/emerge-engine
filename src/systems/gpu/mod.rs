@@ -35,6 +35,7 @@ pub mod shaders {
     pub const FORCE_FIELDS: &str = include_str!("shaders/force_fields.wgsl");
     pub const APPLY_IMPULSES: &str = include_str!("shaders/apply_impulses.wgsl");
     pub const RESOLVE_CONTACT: &str = include_str!("shaders/resolve_contact.wgsl");
+    pub const THERMAL: &str = include_str!("shaders/thermal.wgsl");
 }
 
 #[cfg(feature = "gpu")]

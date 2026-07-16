@@ -11,7 +11,7 @@
 
 use super::super::step_params::{
     GpuFieldEntry, GpuFieldsParams, GpuImpulseParams, GpuSleepWakeParams, GpuStepParams,
-    MAX_FORCE_FIELDS, NUM_BLOCKS,
+    GpuThermalParams, MAX_FORCE_FIELDS, NUM_BLOCKS,
 };
 use super::{GpuSimulation, PROFILE_PASS_LABELS, WG_PARTICLES};
 use crate::particle::Particles;
@@ -193,6 +193,14 @@ impl GpuSimulation {
         self.buffers
             .upload_grip_params(&self.queue, &self.grip_params);
 
+        // Day-night/ambient thermal diffusion (GPU port) — uploaded once per frame,
+        // same pattern as grip_params above. `enabled == 0` (the default, every
+        // existing scene) makes the 4 thermal passes below skip their dispatch
+        // entirely, not just early-return per-thread — real, not just disabled-in-name.
+        self.buffers
+            .upload_thermal_params(&self.queue, &self.thermal_params);
+        let thermal_active = self.thermal_params.enabled != 0;
+
         // Force-sleep/force-wake-by-tag — minimal hook for LP's future chunk system.
         // Uploaded every frame (zeroed when nothing's pending, same as ff_params above)
         // and read once per substep in force_fields.wgsl; cleared after upload since
@@ -321,6 +329,7 @@ impl GpuSimulation {
             });
             pass.set_bind_group(0, &sort_bg, &[]);
             pass.set_bind_group(1, &self.contact_bind_group, &[]);
+            pass.set_bind_group(2, &self.thermal_bind_group, &[]);
             pass.set_pipeline(&self.pipelines.particle_sort_clear);
             pass.dispatch_workgroups(1, 1, 1); // 1 workgroup of 256 == NUM_BLOCKS
             pass.set_pipeline(&self.pipelines.particle_sort_count);
@@ -376,6 +385,7 @@ impl GpuSimulation {
                     particle_wg,
                     force_fields_needed,
                     contact_active,
+                    thermal_active,
                 );
             }
             self.queue.submit(std::iter::once(sub_encoder.finish()));
@@ -569,6 +579,47 @@ impl GpuSimulation {
         self.grip_params.mu_resist = mu_resist;
     }
 
+    /// Attach day-night/ambient thermal diffusion -- GPU counterpart to CPU's
+    /// `Simulation::with_thermal`/`thermal_config_mut`. Real PDE (Fourier's law
+    /// `∂T/∂t = α·∇²T` plus Newton cooling), see `GpuThermalParams`' own doc. Enables
+    /// all 4 thermal passes starting next `step_frame`; call `set_thermal_ambient`
+    /// afterward for live day-night oscillation.
+    ///
+    /// - `conductivity_w_m_k` / `heat_capacity_j_kg_k`: real SI material constants
+    /// - `grid_cell_size_m`: physical cell size (pass `SimConfig::dx_meters`, NOT
+    ///   `grid_cell_size` which is always 1.0 -- same trap `ThermalConfig`'s own doc
+    ///   warns about)
+    /// - `ambient`: background temperature; `cooling_rate`: Newton cooling k_c (1/s,
+    ///   0.0 = none)
+    pub fn attach_thermal_gpu(
+        &mut self,
+        conductivity_w_m_k: f32,
+        heat_capacity_j_kg_k: f32,
+        grid_cell_size_m: f32,
+        ambient: f32,
+        cooling_rate: f32,
+    ) {
+        let alpha =
+            conductivity_w_m_k / (heat_capacity_j_kg_k * grid_cell_size_m * grid_cell_size_m);
+        self.thermal_params = GpuThermalParams {
+            alpha,
+            ambient,
+            cooling_rate,
+            enabled: 1,
+        };
+    }
+
+    /// Update the ambient/boundary temperature live (e.g. day-night oscillation) --
+    /// GPU counterpart to CPU's `thermal_config_mut().ambient = ...`. No-op (with a
+    /// debug assert) if thermal hasn't been attached yet.
+    pub fn set_thermal_ambient(&mut self, ambient: f32) {
+        debug_assert!(
+            self.thermal_params.enabled != 0,
+            "set_thermal_ambient: call attach_thermal_gpu first"
+        );
+        self.thermal_params.ambient = ambient;
+    }
+
     /// Encode one substep's passes into an existing encoder. No submission — caller batches.
     fn encode_substep(
         &self,
@@ -577,6 +628,7 @@ impl GpuSimulation {
         particle_wg: u32,
         force_fields_needed: bool,
         contact_active: bool,
+        thermal_active: bool,
     ) {
         {
             // GPU sparse grid Phase 1 — re-detect active blocks from CURRENT particle
@@ -611,6 +663,7 @@ impl GpuSimulation {
             });
             pass.set_bind_group(0, bg, &[]);
             pass.set_bind_group(1, &self.contact_bind_group, &[]);
+            pass.set_bind_group(2, &self.thermal_bind_group, &[]);
             pass.set_pipeline(&self.pipelines.active_block_swap);
             pass.dispatch_workgroups(1, 1, 1); // 1 workgroup of 256 == NUM_BLOCKS
             pass.set_pipeline(&self.pipelines.particle_sort_clear);
@@ -628,6 +681,7 @@ impl GpuSimulation {
             pass.set_pipeline(&self.pipelines.grid_clear);
             pass.set_bind_group(0, bg, &[]);
             pass.set_bind_group(1, &self.contact_bind_group, &[]);
+            pass.set_bind_group(2, &self.thermal_bind_group, &[]);
             // GPU sparse grid Phase 1: one workgroup per potential active-block slot, for
             // EACH of the two lists (this substep's + last substep's grace period) — fixed
             // worst-case size (2 * NUM_BLOCKS), not grid_res-dependent anymore. Most slots
@@ -643,6 +697,7 @@ impl GpuSimulation {
             pass.set_pipeline(&self.pipelines.p2g);
             pass.set_bind_group(0, bg, &[]);
             pass.set_bind_group(1, &self.contact_bind_group, &[]);
+            pass.set_bind_group(2, &self.thermal_bind_group, &[]);
             pass.dispatch_workgroups(particle_wg, 1, 1);
         }
         // Skipped entirely (not just an empty loop body) when NO particle anywhere has
@@ -664,6 +719,7 @@ impl GpuSimulation {
             pass.set_pipeline(&self.pipelines.gather_contact_points);
             pass.set_bind_group(0, bg, &[]);
             pass.set_bind_group(1, &self.contact_bind_group, &[]);
+            pass.set_bind_group(2, &self.thermal_bind_group, &[]);
             pass.dispatch_workgroups(particle_wg, 1, 1);
         }
         {
@@ -674,6 +730,7 @@ impl GpuSimulation {
             pass.set_pipeline(&self.pipelines.grid_update);
             pass.set_bind_group(0, bg, &[]);
             pass.set_bind_group(1, &self.contact_bind_group, &[]);
+            pass.set_bind_group(2, &self.thermal_bind_group, &[]);
             // GPU sparse grid Phase 2: same active-block dispatch pattern as grid_clear (see
             // grid_update.wgsl's doc comment) -- was the last remaining O(grid_res²)-dispatch
             // pass; now bounded to occupied blocks (+ one substep's grace period) instead.
@@ -698,6 +755,7 @@ impl GpuSimulation {
             pass.set_pipeline(&self.pipelines.resolve_contact);
             pass.set_bind_group(0, bg, &[]);
             pass.set_bind_group(1, &self.contact_bind_group, &[]);
+            pass.set_bind_group(2, &self.thermal_bind_group, &[]);
             pass.dispatch_workgroups(2 * NUM_BLOCKS as u32, 1, 1);
         }
         {
@@ -708,6 +766,7 @@ impl GpuSimulation {
             pass.set_pipeline(&self.pipelines.g2p);
             pass.set_bind_group(0, bg, &[]);
             pass.set_bind_group(1, &self.contact_bind_group, &[]);
+            pass.set_bind_group(2, &self.thermal_bind_group, &[]);
             pass.dispatch_workgroups(particle_wg, 1, 1);
         }
         {
@@ -718,6 +777,7 @@ impl GpuSimulation {
             pass.set_pipeline(&self.pipelines.particles_update);
             pass.set_bind_group(0, bg, &[]);
             pass.set_bind_group(1, &self.contact_bind_group, &[]);
+            pass.set_bind_group(2, &self.thermal_bind_group, &[]);
             pass.dispatch_workgroups(particle_wg, 1, 1);
         }
         // Skipped entirely (not just an empty loop body) when force_fields_main is
@@ -735,7 +795,64 @@ impl GpuSimulation {
             pass.set_pipeline(&self.pipelines.force_fields);
             pass.set_bind_group(0, bg, &[]);
             pass.set_bind_group(1, &self.contact_bind_group, &[]);
+            pass.set_bind_group(2, &self.thermal_bind_group, &[]);
             pass.dispatch_workgroups(particle_wg, 1, 1);
+        }
+        // Day-night/ambient thermal diffusion (GPU port) — skipped ENTIRELY (not just
+        // early-returning per-thread) when no thermal system is attached, same
+        // dispatch-skip discipline as contact_active/force_fields_needed above. Runs
+        // after force_fields, matching CPU's own `ThermalDiffusion::apply` ordering
+        // ("after force fields, before state projection") — fully decoupled from
+        // mechanics (operates only on particle.temperature), so exact ordering
+        // relative to force_fields doesn't affect correctness, just matches CPU's own
+        // call site for consistency.
+        if thermal_active {
+            let grid_res = self.config.grid_res as u32;
+            let cell_wg = (grid_res * grid_res).div_ceil(64);
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("thermal_clear"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.pipelines.thermal_clear);
+                pass.set_bind_group(0, bg, &[]);
+                pass.set_bind_group(1, &self.contact_bind_group, &[]);
+                pass.set_bind_group(2, &self.thermal_bind_group, &[]);
+                pass.dispatch_workgroups(cell_wg, 1, 1);
+            }
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("thermal_p2g"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.pipelines.thermal_p2g);
+                pass.set_bind_group(0, bg, &[]);
+                pass.set_bind_group(1, &self.contact_bind_group, &[]);
+                pass.set_bind_group(2, &self.thermal_bind_group, &[]);
+                pass.dispatch_workgroups(particle_wg, 1, 1);
+            }
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("thermal_normalize_laplacian"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.pipelines.thermal_normalize_laplacian);
+                pass.set_bind_group(0, bg, &[]);
+                pass.set_bind_group(1, &self.contact_bind_group, &[]);
+                pass.set_bind_group(2, &self.thermal_bind_group, &[]);
+                pass.dispatch_workgroups(cell_wg, 1, 1);
+            }
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("thermal_g2p"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.pipelines.thermal_g2p);
+                pass.set_bind_group(0, bg, &[]);
+                pass.set_bind_group(1, &self.contact_bind_group, &[]);
+                pass.set_bind_group(2, &self.thermal_bind_group, &[]);
+                pass.dispatch_workgroups(particle_wg, 1, 1);
+            }
         }
         if let Some(profiling) = &self.profiling {
             let n = PROFILE_PASS_LABELS.len() as u32;
