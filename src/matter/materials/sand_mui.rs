@@ -90,6 +90,12 @@ impl MuIRheologyMaterial {
     }
 
     /// Dense-packed: higher static + dynamic friction, larger µ₂-µ₁ gap.
+    /// mu_static/mu_dynamic = tan(30°)/tan(40°) -- within the standard real range for
+    /// dense granular material internal friction angle (~35-45° peak, textbook soil
+    /// mechanics, e.g. Lambe & Whitman 1969), unlike `small_grain`/`large_grain` above
+    /// which cite Cicoira et al. 2022 directly for their specific values -- flagged
+    /// here (audit 2026-07-17) as a real, plausible range but not yet tied to that same
+    /// specific paper's own dense-packing numbers.
     pub fn dense_packed(young_modulus: f32, poisson_ratio: f32) -> Self {
         let (lambda, mu) = lame_from_young(young_modulus, poisson_ratio);
         Self {

@@ -21,7 +21,10 @@ use crate::particle::{Particle, Particles};
 ///   - `StomakhinMaterial` (no EOS, purely elastic+plastic)
 ///
 /// Use for: wet terrain substrates, wet granular flows, biological cell matrices.
-/// Ref: Kamrin 2015 granular-fluid; SoftZoo §3 mud material (blend of fluid EOS + corotated).
+/// Ref: Kamrin 2015 granular-fluid; SoftZoo's own mud material (`mud.py`) independently
+/// confirms the same fluid-EOS + corotated blend CONCEPT -- but its own specific
+/// parameters (a single fixed set, linear not Tait EOS, θ_c=0.025) do NOT match this
+/// file's three presets below; see each preset's own honest-disclosure doc comment.
 #[derive(Debug, Clone, Copy)]
 pub struct GranularFluidMaterial {
     /// Elastic shear modulus µ — corotated deviatoric stiffness.
@@ -50,6 +53,22 @@ pub struct GranularFluidMaterial {
 
 impl GranularFluidMaterial {
     /// Saturated loam: eos_stiffness=200, ξ=5, θ_c=0.4 — yields easily, flows under load.
+    ///
+    /// HONEST DISCLOSURE (audit 2026-07-17): the constitutive LAW above (Tait EOS +
+    /// corotated elastic + Stomakhin SVD plasticity) is real and cited. These specific
+    /// shape-parameter VALUES (eos_stiffness, hardening_exponent, compression_limit,
+    /// stretch_limit, plastic-Jacobian bounds, rest_density) are NOT — checked directly
+    /// against SoftZoo's own mud material (`mud.py`, the file this module's top doc
+    /// pointed to) and they don't trace to it: SoftZoo uses one fixed parameter set
+    /// (not three material variants), a different (linear, not Tait power-law) EOS
+    /// form, and its compression limit (θ_c=0.025) is off by ~12-24x from this preset's
+    /// 0.4. They also don't trace to Dunatunga & Kamrin 2015 (a granular-only paper,
+    /// no mud/fluid blend or these numbers). This preset's real-world name ("saturated
+    /// loam") is illustrative/hand-tuned, not a measured real-loam value -- same
+    /// honesty standard as `FORAGING_RECOVERY_RATE` elsewhere in this codebase: the
+    /// mechanism is real, this specific calibration is not yet, and shouldn't be
+    /// presented as if it were. Needs a real geotechnical/soil-mechanics source before
+    /// any claim of "this is real loam" would be honest.
     pub fn saturated_loam(young_modulus: f32, poisson_ratio: f32) -> Self {
         let (lambda, mu) = lame_from_young(young_modulus, poisson_ratio);
         Self {
@@ -68,6 +87,10 @@ impl GranularFluidMaterial {
     }
 
     /// Consolidated clay: eos_stiffness=500, ξ=3, θ_c=0.3 — higher stiffness, slower creep.
+    ///
+    /// Same honest disclosure as `saturated_loam` above: real cited law, hand-tuned
+    /// (not measured) shape parameters -- not yet verified against real consolidated-
+    /// clay geotechnical data.
     pub fn consolidated_clay(young_modulus: f32, poisson_ratio: f32) -> Self {
         let (lambda, mu) = lame_from_young(young_modulus, poisson_ratio);
         Self {
@@ -87,6 +110,10 @@ impl GranularFluidMaterial {
 
     /// Cytoplasmic matrix: eos_stiffness=50, ξ=1, large yield surface.
     /// Use for biological cell interiors and soft tissue matrices.
+    ///
+    /// Same honest disclosure as `saturated_loam` above: real cited law, hand-tuned
+    /// (not measured) shape parameters -- not yet verified against real cytoplasm
+    /// rheology literature.
     pub fn cytoplasmic(young_modulus: f32, poisson_ratio: f32) -> Self {
         let (lambda, mu) = lame_from_young(young_modulus, poisson_ratio);
         Self {
