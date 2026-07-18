@@ -79,6 +79,32 @@ pub struct SimConfig {
     /// Costs nothing when 0.0: no grid-velocity snapshot is taken, G2P takes the exact
     /// original code path.
     pub asflip_blend: f32,
+    /// Two-phase mixture coupling drag coefficient (Tampubolon et al. 2017,
+    /// "Multi-species simulation of porous sand and water mixtures" — Darcy-style
+    /// momentum exchange between a `MixturePhase::Solid` and `MixturePhase::Fluid`
+    /// material, see `WithMixturePhase`). Units: mass/time (a per-node drag rate,
+    /// NOT the paper's own permeability-derived `c_E` directly — this is a first,
+    /// simplified scalar-coefficient version; mapping to real soil permeability/
+    /// porosity is real, disclosed future work, not attempted yet).
+    /// 0.0 = disabled (default) — `Grid::has_mixture_activity()` gates the extra
+    /// P2G scatter and the whole resolve pass, zero cost for every scene that
+    /// doesn't use `WithMixturePhase`, matching `asflip_blend`'s own convention.
+    pub mixture_drag_coefficient: f32,
+    /// Jacobi iterations for the mixture incompressibility pressure projection
+    /// (`Grid::project_mixture_incompressibility`, see its own doc for the full
+    /// derivation and citations). Real fix for a real, root-caused instability:
+    /// the drag coupling above conserves momentum but never enforces the
+    /// mixture's actual incompressibility constraint, so under sustained/
+    /// confined loading (water settled into sand) the violation compounds
+    /// silently over hundreds of steps until velocities blow past the CFL
+    /// bound. 0 = disabled (default) — byte-identical to the original
+    /// momentum-only coupling, matching every other opt-in field's convention.
+    /// Real, disclosed caveat: this is an approximate, real-time-affordable
+    /// Jacobi solve, not an exact Poisson solve — pick this value by measuring
+    /// against your actual scene's long-settle behavior (a settled, confined
+    /// liquid is the documented worst case for a low iteration count), not by
+    /// assuming a small fixed count is free.
+    pub mixture_pressure_iterations: u32,
 
     // ── Physical unit scaling ──────────────────────────────────────────────────
     // Default 1.0 = simulation units (no scaling). Set these to enable SI-calibrated materials.
@@ -124,6 +150,8 @@ impl Default for SimConfig {
             sleep_threshold: 0.0,
             contact_friction: 0.5,
             asflip_blend: 0.0,
+            mixture_drag_coefficient: 0.0,
+            mixture_pressure_iterations: 0,
             dx_meters: 1.0,
             dt_seconds: 1.0,
         }

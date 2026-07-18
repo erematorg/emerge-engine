@@ -84,6 +84,24 @@ const _: () = {
     assert!(C::GranularFluid as u32 == 11);
 };
 
+/// Which role a material plays in two-phase mixture coupling (Tampubolon et al.
+/// 2017, "Multi-species simulation of porous sand and water mixtures" --
+/// interpenetrating granular-fluid Darcy drag, e.g. water soaking into sand).
+/// This is a MATERIAL-level classification (via `MaterialModel::mixture_phase`),
+/// not a per-particle field -- every particle of a given material shares the
+/// same phase, matching how `constitutive_model` already works. `None` (the
+/// default for every existing material) opts a scene entirely out of mixture
+/// coupling at zero cost -- see `Grid::has_mixture_activity`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MixturePhase {
+    /// The porous solid (e.g. sand/soil) -- keeps its own full elastic/plastic
+    /// deformation, unaffected by mixture coupling beyond the drag force itself.
+    Solid,
+    /// The interpenetrating fluid (e.g. water) -- exchanges momentum with the
+    /// solid phase via Darcy-style drag at every node both phases touch.
+    Fluid,
+}
+
 pub trait MaterialModel: Send + Sync + core::fmt::Debug {
     /// Which constitutive law this material implements.
     /// Used by the GPU shader to select the correct stress branch per particle.
@@ -143,6 +161,14 @@ pub trait MaterialModel: Send + Sync + core::fmt::Debug {
     /// Default: false. Override in fluid models.
     fn needs_density_recompute(&self) -> bool {
         false
+    }
+
+    /// Which two-phase mixture role this material plays, if any -- see
+    /// `MixturePhase`'s own doc. `None` (default) means this material never
+    /// participates in mixture coupling, the zero-cost-when-unused case that
+    /// covers every material/scene that doesn't need this feature.
+    fn mixture_phase(&self) -> Option<MixturePhase> {
+        None
     }
 
     /// Scaling coefficient for activation-driven deviatoric stress.
@@ -249,6 +275,84 @@ impl<M: MaterialModel> MaterialModel for WithLatentHeat<M> {
     }
     fn latent_heat(&self) -> f32 {
         self.latent_heat
+    }
+}
+
+/// Wraps any `MaterialModel` to opt it into two-phase mixture coupling as either
+/// the `Solid` or `Fluid` phase -- see `MixturePhase`'s own doc. Same pattern as
+/// `WithLatentHeat`: existing materials (`DruckerPragerMaterial`,
+/// `NewtonianFluidMaterial`, etc.) never opt in by themselves, so combining sand
+/// and water in a scene that DOESN'T wrap either one behaves exactly as before
+/// (two ordinary single-phase materials sharing a grid, no drag coupling) --
+/// mixture physics is explicit, per-scene, not a silent side effect of which
+/// materials happen to coexist.
+///
+/// ```rust,no_run
+/// # extern crate emerge_engine as emerge;
+/// # use emerge::{DruckerPragerMaterial, MixturePhase, WithMixturePhase};
+/// let sand = WithMixturePhase::new(DruckerPragerMaterial::cohesionless(1.0e5, 0.2), MixturePhase::Solid);
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct WithMixturePhase<M> {
+    pub inner: M,
+    pub phase: MixturePhase,
+}
+
+impl<M> WithMixturePhase<M> {
+    pub fn new(inner: M, phase: MixturePhase) -> Self {
+        Self { inner, phase }
+    }
+}
+
+impl<M: MaterialModel> MaterialModel for WithMixturePhase<M> {
+    fn constitutive_model(&self) -> ConstitutiveModel {
+        self.inner.constitutive_model()
+    }
+    fn kirchhoff_stress(&self, particles: &Particles, i: usize) -> Mat2 {
+        self.inner.kirchhoff_stress(particles, i)
+    }
+    fn stress_volume(&self, particles: &Particles, i: usize) -> f32 {
+        self.inner.stress_volume(particles, i)
+    }
+    fn timestep_bound(
+        &self,
+        density: f32,
+        hardening_scale: f32,
+        cell_width: f32,
+        material_cfl: f32,
+        viscous_cfl: f32,
+    ) -> f32 {
+        self.inner.timestep_bound(
+            density,
+            hardening_scale,
+            cell_width,
+            material_cfl,
+            viscous_cfl,
+        )
+    }
+    fn update_particle(&self, particles: &mut Particles, i: usize, dt: f32) {
+        self.inner.update_particle(particles, i, dt)
+    }
+    fn init_particle(&self, particle: &mut Particle) {
+        self.inner.init_particle(particle)
+    }
+    fn needs_cpu_update(&self) -> bool {
+        self.inner.needs_cpu_update()
+    }
+    fn needs_density_recompute(&self) -> bool {
+        self.inner.needs_density_recompute()
+    }
+    fn activation_scale(&self) -> f32 {
+        self.inner.activation_scale()
+    }
+    fn params(&self) -> MaterialParams {
+        self.inner.params()
+    }
+    fn latent_heat(&self) -> f32 {
+        self.inner.latent_heat()
+    }
+    fn mixture_phase(&self) -> Option<MixturePhase> {
+        Some(self.phase)
     }
 }
 

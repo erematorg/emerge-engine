@@ -11,9 +11,9 @@ use emerge::thermodynamics::{
     ScalarDiffusionConfig, ScalarDiffusionField, ThermalConfig, ThermalDiffusion, saturating_uptake,
 };
 use emerge::{
-    DruckerPragerMaterial, Elastic, Field, MuIRheologyMaterial, NaccMaterial, NeoHookeanMaterial,
-    NewtonianFluidMaterial, RankineMaterial, SimConfig, Simulation, SlipBoundary, SpawnRegion,
-    StomakhinMaterial, VonMisesMaterial,
+    DruckerPragerMaterial, Elastic, Field, MixturePhase, MuIRheologyMaterial, NaccMaterial,
+    NeoHookeanMaterial, NewtonianFluidMaterial, RankineMaterial, SimConfig, Simulation,
+    SlipBoundary, SpawnRegion, StomakhinMaterial, VonMisesMaterial, WithMixturePhase,
 };
 use glam::{IVec2, Vec2};
 
@@ -1722,5 +1722,113 @@ fn spawn_region_mass_from_matches_manual_particle_mass() {
         region.mass_override,
         Some(expected),
         "mass_from should produce the exact same value as calling particle_mass manually"
+    );
+}
+
+// --- two-phase mixture coupling (Tampubolon et al. 2017) ---
+
+/// Real end-to-end check through the FULL pipeline (P2G scatter -> grid-level
+/// closed-form drag solve -> G2P routing), not just the unit-level grid solve
+/// already verified in `spacetime::grid::mixture_coupling_tests`.
+///
+/// REAL FINDING while building this test, worth recording: comparing against
+/// `mixture_drag_coefficient=0.0` ("disabled") is NOT a valid "no coupling"
+/// baseline for an A/B here. Ordinary single-field MPM already fully merges
+/// momentum for ANY two materials sharing a grid node (one shared `Cell`,
+/// unconditionally) -- that's a stronger, effectively-infinite-stiffness
+/// coupling, not "no coupling at all". A genuinely LOWER, physically-correct
+/// finite-drag exchange therefore looks *weaker* than the disabled/merged
+/// baseline for two fully-co-located bodies, which is real and expected, not a
+/// bug (confirmed via direct instrumentation of the resolved per-node
+/// velocities during investigation, not assumed). The valid, confound-free A/B
+/// is HIGH drag vs LOW drag -- both paths engage the exact same resolved-
+/// velocity routing, differing only in how strongly it relaxes the two phases
+/// toward each other, which is exactly what the closed-form solve predicts.
+fn build_mixture_scene(drag_coefficient: f32) -> Simulation {
+    let config = SimConfig {
+        mixture_drag_coefficient: drag_coefficient,
+        gravity: Vec2::ZERO,
+        ..small_solver_config()
+    };
+    let solid_spawn = SpawnRegion {
+        spacing: 0.5,
+        box_size: IVec2::new(10, 10),
+        box_center: Vec2::new(16.0, 16.0),
+        material_id: 0,
+        initial_velocity_scale: 0.0,
+        precompute_initial_volumes: true,
+        ..SpawnRegion::for_sim(&config)
+    };
+    let fluid_spawn = SpawnRegion {
+        spacing: 0.5,
+        box_size: IVec2::new(10, 10),
+        box_center: Vec2::new(16.0, 16.0),
+        material_id: 1,
+        initial_velocity_scale: 0.0,
+        precompute_initial_volumes: true,
+        ..SpawnRegion::for_sim(&config)
+    };
+    let solid = WithMixturePhase::new(
+        DruckerPragerMaterial::from_young_modulus(1.0e6, 0.2),
+        MixturePhase::Solid,
+    );
+    let fluid = WithMixturePhase::new(
+        NewtonianFluidMaterial::low_viscosity(4.0, 10.0),
+        MixturePhase::Fluid,
+    );
+    let mut solver = Simulation::new(config, solid_spawn)
+        .with_default_material(Box::new(solid))
+        .with_material(1, Box::new(fluid));
+    let _ = solver.add_body(fluid_spawn);
+    // Give every fluid particle a real, direct initial velocity relative to the
+    // (still-at-rest) solid -- co-located from frame 0, no waiting for a fall.
+    let particles = solver.particles_mut();
+    let n = particles.material_id.len();
+    for i in 0..n {
+        if particles.material_id[i] == 1 {
+            particles.v[i] = Vec2::new(0.0, -3.0);
+        }
+    }
+    solver
+}
+
+fn relative_solid_fluid_speed(sim: &Simulation) -> f32 {
+    let particles = sim.particles();
+    let avg = |id: u32| -> Vec2 {
+        let group: Vec<Vec2> = particles
+            .iter()
+            .filter(|p| p.material_id == id)
+            .map(|p| p.v)
+            .collect();
+        group.iter().sum::<Vec2>() / group.len() as f32
+    };
+    (avg(0) - avg(1)).length()
+}
+
+#[test]
+fn higher_drag_relaxes_solid_fluid_relative_velocity_faster() {
+    let mut low = build_mixture_scene(1.0);
+    let mut high = build_mixture_scene(50.0);
+    let initial_relative_speed = relative_solid_fluid_speed(&low);
+
+    low.step_n(1);
+    high.step_n(1);
+    let low_relative = relative_solid_fluid_speed(&low);
+    let high_relative = relative_solid_fluid_speed(&high);
+
+    println!(
+        "mixture coupling: initial_relative={initial_relative_speed:.4} \
+         low_drag_relative={low_relative:.4} high_drag_relative={high_relative:.4}"
+    );
+    assert!(low_relative.is_finite() && high_relative.is_finite());
+    assert!(
+        low_relative < initial_relative_speed,
+        "even low drag should reduce relative velocity somewhat: \
+         initial={initial_relative_speed:.4} low={low_relative:.4}"
+    );
+    assert!(
+        high_relative < low_relative,
+        "higher drag should relax the solid/fluid relative velocity MORE than \
+         lower drag over the same real time: low={low_relative:.4} high={high_relative:.4}"
     );
 }

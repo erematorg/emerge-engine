@@ -178,6 +178,17 @@ impl Simulation {
             self.config.grid_cell_size,
             self.contact_grip.as_deref(),
         );
+        // Two-phase mixture coupling (Tampubolon et al. 2017) — same "after the
+        // clamp, no-op when unused" positioning as contact above. No-op (no dirty
+        // mixture cells) for every scene that never uses `WithMixturePhase` — see
+        // `Grid::resolve_mixture_coupling` doc.
+        self.grid.resolve_mixture_coupling(
+            sub_dt,
+            self.config.gravity,
+            self.config.mixture_drag_coefficient,
+            self.config.grid_cell_size,
+            self.config.mixture_pressure_iterations,
+        );
         self.last_timing.grid_update_us += t1.elapsed().as_micros() as u64;
 
         // ── G2P ──────────────────────────────────────────────────────────────

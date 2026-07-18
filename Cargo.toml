@@ -98,6 +98,10 @@ name = "basic_fluids"
 required-features = ["render"]
 
 [[example]]
+name = "mixture_sand_water"
+required-features = ["render"]
+
+[[example]]
 name = "basic_jellies"
 required-features = ["render"]
 

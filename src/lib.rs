@@ -76,10 +76,10 @@ pub use materials::{
     BinghamFluidMaterial, BrittleProps, ConstitutiveModel, CorotatedMaterial,
     DruckerPragerMaterial, Elastic, Elastoplastic, Fluid, FluidGranular, FromSI,
     GranularFluidMaterial, MAX_MATERIAL_SLOTS, MaterialModel, MaterialParams, MaterialRegistry,
-    MuIRheologyMaterial, NaccMaterial, NeoHookeanMaterial, NewtonianFluidMaterial, ParticleMass,
-    PlasticityModel, RankineMaterial, StomakhinMaterial, Viscoelastic, ViscoelasticMaterial,
-    VonMisesMaterial, WithLatentHeat, gravity_to_grid, lame_from_si, lame_from_young,
-    rankine_damage_estimate,
+    MixturePhase, MuIRheologyMaterial, NaccMaterial, NeoHookeanMaterial, NewtonianFluidMaterial,
+    ParticleMass, PlasticityModel, RankineMaterial, StomakhinMaterial, Viscoelastic,
+    ViscoelasticMaterial, VonMisesMaterial, WithLatentHeat, WithMixturePhase, gravity_to_grid,
+    lame_from_si, lame_from_young, rankine_damage_estimate,
 };
 
 // Boundary conditions
