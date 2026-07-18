@@ -107,6 +107,33 @@ const PALETTE: &[(u32, &str, [u8; 3])] = &[
 const SIGMA_JELLY: [f32; 3] = [0.05, 0.55, 0.60]; // basic_jellies_gpu (SIGMA_NEO)
 const SIGMA_SAND: [f32; 3] = [0.180, 0.220, 0.550]; // basic_sand_gpu
 const SIGMA_WATER: [f32; 3] = [0.85, 0.25, 0.07]; // render_physics (real: water absorbs red faster than blue)
+// REAL water absorption coefficients, per-meter -- Pope & Fry 1997 (via the OMLC
+// optical absorption compendium, omlc.org/spectra/water/abs, same real-source
+// tradition as this file's own Jacques 2013 tissue-scattering citation):
+// a_red(630nm)~0.34 m^-1, a_green(532nm)~0.044 m^-1, a_blue(420nm)~0.0044 m^-1.
+// Kept as the literal real-world m^-1 values, NOT pre-multiplied by any particular
+// dx_meters -- see `real_water_sigma_a` below for why baking in one scene's scale
+// as a frozen constant would silently go stale if that scale ever changes.
+const WATER_ABSORPTION_PER_METER: [f32; 3] = [0.34, 0.044, 0.0044];
+
+// Beer-Lambert here is per ONE PARTICLE's own depth (prep_instances.wgsl's own doc:
+// "depth=1 particle"), so the real shader-space sigma_a is the real m^-1 value
+// scaled by however many real meters one particle actually represents at THIS
+// scene's live scale -- computed from `config.dx_meters`, not a frozen literal, so
+// it stays correct if the scene's scale ever changes.
+//
+// HONEST FINDING, not a bug to fix: at this demo's real scale (dx_meters=0.01,
+// SimConfig::earth), this comes out genuinely tiny (~0.0034/0.00044/0.00004) --
+// real water at 1cm of real depth IS nearly perfectly transparent, true physics,
+// not a rendering gap. This engine is 2D (a face-on cross-section, no camera-ray-
+// through-volume axis), so there's no real depth-ACCUMULATION technique (like 3D
+// screen-space fluid rendering's thickness pass) that applies here -- `1/J`
+// (compression-as-density) is already the correct 2D analog, not a placeholder
+// for something more real. SIGMA_WATER above stays the demo's deliberate artistic
+// exaggeration (disclosed as such); this is the literal real-physics answer.
+fn real_water_sigma_a(dx_meters: f32) -> [f32; 3] {
+    WATER_ABSORPTION_PER_METER.map(|a| a * dx_meters)
+}
 const SIGMA_TISSUE: [f32; 3] = [0.05, 0.55, 0.60]; // render_physics (SIGMA_TISSUE)
 // No established value exists elsewhere in this codebase for snow specifically -- low,
 // roughly-neutral absorption (real snow is near-white, dominated by scattering not
@@ -264,6 +291,14 @@ struct State {
     /// (that glow term is normalized to 5000K, a lava/molten-metal scale) -- clear textual
     /// proof that heat is genuinely accumulating, not just the sudden melt/boil jump.
     near_cursor_max_temp: f32,
+    /// Toggle with M -- swaps water's optics between the demo's artistic
+    /// exaggeration (`SIGMA_WATER`) and the literal real-physics value, computed
+    /// live via `real_water_sigma_a` (properly derived from Pope & Fry 1997 -- see
+    /// that function's own doc). Real, live demonstration that real water at this
+    /// engine's actual 1cm/particle scale is nearly transparent, not the vivid
+    /// blue every other demo shows -- both are honest, just answering different
+    /// questions ("looks nice" vs "what would this really look like").
+    real_water_optics: bool,
 }
 
 impl State {
@@ -359,6 +394,7 @@ impl State {
             fps_frames: 0,
             last_fps: 0.0,
             near_cursor_max_temp: AMBIENT_K,
+            real_water_optics: false,
         }
     }
 
@@ -703,6 +739,23 @@ impl ApplicationHandler for App {
                     KeyCode::Digit3 => s.select_brush(2),
                     KeyCode::Digit4 => s.select_brush(3),
                     KeyCode::Digit5 => s.select_brush(4),
+                    KeyCode::KeyM => {
+                        s.real_water_optics = !s.real_water_optics;
+                        let sigma = if s.real_water_optics {
+                            real_water_sigma_a(s.sim.config().dx_meters)
+                        } else {
+                            SIGMA_WATER
+                        };
+                        s.renderer.set_optical_params(WATER_ID as usize, sigma);
+                        println!(
+                            "water optics: {} (M to toggle)",
+                            if s.real_water_optics {
+                                "REAL PHYSICS (Pope & Fry 1997, ~1cm real depth -- nearly transparent)"
+                            } else {
+                                "artistic (exaggerated for visibility)"
+                            }
+                        );
+                    }
                     _ => {}
                 }
             }
