@@ -55,7 +55,9 @@ fn make_sim() -> Simulation {
         gravity: Vec2::new(0.0, -0.15),
         ..SimConfig::earth(GRID, 0.01, DT)
     };
-    let water = NewtonianFluidMaterial::new(4.0, 0.1, 10.0, 3.0);
+    // Real water: Cole 1948 Tait exponent (7.0) + real dynamic viscosity, not a
+    // hand-picked 0.1/3.0 pair -- see NewtonianFluidMaterial::low_viscosity.
+    let water = NewtonianFluidMaterial::low_viscosity(4.0, 10.0);
     let spawn_water = SpawnRegion {
         spacing: 0.6,
         box_size: IVec2::new(20, 16),

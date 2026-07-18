@@ -73,7 +73,9 @@ fn make_sim_data(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) -> GpuSimul
     let mut particles = build_particles(&config, spawn_water);
     particles.extend(build_particles(&config, spawn_mud));
 
-    let water = NewtonianFluidMaterial::new(4.0, 0.1, 10.0, 3.0);
+    // Real water: Cole 1948 Tait exponent (7.0) + real dynamic viscosity, not a
+    // hand-picked 0.1/3.0 pair -- see NewtonianFluidMaterial::low_viscosity.
+    let water = NewtonianFluidMaterial::low_viscosity(4.0, 10.0);
     let mud = BinghamFluidMaterial::new(4.0, 8.0, 5.0, 3.0, 4.0);
     let mut registry = MaterialRegistry::with_default(Box::new(water));
     registry.insert(MAT_MUD, Box::new(mud));

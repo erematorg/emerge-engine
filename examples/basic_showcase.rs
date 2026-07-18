@@ -62,7 +62,9 @@ fn make_sim() -> Simulation {
     };
     let elastic = NeoHookeanMaterial::new(40.0, 80.0);
     let sand = DruckerPragerMaterial::new(400.0, 200.0);
-    let fluid = NewtonianFluidMaterial::new(4.0, 0.1, 10.0, 4.0);
+    // Real water: Cole 1948 Tait exponent (7.0) + real dynamic viscosity, not a
+    // hand-picked 0.1/4.0 pair -- see NewtonianFluidMaterial::low_viscosity.
+    let fluid = NewtonianFluidMaterial::low_viscosity(4.0, 10.0);
 
     let mut solver = Simulation::empty(config)
         .with_default_material(Box::new(elastic))
