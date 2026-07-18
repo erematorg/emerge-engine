@@ -447,23 +447,45 @@ pub const NUM_BLOCKS: usize = NUM_BLOCKS_PER_DIM * NUM_BLOCKS_PER_DIM; // 256
 /// points per exact GRID NODE (`grid_res² × capacity`) — this OOM'd the existing
 /// `gpu_grid_resolution_cost` regression test at grid_res=2048 (a ~4 GiB allocation),
 /// confirmed via the real failure, not predicted in advance. Fixed by bucketing per
-/// coarse BLOCK instead (`NUM_BLOCKS` = 256, fixed regardless of grid_res — the same
-/// spatial partition `particle_sort.wgsl` already uses), so total memory
-/// (`NUM_BLOCKS × MAX_CONTACT_POINTS_PER_BLOCK × 16 bytes` ≈ 16 MiB) is now CONSTANT
-/// at any grid resolution, matching how `active_block_ids`/`block_counts` are already
-/// sized. Trade-off, disclosed: a future `resolve_contact` pass processing a specific
-/// node must scan its own block's (and, for stencil spillover at a block boundary,
-/// neighboring blocks') point bucket and filter by real distance, rather than reading
-/// an exact per-node list directly — more per-node filtering work, but bounded,
-/// constant memory instead of a real OOM.
+/// coarse BLOCK instead, so total memory is CONSTANT at any grid resolution, matching
+/// how `active_block_ids`/`block_counts` are already sized.
 ///
-/// 4096 per block is a real, disclosed cap (like the CPU's own bounded caps, e.g.
-/// `fit_contact_normal_lr`'s 15-iteration Newton cap) — chosen generously since a
-/// block covers many cells' worth of interface, not just one node; the atomic
-/// slot-claim is bounds-checked (points beyond the cap are dropped, not undefined
-/// behavior), and `contact_point_counts` keeps counting past the cap so overflow is a
-/// real, observable signal, not silently absorbed.
-pub const MAX_CONTACT_POINTS_PER_BLOCK: usize = 4096;
+/// GPU sparse-contact perf pass (2026-07-18, see `resolve_contact_perf_research_
+/// 2026-07-15` memory's "candidate 1"): this partition is now DEDICATED to contact
+/// points (`NUM_CONTACT_BLOCKS_PER_DIM`, below), independent of `NUM_BLOCKS_PER_DIM`
+/// (the P2G-sort/active-block partition). Real, measured, sourced problem this fixes:
+/// reusing the sort partition (`NUM_BLOCKS_PER_DIM=16`, block_size≈20 cells at
+/// grid_res=320) for contact points meant `gather_local_points` scanned up to
+/// 9 × 4096 = 36,864 candidate points per node to find at most 128 real ones inside the
+/// actual 1.5-cell kernel reach — the canonical uniform-grid neighbor-search mismatch
+/// (Green, "Particle Simulation using CUDA", GPU Gems 3; corroborated by SPH literature,
+/// Ihmsen et al. 2011: bucket size should match the interaction radius). Profiled at
+/// `resolve_contact` = 54.9% of substep GPU time in a real contact-using scene before
+/// this fix. A finer, DEDICATED partition (64×64 = 4096 blocks, block_size≈5 cells at
+/// grid_res=320, vs 20 before) closes most of that gap without changing the fit's
+/// inputs/outputs at all (numerics-neutral by construction — same points feed the same
+/// Newton-Raphson fit, only how they're fetched changes).
+///
+/// 256 per block (down from the old partition's 4096) is a real, disclosed cap sized
+/// to the new, much smaller area a contact block now covers (~5×5=25 cells vs ~20×20=
+/// 400 before) — same per-cell headroom as before, not an arbitrary shrink. Total
+/// memory (`NUM_CONTACT_BLOCKS × MAX_CONTACT_POINTS_PER_BLOCK × 16 bytes` ≈ 16 MiB) is
+/// unchanged from the old fixed-256-block sizing — this is a re-partition, not a bigger
+/// allocation. The atomic slot-claim is bounds-checked (points beyond the cap are
+/// dropped, not undefined behavior), and `contact_point_counts` keeps counting past the
+/// cap so overflow is a real, observable signal, not silently absorbed.
+pub const MAX_CONTACT_POINTS_PER_BLOCK: usize = 256;
+
+/// Dedicated spatial partition for contact-point bucketing (`gather_contact_points_main`
+/// writes, `resolve_contact.wgsl`'s `gather_local_points`/`debug_fit_normal_main` read) —
+/// deliberately SEPARATE from `NUM_BLOCKS_PER_DIM` (the P2G-sort/active-block-detection
+/// partition), which serves an unrelated purpose (sort-permutation coherence, active-block
+/// occupancy) and has no reason to share bucket geometry with contact-point neighbor
+/// search. See `MAX_CONTACT_POINTS_PER_BLOCK`'s doc for the full sizing rationale. Fixed
+/// regardless of `grid_res`, same reasoning as `NUM_BLOCKS_PER_DIM` (re-deriving at
+/// runtime isn't an option — sizes buffers allocated once at `GpuBuffers::new()`).
+pub const NUM_CONTACT_BLOCKS_PER_DIM: usize = 64;
+pub const NUM_CONTACT_BLOCKS: usize = NUM_CONTACT_BLOCKS_PER_DIM * NUM_CONTACT_BLOCKS_PER_DIM; // 4096
 
 /// Debug/test-only uniform for `resolve_contact.wgsl`'s `debug_fit_normal_main` — picks
 /// which block's point cloud to run the Newton-Raphson LR normal fit against and what

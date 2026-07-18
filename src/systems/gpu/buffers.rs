@@ -23,6 +23,7 @@ use super::step_params::{
     ContactDebugParams, GpuAsflipParams, GpuDirectionalGripParams, GpuFieldsParams,
     GpuImpulseParams, GpuMaterialMassParams, GpuResourceParams, GpuSleepWakeParams, GpuStepParams,
     GpuThermalParams, MAX_CONTACT_POINTS_PER_BLOCK, MAX_RENDER_MATERIAL_SLOTS, NUM_BLOCKS,
+    NUM_CONTACT_BLOCKS,
 };
 use crate::materials::MaterialParams;
 use crate::particle::Particle;
@@ -114,25 +115,29 @@ pub struct GpuBuffers {
     /// Labeled contact point cloud (`+1.0` grip / `-1.0` rest, `vec4<f32>` = position.xy,
     /// label, unused) for the Newton-Raphson LR contact-normal fit — CPU's mirror is
     /// `ContactCell::points` (an unbounded per-node `Vec`, see that type's doc). Bucketed
-    /// per coarse BLOCK (`NUM_BLOCKS` = 256, same spatial partition `particle_sort.wgsl`
-    /// already uses), NOT per exact grid node — a first version bucketed per node and
-    /// OOM'd the real `gpu_grid_resolution_cost` regression test at grid_res=2048 (see
-    /// `MAX_CONTACT_POINTS_PER_BLOCK`'s doc in `step_params.rs` for the full story).
-    /// Fixed total size (`NUM_BLOCKS × MAX_CONTACT_POINTS_PER_BLOCK × 16 bytes` ≈ 16 MiB),
-    /// independent of grid_res. Populated by a dedicated pass (`gather_contact_points_main`
-    /// in `p2g.wgsl`) that runs AFTER the main P2G scatter, mirroring CPU's own two-pass
-    /// ordering (`gather_contact_point_cloud`'s doc: point data is only meaningful once
-    /// grip mass has already been measured at a node this same substep). STORAGE |
-    /// COPY_SRC (test readback only, same precedent as `sorted_particle_ids`).
+    /// per `NUM_CONTACT_BLOCKS` (64×64=4096), a DEDICATED finer partition, NOT per exact
+    /// grid node (a first version bucketed per node and OOM'd the real
+    /// `gpu_grid_resolution_cost` regression test at grid_res=2048) and NOT sharing
+    /// `particle_sort.wgsl`'s coarser `NUM_BLOCKS` partition either anymore (see
+    /// `MAX_CONTACT_POINTS_PER_BLOCK`'s doc in `step_params.rs` for the full sizing story,
+    /// including the 2026-07-18 re-partition that fixed a real scan-to-keep mismatch).
+    /// Fixed total size (`NUM_CONTACT_BLOCKS × MAX_CONTACT_POINTS_PER_BLOCK × 16 bytes` ≈
+    /// 16 MiB), independent of grid_res. Populated by a dedicated pass
+    /// (`gather_contact_points_main` in `p2g.wgsl`) that runs AFTER the main P2G scatter,
+    /// mirroring CPU's own two-pass ordering (`gather_contact_point_cloud`'s doc: point
+    /// data is only meaningful once grip mass has already been measured at a node this
+    /// same substep). STORAGE | COPY_SRC (test readback only, same precedent as
+    /// `sorted_particle_ids`).
     pub contact_points: wgpu::Buffer,
-    /// Per-BLOCK atomic count of points written into `contact_points` this substep —
-    /// `NUM_BLOCKS` (256) × `atomic<u32>`, fixed size regardless of grid_res. Bounds-
-    /// checked against `MAX_CONTACT_POINTS_PER_BLOCK` at the atomic slot-claim site
-    /// (`gather_contact_points_main`) — excess points are dropped, not undefined
-    /// behavior, and the counter keeps counting past the cap so overflow is a real,
-    /// observable signal. Zeroed every substep by `particle_sort_clear_main`
-    /// (`particle_sort.wgsl`) alongside its own `block_counts` — same 256-wide dispatch,
-    /// not `grid_clear.wgsl` (which processes per-CELL work; this is per-block).
+    /// Per-contact-block atomic count of points written into `contact_points` this
+    /// substep — `NUM_CONTACT_BLOCKS` (4096) × `atomic<u32>`, fixed size regardless of
+    /// grid_res. Bounds-checked against `MAX_CONTACT_POINTS_PER_BLOCK` at the atomic
+    /// slot-claim site (`gather_contact_points_main`) — excess points are dropped, not
+    /// undefined behavior, and the counter keeps counting past the cap so overflow is a
+    /// real, observable signal. Zeroed every substep by `particle_sort_clear_main`
+    /// (`particle_sort.wgsl`, grid-stride loop since `NUM_CONTACT_BLOCKS` (4096) exceeds
+    /// that pass's own 256-thread workgroup) — not `grid_clear.wgsl` (which processes
+    /// per-CELL work; this is per-block).
     pub contact_point_counts: wgpu::Buffer,
     /// Debug/test-only uniform for `resolve_contact.wgsl`'s `debug_fit_normal_main` —
     /// see `ContactDebugParams`'s own doc. Not touched by the real per-substep
@@ -362,15 +367,16 @@ impl GpuBuffers {
             mapped_at_creation: false,
         });
         // Fixed size, independent of grid_res — see MAX_CONTACT_POINTS_PER_BLOCK's doc
-        // for why this is bucketed per coarse block (NUM_BLOCKS), not per exact node.
-        let contact_points_bytes = (NUM_BLOCKS * MAX_CONTACT_POINTS_PER_BLOCK * 16) as u64;
+        // for why this is bucketed per its own dedicated NUM_CONTACT_BLOCKS partition
+        // (finer than NUM_BLOCKS, the unrelated P2G-sort partition), not per exact node.
+        let contact_points_bytes = (NUM_CONTACT_BLOCKS * MAX_CONTACT_POINTS_PER_BLOCK * 16) as u64;
         let contact_points = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mpm_contact_points"),
             size: contact_points_bytes,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        let contact_point_counts_bytes = (NUM_BLOCKS * mem::size_of::<u32>()) as u64;
+        let contact_point_counts_bytes = (NUM_CONTACT_BLOCKS * mem::size_of::<u32>()) as u64;
         let contact_point_counts = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mpm_contact_point_counts"),
             size: contact_point_counts_bytes,

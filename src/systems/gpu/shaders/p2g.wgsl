@@ -89,13 +89,18 @@ const MAX_RENDER_MATERIAL_SLOTS: u32 = 16u;
 // `step_params::MAX_CONTACT_POINTS_PER_BLOCK` (Rust-side source of truth, sizes the
 // `contact_points` buffer at construction) exactly, same duplicated-constant
 // convention already used for MASS_ATOMIC_SCALE/MOM_ATOMIC_SCALE above. Bucketed per
-// coarse BLOCK, not per exact node — see that constant's own doc in step_params.rs
-// for why (a first per-node version OOM'd at high grid_res).
-const MAX_POINTS_PER_BLOCK: u32 = 4096u;
-// override, not a hardcoded literal — must match particle_sort.wgsl's NUM_BLOCKS_PER_DIM
-// exactly, single Rust-side source of truth (src/gpu/step_params.rs). Needed here so
-// gather_contact_points_main can compute the SAME block index particle_sort uses.
-override NUM_BLOCKS_PER_DIM: u32;
+// a DEDICATED finer contact-block partition, not per exact node — see that constant's
+// own doc in step_params.rs for why (a first per-node version OOM'd at high grid_res;
+// a 2026-07-18 re-partition then split this off from the coarser P2G-sort partition to
+// fix a real scan-to-keep mismatch, see MAX_CONTACT_POINTS_PER_BLOCK's doc).
+const MAX_POINTS_PER_BLOCK: u32 = 256u;
+// override, not a hardcoded literal — must match resolve_contact.wgsl's
+// NUM_CONTACT_BLOCKS_PER_DIM exactly, single Rust-side source of truth
+// (src/gpu/step_params.rs). Needed here so gather_contact_points_main computes the SAME
+// block index resolve_contact's gather_local_points reads. DEDICATED to contact-point
+// bucketing — deliberately NOT the same override as particle_sort.wgsl's
+// NUM_BLOCKS_PER_DIM (an unrelated partition, sort-permutation/active-block occupancy).
+override NUM_CONTACT_BLOCKS_PER_DIM: u32;
 
 @group(0) @binding(0) var<storage, read_write> particles:           array<Particle>;
 @group(0) @binding(1) var<storage, read_write> grid_atomic:         array<atomic<i32>>;
@@ -122,19 +127,19 @@ struct MaterialMassParams {
 @group(1) @binding(30) var<storage, read_write> material_mass_atomic: array<atomic<i32>>;
 @group(1) @binding(31) var<uniform>              material_mass_params: MaterialMassParams;
 
-// Exact copy of particle_sort.wgsl's block_index — WGSL has no cross-file includes, so
-// this is duplicated the same way MASS_ATOMIC_SCALE etc. already are across shader
-// files. Must stay byte-for-byte identical: gather_contact_points_main needs the SAME
-// block a given cell belongs to as particle_sort computes for particles, since a
-// future resolve_contact pass will scan a block's bucket by this same index.
-fn block_index(pos: vec2<f32>, grid_res: u32) -> u32 {
+// Exact copy of resolve_contact.wgsl's block_index_of — WGSL has no cross-file
+// includes, so this is duplicated the same way MASS_ATOMIC_SCALE etc. already are
+// across shader files. Must stay byte-for-byte identical: gather_contact_points_main
+// needs the SAME contact-block a given cell belongs to as resolve_contact's
+// gather_local_points scans by this same index.
+fn contact_block_index(pos: vec2<f32>, grid_res: u32) -> u32 {
     let max_cell = grid_res - 1u;
     let cell_x = u32(clamp(pos.x, 0.0, f32(max_cell)));
     let cell_y = u32(clamp(pos.y, 0.0, f32(max_cell)));
-    let block_size = (grid_res + NUM_BLOCKS_PER_DIM - 1u) / NUM_BLOCKS_PER_DIM;
-    let block_x = min(cell_x / block_size, NUM_BLOCKS_PER_DIM - 1u);
-    let block_y = min(cell_y / block_size, NUM_BLOCKS_PER_DIM - 1u);
-    return block_y * NUM_BLOCKS_PER_DIM + block_x;
+    let block_size = (grid_res + NUM_CONTACT_BLOCKS_PER_DIM - 1u) / NUM_CONTACT_BLOCKS_PER_DIM;
+    let block_x = min(cell_x / block_size, NUM_CONTACT_BLOCKS_PER_DIM - 1u);
+    let block_y = min(cell_y / block_size, NUM_CONTACT_BLOCKS_PER_DIM - 1u);
+    return block_y * NUM_CONTACT_BLOCKS_PER_DIM + block_x;
 }
 
 fn bspline_w(d: f32) -> f32 {
@@ -473,20 +478,22 @@ fn gather_contact_points_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // (matches CPU's `add_contact_point`, which only ever appends to an ALREADY-
     // existing `contact_cells` entry — the CPU equivalent of "grip mass already
     // registered here"). Checking one representative cell (not all 9 stencil cells)
-    // is deliberate: bucketing is per-BLOCK now (see MAX_POINTS_PER_BLOCK's doc), and a
-    // future resolve_contact pass scans a node's own block PLUS its neighbors, so a
-    // particle recorded once in its own block is already visible to every node that
-    // could plausibly need it — recording once per particle avoids redundantly
-    // writing the same particle into the same block bucket up to 9 times (nearly
-    // every particle's 3×3 stencil maps to the SAME block, since block_size is
-    // normally much larger than 3 cells).
+    // is deliberate: bucketing is per dedicated contact-block now (see
+    // MAX_POINTS_PER_BLOCK's doc), and resolve_contact's gather_local_points scans a
+    // node's own block PLUS its neighbors, so a particle recorded once in its own
+    // block is already visible to every node that could plausibly need it — recording
+    // once per particle avoids redundantly writing the same particle into the same
+    // block bucket up to 9 times. Note this partition is now finer than P2G's own
+    // block_size (that's the whole point of the 2026-07-18 re-partition), so a
+    // particle's 3×3 cell stencil CAN span multiple contact blocks — still correct:
+    // gather_local_points's own 3×3 NEIGHBOR-BLOCK scan is exactly what covers that.
     let home_x = clamp(u32(p.x.x), 0u, res - 1u);
     let home_y = clamp(u32(p.x.y), 0u, res - 1u);
     let home_idx = home_y * res + home_x;
     let grip_mass_bits = atomicLoad(&grip_grid_atomic[home_idx * 4u + 2u]);
     if grip_mass_bits <= 0 { return; }
 
-    let block = block_index(p.x, res);
+    let block = contact_block_index(p.x, res);
     // NOTE for any future reader of `contact_point_counts`: this counter keeps
     // incrementing past MAX_POINTS_PER_BLOCK even though writes beyond it are dropped
     // below (a real, honest overflow signal, not silently capped) — any consumer must

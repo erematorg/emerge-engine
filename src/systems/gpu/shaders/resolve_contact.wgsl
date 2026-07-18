@@ -61,8 +61,13 @@ struct DirectionalGripParams {
     mu_resist:      f32,
 }
 
-const MAX_POINTS_PER_BLOCK: u32 = 4096u;
+const MAX_POINTS_PER_BLOCK: u32 = 256u;
 const MAX_LOCAL_POINTS:     u32 = 128u;
+// Dedicated finer contact-point partition (2026-07-18 re-partition, see
+// MAX_CONTACT_POINTS_PER_BLOCK's doc in step_params.rs) — deliberately NOT the same
+// override as this file's OWN NUM_BLOCKS_PER_DIM below (that one sizes
+// active_block_ids/active_block_count, the unrelated sparse-MPM-dispatch partition).
+override NUM_CONTACT_BLOCKS_PER_DIM: u32;
 override NUM_BLOCKS_PER_DIM: u32;
 const NUM_BLOCKS: u32 = 256u;
 const BLOCK_THREADS_PER_DIM: u32 = 16u;
@@ -254,10 +259,14 @@ fn grip_mass_gradient_normal(cx: u32, cy: u32, res: u32) -> vec3<f32> {
     return vec3<f32>(n.x, n.y, 1.0);
 }
 
+// Contact-point bucket geometry — uses the DEDICATED NUM_CONTACT_BLOCKS_PER_DIM
+// partition, not this file's own NUM_BLOCKS_PER_DIM (that one is the sparse-MPM
+// active-block partition resolve_contact_main iterates cells within, an unrelated
+// purpose). Must stay byte-for-byte identical to p2g.wgsl's contact_block_index.
 fn block_index_of(cell_x: u32, cell_y: u32, res: u32) -> vec2<u32> {
-    let block_size = (res + NUM_BLOCKS_PER_DIM - 1u) / NUM_BLOCKS_PER_DIM;
-    let bx = min(cell_x / block_size, NUM_BLOCKS_PER_DIM - 1u);
-    let by = min(cell_y / block_size, NUM_BLOCKS_PER_DIM - 1u);
+    let block_size = (res + NUM_CONTACT_BLOCKS_PER_DIM - 1u) / NUM_CONTACT_BLOCKS_PER_DIM;
+    let bx = min(cell_x / block_size, NUM_CONTACT_BLOCKS_PER_DIM - 1u);
+    let by = min(cell_y / block_size, NUM_CONTACT_BLOCKS_PER_DIM - 1u);
     return vec2<u32>(bx, by);
 }
 
@@ -278,11 +287,11 @@ fn gather_local_points(node_pos: vec2<f32>, res: u32, out_points: ptr<function, 
     var n: u32 = 0u;
     for (var dy: i32 = -1; dy <= 1; dy++) {
         let nby = by + dy;
-        if nby < 0 || nby >= i32(NUM_BLOCKS_PER_DIM) { continue; }
+        if nby < 0 || nby >= i32(NUM_CONTACT_BLOCKS_PER_DIM) { continue; }
         for (var dx: i32 = -1; dx <= 1; dx++) {
             let nbx = bx + dx;
-            if nbx < 0 || nbx >= i32(NUM_BLOCKS_PER_DIM) { continue; }
-            let block = u32(nby) * NUM_BLOCKS_PER_DIM + u32(nbx);
+            if nbx < 0 || nbx >= i32(NUM_CONTACT_BLOCKS_PER_DIM) { continue; }
+            let block = u32(nby) * NUM_CONTACT_BLOCKS_PER_DIM + u32(nbx);
             let count = min(atomicLoad(&contact_point_counts[block]), MAX_POINTS_PER_BLOCK);
             let base = block * MAX_POINTS_PER_BLOCK;
             for (var i: u32 = 0u; i < count; i++) {
@@ -299,22 +308,24 @@ fn gather_local_points(node_pos: vec2<f32>, res: u32, out_points: ptr<function, 
     return n;
 }
 
-// Debug-only entry point (1 thread) — runs the fit against ONE chosen block's RAW
-// point cloud (`contact_debug_params.target_block`), no distance filtering. UNCHANGED
-// behavior from the first verified version -- see this file's own top doc comment.
+// Debug-only entry point (1 thread) — runs the fit against `gather_local_points`'s real
+// neighbor-expanded, distance-filtered point cloud around `contact_debug_params.
+// node_pos`, i.e. the EXACT same input `resolve_cell` itself uses. `target_block`/
+// `point_count` are no longer read: CHANGED 2026-07-18 (GPU sparse-contact perf pass)
+// from reading one un-expanded block's raw points -- that assumption (a whole known
+// interface fits inside a single un-expanded block) only held by coincidence at the
+// OLD coarse partition's block_size=4; the new dedicated, finer contact partition
+// (see MAX_CONTACT_POINTS_PER_BLOCK's doc, step_params.rs) makes it false in general.
+// This is also a real correctness improvement on its own, independent of the
+// re-partition: this debug path is now representative of what `resolve_cell` actually
+// sees (see the `gpu_directional_grip_is_direction_aware` test's own doc, which
+// already flagged the OLD single-block debug path as testing "the wrong code path").
 @compute @workgroup_size(1, 1, 1)
 fn debug_fit_normal_main() {
-    let block = contact_debug_params.target_block;
-    let count = min(contact_debug_params.point_count, MAX_POINTS_PER_BLOCK);
-    let base = block * MAX_POINTS_PER_BLOCK;
+    let node_pos = contact_debug_params.node_pos;
     var local_points: array<vec4<f32>, 128>;
-    var n: u32 = 0u;
-    for (var i: u32 = 0u; i < count; i++) {
-        if n >= MAX_LOCAL_POINTS { break; }
-        local_points[n] = contact_points[base + i];
-        n++;
-    }
-    let result = fit_normal_from_local_points(&local_points, n, contact_debug_params.node_pos, 1.0);
+    let n = gather_local_points(node_pos, step_params.grid_res, &local_points);
+    let result = fit_normal_from_local_points(&local_points, n, node_pos, step_params.grid_cell_size);
     contact_debug_output[0] = result.x;
     contact_debug_output[1] = result.y;
     contact_debug_output[2] = result.z;

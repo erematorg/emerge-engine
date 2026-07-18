@@ -81,6 +81,7 @@ use super::buffers::GpuBuffers;
 use super::shaders;
 use super::step_params::{
     MAX_FORCE_FIELDS, MAX_MATERIALS, MAX_SLEEP_WAKE_TAGS, NUM_BLOCKS_PER_DIM,
+    NUM_CONTACT_BLOCKS_PER_DIM,
 };
 
 /// All compiled compute pipelines for one GpuSimulation instance.
@@ -345,6 +346,26 @@ impl SimPipelines {
         // shared by particle_sort's compaction pass and grid_clear/grid_update's block-guarded
         // dispatch.
         let block_consts: &[(&str, f64)] = &[("NUM_BLOCKS_PER_DIM", NUM_BLOCKS_PER_DIM as f64)];
+        // NUM_CONTACT_BLOCKS_PER_DIM: dedicated finer contact-point partition (2026-07-18
+        // re-partition, see MAX_CONTACT_POINTS_PER_BLOCK's doc in step_params.rs) --
+        // separate override from NUM_BLOCKS_PER_DIM above, needed by p2g.wgsl's
+        // gather_contact_points_main and resolve_contact.wgsl's gather_local_points/
+        // debug_fit_normal_main.
+        let contact_block_consts: &[(&str, f64)] = &[(
+            "NUM_CONTACT_BLOCKS_PER_DIM",
+            NUM_CONTACT_BLOCKS_PER_DIM as f64,
+        )];
+        // resolve_contact.wgsl declares BOTH overrides (its own NUM_BLOCKS_PER_DIM for
+        // resolve_contact_main's active-block iteration, plus NUM_CONTACT_BLOCKS_PER_DIM
+        // for gather_local_points' contact-block scan) -- every pipeline built from that
+        // module needs both supplied.
+        let resolve_contact_consts: &[(&str, f64)] = &[
+            ("NUM_BLOCKS_PER_DIM", NUM_BLOCKS_PER_DIM as f64),
+            (
+                "NUM_CONTACT_BLOCKS_PER_DIM",
+                NUM_CONTACT_BLOCKS_PER_DIM as f64,
+            ),
+        ];
         // grid_update needs BOTH the force-field loop bound AND the block-dispatch constant
         // (Phase 2 — see grid_update.wgsl doc comment).
         let grid_update_consts: &[(&str, f64)] = &[
@@ -428,17 +449,17 @@ impl SimPipelines {
             block_consts,
             false,
         );
-        // p2g.wgsl declares `override NUM_BLOCKS_PER_DIM` (needed by
-        // gather_contact_points_main's block_index call) -- both entry points compiled
-        // from this same module need it supplied, even though p2g_main itself doesn't
-        // reference it.
+        // p2g.wgsl declares `override NUM_CONTACT_BLOCKS_PER_DIM` (needed by
+        // gather_contact_points_main's contact_block_index call) -- both entry points
+        // compiled from this same module need it supplied, even though p2g_main itself
+        // doesn't reference it.
         let p2g = make_pipeline(
             device,
             &pipeline_layout,
             &p2g_src,
             "p2g_main",
             "p2g",
-            block_consts,
+            contact_block_consts,
             false,
         );
         let gather_contact_points = make_pipeline(
@@ -447,7 +468,7 @@ impl SimPipelines {
             &p2g_src,
             "gather_contact_points_main",
             "gather_contact_points",
-            block_consts,
+            contact_block_consts,
             false,
         );
         let grid_update = make_pipeline(
@@ -525,18 +546,20 @@ impl SimPipelines {
             false,
         );
 
-        // resolve_contact.wgsl declares `override NUM_BLOCKS_PER_DIM` (needed by
-        // resolve_contact_main's block-neighbor gather) -- both entry points compiled
-        // from this module need it supplied, even though debug_fit_normal_main itself
-        // doesn't reference it (same requirement already established for p2g/
-        // gather_contact_points sharing p2g.wgsl's own override).
+        // resolve_contact.wgsl declares BOTH `override NUM_BLOCKS_PER_DIM` (needed by
+        // resolve_contact_main's active-block-neighbor gather) and
+        // `override NUM_CONTACT_BLOCKS_PER_DIM` (needed by gather_local_points' contact-
+        // block scan) -- every entry point compiled from this module needs both
+        // supplied, even though debug_fit_normal_main itself doesn't reference either
+        // (same requirement already established for p2g/gather_contact_points sharing
+        // p2g.wgsl's own override).
         let debug_fit_normal = make_pipeline(
             device,
             &pipeline_layout,
             shaders::RESOLVE_CONTACT,
             "debug_fit_normal_main",
             "debug_fit_normal",
-            block_consts,
+            resolve_contact_consts,
             false,
         );
         let resolve_contact = make_pipeline(
@@ -545,7 +568,7 @@ impl SimPipelines {
             shaders::RESOLVE_CONTACT,
             "resolve_contact_main",
             "resolve_contact",
-            block_consts,
+            resolve_contact_consts,
             false,
         );
 

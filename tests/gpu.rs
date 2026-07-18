@@ -3163,7 +3163,6 @@ mod gpu_tests {
             return;
         }
         use emerge::Particle;
-        use emerge::gpu::NUM_BLOCKS_PER_DIM;
 
         const GRID_RES: usize = 64;
         let config = SimConfig {
@@ -3202,23 +3201,18 @@ mod gpu_tests {
         let mut solver = block_on(GpuSimulation::new(config, particles, registry));
         solver.step_frame();
 
-        // Same node_pos as the CPU test — compute which coarse block it falls in via
-        // the identical arithmetic gather_contact_points_main uses (block_index in
-        // p2g.wgsl), so the debug pass reads the block real points actually landed in.
+        // Same node_pos as the CPU test. debug_fit_normal_main now gathers its own
+        // neighbor-expanded, distance-filtered point cloud around node_pos (the same
+        // gather_local_points the real resolve_cell pass uses), so no block-index
+        // arithmetic is needed here anymore — see debug_fit_contact_normal_blocking's doc.
         let node_pos = Vec2::new(32.0, 10.0);
-        let block_size = (GRID_RES as u32).div_ceil(NUM_BLOCKS_PER_DIM as u32);
-        let block_x = (node_pos.x as u32 / block_size).min(NUM_BLOCKS_PER_DIM as u32 - 1);
-        let block_y = (node_pos.y as u32 / block_size).min(NUM_BLOCKS_PER_DIM as u32 - 1);
-        let block = block_y * NUM_BLOCKS_PER_DIM as u32 + block_x;
-
-        let counts = solver.contact_point_counts_blocking();
-        let count = counts[block as usize];
+        let total_points: u32 = solver.contact_point_counts_blocking().iter().sum();
         assert!(
-            count > 0,
-            "expected block {block} to have recorded contact points, got count={count}"
+            total_points > 0,
+            "expected some contact points to have been recorded this substep, got 0"
         );
 
-        let (n, valid) = solver.debug_fit_contact_normal_blocking(block, node_pos, count);
+        let (n, valid) = solver.debug_fit_contact_normal_blocking(node_pos);
         assert!(valid, "fit found no confident normal (n={n:?})");
         assert!(
             n.x.abs() < 0.1,

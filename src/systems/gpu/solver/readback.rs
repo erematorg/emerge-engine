@@ -1,6 +1,6 @@
 use super::GpuSimulation;
 use crate::systems::gpu::step_params::{
-    ContactDebugParams, MAX_CONTACT_POINTS_PER_BLOCK, NUM_BLOCKS,
+    ContactDebugParams, MAX_CONTACT_POINTS_PER_BLOCK, NUM_BLOCKS, NUM_CONTACT_BLOCKS,
 };
 
 impl GpuSimulation {
@@ -79,28 +79,28 @@ impl GpuSimulation {
         )
     }
 
-    /// Test/diagnostic readback of the per-block contact point-cloud counts (GPU port,
-    /// first slice) — `NUM_BLOCKS` (256) `u32` entries, one per coarse spatial block (see
-    /// `MAX_CONTACT_POINTS_PER_BLOCK`'s doc in `step_params.rs`). A count can exceed
-    /// `MAX_CONTACT_POINTS_PER_BLOCK` on overflow (a real, observable signal, not silently
-    /// capped) — callers must clamp before indexing `contact_points_blocking`.
+    /// Test/diagnostic readback of the per-block contact point-cloud counts (GPU port) —
+    /// `NUM_CONTACT_BLOCKS` (4096) `u32` entries, one per dedicated contact-point spatial
+    /// block (see `MAX_CONTACT_POINTS_PER_BLOCK`'s doc in `step_params.rs`). A count can
+    /// exceed `MAX_CONTACT_POINTS_PER_BLOCK` on overflow (a real, observable signal, not
+    /// silently capped) — callers must clamp before indexing `contact_points_blocking`.
     pub fn contact_point_counts_blocking(&self) -> Vec<u32> {
         self.buffers.readback_u32_blocking(
             &self.device,
             &self.queue,
             &self.buffers.contact_point_counts,
-            NUM_BLOCKS,
+            NUM_CONTACT_BLOCKS,
         )
     }
 
-    /// Test/diagnostic readback of the full contact point-cloud buffer (GPU port, first
-    /// slice) — `NUM_BLOCKS * MAX_CONTACT_POINTS_PER_BLOCK` `vec4<f32>` entries
+    /// Test/diagnostic readback of the full contact point-cloud buffer (GPU port) —
+    /// `NUM_CONTACT_BLOCKS * MAX_CONTACT_POINTS_PER_BLOCK` `vec4<f32>` entries
     /// (position.x, position.y, label, unused), flat-indexed
     /// `block * MAX_CONTACT_POINTS_PER_BLOCK + slot`. Only the first
     /// `min(count, MAX_CONTACT_POINTS_PER_BLOCK)` entries per block (per
     /// `contact_point_counts_blocking`) are meaningful; the rest are stale/unused.
     pub fn contact_points_blocking(&self) -> Vec<f32> {
-        let floats = NUM_BLOCKS * MAX_CONTACT_POINTS_PER_BLOCK * 4;
+        let floats = NUM_CONTACT_BLOCKS * MAX_CONTACT_POINTS_PER_BLOCK * 4;
         self.buffers.readback_f32_blocking(
             &self.device,
             &self.queue,
@@ -109,24 +109,26 @@ impl GpuSimulation {
         )
     }
 
-    /// Debug/test-only: runs `resolve_contact.wgsl`'s `debug_fit_normal_main` against
-    /// `target_block`'s CURRENT point cloud (populated by a prior real `step_frame()`
-    /// call, e.g. via `gather_contact_points_main`), centered on `node_pos`. Returns
-    /// `(normal, valid)` — `valid` is `false` if the fit found no confident answer
-    /// (mirrors CPU's `fit_contact_normal_lr`'s `Option<Vec2>`). Verifies the Newton-
-    /// Raphson LR fit's WGSL port in isolation, the same way CPU's own
-    /// `fit_contact_normal_lr_tests` module unit-tests the fit separately from the
-    /// full `resolve_contact` integration. Blocking — test/diagnostic use only.
-    pub fn debug_fit_contact_normal_blocking(
-        &self,
-        target_block: u32,
-        node_pos: glam::Vec2,
-        point_count: u32,
-    ) -> (glam::Vec2, bool) {
+    /// Debug/test-only: runs `resolve_contact.wgsl`'s `debug_fit_normal_main` — the SAME
+    /// neighbor-expanded, distance-filtered `gather_local_points` the real per-substep
+    /// `resolve_cell` uses — centered on `node_pos`. Returns `(normal, valid)` — `valid`
+    /// is `false` if the fit found no confident answer (mirrors CPU's
+    /// `fit_contact_normal_lr`'s `Option<Vec2>`). Verifies the Newton-Raphson LR fit's
+    /// WGSL port against a known reference case, the same way CPU's own
+    /// `fit_contact_normal_lr_tests` module unit-tests the fit separately from the full
+    /// `resolve_contact` integration. Blocking — test/diagnostic use only.
+    ///
+    /// CHANGED 2026-07-18 (GPU sparse-contact perf pass): `target_block`/`point_count`
+    /// are vestigial — the shader no longer reads one un-expanded block's raw points (an
+    /// assumption that only held by coincidence at the old coarse partition's
+    /// block_size=4, false in general and definitely false against the new, finer,
+    /// dedicated contact partition). Kept as parameters only because removing them would
+    /// also require reshaping `ContactDebugParams`'s uniform layout for no real benefit.
+    pub fn debug_fit_contact_normal_blocking(&self, node_pos: glam::Vec2) -> (glam::Vec2, bool) {
         let params = ContactDebugParams {
             node_pos,
-            target_block,
-            point_count,
+            target_block: 0,
+            point_count: 0,
         };
         self.buffers
             .upload_contact_debug_params(&self.queue, &params);

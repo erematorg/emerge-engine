@@ -47,7 +47,8 @@ pub use solver::GpuSimulation;
 pub use step_params::{
     GpuFieldEntry, GpuFieldsParams, GpuImpulseEntry, GpuImpulseParams, GpuSleepWakeParams,
     GpuStepParams, MAX_CONTACT_POINTS_PER_BLOCK, MAX_FORCE_FIELDS, MAX_GPU_IMPULSES,
-    MAX_SLEEP_WAKE_TAGS, NUM_BLOCKS, NUM_BLOCKS_PER_DIM, field_type,
+    MAX_SLEEP_WAKE_TAGS, NUM_BLOCKS, NUM_BLOCKS_PER_DIM, NUM_CONTACT_BLOCKS,
+    NUM_CONTACT_BLOCKS_PER_DIM, field_type,
 };
 
 #[cfg(feature = "gpu")]
