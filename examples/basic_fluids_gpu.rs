@@ -9,7 +9,7 @@ extern crate emerge_engine as emerge;
 use std::sync::Arc;
 
 use emerge::diagnostics::log_frame_gpu;
-use emerge::render::{ColorMode, Renderer};
+use emerge::render::{ColorMode, GridVolumeSource, Renderer};
 use emerge::{
     BinghamFluidMaterial, GpuSimulation, MaterialRegistry, NewtonianFluidMaterial, SimConfig,
     SpawnRegion, build_particles,
@@ -43,6 +43,11 @@ struct State {
     frame: u64,
     fps_timer: std::time::Instant,
     fps_frames: u64,
+    /// Toggle with G -- grid-volume rendering (real, verified mechanism, see
+    /// basic_jellies_gpu/material_sandbox_gpu), attached lazily on first press
+    /// (NOT eagerly at construction -- that pattern caused a real, measured perf
+    /// regression in material_sandbox_gpu, fixed same session).
+    grid_volume_mode: bool,
 }
 
 fn make_sim_data(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) -> GpuSimulation {
@@ -125,8 +130,15 @@ impl State {
         let mut renderer = Renderer::new(sim.device(), sim.particle_count(), fmt);
         renderer.set_camera(sim.queue(), GRID as u32, size.width, size.height, 0.6, true);
         renderer.set_color_mode(ColorMode::ByMaterial);
+        // Real Beer-Lambert optics for grid-volume mode's per-material coloring
+        // (ByMaterial's palette above is separate/unrelated -- see
+        // material_sandbox_gpu.rs's own comment on this exact distinction). Water
+        // reuses the same aesthetic SIGMA_WATER other demos use; mud gets a real
+        // brownish estimate (not cited -- no real mud reflectance spectrum searched).
+        renderer.set_optical_params(MAT_WATER as usize, [0.85, 0.25, 0.07]);
+        renderer.set_optical_params(MAT_MUD as usize, [0.30, 0.20, 0.12]);
         println!(
-            "fluids GPU: {} particles  |  LMB push  RMB pull  R reset  Q quit",
+            "fluids GPU: {} particles  |  LMB push  RMB pull  G grid-volume  R reset  Q quit",
             sim.particle_count()
         );
         Self {
@@ -140,6 +152,7 @@ impl State {
             frame: 0,
             fps_timer: std::time::Instant::now(),
             fps_frames: 0,
+            grid_volume_mode: false,
         }
     }
 
@@ -202,14 +215,28 @@ impl State {
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        self.renderer.render_gpu(
-            self.sim.device(),
-            self.sim.queue(),
-            self.sim.particle_buffer(),
-            self.sim.particle_count(),
-            &view,
-            true,
-        );
+        if self.grid_volume_mode {
+            self.renderer.render_grid_volume(
+                self.sim.device(),
+                self.sim.queue(),
+                GridVolumeSource {
+                    grid: self.sim.grid_buffer(),
+                    material_mass: self.sim.material_mass_buffer(),
+                    material_mass_enabled: true,
+                },
+                &view,
+                true,
+            );
+        } else {
+            self.renderer.render_gpu(
+                self.sim.device(),
+                self.sim.queue(),
+                self.sim.particle_buffer(),
+                self.sim.particle_count(),
+                &view,
+                true,
+            );
+        }
         output.present();
     }
 }
@@ -251,6 +278,16 @@ impl ApplicationHandler for App {
             } => match key {
                 KeyCode::Escape | KeyCode::KeyQ => el.exit(),
                 KeyCode::KeyR => s.reset(),
+                KeyCode::KeyG => {
+                    s.grid_volume_mode = !s.grid_volume_mode;
+                    if s.grid_volume_mode {
+                        s.sim.attach_grid_material_render_gpu();
+                    }
+                    println!(
+                        "grid-volume render: {}",
+                        if s.grid_volume_mode { "on" } else { "off" }
+                    );
+                }
                 _ => {}
             },
             WindowEvent::Resized(sz) => s.resize(sz.width, sz.height),

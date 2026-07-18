@@ -123,7 +123,24 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let m11 = sample_mass(bx + 1, by + 1);
     let mass = mix(mix(m00, m10, frac.x), mix(m01, m11, frac.x), frac.y);
 
-    if mass < params.mass_floor {
+    // REAL BUG FOUND AND FIXED 2026-07-18: the shape-boundary test used to gate on
+    // the BILINEAR-BLENDED mass -- which is nonzero up to a full cell width beyond
+    // the nearest actually-occupied cell (any nonzero neighbor drags the blend
+    // above zero out into its empty neighbors). That's what made the rendered
+    // shape visibly overshoot true particle extent ("overlaps," puffier than real
+    // sizing, reported live) even after raising mass_floor -- a higher floor only
+    // shrinks the overshoot, it can't eliminate it, since the blend itself extends
+    // past the real boundary by construction. Real fix: gate visibility on the
+    // NEAREST cell's own mass (an exact "is there real matter here" test, zero
+    // smoothing) while still using the bilinear-blended value for interior SHADING
+    // only. This decouples where the edge sits (now matches real occupied cells
+    // exactly, 1:1) from how the interior looks (still a smooth density gradient,
+    // not a blocky per-cell fill) -- the puffiness is gone, the smooth look isn't.
+    let nx = i32(round(grid_pos.x - 0.5));
+    let ny = i32(round(grid_pos.y - 0.5));
+    let nx_c = clamp(nx, 0, i32(params.grid_res) - 1);
+    let ny_c = clamp(ny, 0, i32(params.grid_res) - 1);
+    if sample_mass(nx_c, ny_c) < params.mass_floor {
         discard;
     }
 
@@ -132,9 +149,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // bilinear neighbors. Falls back to slot 0 when material tracking isn't attached.
     var slot: u32 = 0u;
     if params.material_mass_enabled != 0u {
-        let nx = i32(round(grid_pos.x - 0.5));
-        let ny = i32(round(grid_pos.y - 0.5));
-        slot = dominant_material(clamp(nx, 0, i32(params.grid_res) - 1), clamp(ny, 0, i32(params.grid_res) - 1));
+        slot = dominant_material(nx_c, ny_c);
     }
 
     // Beer-Lambert absorption, same formula ByPhysics uses per-particle
@@ -145,5 +160,19 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let sigma_a = optics.slots[slot].rgb;
     let optical_depth = clamp(mass, 0.0, 4.0);
     let transmitted = exp(-sigma_a * optical_depth);
-    return vec4<f32>(transmitted, 1.0);
+
+    // Thin anti-aliased edge (real, deliberately narrow -- NOT a return to the old
+    // full-cell bilinear overshoot). The nearest-cell discard above already fixes
+    // WHERE the shape ends (exact, 1:1); this only softens a couple of pixels
+    // right at that true boundary so it doesn't read as a hard stair-step, using
+    // the pipeline's existing alpha blending (`wgpu::BlendState::ALPHA_BLENDING`,
+    // already enabled). `edge_margin` is deliberately small relative to
+    // `mass_floor` -- a real coverage-style falloff, not a re-introduced blur.
+    // Genuinely blocky/coarse regions (sparse stray droplets at low grid_res) are
+    // a real resolution limit, not something anti-aliasing alone can smooth into
+    // curved geometry -- that needs real geometry extraction (marching squares /
+    // dual contouring), a separate, larger, future engine feature, not this pass.
+    let edge_margin = max(params.mass_floor * 0.5, 1.0e-4);
+    let alpha = smoothstep(params.mass_floor, params.mass_floor + edge_margin, mass);
+    return vec4<f32>(transmitted, alpha);
 }

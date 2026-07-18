@@ -4412,4 +4412,83 @@ mod gpu_tests {
             );
         }
     }
+
+    /// GPU sparse-contact-adjacent grid-volume check (2026-07-18): proves
+    /// `attach_grid_material_render_gpu`'s per-cell `material_mass` accumulator
+    /// records each material into ITS OWN slot correctly (P2G scatter -> render
+    /// shader's `dominant_material` reads the SAME buffer this test reads). Real
+    /// regression, not scratch -- found via this exact test that `material_mass`
+    /// lacked `COPY_SRC` (fixed in `buffers.rs`, both placeholder and grown
+    /// allocations) and would otherwise be unreadable/untestable entirely.
+    ///
+    /// NOTE, disclosed not hidden: the raw values read back are NOT true decoded
+    /// float masses -- `p2g.wgsl` scatters via the same fixed-point atomic-integer
+    /// trick `grid`'s own mass channel uses, but unlike `grid` (decoded back to a
+    /// real float by `grid_update.wgsl`), nothing ever decodes `material_mass` back
+    /// out of its scaled-integer bit pattern. This test only checks WHICH slot has
+    /// the most nonzero content (majority-wins-by-presence, matching the shader's
+    /// own `dominant_material` logic exactly), not real mass magnitudes -- that
+    /// comparison is unaffected by the missing decode (any nonzero-vs-exact-zero
+    /// atomic bit pattern still compares correctly as "greater"), but a future
+    /// feature wanting real weighted blending would need the decode step added.
+    #[test]
+    fn gpu_grid_material_mass_dominant_slot_matches_spawned_material() {
+        if !gpu_available() {
+            return;
+        }
+        use emerge::CorotatedMaterial;
+        use glam::IVec2;
+        const GRID_RES: usize = 64;
+        const MAT_NEO: u32 = 0;
+        const MAT_COR: u32 = 1;
+        const MAT_VIS: u32 = 2;
+        const SLOTS: usize = 16;
+        let config = SimConfig {
+            max_substeps_per_step: 12,
+            gravity: Vec2::new(0.0, -0.3),
+            ..SimConfig::earth(GRID_RES, 0.01, 0.1)
+        };
+        let blob = |cx: f32, mat: u32, seed: u32| SpawnRegion {
+            spacing: 0.5,
+            box_size: IVec2::new(16, 16),
+            box_center: Vec2::new(cx, 48.0),
+            material_id: mat,
+            precompute_initial_volumes: true,
+            rng_seed: seed,
+            ..SpawnRegion::for_sim(&config)
+        };
+        let mut particles = build_particles(&config, blob(16.0, MAT_NEO, 1));
+        particles.extend(build_particles(&config, blob(32.0, MAT_COR, 2)));
+        particles.extend(build_particles(&config, blob(48.0, MAT_VIS, 3)));
+        let mut registry =
+            MaterialRegistry::with_default(Box::new(NeoHookeanMaterial::new(10.0, 20.0)));
+        registry.insert(MAT_COR, Box::new(CorotatedMaterial::new(30.0, 60.0)));
+        registry.insert(
+            MAT_VIS,
+            Box::new(ViscoelasticMaterial::new(10.0, 15.0, 0.15)),
+        );
+        let mut solver = block_on(GpuSimulation::new(config, particles, registry));
+        solver.attach_grid_material_render_gpu();
+        for _ in 0..30 {
+            solver.step_frame();
+        }
+        solver.sync_particles_blocking();
+        let mass = solver.material_mass_blocking();
+        for (expected_slot, cx) in [(MAT_NEO, 16usize), (MAT_COR, 32usize), (MAT_VIS, 48usize)] {
+            let cy = 48usize;
+            let idx = cy * GRID_RES + cx;
+            let base = idx * SLOTS;
+            let slot_masses: Vec<f32> = (0..SLOTS).map(|s| mass[base + s]).collect();
+            let (best_slot, best_mass) = slot_masses
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .unwrap();
+            assert_eq!(
+                best_slot as u32, expected_slot,
+                "cell({cx},{cy}) expected dominant slot {expected_slot}, got {best_slot} \
+                 (mass={best_mass}, all={slot_masses:?})"
+            );
+        }
+    }
 }

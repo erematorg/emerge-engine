@@ -215,6 +215,14 @@ impl Simulation {
         &self.particles
     }
 
+    /// Direct read-only access to the background grid -- lets a CPU-simulated scene's
+    /// renderer sample the solver's own mass field (e.g. for grid-volume rendering,
+    /// mirroring what GPU scenes get via `GpuSimulation::grid_buffer()`) without
+    /// duplicating the solver's own P2G-computed density.
+    pub fn grid(&self) -> &Grid {
+        &self.grid
+    }
+
     /// Direct mutable access to all particles.
     ///
     /// **CFL WARNING:** velocity changes made here bypass the solver's CFL clamp.

@@ -615,7 +615,20 @@ impl Renderer {
                 sy,
                 ty,
                 grid_res: self.cached_grid_res,
-                mass_floor: 1e-4,
+                // REAL BUG FOUND AND FIXED 2026-07-18: 1e-4 is "any trace of mass at
+                // all" -- combined with bilinear smoothing (which spreads a full
+                // cell's worth of falloff outward from even ONE occupied neighbor),
+                // this made the rendered shape visibly overshoot the real particle-
+                // occupied extent (reported live: "overlaps," puffy edges bigger than
+                // true sizing) and let single sparse/low-mass cells (e.g. a lone
+                // stray water particle) render as isolated blocky rectangles. Real
+                // per-particle cell-mass scale at this project's typical demo density
+                // (~4.0) and spacing (~0.5) is order 0.5-4 per occupied cell (B-spline
+                // center weight up to 0.75 * particle mass, several particles/cell in
+                // steady state) -- 0.15 requires genuine, non-trivial local density
+                // before showing anything, tightening the visible edge to real
+                // occupied cells instead of any measurable trace.
+                mass_floor: 0.15,
                 material_mass_enabled: source.material_mass_enabled as u32,
                 _pad1: 0.0,
             }),

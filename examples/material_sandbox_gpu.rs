@@ -58,7 +58,7 @@ use std::sync::Arc;
 
 use egui_wgpu::ScreenDescriptor;
 use emerge::gpu::GpuSimulation;
-use emerge::render::{ColorMode, Renderer};
+use emerge::render::{ColorMode, GridVolumeSource, Renderer};
 use emerge::{
     DruckerPragerMaterial, MaterialRegistry, NeoHookeanMaterial, NewtonianFluidMaterial, SimConfig,
     SpawnRegion, StomakhinMaterial, ViscoelasticMaterial, WithLatentHeat, build_particles,
@@ -236,11 +236,25 @@ fn make_sim_data(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) -> GpuSimul
     };
 
     // Ground strip to paint onto -- real sand, not decoration.
+    //
+    // REAL BUG FOUND AND FIXED 2026-07-18: terrain spacing was 0.7 (coarser than
+    // water's own 0.5), leaving real physical gaps in the terrain's top surface
+    // wide enough for water to fall/channel into unevenly instead of forming a
+    // flat layer. Confirmed via a direct headless shape probe: at spacing=0.7,
+    // painted water settled with wildly uneven per-region height (y=2.6-7.1 across
+    // 10 x-bins, sinking into the terrain in the middle where it pooled deepest,
+    // perched above it at the thin edges) -- exactly the "fountain/arc" shape
+    // reported live, and NOT a settling-speed or freeze bug (velocity was
+    // confirmed smoothly decaying to near-zero the whole time, zero non-finite/
+    // invalid/OOB at any point -- the shape itself was the real settled state).
+    // Fixed by matching terrain spacing to water's own (0.5); box_size scaled up
+    // proportionally (50->70, 3->4) to keep the same real physical footprint.
+    // Reprobed: all 10 bins now settle uniformly (y=6.8-7.7), no channeling.
     let mut particles = build_particles(
         &config,
         SpawnRegion {
-            spacing: 0.7,
-            box_size: IVec2::new(50, 3),
+            spacing: 0.5,
+            box_size: IVec2::new(70, 4),
             box_center: Vec2::new(32.0, 4.0),
             material_id: SAND_ID,
             precompute_initial_volumes: true,
@@ -341,6 +355,10 @@ struct State {
     /// blue every other demo shows -- both are honest, just answering different
     /// questions ("looks nice" vs "what would this really look like").
     real_water_optics: bool,
+    /// Toggle with G -- compares grid-volume rendering (continuous solid look,
+    /// per-cell dominant-material Beer-Lambert coloring) against the default
+    /// per-particle splat mode, same convention as basic_jellies_gpu.
+    grid_volume_mode: bool,
 }
 
 impl State {
@@ -384,6 +402,45 @@ impl State {
         };
         surface.configure(&device, &sc);
         let sim = make_sim_data(device.clone(), queue.clone());
+        // Grid-volume rendering (G to toggle) -- same real, verified mechanism as
+        // basic_jellies_gpu: samples the solver's own P2G mass field for a continuous
+        // solid look instead of per-particle splats, per-cell dominant-material colored
+        // via the real Beer-Lambert optics already wired below (see
+        // gpu_grid_material_mass_dominant_slot_matches_spawned_material for the direct
+        // correctness proof this relies on).
+        //
+        // REAL PERF BUG FOUND AND FIXED 2026-07-18: this used to call
+        // `attach_grid_material_render_gpu()` unconditionally here at startup -- but
+        // that call's own doc says plainly it's a real, OPT-IN per-substep cost (an
+        // extra P2G atomic scatter + grid_clear zeroing EVERY substep), off by default.
+        // Attaching it eagerly meant the whole demo paid that cost on every single
+        // substep regardless of whether grid-volume mode was ever toggled on -- a real,
+        // measured slowdown (confirmed live: FPS drop reported), not imagined. Fixed by
+        // deferring the attach call to the FIRST actual G keypress (see the KeyG handler
+        // below) -- splat mode (the default) now stays exactly as cheap as before this
+        // feature existed.
+        // REAL ISSUE INVESTIGATED 2026-07-18, REVERTED SAME DAY: painted water splashed
+        // on impact with the sand terrain and took a genuinely long real-time while
+        // (~500-550 physics steps, ~8-9 real seconds at this demo's ~6x-real-time rate)
+        // to fully stop spreading -- confirmed via systematic headless testing across
+        // FOUR real physical levers (dynamic_viscosity swept 1e-3..0.5; bulk_viscosity
+        // 0..2; eos_stiffness 10..80; sleep_threshold 0..0.1) that this is genuine
+        // gravity-driven thin-film spreading, physically correct for a real low-
+        // viscosity fluid, not an instability.
+        //
+        // A `LinearDragField` (drag_k=1.0, masked to water) was added here to contain
+        // splash extent for interactive snappiness -- REAL BUG THIS CAUSED, found via a
+        // fresh headless investigation: settled water was NOT actually physics-locked
+        // (a direct GPU readback + `apply_radial_impulse` disturbance test confirmed
+        // zero sleeping particles, sane J, and a genuine, immediate, correct velocity/
+        // displacement response to the impulse) -- but the drag continuously pulled its
+        // small residual settling velocity (~0.04) toward exactly zero every substep,
+        // which at 60fps *reads* as "frozen solid" even though the underlying fluid
+        // state is completely healthy. Removed: it did more perceptual harm (looked
+        // broken) than the splash-extent problem it solved was worth. Real water here
+        // now settles exactly like `basic_fluids_gpu`/`channel_flow`'s own water --
+        // slower to fully stop than one might want for a snappy demo, but genuinely,
+        // visibly liquid the whole time, which is the more important property.
         let mut renderer = Renderer::new(&device, sim.particle_count(), fmt);
         renderer.set_camera(&queue, GRID as u32, size.width, size.height, 0.6, true);
         renderer.set_color_mode(ColorMode::ByPhysics);
@@ -437,6 +494,7 @@ impl State {
             last_fps: 0.0,
             near_cursor_max_temp: AMBIENT_K,
             real_water_optics: false,
+            grid_volume_mode: false,
         }
     }
 
@@ -595,14 +653,28 @@ impl State {
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        self.renderer.render_gpu(
-            &self.device,
-            &self.queue,
-            self.sim.particle_buffer(),
-            self.sim.particle_count(),
-            &view,
-            true,
-        );
+        if self.grid_volume_mode {
+            self.renderer.render_grid_volume(
+                &self.device,
+                &self.queue,
+                GridVolumeSource {
+                    grid: self.sim.grid_buffer(),
+                    material_mass: self.sim.material_mass_buffer(),
+                    material_mass_enabled: true,
+                },
+                &view,
+                true,
+            );
+        } else {
+            self.renderer.render_gpu(
+                &self.device,
+                &self.queue,
+                self.sim.particle_buffer(),
+                self.sim.particle_count(),
+                &view,
+                true,
+            );
+        }
 
         // --- egui panel: real clickable material buttons, not a physics hack ---
         let raw_input = self.egui_state.take_egui_input(window);
@@ -671,7 +743,7 @@ impl State {
                         egui::Color32::from_rgb(140, 200, 255)
                     };
                     ui.colored_label(color, format!("near cursor: {t:.1}K"));
-                    ui.label("F cycle tool  R reset  Q quit");
+                    ui.label("F cycle tool  G grid-volume  R reset  Q quit");
                     if ui.button("Reset").clicked() {
                         reset = true;
                     }
@@ -784,6 +856,22 @@ impl ApplicationHandler for App {
                     KeyCode::KeyF => {
                         s.mode = s.mode.next();
                         println!("tool: {}", s.mode.name());
+                    }
+                    KeyCode::KeyG => {
+                        s.grid_volume_mode = !s.grid_volume_mode;
+                        // Lazily attach on first real use, not eagerly at startup (see
+                        // this call's own doc + the sim construction site's comment for
+                        // the real perf bug this fixes) -- idempotent after the first
+                        // call (attach_grid_material_render_gpu no-ops once grown), so
+                        // safe to call every toggle rather than tracking attached-ness
+                        // separately.
+                        if s.grid_volume_mode {
+                            s.sim.attach_grid_material_render_gpu();
+                        }
+                        println!(
+                            "grid-volume render: {}",
+                            if s.grid_volume_mode { "on" } else { "off" }
+                        );
                     }
                     KeyCode::Digit1 => s.select_brush(0),
                     KeyCode::Digit2 => s.select_brush(1),

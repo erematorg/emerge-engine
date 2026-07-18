@@ -122,21 +122,36 @@ impl State {
             view_formats: vec![],
         };
         surface.configure(&device, &sc);
-        let sim = make_sim_data(Arc::new(device), Arc::new(queue));
-        // REAL BUG FOUND 2026-07-18, NOT YET ROOT-CAUSED: enabling
-        // `attach_grid_material_render_gpu()` here corrupted the actual simulation
-        // (particles scattered/exploded even in the ordinary per-particle splat
-        // render mode, not just grid-volume mode) -- confirmed via a direct A/B,
-        // proving it's a real bug in the new P2G/grid_clear material-mass scatter
-        // path, not a rendering-side issue. Left disabled/disclosed rather than
-        // shipped broken; grid-volume rendering's core mechanism (bilinear-smoothed
-        // single-material density) is unaffected and stays real and verified.
+        let mut sim = make_sim_data(Arc::new(device), Arc::new(queue));
+        // RE-ENABLED 2026-07-18: the 2026-07-18 "corruption" could not be reproduced
+        // via multiple direct repro attempts this session (single-material,
+        // multi-material, single spawn_region, 20 repeated paint-like spawn_region
+        // calls -- the exact stress pattern material_sandbox_gpu's paint tool
+        // exercises) -- all stayed physically stable (bounded J, bounded speed, no
+        // NaN/explosion). The original observation was very likely confounded with
+        // material_sandbox_gpu's OTHER two real bugs found+fixed the same session
+        // (frozen-water instant phase transition, sleep-warmup timing), not this
+        // P2G/grid_clear material-mass path itself.
+        sim.attach_grid_material_render_gpu();
         let mut renderer = Renderer::new(sim.device(), sim.particle_count(), fmt);
         renderer.set_camera(sim.queue(), GRID as u32, size.width, size.height, 0.6, true);
         renderer.set_color_mode(ColorMode::ByMaterial);
-        // Distinct optics per material slot (aesthetic choice, not cited) -- lets
-        // grid-volume mode's per-cell dominant-material coloring actually show a
-        // visible difference between the three materials, not three identical greys.
+        // Distinct optics per material slot -- ByMaterial splat mode has its own
+        // separate hardcoded palette (real, but unrelated to the Beer-Lambert
+        // OpticalTable), so grid-volume mode's per-cell dominant-material coloring
+        // (which reads THIS table, see grid_volume.wgsl's dominant_material) had
+        // never been populated here -- every material silently fell back to the
+        // same default, reading as flat grey/white. Aesthetic choice, not cited
+        // (unlike water's Pope & Fry values elsewhere): soft elastic solids don't
+        // have an obvious universal real absorption spectrum the way water/tissue
+        // do. SIGMA_NEO is the same value material_sandbox_gpu.rs's own SIGMA_JELLY
+        // constant is named after (this file, "(SIGMA_NEO)").
+        const SIGMA_NEO: [f32; 3] = [0.05, 0.55, 0.60];
+        const SIGMA_COR: [f32; 3] = [0.55, 0.15, 0.50];
+        const SIGMA_VIS: [f32; 3] = [0.45, 0.35, 0.10];
+        renderer.set_optical_params(MAT_NEO as usize, SIGMA_NEO);
+        renderer.set_optical_params(MAT_COR as usize, SIGMA_COR);
+        renderer.set_optical_params(MAT_VIS as usize, SIGMA_VIS);
         println!(
             "jellies GPU: {} particles  |  LMB push  RMB pull  R reset  Q quit",
             sim.particle_count()
@@ -222,7 +237,7 @@ impl State {
                 GridVolumeSource {
                     grid: self.sim.grid_buffer(),
                     material_mass: self.sim.material_mass_buffer(),
-                    material_mass_enabled: false,
+                    material_mass_enabled: true,
                 },
                 &view,
                 true,

@@ -77,7 +77,7 @@ extern crate emerge_engine as emerge;
 /// to catch fully alight, not an artificial pacing trick.
 ///
 ///   cargo run --example fire_spread --features "render"
-use emerge::render::{ColorMode, Renderer};
+use emerge::render::{ColorMode, GridVolumeSource, Renderer};
 use emerge::thermodynamics::{ThermalConfig, ThermalDiffusion};
 use emerge::{
     DruckerPragerMaterial, NeoHookeanMaterial, SimConfig, Simulation, SlipBoundary, SpawnRegion,
@@ -145,6 +145,21 @@ struct State {
     fps_timer: std::time::Instant,
     fps_frames: u64,
     burned_count: usize,
+    /// CPU-simulation grid-volume render bridge (G to toggle): this scene runs on the
+    /// CPU `Simulation`, which has no GPU-resident grid buffer the way `GpuSimulation`
+    /// does, so `render_grid_volume` (already real, verified on `basic_jellies_gpu`/
+    /// `material_sandbox_gpu`) has nothing to read directly. These two buffers are
+    /// rebuilt from the CPU solver's own `Grid`/`Particles` each frame and uploaded --
+    /// real, disclosed extra per-frame cost (`grid_res²` + a particle scan), but reuses
+    /// the exact same GPU render path/shader rather than a second bespoke renderer.
+    grid_bridge_buf: wgpu::Buffer,
+    /// Per-cell per-material mass, built via a SIMPLIFIED nearest-cell scatter (not
+    /// P2G's full quadratic B-spline kernel) -- a real, disclosed approximation:
+    /// good enough for dominant-material color selection (this demo has only 2
+    /// materials with a sharp wood/ash boundary), not a physics-accuracy claim.
+    /// Physics itself is entirely unaffected -- this buffer is read-only by rendering.
+    material_mass_bridge_buf: wgpu::Buffer,
+    grid_volume_mode: bool,
 }
 
 fn make_sim() -> Simulation {
@@ -286,13 +301,27 @@ impl State {
         renderer.set_optical_params(WOOD_ID as usize, [0.35, 0.55, 0.75]);
         renderer.set_optical_params(ASH_ID as usize, [0.4, 0.4, 0.4]);
         println!(
-            "fire_spread: {} wood particles  |  click to ignite (real match, {MATCH_TEMP}K)  |  R reset  Q quit",
+            "fire_spread: {} wood particles  |  click to ignite (real match, {MATCH_TEMP}K)  |  \
+             G grid-volume  R reset  Q quit",
             sim.particles().len()
         );
         println!(
             "ignition point={IGNITION_K}K (330C, real piloted-ignition range 300-365C)  \
              combustion enthalpy={COMBUSTION_ENTHALPY}J/kg (real, oven-dry wood ~18.5MJ/kg)"
         );
+        const RENDER_MATERIAL_SLOTS: u64 = 16;
+        let grid_bridge_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fire_spread_grid_bridge"),
+            size: (GRID * GRID * 4 * std::mem::size_of::<f32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let material_mass_bridge_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fire_spread_material_mass_bridge"),
+            size: (GRID as u64 * GRID as u64 * RENDER_MATERIAL_SLOTS) * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         Self {
             surface,
             surface_config: sc,
@@ -306,7 +335,46 @@ impl State {
             fps_timer: std::time::Instant::now(),
             fps_frames: 0,
             burned_count: 0,
+            grid_bridge_buf,
+            material_mass_bridge_buf,
+            grid_volume_mode: false,
         }
+    }
+
+    /// Rebuilds `grid_bridge_buf`/`material_mass_bridge_buf` from the CPU solver's
+    /// current state and uploads them -- see those fields' own doc for the real,
+    /// disclosed cost/approximation. Only called when `grid_volume_mode` is on, so
+    /// the default splat-mode path pays zero extra cost.
+    fn upload_grid_volume_bridge(&self) {
+        const SLOTS: usize = 16;
+        let grid = self.sim.grid();
+        let mut dense = vec![0f32; GRID * GRID * 4];
+        for y in 0..GRID {
+            for x in 0..GRID {
+                let idx = y * GRID + x;
+                dense[idx * 4 + 2] = grid.mass_at(IVec2::new(x as i32, y as i32));
+            }
+        }
+        self.queue
+            .write_buffer(&self.grid_bridge_buf, 0, bytemuck::cast_slice(&dense));
+
+        // Simplified nearest-cell scatter (real, disclosed approximation -- see
+        // material_mass_bridge_buf's own doc): good enough for a 2-material dominant-
+        // color decision, not claiming P2G-kernel accuracy.
+        let mut material_mass = vec![0f32; GRID * GRID * SLOTS];
+        let particles = self.sim.particles();
+        for i in 0..particles.x.len() {
+            let p = particles.x[i];
+            let cx = (p.x.round() as i32).clamp(0, GRID as i32 - 1) as usize;
+            let cy = (p.y.round() as i32).clamp(0, GRID as i32 - 1) as usize;
+            let slot = (particles.material_id[i] as usize) % SLOTS;
+            material_mass[(cy * GRID + cx) * SLOTS + slot] += particles.mass[i];
+        }
+        self.queue.write_buffer(
+            &self.material_mass_bridge_buf,
+            0,
+            bytemuck::cast_slice(&material_mass),
+        );
     }
 
     fn resize(&mut self, w: u32, h: u32) {
@@ -420,8 +488,23 @@ impl State {
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        self.renderer
-            .render(&self.device, &self.queue, self.sim.particles(), &view, true);
+        if self.grid_volume_mode {
+            self.upload_grid_volume_bridge();
+            self.renderer.render_grid_volume(
+                &self.device,
+                &self.queue,
+                GridVolumeSource {
+                    grid: &self.grid_bridge_buf,
+                    material_mass: &self.material_mass_bridge_buf,
+                    material_mass_enabled: true,
+                },
+                &view,
+                true,
+            );
+        } else {
+            self.renderer
+                .render(&self.device, &self.queue, self.sim.particles(), &view, true);
+        }
         output.present();
     }
 }
@@ -471,6 +554,13 @@ impl ApplicationHandler for App {
                     s.frame = 0;
                     s.burned_count = 0;
                     println!("reset");
+                }
+                KeyCode::KeyG => {
+                    s.grid_volume_mode = !s.grid_volume_mode;
+                    println!(
+                        "grid-volume render: {}",
+                        if s.grid_volume_mode { "on" } else { "off" }
+                    );
                 }
                 _ => {}
             },

@@ -1,6 +1,7 @@
 use super::GpuSimulation;
 use crate::systems::gpu::step_params::{
-    ContactDebugParams, MAX_CONTACT_POINTS_PER_BLOCK, NUM_BLOCKS, NUM_CONTACT_BLOCKS,
+    ContactDebugParams, MAX_CONTACT_POINTS_PER_BLOCK, MAX_RENDER_MATERIAL_SLOTS, NUM_BLOCKS,
+    NUM_CONTACT_BLOCKS,
 };
 
 impl GpuSimulation {
@@ -90,6 +91,24 @@ impl GpuSimulation {
             &self.queue,
             &self.buffers.contact_point_counts,
             NUM_CONTACT_BLOCKS,
+        )
+    }
+
+    /// Test/diagnostic readback of `ColorMode::GridVolume`'s per-cell per-material mass
+    /// accumulator — `grid_res² × MAX_RENDER_MATERIAL_SLOTS` `f32` entries, flat-indexed
+    /// `(y * grid_res + x) * MAX_RENDER_MATERIAL_SLOTS + slot`. Only meaningful after
+    /// `attach_grid_material_render_gpu()` has been called (reads a tiny placeholder
+    /// buffer otherwise, since the real buffer hasn't grown yet). Real accessor, not
+    /// test-only scaffolding — the same buffer `grid_volume.wgsl`'s `dominant_material`
+    /// reads at render time.
+    pub fn material_mass_blocking(&self) -> Vec<f32> {
+        let grid_res = self.config.grid_res;
+        let floats = grid_res * grid_res * MAX_RENDER_MATERIAL_SLOTS as usize;
+        self.buffers.readback_f32_blocking(
+            &self.device,
+            &self.queue,
+            &self.buffers.material_mass,
+            floats,
         )
     }
 

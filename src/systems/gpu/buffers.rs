@@ -497,7 +497,7 @@ impl GpuBuffers {
         let material_mass = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mpm_material_mass"),
             size: MATERIAL_MASS_PLACEHOLDER_BYTES,
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
@@ -572,7 +572,7 @@ impl GpuBuffers {
             label: Some("mpm_material_mass"),
             size: (grid_res * grid_res * MAX_RENDER_MATERIAL_SLOTS as usize * mem::size_of::<f32>())
                 as u64,
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         self.material_mass_grown = true;
