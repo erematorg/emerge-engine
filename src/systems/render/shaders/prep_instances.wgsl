@@ -41,7 +41,8 @@ struct Particle {
     contact_group:        u32,
     sleeping:             u32,
     pinned:               u32,
-    _pad:                 array<u32, 2>,
+    scalar_field:         f32,
+    _pad:                 u32,
 }
 
 // InstanceData layout (48 bytes) — must match MpmRenderer's VertexBufferLayout:
@@ -62,7 +63,7 @@ struct RenderConfig {
     mode:           u32,
     particle_count: u32,
     vel_scale:      f32,
-    _pad:           u32,
+    _pad:                 u32,
 }
 
 // Per-material optical absorption: σ_a [r, g, b, σ_s] × 16 slots.
@@ -189,6 +190,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // ByThermal: blackbody emission only. Cold → black, warm → orange, hot → white.
         let t_norm = clamp(p.temperature / 1500.0, 0.0, 1.0);
         color = vec4(heat(t_norm).rgb * (0.1 + t_norm * 0.9), 1.0);
+    } else if config.mode == 6u {
+        // ByScalarField: generic second carrier (resource/grass level, pheromone,
+        // nutrients -- see Particle::scalar_field's own doc). Unlike temperature,
+        // this field has no universal physical scale, so no normalization divisor --
+        // callers own fields in roughly [0,1] (matches GpuResourceParams' own
+        // logistic carrying-capacity convention).
+        let s = clamp(p.scalar_field, 0.0, 1.0);
+        color = heat(s);
     } else {
         // ByActivation: muscle activation [0,1] → cool (rest) → warm (firing).
         color = heat(clamp(p.activation, 0.0, 1.0) * 0.8);

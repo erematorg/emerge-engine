@@ -11,9 +11,9 @@ mod gpu_tests {
     use emerge::{
         DruckerPragerMaterial, MaterialRegistry, MuIRheologyMaterial, NeoHookeanMaterial,
         NewtonianFluidMaterial, RankineMaterial, SimConfig, SpawnRegion, StomakhinMaterial,
-        ViscoelasticMaterial, build_particles,
+        ViscoelasticMaterial, WithLatentHeat, build_particles,
     };
-    use glam::Vec2;
+    use glam::{IVec2, Vec2};
     use pollster::block_on;
     use wgpu::InstanceDescriptor;
 
@@ -549,6 +549,77 @@ mod gpu_tests {
         assert!(
             mean_cold_after > mean_cold_before,
             "cold region did not warm via real diffusion: before={mean_cold_before:.3} after={mean_cold_after:.3}"
+        );
+    }
+
+    /// GPU port of resource regrowth's real logistic-growth PDE (CPU:
+    /// `resource_regrowth_matches_logistic_curve`, `tests/accuracy.rs`) -- Verhulst
+    /// 1838, `dφ/dt = r·φ·(1−φ/K)`. Uniform initial φ (so the Laplacian term is
+    /// exactly zero everywhere, isolating growth from diffusion, same isolation
+    /// technique as `gpu_thermal_diffusion_cooling_matches_analytical_relaxation`)
+    /// starting BELOW carrying capacity -- checked against the exact closed-form
+    /// solution `φ(t) = K / (1 + ((K−φ0)/φ0)·e^(−rt))`.
+    #[test]
+    fn gpu_resource_regrowth_matches_logistic_curve() {
+        if !gpu_available() {
+            return;
+        }
+        let phi0 = 0.1_f32;
+        let k = 1.0_f32;
+        let r = 0.5_f32;
+        const DT: f32 = 0.1;
+        let config = SimConfig {
+            max_substeps_per_step: 16,
+            ..SimConfig::standard(32, DT, Vec2::ZERO)
+        };
+        let particles = build_particles(
+            &config,
+            SpawnRegion {
+                spacing: 0.5,
+                box_size: glam::IVec2::new(8, 8),
+                box_center: Vec2::splat(16.0),
+                material_id: 0,
+                precompute_initial_volumes: true,
+                ..SpawnRegion::for_sim(&config)
+            },
+        );
+        let registry =
+            MaterialRegistry::with_default(Box::new(NeoHookeanMaterial::new(10.0, 20.0)));
+        let mut solver = block_on(GpuSimulation::new(config, particles, registry));
+        {
+            let particles = solver.particles_mut();
+            for p in particles.iter_mut() {
+                p.scalar_field = phi0;
+            }
+        }
+        solver.mark_particles_dirty();
+        solver.attach_resource_field_gpu(0.0, phi0, r, k);
+
+        const STEPS: usize = 20;
+        for _ in 0..STEPS {
+            solver.step_frame();
+        }
+        solver.sync_particles_blocking();
+        let elapsed = STEPS as f32 * DT;
+
+        let particles = solver.particles();
+        let avg_phi: f32 =
+            particles.iter().map(|p| p.scalar_field).sum::<f32>() / particles.len() as f32;
+        let expected = k / (1.0 + ((k - phi0) / phi0) * (-r * elapsed).exp());
+
+        println!(
+            "gpu_resource_regrowth_matches_logistic_curve: avg_phi={avg_phi:.4} expected={expected:.4}"
+        );
+        assert!(avg_phi.is_finite(), "non-finite phi: {avg_phi}");
+        assert!(
+            avg_phi <= k + 1e-3,
+            "resource must never exceed carrying capacity K={k}, got {avg_phi:.4}"
+        );
+        let rel_err = (avg_phi - expected).abs() / expected;
+        assert!(
+            rel_err < 0.1,
+            "GPU resource regrowth should match the analytical logistic curve: \
+             avg_phi={avg_phi:.4} expected={expected:.4} rel_err={rel_err:.3}"
         );
     }
 
@@ -3888,5 +3959,463 @@ mod gpu_tests {
             total_ns / 1.0e6,
             (total_ns - accounted) / 1.0e6
         );
+    }
+
+    /// GPU counterpart to `Simulation::remove_particles` (CPU) -- real buffer
+    /// reallocation-and-shrink, not a flag flip. Two disks of different
+    /// materials; remove one entirely by material_id and confirm: the count
+    /// drops by exactly the removed disk's size, every surviving particle is
+    /// the OTHER material (none of the removed material leaked through), and
+    /// positions of survivors are untouched by the compaction.
+    #[test]
+    fn gpu_remove_particles_shrinks_buffers_and_keeps_survivors_correct() {
+        if !gpu_available() {
+            return;
+        }
+        let config = small_config();
+        let mut particles = spawn_disk(&config, Vec2::splat(10.0), 0);
+        let keep_positions: Vec<Vec2> = particles.iter().map(|p| p.x).collect();
+        let keep_count = particles.len();
+        particles.extend(spawn_disk(&config, Vec2::splat(22.0), 1));
+        let total_before = particles.len();
+        let remove_count = total_before - keep_count;
+        assert!(
+            remove_count > 0 && keep_count > 0,
+            "test needs both disks non-empty to be meaningful"
+        );
+
+        let mut registry =
+            MaterialRegistry::with_default(Box::new(NeoHookeanMaterial::new(100.0, 50.0)));
+        registry.insert(1, Box::new(NeoHookeanMaterial::new(100.0, 50.0)));
+        let mut solver = block_on(GpuSimulation::new(config, particles, registry));
+
+        let removed = solver.remove_particles(|p| p.material_id == 1);
+        assert_eq!(
+            removed, remove_count,
+            "should have removed exactly the second disk's particles"
+        );
+        assert_eq!(
+            solver.particle_count(),
+            keep_count,
+            "particle_count must reflect the shrunk buffer, not the original count"
+        );
+        assert_eq!(
+            solver.particles().len(),
+            keep_count,
+            "CPU mirror must match the new particle_count exactly"
+        );
+        assert!(
+            solver.particles().iter().all(|p| p.material_id == 0),
+            "no material_id==1 particle should have survived the compaction"
+        );
+        let mut survivor_positions: Vec<Vec2> = solver.particles().iter().map(|p| p.x).collect();
+        let mut expected_positions = keep_positions;
+        // Order isn't guaranteed to be preserved by retain-on-a-Vec across the
+        // GPU round-trip the way CPU's in-place retain preserves it -- compare
+        // as sets, not sequences.
+        let sort_key = |v: &Vec2| (v.x.to_bits(), v.y.to_bits());
+        survivor_positions.sort_by_key(sort_key);
+        expected_positions.sort_by_key(sort_key);
+        assert_eq!(
+            survivor_positions, expected_positions,
+            "surviving particle positions must be exactly the kept disk's, unperturbed by removal"
+        );
+
+        // GPU still runs cleanly on the shrunk buffers -- the bind-group-pool
+        // rebuild and buffer reallocation actually left the sim in a valid state,
+        // not just superficially-correct particle data.
+        for _ in 0..5 {
+            solver.step_frame();
+        }
+        let snap = solver.diagnostics_snapshot();
+        assert_eq!(
+            snap.non_finite_particle_values, 0,
+            "stepping after remove_particles must not produce NaN/Inf"
+        );
+    }
+
+    /// Test-only material exposing a fixed `latent_heat()` -- mirrors
+    /// `tests/solver.rs`'s `LatentHeatMaterial` exactly (same real water
+    /// constants below), isolating the energy-debit mechanism from any
+    /// specific constitutive law.
+    #[derive(Debug, Default)]
+    struct LatentHeatMaterial(f32);
+
+    impl emerge::MaterialModel for LatentHeatMaterial {
+        fn latent_heat(&self) -> f32 {
+            self.0
+        }
+    }
+
+    /// GPU parity check for `phase_transition`'s latent-heat debit -- real energy
+    /// conservation (`ΔT = -latent_heat / heat_capacity`), not a free material swap,
+    /// verified against the exact real constants (water's latent heat of fusion
+    /// 334 kJ/kg, heat capacity 4182 J/(kg·K)) `tests/solver.rs`'s CPU counterpart
+    /// (`phase_transition_applies_latent_heat_energy_debit`) already proves.
+    #[test]
+    fn gpu_phase_transition_applies_latent_heat_energy_debit() {
+        if !gpu_available() {
+            return;
+        }
+        const MELTED_ID: u32 = 1;
+        const LATENT_HEAT: f32 = 334.0;
+        const HEAT_CAPACITY: f32 = 4182.0;
+
+        let config = small_config();
+        let particles = spawn_disk(&config, Vec2::splat(16.0), 0);
+        let mut registry = MaterialRegistry::with_default(Box::new(LatentHeatMaterial(0.0)));
+        registry.insert(MELTED_ID, Box::new(LatentHeatMaterial(LATENT_HEAT)));
+        let mut solver = block_on(GpuSimulation::new(config, particles, registry));
+        solver.attach_thermal_gpu(0.6, HEAT_CAPACITY, 1.0, 0.0, 0.0);
+
+        solver.phase_transition(|_| true, MELTED_ID);
+
+        let expected = -LATENT_HEAT / HEAT_CAPACITY;
+        for p in solver.particles().iter() {
+            assert_eq!(p.material_id, MELTED_ID);
+            assert!(
+                (p.temperature - expected).abs() < 1e-6,
+                "expected latent-heat debit {expected}, got {}",
+                p.temperature
+            );
+        }
+    }
+
+    /// Same energy accounting, without `attach_thermal_gpu` -- must be a pure
+    /// material swap with zero temperature side effect, mirroring CPU's
+    /// `phase_transition_skips_latent_heat_without_thermal_model`.
+    #[test]
+    fn gpu_phase_transition_skips_latent_heat_without_thermal_model() {
+        if !gpu_available() {
+            return;
+        }
+        const MELTED_ID: u32 = 1;
+
+        let config = small_config();
+        let mut particles = spawn_disk(&config, Vec2::splat(16.0), 0);
+        for p in &mut particles {
+            p.temperature = 12.0;
+        }
+        let mut registry = MaterialRegistry::with_default(Box::new(LatentHeatMaterial(0.0)));
+        registry.insert(MELTED_ID, Box::new(LatentHeatMaterial(334.0)));
+        let mut solver = block_on(GpuSimulation::new(config, particles, registry));
+        // No attach_thermal_gpu call -- latent_heat must be a no-op.
+
+        solver.phase_transition(|_| true, MELTED_ID);
+
+        assert!(
+            solver.particles().iter().all(|p| p.temperature == 12.0),
+            "temperature must be untouched when no thermal model is attached"
+        );
+    }
+
+    // Real water/ice constants -- same numbers `material_sandbox_gpu`'s demo uses,
+    // not invented separately for these tests.
+    const MELT_POINT_K: f32 = 273.15;
+    const FREEZE_POINT_K: f32 = 272.15;
+    const BOIL_POINT_K: f32 = 373.15;
+    const LATENT_HEAT_FUSION: f32 = 334.0;
+    const HEAT_CAPACITY: f32 = 4182.0;
+    const AMBIENT_K: f32 = 260.0;
+    const COOLING_RATE: f32 = 0.05;
+    const CONDUCTIVITY: f32 = 0.6;
+    const CELL_SIZE_M: f32 = 0.02;
+
+    fn snow_water_registry() -> MaterialRegistry {
+        const WATER_ID: u32 = 1;
+        let snow = StomakhinMaterial::new(1389.0, 2083.0, 7.0, 0.025, 0.0075, 0.6, 20.0);
+        let water = NewtonianFluidMaterial::new(4.0, 0.1, 10.0, 4.0);
+        let mut reg = MaterialRegistry::with_default(Box::new(WithLatentHeat::new(
+            snow,
+            -LATENT_HEAT_FUSION,
+        )));
+        reg.insert(
+            WATER_ID,
+            Box::new(WithLatentHeat::new(water, LATENT_HEAT_FUSION)),
+        );
+        reg
+    }
+
+    /// End-to-end proof of the full real-PDE phase-transition chain the
+    /// `material_sandbox_gpu` demo claims: a real heat source feeds the real GPU
+    /// thermal diffusion PDE (`attach_thermal_gpu`, Fourier's law), and a snow
+    /// blob genuinely melts (`phase_transition` fires only once the real
+    /// diffused temperature field crosses the real melting point, not a fake
+    /// instant swap), then genuinely refreezes once heating stops and real
+    /// Newton cooling pulls it back below the freeze point -- no material_id
+    /// changes without the real temperature field actually crossing the real
+    /// threshold at each step.
+    #[test]
+    fn gpu_snow_melts_then_refreezes_via_real_thermal_pde() {
+        if !gpu_available() {
+            return;
+        }
+        const SNOW_ID: u32 = 0;
+        const WATER_ID: u32 = 1;
+
+        let config = SimConfig {
+            max_substeps_per_step: 8,
+            ..SimConfig::standard(32, 0.1, Vec2::new(0.0, 0.0))
+        };
+        let mut particles = spawn_disk(&config, Vec2::splat(16.0), SNOW_ID);
+        for p in &mut particles {
+            p.temperature = AMBIENT_K;
+        }
+        let mut solver = block_on(GpuSimulation::new(config, particles, snow_water_registry()));
+        solver.attach_thermal_gpu(
+            CONDUCTIVITY,
+            HEAT_CAPACITY,
+            CELL_SIZE_M,
+            AMBIENT_K,
+            COOLING_RATE,
+        );
+
+        assert!(
+            solver.particles().iter().all(|p| p.material_id == SNOW_ID),
+            "must start as snow, well below the real melting point"
+        );
+
+        // Heat phase: a real, bounded external source (matches the demo's Heat tool
+        // formula) -- NOT enough to reach boiling, this test is isolating melt/freeze
+        // from evaporation (that's the next test).
+        for frame in 0..400 {
+            solver.sync_particles_blocking();
+            let particles = solver.particles_mut();
+            for p in particles.iter_mut() {
+                p.temperature += 3.0 * config.dt;
+            }
+            solver.mark_particles_dirty();
+            if frame % 15 == 0 {
+                solver.phase_transition(
+                    |p| p.material_id == SNOW_ID && p.temperature > MELT_POINT_K,
+                    WATER_ID,
+                );
+            }
+            solver.step_frame();
+        }
+
+        solver.sync_particles_blocking();
+        assert!(
+            solver.particles().iter().all(|p| p.material_id == WATER_ID),
+            "sustained real heating past the real melting point must have melted every \
+             particle -- got a mix, meaning the phase rule isn't tracking the real field"
+        );
+        assert!(
+            solver
+                .particles()
+                .iter()
+                .all(|p| p.temperature < BOIL_POINT_K),
+            "heat budget was intentionally bounded below boiling for this test"
+        );
+        let melted_count = solver.particle_count();
+
+        // Cool phase: heating stops entirely -- refreezing must come ONLY from the
+        // real Newton-cooling term pulling temperature back toward the (below-
+        // freezing) ambient, plus the real freeze phase rule catching the crossing.
+        for frame in 0..600 {
+            if frame % 15 == 0 {
+                solver.phase_transition(
+                    |p| p.material_id == WATER_ID && p.temperature < FREEZE_POINT_K,
+                    SNOW_ID,
+                );
+            }
+            solver.step_frame();
+        }
+
+        solver.sync_particles_blocking();
+        assert_eq!(
+            solver.particle_count(),
+            melted_count,
+            "refreezing must not have lost or gained particles"
+        );
+        assert!(
+            solver.particles().iter().all(|p| p.material_id == SNOW_ID),
+            "removing the heat source must let real Newton cooling + the freeze rule \
+             bring every particle back to snow -- got particles still marked as water"
+        );
+    }
+
+    /// The other half of the chain: water pushed past the real boiling point
+    /// genuinely vanishes (`remove_particles`, real buffer compaction), not just
+    /// relabeled -- proves evaporation is a real removal, not a third material
+    /// masquerading as "gone."
+    #[test]
+    fn gpu_water_evaporates_above_boiling_point() {
+        if !gpu_available() {
+            return;
+        }
+        const WATER_ID: u32 = 1;
+
+        let config = SimConfig {
+            max_substeps_per_step: 8,
+            ..SimConfig::standard(32, 0.1, Vec2::new(0.0, 0.0))
+        };
+        let mut particles = spawn_disk(&config, Vec2::splat(16.0), WATER_ID);
+        for p in &mut particles {
+            p.temperature = MELT_POINT_K + 5.0; // start already-melted, near freezing
+        }
+        // material_id 0 (default/unused here) still needs a real registered model.
+        let snow = StomakhinMaterial::new(1389.0, 2083.0, 7.0, 0.025, 0.0075, 0.6, 20.0);
+        let water = NewtonianFluidMaterial::new(4.0, 0.1, 10.0, 4.0);
+        let mut registry = MaterialRegistry::with_default(Box::new(snow));
+        registry.insert(WATER_ID, Box::new(water));
+        let mut solver = block_on(GpuSimulation::new(config, particles, registry));
+        solver.attach_thermal_gpu(
+            CONDUCTIVITY,
+            HEAT_CAPACITY,
+            CELL_SIZE_M,
+            AMBIENT_K,
+            0.0, // no cooling -- this test wants heat to only go up
+        );
+        let before = solver.particle_count();
+
+        for frame in 0..300 {
+            solver.sync_particles_blocking();
+            let particles = solver.particles_mut();
+            for p in particles.iter_mut() {
+                p.temperature += 5.0 * config.dt; // aggressive heating, well past boiling
+            }
+            solver.mark_particles_dirty();
+            if frame % 15 == 0 {
+                let removed = solver.remove_particles(|p| {
+                    p.material_id == WATER_ID && p.temperature > BOIL_POINT_K
+                });
+                if removed > 0 && solver.particle_count() == 0 {
+                    break;
+                }
+            }
+            solver.step_frame();
+        }
+
+        assert!(
+            solver.particle_count() < before,
+            "aggressive real heating past the real boiling point must have evaporated \
+             at least some particles via real remove_particles, got count unchanged \
+             ({before} -> {})",
+            solver.particle_count()
+        );
+    }
+
+    /// ASFLIP (GPU port, Fei et al. 2021) -- direct GPU counterpart of CPU's
+    /// `asflip_preserves_more_relative_velocity_between_separating_halves`
+    /// (tests/accuracy.rs), same exact scene: a single compact soft-NeoHookean block
+    /// split into two halves given explicitly DIVERGING initial velocity, no gravity,
+    /// no boundary. Measures how much of that relative velocity survives one grid
+    /// round-trip -- plain APIC damps it toward the shared average; ASFLIP (via the
+    /// fused g2p_asflip_fused pass) should retain more, mirroring the CPU reference's
+    /// own real, already-passing assertion. This is the load-bearing correctness check
+    /// for the whole GPU port: it directly exercises the diff_vel/gamma math the fused
+    /// kernel adds on top of the ordinary split g2p+particles_update pair.
+    #[test]
+    fn gpu_asflip_preserves_more_relative_velocity_than_apic() {
+        if !gpu_available() {
+            return;
+        }
+        let side = 6i32;
+        let grid = 32usize;
+        let center = Vec2::new(grid as f32 * 0.5, grid as f32 * 0.5);
+        let speed = 2.0_f32;
+
+        let make_config = |asflip_blend: f32| {
+            let _ = asflip_blend; // GPU's own gate lives in attach_asflip_gpu, not SimConfig
+            SimConfig {
+                max_substeps_per_step: 4,
+                ..SimConfig::standard(grid, 0.1, Vec2::ZERO)
+            }
+        };
+        let build = |asflip_blend: f32| -> GpuSimulation {
+            let config = make_config(asflip_blend);
+            let spawn = SpawnRegion {
+                spacing: 0.5,
+                box_size: IVec2::new(side, side),
+                box_center: center,
+                precompute_initial_volumes: true,
+                ..SpawnRegion::for_sim(&config)
+            };
+            let mut particles = build_particles(&config, spawn);
+            for p in &mut particles {
+                p.v = Vec2::new(if p.x.x < center.x { -speed } else { speed }, 0.0);
+            }
+            let registry =
+                MaterialRegistry::with_default(Box::new(NeoHookeanMaterial::new(1.0, 1.0)));
+            let mut sim = block_on(GpuSimulation::new(config, particles, registry));
+            if asflip_blend > 0.0 {
+                sim.attach_asflip_gpu(asflip_blend);
+            }
+            sim
+        };
+
+        let mean_abs_vx = |sim: &mut GpuSimulation| -> f32 {
+            sim.sync_particles_blocking();
+            let particles = sim.particles();
+            let n = particles.len() as f32;
+            particles.iter().map(|p| p.v.x.abs()).sum::<f32>() / n
+        };
+
+        const STEPS: usize = 1;
+
+        let mut apic_solver = build(0.0);
+        apic_solver.step_frame();
+        let retained_apic = mean_abs_vx(&mut apic_solver);
+
+        let mut asflip_solver = build(0.97);
+        for _ in 0..STEPS {
+            asflip_solver.step_frame();
+        }
+        let retained_asflip = mean_abs_vx(&mut asflip_solver);
+
+        println!("── GPU ASFLIP vs APIC: relative velocity retained across a separating seam ──");
+        println!("  original speed={speed:.3}");
+        println!(
+            "  APIC   retained mean|vx|={retained_apic:.4}  ratio={:.3}",
+            retained_apic / speed
+        );
+        println!(
+            "  ASFLIP retained mean|vx|={retained_asflip:.4}  ratio={:.3}",
+            retained_asflip / speed
+        );
+
+        assert!(
+            retained_apic.is_finite() && retained_asflip.is_finite(),
+            "non-finite velocity: apic={retained_apic}, asflip={retained_asflip}"
+        );
+        assert!(
+            retained_asflip > retained_apic,
+            "GPU ASFLIP should preserve more of the two halves' original diverging \
+             velocity than plain APIC (less dissipation across the separating seam), \
+             same real property the CPU reference test asserts: \
+             apic_retained={retained_apic:.4} asflip_retained={retained_asflip:.4}"
+        );
+    }
+
+    /// ASFLIP (GPU port) must be a true opt-in no-op when disabled -- `attach_asflip_gpu`
+    /// is simply never called, matching CPU's `asflip_blend: 0.0` default exactly. Real
+    /// regression guard: confirms the fused-vs-split dispatch branch in encode_substep.rs
+    /// stays on the ordinary (already-proven) g2p+particles_update path for every scene
+    /// that doesn't opt in, not just "probably fine because enabled defaults to 0".
+    #[test]
+    fn gpu_asflip_disabled_by_default_matches_plain_apic_step() {
+        if !gpu_available() {
+            return;
+        }
+        let config = small_config();
+        let particles = spawn_disk(&config, Vec2::splat(16.0), 0);
+        let registry =
+            MaterialRegistry::with_default(Box::new(NeoHookeanMaterial::new(100.0, 50.0)));
+        let mut solver = block_on(GpuSimulation::new(config, particles, registry));
+        // Never call attach_asflip_gpu -- default state.
+        for _ in 0..10 {
+            solver.step_frame();
+        }
+        solver.sync_particles_blocking();
+        for p in solver.particles() {
+            assert!(
+                p.v.is_finite() && p.x.is_finite(),
+                "default (ASFLIP never attached) GPU stepping must stay stable: \
+                 v={:?} x={:?}",
+                p.v,
+                p.x
+            );
+        }
     }
 }

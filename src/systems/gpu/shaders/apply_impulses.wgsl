@@ -34,7 +34,8 @@ struct Particle {
     contact_group:        u32,
     sleeping:             u32,
     pinned:               u32,
-    _pad:                 array<u32, 2>,
+    scalar_field:         f32,
+    _pad:                 u32,
 }
 
 struct ImpulseEntry {
@@ -43,14 +44,14 @@ struct ImpulseEntry {
     strength: f32,         // radial strength (signed — negative = pull)
     force:    vec2<f32>,  // directional force vector (mode 1 only)
     mode:     u32,         // 0 = radial, 1 = directional
-    _pad:     u32,
+    _pad:                 u32,
 }
 
 struct ImpulseParams {
     count:          u32,
     vel_limit:      f32,   // grid_cell_size / min_dt — hard cap per particle
     particle_count: u32,
-    _pad:           u32,
+    _pad:                 u32,
     entries:        array<ImpulseEntry, 16>,
 }
 

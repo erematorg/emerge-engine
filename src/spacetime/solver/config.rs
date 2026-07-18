@@ -430,6 +430,29 @@ impl SpawnRegion {
         self
     }
 
+    /// Non-panicking check: would this region fit entirely inside `solver`'s
+    /// domain (same boundary math `validate_for_sim` asserts on)? For callers
+    /// building a `SpawnRegion` from live/interactive input (mouse position,
+    /// a creature's current location) where going out of bounds is a normal,
+    /// expected outcome to skip gracefully -- not a programmer error to crash
+    /// on. `validate_for_sim` stays a hard assert for the scripted/startup
+    /// spawn path, where an out-of-bounds region really is a real bug worth
+    /// catching loudly; this is the same check, exposed so interactive
+    /// callers aren't forced to hand-derive the margin math themselves (that
+    /// duplication is exactly how a real off-by-one crash slipped into
+    /// `material_sandbox_gpu`'s paint tool).
+    pub fn fits_in_sim(&self, solver: &SimConfig) -> bool {
+        if self.spacing <= 0.0 || self.box_size.x <= 0 || self.box_size.y <= 0 {
+            return false;
+        }
+        let half = self.box_size.as_vec2() * 0.5;
+        let min = self.box_center - half;
+        let max = self.box_center + half;
+        let domain_min = solver.boundary_thickness as f32;
+        let domain_max = solver.grid_res.saturating_sub(solver.boundary_thickness) as f32;
+        min.x >= domain_min && min.y >= domain_min && max.x <= domain_max && max.y <= domain_max
+    }
+
     /// Validate spawn-side constraints relative to the solver domain.
     pub fn validate_for_sim(&self, solver: &SimConfig) {
         assert!(self.spacing > 0.0, "spacing must be positive");
@@ -439,15 +462,9 @@ impl SpawnRegion {
         let half = self.box_size.as_vec2() * 0.5;
         let min = self.box_center - half;
         let max = self.box_center + half;
-        // Spawn must stay strictly inside the boundary zone.
-        let domain_min = solver.boundary_thickness as f32;
-        let domain_max = solver.grid_res.saturating_sub(solver.boundary_thickness) as f32;
 
         assert!(
-            min.x >= domain_min
-                && min.y >= domain_min
-                && max.x <= domain_max
-                && max.y <= domain_max,
+            self.fits_in_sim(solver),
             "spawn region must stay inside the simulation domain \
              (boundary_thickness={}, grid_res={}): box [{:.1},{:.1}]–[{:.1},{:.1}]",
             solver.boundary_thickness,
@@ -457,5 +474,71 @@ impl SpawnRegion {
             max.x,
             max.y
         );
+    }
+}
+
+#[cfg(test)]
+mod fits_in_sim_tests {
+    use super::*;
+
+    fn config() -> SimConfig {
+        SimConfig::standard(64, 0.05, glam::Vec2::NEG_Y)
+    }
+
+    #[test]
+    fn region_well_inside_domain_fits() {
+        let region = SpawnRegion {
+            spacing: 0.5,
+            box_size: glam::IVec2::new(6, 6),
+            box_center: glam::Vec2::new(32.0, 32.0),
+            ..SpawnRegion::for_sim(&config())
+        };
+        assert!(region.fits_in_sim(&config()));
+    }
+
+    #[test]
+    fn region_crossing_the_boundary_does_not_fit() {
+        // Exact repro of the material_sandbox_gpu panic: box_size=6 centered
+        // near the domain's right edge overruns the boundary by 0.5 units.
+        let region = SpawnRegion {
+            spacing: 0.5,
+            box_size: glam::IVec2::new(6, 6),
+            box_center: glam::Vec2::new(59.5, 19.8),
+            ..SpawnRegion::for_sim(&config())
+        };
+        assert!(!region.fits_in_sim(&config()));
+    }
+
+    #[test]
+    fn region_exactly_on_the_boundary_fits() {
+        // grid_res=64, boundary_thickness default -- confirm the check is
+        // inclusive (>=/<=) at the exact edge, not off-by-one in either
+        // direction.
+        let c = config();
+        let half = 3.0;
+        let edge = c.grid_res as f32 - c.boundary_thickness as f32 - half;
+        let region = SpawnRegion {
+            spacing: 0.5,
+            box_size: glam::IVec2::new(6, 6),
+            box_center: glam::Vec2::new(edge, edge),
+            ..SpawnRegion::for_sim(&c)
+        };
+        assert!(region.fits_in_sim(&c));
+    }
+
+    #[test]
+    fn fits_in_sim_and_validate_for_sim_agree() {
+        // The two must never disagree -- validate_for_sim delegates to
+        // fits_in_sim internally specifically to prevent them drifting apart.
+        let c = config();
+        let bad = SpawnRegion {
+            spacing: 0.5,
+            box_size: glam::IVec2::new(6, 6),
+            box_center: glam::Vec2::new(59.5, 19.8),
+            ..SpawnRegion::for_sim(&c)
+        };
+        assert!(!bad.fits_in_sim(&c));
+        let result = std::panic::catch_unwind(|| bad.validate_for_sim(&c));
+        assert!(result.is_err(), "validate_for_sim should have panicked");
     }
 }

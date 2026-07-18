@@ -20,8 +20,9 @@
 use std::mem;
 
 use super::step_params::{
-    ContactDebugParams, GpuDirectionalGripParams, GpuFieldsParams, GpuImpulseParams,
-    GpuSleepWakeParams, GpuStepParams, GpuThermalParams, MAX_CONTACT_POINTS_PER_BLOCK, NUM_BLOCKS,
+    ContactDebugParams, GpuAsflipParams, GpuDirectionalGripParams, GpuFieldsParams,
+    GpuImpulseParams, GpuResourceParams, GpuSleepWakeParams, GpuStepParams, GpuThermalParams,
+    MAX_CONTACT_POINTS_PER_BLOCK, NUM_BLOCKS,
 };
 use crate::materials::MaterialParams;
 use crate::particle::Particle;
@@ -165,7 +166,52 @@ pub struct GpuBuffers {
     /// Thermal scratch, dual-use like CPU's own `grid_work`: P2G scatter accumulator
     /// first, then overwritten with the post-Laplacian `T_new` — dense `grid_res²` f32.
     pub thermal_work: wgpu::Buffer,
+    /// Resource regrowth (GPU port) -- real config uniform, see `GpuResourceParams`'
+    /// own doc. Own separate group/buffers from thermal (see that struct's doc for why).
+    pub resource_params: wgpu::Buffer,
+    /// Resource scratch: Σ(w·mass) per cell -- dense `grid_res²` f32, mirrors
+    /// `thermal_mass`.
+    pub resource_mass: wgpu::Buffer,
+    /// Resource scratch: normalized φ_old per cell -- dense `grid_res²` f32, mirrors
+    /// `thermal_temp_old`.
+    pub resource_phi_old: wgpu::Buffer,
+    /// Resource scratch, dual-use like `thermal_work`: P2G scatter accumulator first,
+    /// then overwritten with the post-Laplacian+logistic-growth `φ_new`.
+    pub resource_work: wgpu::Buffer,
+    /// ASFLIP (GPU port) -- real config uniform, see `GpuAsflipParams`' own doc.
+    pub asflip_params: wgpu::Buffer,
+    /// Dense `grid_res² × vec2<f32>` pre-force velocity snapshot -- GPU mirror of CPU's
+    /// `Grid::snapshot_velocities` (a sparse `HashMap`), made dense here because the GPU
+    /// `grid` buffer already is (no sparse GPU allocation scheme exists, same real
+    /// trade-off `grid` itself already discloses). Written by `grid_update.wgsl` right
+    /// after momentum normalization, before gravity is added -- the same pre-force
+    /// instant CPU snapshots at. Read by `g2p_asflip_fused.wgsl`'s second gather.
+    ///
+    /// LAZILY allocated, unlike `grip_params`/`thermal_params` -- REAL bug found and
+    /// fixed 2026-07-17: at 8 bytes/cell this is the same order of magnitude as the main
+    /// `grid` buffer itself (16 bytes/cell), not a cheap tiny uniform. Allocating it
+    /// unconditionally at full `grid_res²` size for every `GpuSimulation` (the vast
+    /// majority of which never call `attach_asflip_gpu`) measurably tipped already
+    /// memory-marginal tests (a 16,000-step terrain settle, a grid_res-up-to-2048 sweep)
+    /// into real `wgpu` "Out of Memory" territory on this machine -- confirmed via a
+    /// direct A/B: the full test suite genuinely OOM'd with this buffer at real size,
+    /// and passed clean (42/42, normal ~200s runtime) with it shrunk to a placeholder.
+    /// Starts at `PLACEHOLDER_BYTES` (never read/written while `asflip_params.enabled ==
+    /// 0`, so a too-small buffer is safe); `GpuSimulation::attach_asflip_gpu` grows it to
+    /// the real size on first use, mirroring `spawn_region`'s existing reallocate-and-
+    /// rebuild-bind-group pattern.
+    pub asflip_snapshot: wgpu::Buffer,
+    /// `true` once `asflip_snapshot` has been grown to its real `grid_res²` size --
+    /// lets `attach_asflip_gpu` skip re-allocating (and rebuilding the bind group that
+    /// references it) on every call, only the first.
+    pub asflip_snapshot_grown: bool,
 }
+
+/// `asflip_snapshot`'s pre-attach size -- large enough to satisfy wgpu's nonzero-buffer
+/// requirement, small enough to be genuinely free. Never actually read/written at this
+/// size (gated on `asflip_params.enabled`), so its exact value doesn't matter beyond
+/// "nonzero and 8-byte aligned for vec2<f32>".
+const ASFLIP_SNAPSHOT_PLACEHOLDER_BYTES: u64 = 8;
 
 impl GpuBuffers {
     pub fn new(
@@ -374,6 +420,46 @@ impl GpuBuffers {
             mapped_at_creation: false,
         });
 
+        // Resource regrowth (GPU port) -- own separate group/buffers, see field docs above.
+        let resource_params = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mpm_resource_params"),
+            size: mem::size_of::<GpuResourceParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let resource_mass = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mpm_resource_mass"),
+            size: thermal_scalar_bytes,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let resource_phi_old = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mpm_resource_phi_old"),
+            size: thermal_scalar_bytes,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let resource_work = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mpm_resource_work"),
+            size: thermal_scalar_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        // ASFLIP (GPU port) -- own separate group/buffer, see field docs above.
+        let asflip_params = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mpm_asflip_params"),
+            size: mem::size_of::<GpuAsflipParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let asflip_snapshot = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mpm_asflip_snapshot"),
+            size: ASFLIP_SNAPSHOT_PLACEHOLDER_BYTES,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
         Self {
             particles,
             grid,
@@ -401,7 +487,32 @@ impl GpuBuffers {
             thermal_mass,
             thermal_temp_old,
             thermal_work,
+            resource_params,
+            resource_mass,
+            resource_phi_old,
+            resource_work,
+            asflip_params,
+            asflip_snapshot,
+            asflip_snapshot_grown: false,
         }
+    }
+
+    /// Grow `asflip_snapshot` from its placeholder to real `grid_res²` size -- called
+    /// once, by `GpuSimulation::attach_asflip_gpu` on first use. No-op if already grown
+    /// (idempotent under repeated `attach_asflip_gpu` calls). Caller must rebuild any
+    /// bind group referencing this buffer afterward (its identity changes) -- see
+    /// `SimPipelines::make_resource_bind_group`.
+    pub fn grow_asflip_snapshot(&mut self, device: &wgpu::Device, grid_res: usize) {
+        if self.asflip_snapshot_grown {
+            return;
+        }
+        self.asflip_snapshot = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mpm_asflip_snapshot"),
+            size: (grid_res * grid_res * mem::size_of::<[f32; 2]>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        self.asflip_snapshot_grown = true;
     }
 
     pub fn upload_particles(&self, queue: &wgpu::Queue, particles: &[Particle]) {
@@ -444,211 +555,17 @@ impl GpuBuffers {
         queue.write_buffer(&self.thermal_params, 0, bytemuck::bytes_of(params));
     }
 
-    /// Begin an async GPU → CPU readback. Non-blocking — returns a shared flag set when done.
-    /// Caller polls the flag each frame via `try_lock` + `take`. Staging buffer must be idle.
-    pub fn begin_readback(
-        &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        particle_count: usize,
-    ) -> std::sync::Arc<std::sync::Mutex<Option<Result<(), wgpu::BufferAsyncError>>>> {
-        use std::sync::{Arc, Mutex};
-        let byte_count = (particle_count * mem::size_of::<Particle>()) as u64;
-
-        // Submit copy GPU → staging (non-blocking GPU command).
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("mpm_readback_copy"),
-        });
-        encoder.copy_buffer_to_buffer(&self.particles, 0, &self.readback_staging, 0, byte_count);
-        queue.submit(std::iter::once(encoder.finish()));
-
-        // Kick off async mapping — callback fires when copy is complete and buffer is ready.
-        let flag: Arc<Mutex<Option<Result<(), wgpu::BufferAsyncError>>>> =
-            Arc::new(Mutex::new(None));
-        let flag_cb = flag.clone();
-        self.readback_staging
-            .slice(..byte_count)
-            .map_async(wgpu::MapMode::Read, move |r| {
-                *flag_cb.lock().expect("emerge: GPU readback flag poisoned") = Some(r);
-            });
-        flag
+    pub fn upload_resource_params(&self, queue: &wgpu::Queue, params: &GpuResourceParams) {
+        queue.write_buffer(&self.resource_params, 0, bytemuck::bytes_of(params));
     }
 
-    /// Blocking GPU → CPU readback of specific particle index ranges only — e.g. a
-    /// handful of live creatures scattered through a much larger terrain/water
-    /// buffer, where reading the WHOLE buffer every frame (via `readback_blocking`)
-    /// would stall on copying/mapping particles the caller doesn't even need this
-    /// frame. All ranges are copied within a SINGLE encoder/submit/poll (batched,
-    /// not one blocking round-trip per range — the per-call CPU↔GPU synchronization
-    /// overhead, not just data volume, is what makes repeated small blocking
-    /// readbacks expensive in practice). Returns one `Vec<Particle>` per input
-    /// range, same order, each sized `range.len()`.
-    ///
-    /// Panics if the combined byte size of all ranges exceeds the readback staging
-    /// buffer's capacity (sized for the full particle count at construction, so any
-    /// subset always fits).
-    pub fn readback_ranges_blocking(
-        &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        ranges: &[std::ops::Range<usize>],
-    ) -> Vec<Vec<Particle>> {
-        let particle_size = mem::size_of::<Particle>() as u64;
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("mpm_readback_ranges_blocking"),
-        });
-        let mut staging_offset = 0u64;
-        let mut spans = Vec::with_capacity(ranges.len());
-        for range in ranges {
-            let byte_count = (range.len() as u64) * particle_size;
-            encoder.copy_buffer_to_buffer(
-                &self.particles,
-                (range.start as u64) * particle_size,
-                &self.readback_staging,
-                staging_offset,
-                byte_count,
-            );
-            spans.push((staging_offset, byte_count));
-            staging_offset += byte_count;
-        }
-        queue.submit(std::iter::once(encoder.finish()));
-        device.poll(wgpu::PollType::wait_indefinitely()).ok();
-
-        let total_bytes = staging_offset;
-        let slice = self.readback_staging.slice(..total_bytes.max(1));
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        device.poll(wgpu::PollType::wait_indefinitely()).ok();
-        let mapped = slice.get_mapped_range();
-        let results = spans
-            .iter()
-            .map(|&(offset, len)| {
-                let start = offset as usize;
-                let end = start + len as usize;
-                bytemuck::cast_slice::<u8, Particle>(&mapped[start..end]).to_vec()
-            })
-            .collect();
-        drop(mapped);
-        self.readback_staging.unmap();
-        results
-    }
-
-    /// Blocking GPU → CPU readback. Submits copy, waits for GPU idle, maps, returns particles.
-    /// Stalls the CPU until the GPU completes all in-flight work — only call from tests or
-    /// parity-mode helpers, never from the render/game loop.
-    pub fn readback_blocking(
-        &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        particle_count: usize,
-    ) -> Vec<Particle> {
-        let byte_count = (particle_count * mem::size_of::<Particle>()) as u64;
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("mpm_readback_blocking"),
-        });
-        encoder.copy_buffer_to_buffer(&self.particles, 0, &self.readback_staging, 0, byte_count);
-        queue.submit(std::iter::once(encoder.finish()));
-        device.poll(wgpu::PollType::wait_indefinitely()).ok();
-        let slice = self.readback_staging.slice(..byte_count);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        device.poll(wgpu::PollType::wait_indefinitely()).ok();
-        let mapped = slice.get_mapped_range();
-        let particles = bytemuck::cast_slice::<u8, Particle>(&mapped).to_vec();
-        drop(mapped);
-        self.readback_staging.unmap();
-        particles
-    }
-
-    /// Blocking GPU → CPU readback of an arbitrary u32 storage buffer (e.g.
-    /// `sorted_particle_ids`). Test/verification use only — uses a throwaway staging buffer,
-    /// never call from the render/game loop.
-    pub fn readback_u32_blocking(
-        &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        buffer: &wgpu::Buffer,
-        count: usize,
-    ) -> Vec<u32> {
-        let byte_count = (count * mem::size_of::<u32>()) as u64;
-        let staging = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mpm_u32_readback_staging"),
-            size: byte_count,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("mpm_u32_readback"),
-        });
-        encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, byte_count);
-        queue.submit(std::iter::once(encoder.finish()));
-        device.poll(wgpu::PollType::wait_indefinitely()).ok();
-        let slice = staging.slice(..byte_count);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        device.poll(wgpu::PollType::wait_indefinitely()).ok();
-        let mapped = slice.get_mapped_range();
-        let values = bytemuck::cast_slice::<u8, u32>(&mapped).to_vec();
-        drop(mapped);
-        staging.unmap();
-        values
-    }
-
-    /// Test/diagnostic readback of `count` f32 values from any storage buffer with COPY_SRC.
-    /// Used to inspect the dense `grid` buffer directly (4 f32 per `Cell`: momentum.x,
-    /// momentum.y, mass, _pad — same field order as the WGSL `Cell` struct in every shader)
-    /// without exposing the crate-private `GpuCell` type outside this module.
-    pub fn readback_f32_blocking(
-        &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        buffer: &wgpu::Buffer,
-        count: usize,
-    ) -> Vec<f32> {
-        let byte_count = (count * mem::size_of::<f32>()) as u64;
-        let staging = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mpm_f32_readback_staging"),
-            size: byte_count,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("mpm_f32_readback"),
-        });
-        encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, byte_count);
-        queue.submit(std::iter::once(encoder.finish()));
-        device.poll(wgpu::PollType::wait_indefinitely()).ok();
-        let slice = staging.slice(..byte_count);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        device.poll(wgpu::PollType::wait_indefinitely()).ok();
-        let mapped = slice.get_mapped_range();
-        let values = bytemuck::cast_slice::<u8, f32>(&mapped).to_vec();
-        drop(mapped);
-        staging.unmap();
-        values
-    }
-
-    /// Read mapped staging data into a Vec and unmap. Call only after the readback receiver fires.
-    pub fn finish_readback(&self, particle_count: usize) -> Vec<Particle> {
-        let byte_count = (particle_count * mem::size_of::<Particle>()) as u64;
-        let slice = self.readback_staging.slice(..byte_count);
-        let mapped = slice.get_mapped_range();
-        let particles: Vec<Particle> = bytemuck::cast_slice::<u8, Particle>(&mapped).to_vec();
-        drop(mapped);
-        self.readback_staging.unmap();
-        particles
-    }
-
-    /// Release a FAILED readback's mapping without extracting data (there's nothing
-    /// valid to read on `Err`). Real bug this closes (found 2026-07-05, see project
-    /// memory): `map_async`'s callback firing at all -- Ok OR Err -- means wgpu
-    /// considers the buffer mapped; only `finish_readback`/this function's call to
-    /// `unmap()` releases that state. The old code only ever unmapped on the Ok path,
-    /// so a single `Err` (rare on fast hardware, far more likely on a slow/software
-    /// backend where async completion timing differs) left the staging buffer
-    /// permanently mapped -- silently disabling every future readback for the rest of
-    /// the run, then panicking ("Buffer is already mapped") the next time anything
-    /// tried to map it again (reproduced locally forcing a software WARP-style
-    /// adapter; plausibly the same root cause behind emerge issue #10's
-    /// STATUS_STACK_BUFFER_OVERRUN on CI, manifesting differently per-driver).
-    pub fn abandon_readback(&self) {
-        self.readback_staging.unmap();
+    pub fn upload_asflip_params(&self, queue: &wgpu::Queue, params: &GpuAsflipParams) {
+        queue.write_buffer(&self.asflip_params, 0, bytemuck::bytes_of(params));
     }
 }
+
+// GPU -> CPU readback methods (begin_readback, readback_blocking and its
+// variants, finish_readback, abandon_readback) -- split into their own file,
+// was ~250 of this file's ~700 lines, matching this file's own doc comment
+// split between "Upload path" and "Download path".
+mod readback;

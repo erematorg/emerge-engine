@@ -43,6 +43,14 @@ struct ForceFieldsParams {
     entries: array<ForceFieldEntry, 16>,
 }
 
+// ASFLIP (GPU port, Fei et al. 2021) — see GpuAsflipParams' own Rust doc.
+struct AsflipParams {
+    blend:   f32,
+    enabled: u32,
+    _pad0:   u32,
+    _pad1:   u32,
+}
+
 const MASS_FLOOR:         f32 = 1e-4;
 const MASS_ATOMIC_SCALE:  f32 = 1000000.0;
 const MOM_ATOMIC_SCALE:   f32 = 100000.0;
@@ -75,6 +83,10 @@ const BLOCK_THREADS_PER_DIM: u32 = 16u;
 // nonsensical near-zero float. Caught by `gpu_contact_grip_scatter_and_point_cloud_are_correct`
 // measuring ~0 total grip mass instead of the real scattered total.
 @group(1) @binding(12) var<storage, read_write> grip_grid_int:          array<i32>;
+// ASFLIP (GPU port) — shares group 3 with resource regrowth, see pipeline.rs's module
+// doc comment for why (WebGPU's 4-bind-group baseline is already fully used).
+@group(3) @binding(28) var<uniform>             asflip_params:           AsflipParams;
+@group(3) @binding(29) var<storage, read_write> asflip_snapshot:         array<vec2<f32>>;
 
 // Smooth taper from 1 at switch_on to 0 at cutoff (cubic Hermite).
 fn force_switch(dist: f32, cutoff: f32, switch_on: f32) -> f32 {
@@ -110,6 +122,13 @@ fn update_cell(cx: u32, cy: u32, res: u32) {
     // Empty cells: gravity for stray particles, but enforce boundary slip so floor/wall
     // cells don't feed downward velocity into the G2P gather and over-compress blobs.
     if mass < MASS_FLOOR {
+        // ASFLIP: an empty/untouched cell has no real pre-force velocity -- write zero,
+        // matching CPU's Grid::pre_force_velocity_at fallback for an untouched cell
+        // exactly (Grid::snapshot_velocities never inserts untouched cells at all; GPU's
+        // buffer is dense, so writing zero here is the dense equivalent of "absent").
+        if asflip_params.enabled != 0u {
+            asflip_snapshot[cy * res + cx] = vec2<f32>(0.0);
+        }
         var grav_vel = step_params.gravity * step_params.dt;
         let bt2 = step_params.boundary_thickness;
         if cx < bt2          && grav_vel.x < 0.0 { grav_vel.x = 0.0; }
@@ -124,6 +143,15 @@ fn update_cell(cx: u32, cy: u32, res: u32) {
     let mom_x = f32(grid_int[base4 + 0u]) / MOM_ATOMIC_SCALE;
     let mom_y = f32(grid_int[base4 + 1u]) / MOM_ATOMIC_SCALE;
     var vel   = vec2<f32>(mom_x, mom_y) / mass;
+
+    // ASFLIP: snapshot the pre-force velocity right after momentum normalization,
+    // before gravity/boundary/CFL-clamp below modify it -- the exact same instant CPU's
+    // Grid::snapshot_velocities captures (see solver/step.rs's normalize_velocities ->
+    // snapshot -> apply_gravity ordering). Real gate: `enabled == 0` (default) means
+    // this write never happens, zero cost for every scene that never attaches ASFLIP.
+    if asflip_params.enabled != 0u {
+        asflip_snapshot[cy * res + cx] = vel;
+    }
 
     vel += step_params.gravity * step_params.dt;
 

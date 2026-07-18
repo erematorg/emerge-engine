@@ -92,6 +92,61 @@ impl GpuSimulation {
         self.spatial_hash_dirty.set(false);
     }
 
+    /// Remove all particles where `predicate` returns true. Returns count removed.
+    ///
+    /// GPU counterpart to `Simulation::remove_particles` (CPU) -- same predicate
+    /// API (LP pattern: tag with a sentinel, then `remove_particles(|p| p.user_tag
+    /// == DEAD)`). Unlike CPU's in-place `Vec::retain`, this reallocates every
+    /// per-particle GPU buffer to the smaller size and re-uploads -- the exact
+    /// same reallocate-and-reupload pattern `spawn_region` already uses to grow,
+    /// just shrinking instead. Real, same-cost-class operation, not free -- don't
+    /// call every frame for large removals any more than you'd call `spawn_region`
+    /// every frame (see that method's own doc).
+    ///
+    /// Calls `sync_particles_blocking` first: the predicate needs genuinely
+    /// current particle state (e.g. current temperature for an evaporation rule),
+    /// not whatever the CPU mirror happened to hold from the last readback.
+    pub fn remove_particles<F: Fn(&Particle) -> bool>(&mut self, predicate: F) -> usize {
+        self.sync_particles_blocking();
+        let before = self.particles.len();
+        self.particles.retain(|p| !predicate(p));
+        let removed = before - self.particles.len();
+        if removed == 0 {
+            return 0;
+        }
+
+        let n = self.particles.len();
+        self.buffers.particles = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mpm_particles"),
+            size: (n * core::mem::size_of::<Particle>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        self.buffers.sorted_particle_ids = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mpm_sorted_particle_ids"),
+            size: (n * core::mem::size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        self.buffers.readback_staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mpm_particle_staging"),
+            size: (n * core::mem::size_of::<Particle>()) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        self.particle_count = n;
+        self.pending_readback = None; // old staging is gone
+        self.buffers.upload_particles(&self.queue, &self.particles);
+        // buffers.particles was just reallocated above -- cached bind groups reference
+        // the old buffer object and would be stale (or invalid) without this.
+        self.bind_group_pool = build_bind_group_pool(&self.device, &self.pipelines, &self.buffers);
+        self.rebuild_spatial_hash();
+        removed
+    }
+
     /// Blocking GPU → CPU particle sync. Updates `self.particles` immediately.
     /// Stalls the CPU until all in-flight GPU work completes — use only after step_frame
     /// when you need current positions right now (e.g. rendering). Not for the hot path.

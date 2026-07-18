@@ -170,9 +170,12 @@ pub trait MaterialModel: Send + Sync + core::fmt::Debug {
     /// solid — releases energy, warming the particle). Default 0.0 = no energy cost
     /// (existing behavior for every material, unchanged).
     ///
-    /// CPU-only: applied in `Simulation::phase_transition`/`add_phase_rule` against
-    /// `ThermalDiffusion::heat_capacity` when a thermal model is configured. Has no
-    /// effect on `GpuSimulation::phase_transition`, which has no automatic phase rules.
+    /// Applied in `Simulation::phase_transition`/`add_phase_rule` (CPU) against
+    /// `ThermalDiffusion::heat_capacity` when a thermal model is configured, and in
+    /// `GpuSimulation::phase_transition` against the `heat_capacity` passed to
+    /// `attach_thermal_gpu` -- same debit, same formula, on both. GPU has no automatic
+    /// `add_phase_rule` counterpart yet (only the manual, one-shot `phase_transition`);
+    /// that gap is real and separate from this energy accounting.
     fn latent_heat(&self) -> f32 {
         0.0
     }

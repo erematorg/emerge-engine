@@ -64,6 +64,18 @@
 ///   binding 18: resolved_rest_v          — storage read_write (grid_res² vec2<f32>)
 ///   binding 19: grip_params              — uniform (GpuDirectionalGripParams, 16 bytes)
 ///
+/// Group 3 also carries ASFLIP's 2 bindings (28-29, GPU port) alongside resource
+/// regrowth -- NOT because the two are related (they aren't), but because WebGPU's
+/// baseline `max_bind_groups` is exactly 4 (confirmed against wgpu-types' own downlevel
+/// defaults) and this pipeline already uses all 4 -- the same baseline-adapter safety
+/// concern that forced the original group 0/1 split in the first place. A 5th group
+/// would break on any adapter reporting only the guaranteed baseline. Group 3 has real
+/// headroom (4 of 8 storage slots used), so ASFLIP's 2 bindings go there instead of a
+/// new group:
+///   binding 28: asflip_params  — uniform (GpuAsflipParams, 16 bytes)
+///   binding 29: asflip_snapshot — storage read_write (grid_res² vec2<f32> pre-force
+///                                velocity snapshot, see buffers.rs doc)
+///
 /// Passes that don't use a binding still share the same layout — avoids rebinding.
 use super::buffers::GpuBuffers;
 use super::shaders;
@@ -118,6 +130,20 @@ pub struct SimPipelines {
     pub thermal_p2g: wgpu::ComputePipeline,
     pub thermal_normalize_laplacian: wgpu::ComputePipeline,
     pub thermal_g2p: wgpu::ComputePipeline,
+    /// Resource regrowth (GPU port) — same 4-pass shape as the thermal passes above,
+    /// logistic growth as the reaction term instead of Newton cooling.
+    pub resource_clear: wgpu::ComputePipeline,
+    pub resource_p2g: wgpu::ComputePipeline,
+    pub resource_normalize_laplacian: wgpu::ComputePipeline,
+    pub resource_g2p: wgpu::ComputePipeline,
+    /// ASFLIP (GPU port, Fei et al. 2021) — replaces `g2p` + `particles_update` for a
+    /// substep, ONLY dispatched when `SimConfig::asflip_blend > 0.0` (see
+    /// `SubstepGates::asflip_active`). Does both passes' jobs fused into one dispatch —
+    /// see `g2p_asflip_fused.wgsl`'s own doc for why the fusion is structurally required
+    /// (the adaptive position-correction gamma needs the pre-correction velocity to
+    /// survive from the gather stage to the position-write stage, and `Particle` has no
+    /// spare capacity for a second stored velocity).
+    pub g2p_asflip_fused: wgpu::ComputePipeline,
     pub bind_group_layout: wgpu::BindGroupLayout,
     /// Group 1 — contact subsystem, see the module doc comment above for why this is a
     /// second layout rather than more entries in `bind_group_layout`.
@@ -125,6 +151,9 @@ pub struct SimPipelines {
     /// Group 2 — thermal subsystem, see its own creation site doc for why this is a
     /// third layout.
     pub thermal_bind_group_layout: wgpu::BindGroupLayout,
+    /// Group 3 — resource regrowth subsystem, also carries ASFLIP's 2 bindings (see the
+    /// module doc comment's Group 3 entry for why they share a group).
+    pub resource_bind_group_layout: wgpu::BindGroupLayout,
     /// Separate layout for apply_impulses — only needs particles + impulse_params.
     pub impulse_bind_group_layout: wgpu::BindGroupLayout,
 }
@@ -250,12 +279,43 @@ impl SimPipelines {
                 ],
             });
 
+        // Group 3 — resource regrowth (GPU port, 2026-07-16). Own separate group from
+        // thermal despite the near-identical shape (see `GpuResourceParams`' doc for
+        // why: both would otherwise fight over the same particle.temperature carrier).
+        // 4 storage + 2 uniform once ASFLIP's 2 bindings are added below, still well
+        // under the baseline 8-storage-per-stage limit. Bindings 24-29.
+        let resource_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("mpm_resource_bind_group_layout"),
+                entries: &[
+                    // 24: resource_params — GpuResourceParams (diffusivity, ambient,
+                    // resource_r, resource_k, enabled).
+                    uniform_entry(24),
+                    // 25: resource_mass — Σ(w·mass) per cell, dense grid_res² f32.
+                    storage_entry(25),
+                    // 26: resource_phi_old — normalized φ_old per cell.
+                    storage_entry(26),
+                    // 27: resource_work — dual-use: P2G scatter accumulator, then post-
+                    // Laplacian+logistic-growth φ_new.
+                    storage_entry(27),
+                    // 28: asflip_params — GpuAsflipParams (blend, enabled). Shares this
+                    // group with resource regrowth purely for bind-group-count economy
+                    // (WebGPU's 4-group baseline is already fully used) — see the module
+                    // doc comment's Group 3 entry.
+                    uniform_entry(28),
+                    // 29: asflip_snapshot — grid_res² vec2<f32> pre-force velocity
+                    // snapshot, written by grid_update.wgsl, read by g2p_asflip_fused.wgsl.
+                    storage_entry(29),
+                ],
+            });
+
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("mpm_pipeline_layout"),
             bind_group_layouts: &[
                 &bind_group_layout,
                 &contact_bind_group_layout,
                 &thermal_bind_group_layout,
+                &resource_bind_group_layout,
             ],
             push_constant_ranges: &[],
         });
@@ -264,6 +324,7 @@ impl SimPipelines {
         // (naga requires CREATION_RESOLVED; WGSL `override` doesn't apply to array sizes).
         let p2g_src = patch_shader(shaders::P2G);
         let particles_update_src = patch_shader(shaders::PARTICLES_UPDATE);
+        let g2p_asflip_fused_src = patch_shader(shaders::G2P_ASFLIP_FUSED);
 
         // MAX_FORCE_FIELDS / MAX_SLEEP_WAKE_TAGS: loop-bound constants — uses WGSL
         // `override` (proper pipeline specialization), not a hardcoded literal in the shader.
@@ -418,6 +479,19 @@ impl SimPipelines {
             false,
         );
 
+        // ASFLIP (GPU port) -- replaces g2p+particles_update for a substep, only when
+        // SimConfig::asflip_blend > 0.0. See g2p_asflip_fused.wgsl's own doc for why this
+        // is one fused kernel rather than two, and SimPipelines::g2p_asflip_fused's doc.
+        let g2p_asflip_fused = make_pipeline(
+            device,
+            &pipeline_layout,
+            &g2p_asflip_fused_src,
+            "g2p_asflip_fused_main",
+            "g2p_asflip_fused",
+            &[],
+            false,
+        );
+
         // Impulse pass has a minimal 2-binding layout: particles + impulse_params.
         let impulse_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -505,6 +579,44 @@ impl SimPipelines {
             false,
         );
 
+        // Resource regrowth (GPU port) -- same 4-pass shape, see field docs.
+        let resource_clear = make_pipeline(
+            device,
+            &pipeline_layout,
+            shaders::RESOURCE_FIELD,
+            "resource_clear_main",
+            "resource_clear",
+            &[],
+            false,
+        );
+        let resource_p2g = make_pipeline(
+            device,
+            &pipeline_layout,
+            shaders::RESOURCE_FIELD,
+            "resource_p2g_main",
+            "resource_p2g",
+            &[],
+            false,
+        );
+        let resource_normalize_laplacian = make_pipeline(
+            device,
+            &pipeline_layout,
+            shaders::RESOURCE_FIELD,
+            "resource_normalize_laplacian_main",
+            "resource_normalize_laplacian",
+            &[],
+            false,
+        );
+        let resource_g2p = make_pipeline(
+            device,
+            &pipeline_layout,
+            shaders::RESOURCE_FIELD,
+            "resource_g2p_main",
+            "resource_g2p",
+            &[],
+            false,
+        );
+
         Self {
             particle_sort_clear,
             particle_sort_count,
@@ -526,183 +638,25 @@ impl SimPipelines {
             thermal_p2g,
             thermal_normalize_laplacian,
             thermal_g2p,
+            resource_clear,
+            resource_p2g,
+            resource_normalize_laplacian,
+            resource_g2p,
+            g2p_asflip_fused,
             bind_group_layout,
             contact_bind_group_layout,
             thermal_bind_group_layout,
+            resource_bind_group_layout,
             impulse_bind_group_layout,
         }
     }
-
-    /// Build a bind group for the apply_impulses pass (particles + impulse_params).
-    /// Created on-demand each cursor frame — cheap, no GPU work.
-    pub fn make_impulse_bind_group(
-        &self,
-        device: &wgpu::Device,
-        buffers: &GpuBuffers,
-    ) -> wgpu::BindGroup {
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("mpm_impulse_bind_group"),
-            layout: &self.impulse_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: buffers.particles.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: buffers.impulse_params.as_entire_binding(),
-                },
-            ],
-        })
-    }
-
-    /// Build a bind group for one substep using the given step_params buffer slot.
-    /// Cheap — wgpu bind groups are descriptor tables, not data copies.
-    pub fn make_bind_group(
-        &self,
-        device: &wgpu::Device,
-        buffers: &GpuBuffers,
-        step_params: &wgpu::Buffer,
-    ) -> wgpu::BindGroup {
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("mpm_bind_group"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: buffers.particles.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: buffers.grid.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: buffers.materials.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: step_params.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: buffers.force_fields_params.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: buffers.sorted_particle_ids.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: buffers.block_counts.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: buffers.sleep_wake_params.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 8,
-                    resource: buffers.active_block_ids.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 9,
-                    resource: buffers.active_block_count.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 10,
-                    resource: buffers.active_block_ids_prev.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 11,
-                    resource: buffers.active_block_count_prev.as_entire_binding(),
-                },
-            ],
-        })
-    }
-
-    /// Build the group-1 (contact subsystem) bind group. Unlike `make_bind_group`, this
-    /// takes no `step_params` slot and is built exactly ONCE for a `GpuSimulation`'s
-    /// whole lifetime — none of its buffers are particle-count-scaled, so `spawn_region`
-    /// reallocating `buffers.particles` never invalidates it. See the module doc comment
-    /// on the bind-group-layout split for why this is a separate group at all.
-    pub fn make_contact_bind_group(
-        &self,
-        device: &wgpu::Device,
-        buffers: &GpuBuffers,
-    ) -> wgpu::BindGroup {
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("mpm_contact_bind_group"),
-            layout: &self.contact_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 12,
-                    resource: buffers.grip_grid.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 13,
-                    resource: buffers.contact_points.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 14,
-                    resource: buffers.contact_point_counts.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 15,
-                    resource: buffers.contact_debug_params.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 16,
-                    resource: buffers.contact_debug_output.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 17,
-                    resource: buffers.resolved_grip_v.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 18,
-                    resource: buffers.resolved_rest_v.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 19,
-                    resource: buffers.grip_params.as_entire_binding(),
-                },
-            ],
-        })
-    }
-
-    /// Build the group-2 (thermal subsystem) bind group. Same "built once, never
-    /// rebuilt" shape as `make_contact_bind_group` -- none of these buffers are
-    /// particle-count-scaled (all fixed `grid_res²`-sized), so `spawn_region`
-    /// reallocating `buffers.particles` never invalidates it.
-    pub fn make_thermal_bind_group(
-        &self,
-        device: &wgpu::Device,
-        buffers: &GpuBuffers,
-    ) -> wgpu::BindGroup {
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("mpm_thermal_bind_group"),
-            layout: &self.thermal_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 20,
-                    resource: buffers.thermal_params.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 21,
-                    resource: buffers.thermal_mass.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 22,
-                    resource: buffers.thermal_temp_old.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 23,
-                    resource: buffers.thermal_work.as_entire_binding(),
-                },
-            ],
-        })
-    }
 }
+
+// Bind-group construction (make_impulse_bind_group, make_bind_group,
+// make_contact_bind_group, make_thermal_bind_group, make_resource_bind_group)
+// -- split into their own file, was ~200 of this file's ~850 lines. Pipeline/
+// layout CONSTRUCTION stays above; per-substep bind-group building lives there.
+mod bind_groups;
 
 /// Replaces `{{MAX_MATERIALS}}` with the Rust-side value.
 /// Needed because naga requires array-size constants to be CREATION_RESOLVED (known at

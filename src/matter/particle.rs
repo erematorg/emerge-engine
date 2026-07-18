@@ -102,14 +102,39 @@ pub struct Particle {
     /// run); a thin pinned "bedrock" layer under the free top layer anchors the whole
     /// body while the top layer still deforms naturally underfoot.
     pub pinned: u32,
+    /// Generic second scalar carrier -- for any `ScalarDiffusionField`-shaped quantity
+    /// (resource/grass level, pheromone concentration, nutrients, morphogen) that needs
+    /// its OWN field distinct from `temperature`. Real motivating case: GPU's day-night
+    /// thermal diffusion and GPU's resource-regrowth field both used to hijack
+    /// `temperature` as their carrier (CPU's generic closure-based `ScalarDiffusionField`
+    /// never had this problem -- it can point at any field; GPU's baked-formula ports
+    /// couldn't stay generic and both defaulted to the one obvious f32 already on the
+    /// struct). `attach_resource_field_gpu` reads/writes this field; `attach_thermal_gpu`
+    /// keeps `temperature` -- the two now compose freely in the same scene.
+    ///
+    /// Deliberately placed as the LAST real field, immediately before `_pad`, not
+    /// inserted after `temperature` where it semantically "belongs" -- a real, confirmed
+    /// bug (2026-07-17): inserting a field in the MIDDLE of the struct (shifting
+    /// `user_tag` through `pinned` by 4 bytes each) corrupted particle data on GPU
+    /// readback even though both the Rust (`offset_of!`-verified) and all 9 WGSL mirror
+    /// declarations agreed byte-for-byte on the resulting layout -- confirmed via a full
+    /// bisection (isolated worktree at the last commit passed; reverting just this field
+    /// while keeping every other uncommitted change fixed it). Root mechanism not fully
+    /// identified; appending at the end (this field replacing one `_pad` slot, nothing
+    /// else moving) verified clean instead. 0.0 = untouched (existing behavior for every
+    /// scene that doesn't use a GPU scalar field).
+    pub scalar_field: f32,
     /// Explicit padding — required after adding `contact_group` (2026-07-11). Real field
-    /// data through `pinned` totals 120 bytes; `Mat2`'s actual alignment is 16 (verified:
-    /// `size_of::<Mat2>()==16, align_of::<Mat2>()==16`, NOT 8 as a first guess assumed),
-    /// so the struct must round up to 128. `derive(Pod)` refuses implicit compiler-inserted
-    /// padding (uninitialized bytes would violate Pod's "every bit pattern is valid"
-    /// guarantee for GPU buffer upload), so all remaining bytes must be real, explicit,
-    /// always-zeroed fields, not silently left out. Unused; always zero.
-    pub _pad: [u32; 2],
+    /// data through `scalar_field` totals 124 bytes; `Mat2`'s actual alignment is 16
+    /// (verified: `size_of::<Mat2>()==16, align_of::<Mat2>()==16`, NOT 8 as a first guess
+    /// assumed), so the struct must round up to 128. `derive(Pod)` refuses implicit
+    /// compiler-inserted padding (uninitialized bytes would violate Pod's "every bit
+    /// pattern is valid" guarantee for GPU buffer upload), so all remaining bytes must be
+    /// real, explicit, always-zeroed fields, not silently left out. A bare `u32` (not
+    /// `[u32; 1]`) -- WGSL's `array<u32, 1>` does not reliably byte-match Rust's
+    /// `[u32; 1]` in every context checked this session; a bare scalar has unambiguous
+    /// 4-byte layout in both languages. Unused; always zero.
+    pub _pad: u32,
 }
 
 // The CPU struct and the WGSL `Particle` mirror must agree byte-for-byte, or GPU upload
@@ -143,7 +168,8 @@ impl Particle {
             contact_group: 0,
             sleeping: 0,
             pinned: 0,
-            _pad: [0; 2],
+            scalar_field: 0.0,
+            _pad: 0,
         }
     }
 
@@ -207,6 +233,8 @@ pub struct Particles {
     pub contact_group: Vec<u32>,
     /// Dirichlet/kinematic anchor flag. See `Particle::pinned` doc.
     pub pinned: Vec<u32>,
+    /// Generic second scalar carrier. See `Particle::scalar_field` doc.
+    pub scalar_field: Vec<f32>,
 
     // ── Sleep state — not in the hot path ────────────────────────────────────
     /// True when the particle is in the sleeping partition and skipped by P2G/G2P.
@@ -238,6 +266,7 @@ impl Particles {
             muscle_group_id: Vec::new(),
             contact_group: Vec::new(),
             pinned: Vec::new(),
+            scalar_field: Vec::new(),
             sleeping: Vec::new(),
         }
     }
@@ -265,6 +294,7 @@ impl Particles {
             muscle_group_id: Vec::with_capacity(cap),
             contact_group: Vec::with_capacity(cap),
             pinned: Vec::with_capacity(cap),
+            scalar_field: Vec::with_capacity(cap),
             sleeping: Vec::with_capacity(cap),
         }
     }
@@ -306,7 +336,8 @@ impl Particles {
             contact_group: self.contact_group[i],
             sleeping: self.sleeping[i] as u32,
             pinned: self.pinned[i],
-            _pad: [0; 2],
+            scalar_field: self.scalar_field[i],
+            _pad: 0,
         }
     }
 
@@ -333,6 +364,7 @@ impl Particles {
         self.muscle_group_id[i] = p.muscle_group_id;
         self.contact_group[i] = p.contact_group;
         self.pinned[i] = p.pinned;
+        self.scalar_field[i] = p.scalar_field;
     }
 
     /// Append a new particle.
@@ -358,6 +390,7 @@ impl Particles {
         self.muscle_group_id.push(p.muscle_group_id);
         self.contact_group.push(p.contact_group);
         self.pinned.push(p.pinned);
+        self.scalar_field.push(p.scalar_field);
         // Honor the incoming particle's real sleeping state — needed by GpuSimulation's
         // CPU-plasticity readback path (Particles::from(Vec<Particle>)), which converts
         // live GPU particles (sleeping state included) into this SoA. Freshly-spawned
@@ -391,6 +424,7 @@ impl Particles {
         self.muscle_group_id.swap(a, b);
         self.contact_group.swap(a, b);
         self.pinned.swap(a, b);
+        self.scalar_field.swap(a, b);
         self.sleeping.swap(a, b);
     }
 
@@ -462,6 +496,7 @@ impl Particles {
         self.muscle_group_id.truncate(write);
         self.contact_group.truncate(write);
         self.pinned.truncate(write);
+        self.scalar_field.truncate(write);
         self.sleeping.truncate(write);
     }
 

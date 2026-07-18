@@ -161,6 +161,7 @@ mod small_strain_linear_elasticity_tests {
             friction_hardening: 0.0,
             log_volume_strain: 0.0,
             temperature: 0.0,
+            scalar_field: 0.0,
             user_tag: 0,
             activation: 0.0,
             activation_dir: Vec2::ZERO,
@@ -168,7 +169,7 @@ mod small_strain_linear_elasticity_tests {
             contact_group: 0,
             sleeping: 0,
             pinned: 0,
-            _pad: [0; 2],
+            _pad: 0,
         });
         particles
     }

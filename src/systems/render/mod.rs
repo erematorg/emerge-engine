@@ -12,7 +12,6 @@
 use std::mem;
 
 use bytemuck::{Pod, Zeroable};
-use glam::Mat2;
 use wgpu::util::DeviceExt;
 
 use crate::particle::{Particle, Particles};
@@ -32,6 +31,11 @@ pub enum ColorMode {
     ByPhysics = 3,
     ByThermal = 4,
     ByActivation = 5,
+    /// Generic second scalar carrier (resource/grass level, pheromone, nutrients).
+    /// See `Particle::scalar_field`'s own doc. Distinct wire value (6, not the next
+    /// unused slot after ByActivation's implicit WGSL else-branch) so the GPU shader's
+    /// existing fallback `else` can keep meaning ByActivation without renumbering it.
+    ByScalarField = 6,
 }
 
 // ── GPU-side structs (must match WGSL) ────────────────────────────────────────
@@ -616,60 +620,13 @@ impl Renderer {
         rp.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
         rp.draw_indexed(0..6, 0, 0..count as u32);
     }
-
-    fn particle_color(&self, p: &Particle) -> [f32; 4] {
-        match self.color_mode {
-            ColorMode::ByMaterial => material_palette(p.material_id),
-            ColorMode::ByVelocity => heat(p.v.length() * self.vel_scale),
-            ColorMode::ByVolume => heat(det2(p.deformation_gradient) * 0.5),
-            ColorMode::ByPhysics => {
-                // Mirrors prep_instances.wgsl's ByPhysics branch exactly -- see that
-                // shader's comments for the real citations/derivation of each term
-                // (Beer-Lambert absorption, single-scattering-albedo subsurface
-                // approximation, Schlick Fresnel specular, blackbody emission).
-                let slot = p.material_id as usize % 16;
-                let sigma = self.sigma_a[slot];
-                let sigma_s = self.sigma_s[slot];
-                let j = det2(p.deformation_gradient).clamp(0.05, 4.0);
-                let od = 1.0 / j;
-                let transmitted = [
-                    (-sigma[0] * od).exp(),
-                    (-sigma[1] * od).exp(),
-                    (-sigma[2] * od).exp(),
-                ];
-                let scatter_glow = [1.0f32, 0.95, 0.9];
-                let with_scattering: Vec<f32> = (0..3)
-                    .map(|c| {
-                        let albedo = (sigma_s / (sigma_s + sigma[c]).max(1e-4)).clamp(0.0, 1.0);
-                        let glow = scatter_glow[c] * (1.0 - (-sigma_s * od).exp());
-                        transmitted[c] * (1.0 - albedo) + glow * albedo
-                    })
-                    .collect();
-                let r0 = self.specular_r0[slot];
-                let t = (p.temperature / 5000.0).clamp(0.0, 1.0);
-                let glow = t * t * 2.0;
-                let [er, eg, eb, _] = heat(0.5 + t * 0.5);
-                [
-                    (with_scattering[0] + r0 + er * glow).min(1.0),
-                    (with_scattering[1] + r0 + eg * glow).min(1.0),
-                    (with_scattering[2] + r0 + eb * glow).min(1.0),
-                    1.0,
-                ]
-            }
-            ColorMode::ByThermal => {
-                let t = (p.temperature / 1500.0).clamp(0.0, 1.0);
-                let [r, g, b, _] = heat(t);
-                [
-                    r * (0.1 + t * 0.9),
-                    g * (0.1 + t * 0.9),
-                    b * (0.1 + t * 0.9),
-                    1.0,
-                ]
-            }
-            ColorMode::ByActivation => heat(p.activation.clamp(0.0, 1.0) * 0.8),
-        }
-    }
 }
+
+// particle_color (the CPU-path per-particle color computation) is split into
+// color.rs alongside the rest of the "Color helpers" section below -- see
+// that file's own doc comment.
+mod color;
+use color::write_optical_table;
 
 // ── BGL helpers ───────────────────────────────────────────────────────────────
 
@@ -712,211 +669,7 @@ fn bgl_uniform(binding: u32, vis: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEn
     }
 }
 
-// ── Color helpers (CPU path) ──────────────────────────────────────────────────
-
-fn write_optical_table(
-    queue: &wgpu::Queue,
-    buf: &wgpu::Buffer,
-    sigma_a: &[[f32; 3]; 16],
-    sigma_s: &[f32; 16],
-    specular_r0: &[f32; 16],
-) {
-    let mut table = OpticalTable {
-        slots: [[0.0; 4]; 16],
-        specular: [[0.0; 4]; 16],
-    };
-    for (i, s) in sigma_a.iter().enumerate() {
-        table.slots[i] = [s[0], s[1], s[2], sigma_s[i]];
-        table.specular[i] = [specular_r0[i], 0.0, 0.0, 0.0];
-    }
-    queue.write_buffer(buf, 0, bytemuck::bytes_of(&table));
-}
-
-fn det2(f: Mat2) -> f32 {
-    f.x_axis.x * f.y_axis.y - f.x_axis.y * f.y_axis.x
-}
-
-fn heat(t: f32) -> [f32; 4] {
-    let c = t.clamp(0.0, 1.0);
-    let r = smoothstep(0.5, 0.75, c);
-    let g = 1.0 - (c - 0.5).abs() * 2.0;
-    let b = 1.0 - smoothstep(0.0, 0.5, c);
-    [r, g, b, 1.0]
-}
-
-fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
-    let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
-
-fn material_palette(id: u32) -> [f32; 4] {
-    match id % 16 {
-        0 => [0.35, 0.65, 1.00, 1.0],
-        1 => [0.90, 0.80, 0.30, 1.0],
-        2 => [0.80, 0.90, 1.00, 1.0],
-        3 => [0.50, 0.85, 0.50, 1.0],
-        4 => [1.00, 0.45, 0.20, 1.0],
-        5 => [0.85, 0.35, 0.35, 1.0],
-        6 => [0.65, 0.40, 0.85, 1.0],
-        7 => [0.40, 0.85, 0.80, 1.0],
-        8 => [0.90, 0.60, 0.40, 1.0],
-        9 => [0.50, 0.50, 0.90, 1.0],
-        10 => [0.70, 0.90, 0.40, 1.0],
-        11 => [1.00, 0.80, 0.20, 1.0],
-        12 => [0.85, 0.50, 0.75, 1.0],
-        13 => [0.40, 0.70, 0.50, 1.0],
-        14 => [0.60, 0.60, 0.60, 1.0],
-        _ => [1.00, 1.00, 1.00, 1.0],
-    }
-}
-
+// Test suite split into its own file -- was ~150 of this file's ~930 lines,
+// same pattern as `gpu/solver/device_lost_tests.rs`.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::particle::Particle;
-
-    fn headless_device() -> (wgpu::Device, wgpu::Queue) {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::None,
-            compatible_surface: None,
-            force_fallback_adapter: false,
-        }))
-        .expect("no GPU adapter available for render test");
-        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
-            .expect("failed to create device")
-    }
-
-    /// Real subsurface scattering must actually change ByPhysics's output, not be
-    /// dead-stored data -- two materials with identical absorption but different
-    /// `sigma_s` must render differently (see prep_instances.wgsl's ByPhysics
-    /// branch for the real single-scattering-albedo derivation this mirrors).
-    #[test]
-    fn scattering_changes_by_physics_color() {
-        let (device, _queue) = headless_device();
-        let mut r = Renderer::new(&device, 16, wgpu::TextureFormat::Rgba8UnormSrgb);
-        r.set_color_mode(ColorMode::ByPhysics);
-        r.set_optical_params(0, [0.3, 0.3, 0.3]);
-        r.set_optical_params(1, [0.3, 0.3, 0.3]);
-        r.set_optical_scattering(1, 5.0); // real tissue-scale reduced scattering coeff
-
-        let mut p0 = Particle::zeroed();
-        p0.material_id = 0;
-        p0.deformation_gradient = Mat2::IDENTITY;
-        let mut p1 = p0;
-        p1.material_id = 1;
-
-        let c0 = r.particle_color(&p0);
-        let c1 = r.particle_color(&p1);
-        assert_ne!(
-            c0, c1,
-            "identical absorption but different sigma_s must render differently"
-        );
-    }
-
-    /// Real specular Fresnel reflectance must actually change ByPhysics's output --
-    /// same check as scattering, for the R0 term.
-    #[test]
-    fn specular_r0_changes_by_physics_color() {
-        let (device, _queue) = headless_device();
-        let mut r = Renderer::new(&device, 16, wgpu::TextureFormat::Rgba8UnormSrgb);
-        r.set_color_mode(ColorMode::ByPhysics);
-        r.set_optical_params(0, [0.3, 0.3, 0.3]);
-        r.set_optical_params(1, [0.3, 0.3, 0.3]);
-        r.set_specular_r0(1, 0.02); // real water-scale Fresnel base reflectance
-
-        let mut p0 = Particle::zeroed();
-        p0.material_id = 0;
-        p0.deformation_gradient = Mat2::IDENTITY;
-        let mut p1 = p0;
-        p1.material_id = 1;
-
-        let c0 = r.particle_color(&p0);
-        let c1 = r.particle_color(&p1);
-        assert_ne!(
-            c0, c1,
-            "identical absorption but different specular R0 must render differently"
-        );
-    }
-
-    /// `Renderer::new` must succeed and `upload_optical_params` must not panic with
-    /// the extended (scattering + specular) `OpticalTable` layout -- a real,
-    /// end-to-end check that the WGSL struct and Rust struct stayed in sync (a
-    /// mismatch here would show up as a wgpu validation panic, not a silent bug).
-    #[test]
-    fn renderer_construction_and_optical_upload_survive_extended_table() {
-        let (device, queue) = headless_device();
-        let mut r = Renderer::new(&device, 16, wgpu::TextureFormat::Rgba8UnormSrgb);
-        r.set_optical_params(0, [0.18, 0.22, 0.55]);
-        r.set_optical_scattering(0, 8.0);
-        r.set_specular_r0(0, 0.02);
-        r.upload_optical_params(&queue);
-    }
-
-    /// End-to-end GPU path (the one LP actually uses, `render_gpu`): real
-    /// particles on a real `GpuSimulation`, real compute dispatch through
-    /// `prep_instances.wgsl` with the extended `OpticalTable`, real render pass to
-    /// an offscreen texture. Proves the whole pipeline survives, not just that
-    /// `Renderer::new` compiles the shader in isolation.
-    #[test]
-    fn render_gpu_survives_scattering_and_specular_end_to_end() {
-        use crate::gpu::GpuSimulation;
-        use crate::{
-            MaterialRegistry, NeoHookeanMaterial, SimConfig, SpawnRegion, build_particles,
-        };
-        use std::sync::Arc;
-
-        let (device, queue) = headless_device();
-        let device = Arc::new(device);
-        let queue = Arc::new(queue);
-
-        let config = SimConfig::standard(32, 0.1, glam::Vec2::new(0.0, -0.3));
-        let particles = build_particles(
-            &config,
-            SpawnRegion::for_sim(&config)
-                .at(glam::Vec2::splat(16.0))
-                .disk(4.0)
-                .spacing(0.5)
-                .material(0)
-                .precompute_volumes(),
-        );
-        let registry =
-            MaterialRegistry::with_default(Box::new(NeoHookeanMaterial::new(100.0, 50.0)));
-        let sim =
-            GpuSimulation::with_device(device.clone(), queue.clone(), config, particles, registry);
-
-        let fmt = wgpu::TextureFormat::Rgba8UnormSrgb;
-        let mut r = Renderer::new(&device, sim.particle_count(), fmt);
-        r.set_color_mode(ColorMode::ByPhysics);
-        r.set_optical_params(0, [0.18, 0.22, 0.55]);
-        r.set_optical_scattering(0, 8.0);
-        r.set_specular_r0(0, 0.02);
-        r.set_camera(&queue, 32, 64, 64, 0.6, true);
-
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("render_gpu_test_target"),
-            size: wgpu::Extent3d {
-                width: 64,
-                height: 64,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: fmt,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-        r.render_gpu(
-            &device,
-            &queue,
-            sim.particle_buffer(),
-            sim.particle_count(),
-            &view,
-            true,
-        );
-        device.poll(wgpu::PollType::wait_indefinitely()).ok();
-    }
-}
+mod tests;

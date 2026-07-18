@@ -10,10 +10,11 @@
 //! code this precise.
 
 use super::super::step_params::{
-    GpuFieldEntry, GpuFieldsParams, GpuImpulseParams, GpuSleepWakeParams, GpuStepParams,
-    GpuThermalParams, MAX_FORCE_FIELDS, NUM_BLOCKS,
+    GpuFieldsParams, GpuImpulseParams, GpuSleepWakeParams, GpuStepParams,
 };
-use super::{GpuSimulation, PROFILE_PASS_LABELS, WG_PARTICLES};
+use super::encode_substep::SubstepGates;
+use super::{GpuSimulation, WG_PARTICLES};
+
 use crate::particle::Particles;
 use crate::solver::config::SimConfig;
 use crate::solver::{affine_cfl_speed_contribution, cfl_bound};
@@ -201,6 +202,20 @@ impl GpuSimulation {
             .upload_thermal_params(&self.queue, &self.thermal_params);
         let thermal_active = self.thermal_params.enabled != 0;
 
+        // Resource regrowth (GPU port) — same upload + real dispatch-skip pattern as
+        // thermal above.
+        self.buffers
+            .upload_resource_params(&self.queue, &self.resource_params);
+        let resource_active = self.resource_params.enabled != 0;
+
+        // ASFLIP (GPU port) — same upload + real dispatch-skip pattern as thermal/
+        // resource above, but the "skip" here means the fused g2p_asflip_fused pass
+        // REPLACES g2p+particles_update rather than an extra pass being skipped
+        // entirely — see SubstepGates::asflip_active's use in encode_substep.rs.
+        self.buffers
+            .upload_asflip_params(&self.queue, &self.asflip_params);
+        let asflip_active = self.asflip_params.enabled != 0;
+
         // Force-sleep/force-wake-by-tag — minimal hook for LP's future chunk system.
         // Uploaded every frame (zeroed when nothing's pending, same as ff_params above)
         // and read once per substep in force_fields.wgsl; cleared after upload since
@@ -318,18 +333,29 @@ impl GpuSimulation {
             );
             self.buffers
                 .upload_step_params_at(&self.queue, sort_slot, &sort_params);
-            let sort_bg = self.pipelines.make_bind_group(
-                &self.device,
-                &self.buffers,
-                &self.buffers.step_params_pool[sort_slot],
-            );
+            // REAL BUG FOUND AND FIXED 2026-07-17: this used to call
+            // `pipelines.make_bind_group(...)` fresh every single `step_frame` call --
+            // structurally the EXACT same "thousands of bind groups every frame exhausts
+            // the GPU's descriptor allocator" issue `bind_group_pool` was introduced to
+            // fix (see that field's own doc comment), just at frame granularity instead
+            // of substep granularity. `bind_group_pool` ALREADY contains one bind group
+            // per `step_params_pool` slot -- including this exact sort slot (see
+            // `build_bind_group_pool`) -- built once and rebuilt only when `buffers`
+            // reallocates. The bind group only depends on buffer IDENTITY (not contents,
+            // which `upload_step_params_at` above already rewrites in place), so reusing
+            // the cached entry is correct, not just faster. Confirmed via a real 16,000-
+            // frame long-horizon test: memory grew unboundedly (multi-GB, eventually a
+            // genuine `wgpu` "Out of Memory") with the fresh-every-frame version, and
+            // stayed flat with this fix.
+            let sort_bg = &self.bind_group_pool[sort_slot];
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("particle_sort"),
                 timestamp_writes: None,
             });
-            pass.set_bind_group(0, &sort_bg, &[]);
+            pass.set_bind_group(0, sort_bg, &[]);
             pass.set_bind_group(1, &self.contact_bind_group, &[]);
             pass.set_bind_group(2, &self.thermal_bind_group, &[]);
+            pass.set_bind_group(3, &self.resource_bind_group, &[]);
             pass.set_pipeline(&self.pipelines.particle_sort_clear);
             pass.dispatch_workgroups(1, 1, 1); // 1 workgroup of 256 == NUM_BLOCKS
             pass.set_pipeline(&self.pipelines.particle_sort_count);
@@ -383,9 +409,13 @@ impl GpuSimulation {
                     &mut sub_encoder,
                     bg,
                     particle_wg,
-                    force_fields_needed,
-                    contact_active,
-                    thermal_active,
+                    SubstepGates {
+                        force_fields_needed,
+                        contact_active,
+                        thermal_active,
+                        resource_active,
+                        asflip_active,
+                    },
                 );
             }
             self.queue.submit(std::iter::once(sub_encoder.finish()));
@@ -529,341 +559,12 @@ impl GpuSimulation {
         let total_ns = total_start.elapsed().as_secs_f32() * 1.0e9;
         self.last_cpu_timings = (cfl_scan_ns, encode_ns, submit_ns, readback_ns, total_ns);
     }
-
-    /// Add a non-uniform body force field for the GPU path.
-    /// Entries are uploaded and dispatched every substep until cleared.
-    /// Panics if `MAX_FORCE_FIELDS` is exceeded.
-    pub fn add_force_field_gpu(&mut self, entry: GpuFieldEntry) {
-        assert!(
-            self.force_field_entries.len() < MAX_FORCE_FIELDS,
-            "add_force_field_gpu: MAX_FORCE_FIELDS ({MAX_FORCE_FIELDS}) exceeded"
-        );
-        self.force_field_entries.push(entry);
-    }
-
-    /// Remove all GPU force field entries.
-    pub fn clear_force_fields_gpu(&mut self) {
-        self.force_field_entries.clear();
-    }
-
-    /// Update the preferred grip direction live (e.g. player/AI steering input) --
-    /// GPU counterpart to `DirectionalContactGrip::set_easy_direction`. Takes effect
-    /// on the very next `step_frame` (re-uploaded fresh every frame, see that
-    /// function's own `grip_params` upload). Only has a visible effect on particles
-    /// with `contact_group != 0` and only once `set_grip_friction` has set
-    /// `mu_easy != mu_resist` -- symmetric friction (the default) makes direction
-    /// irrelevant, same "no bias without input" principle as `RatchetFrictionBoundary`.
-    ///
-    /// HONEST STATUS (2026-07-16): this API is real and correctly wired -- verified
-    /// reaching `resolve_contact.wgsl`'s `grip_params` uniform. The RESULTING
-    /// directional effect is correctly signed (the "easy" direction genuinely retains
-    /// more speed) but its MAGNITUDE is measurably unstable run to run, unlike CPU's
-    /// `DirectionalContactGrip` which is consistent -- see
-    /// `gpu_directional_grip_is_direction_aware`'s `#[ignore]` reason in `tests/gpu.rs`
-    /// for the real measured numbers and the likely (not confirmed) root cause. Usable
-    /// for real, but don't present it as equivalent to CPU's steering yet.
-    pub fn set_grip_direction(&mut self, direction: glam::Vec2) {
-        self.grip_params.easy_direction = direction.normalize_or_zero();
-    }
-
-    /// Update the grip friction coefficients live -- GPU counterpart to
-    /// `DirectionalContactGrip::set_friction`. Set `mu_easy == mu_resist` to disable
-    /// directional asymmetry entirely (ordinary symmetric Coulomb friction) whenever
-    /// there's no real steering intent.
-    pub fn set_grip_friction(&mut self, mu_easy: f32, mu_resist: f32) {
-        assert!(
-            (0.0..=1.0).contains(&mu_easy) && (0.0..=1.0).contains(&mu_resist),
-            "set_grip_friction: mu_easy and mu_resist must be in [0.0, 1.0]"
-        );
-        self.grip_params.mu_easy = mu_easy;
-        self.grip_params.mu_resist = mu_resist;
-    }
-
-    /// Attach day-night/ambient thermal diffusion -- GPU counterpart to CPU's
-    /// `Simulation::with_thermal`/`thermal_config_mut`. Real PDE (Fourier's law
-    /// `∂T/∂t = α·∇²T` plus Newton cooling), see `GpuThermalParams`' own doc. Enables
-    /// all 4 thermal passes starting next `step_frame`; call `set_thermal_ambient`
-    /// afterward for live day-night oscillation.
-    ///
-    /// - `conductivity_w_m_k` / `heat_capacity_j_kg_k`: real SI material constants
-    /// - `grid_cell_size_m`: physical cell size (pass `SimConfig::dx_meters`, NOT
-    ///   `grid_cell_size` which is always 1.0 -- same trap `ThermalConfig`'s own doc
-    ///   warns about)
-    /// - `ambient`: background temperature; `cooling_rate`: Newton cooling k_c (1/s,
-    ///   0.0 = none)
-    pub fn attach_thermal_gpu(
-        &mut self,
-        conductivity_w_m_k: f32,
-        heat_capacity_j_kg_k: f32,
-        grid_cell_size_m: f32,
-        ambient: f32,
-        cooling_rate: f32,
-    ) {
-        let alpha =
-            conductivity_w_m_k / (heat_capacity_j_kg_k * grid_cell_size_m * grid_cell_size_m);
-        self.thermal_params = GpuThermalParams {
-            alpha,
-            ambient,
-            cooling_rate,
-            enabled: 1,
-        };
-    }
-
-    /// Update the ambient/boundary temperature live (e.g. day-night oscillation) --
-    /// GPU counterpart to CPU's `thermal_config_mut().ambient = ...`. No-op (with a
-    /// debug assert) if thermal hasn't been attached yet.
-    pub fn set_thermal_ambient(&mut self, ambient: f32) {
-        debug_assert!(
-            self.thermal_params.enabled != 0,
-            "set_thermal_ambient: call attach_thermal_gpu first"
-        );
-        self.thermal_params.ambient = ambient;
-    }
-
-    /// Encode one substep's passes into an existing encoder. No submission — caller batches.
-    fn encode_substep(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        bg: &wgpu::BindGroup,
-        particle_wg: u32,
-        force_fields_needed: bool,
-        contact_active: bool,
-        thermal_active: bool,
-    ) {
-        {
-            // GPU sparse grid Phase 1 — re-detect active blocks from CURRENT particle
-            // positions, every substep, immediately before grid_clear uses the result.
-            //
-            // Real bug found via direct testing (gpu_sleep_freezes_settled_particles
-            // regressed, plus a native crash — see mpm_technique_survey memory note):
-            // particle_sort's once-per-frame active-block detection (computed from
-            // frame-START positions) went stale by substep 2+ of the same frame, since
-            // particles move every substep. Fixed by re-running clear+count+compact (NOT
-            // scan/scatter — those only matter for the once-per-frame sort permutation,
-            // unrelated to grid_clear correctness) every substep.
-            //
-            // Second real bug, found via a long-running headless diagnostic AFTER the
-            // above fix (basic_sand_gpu blew up after ~1500 frames, ~1-in-5 runs): a block
-            // that stops being active (a particle moves away) was never cleared again —
-            // grid_clear only ever clears CURRENTLY active blocks, so a block's last P2G
-            // contribution sat there permanently until some particle wandered back near it
-            // much later, at which point P2G's atomic ADD compounded onto the stale
-            // residual. Dense grid_clear never had this problem (it unconditionally zeroed
-            // every cell every substep regardless of activity). Fix: active_block_swap
-            // (dispatched FIRST, before clear/count/compact) snapshots this substep's
-            // about-to-be-overwritten active list into active_block_ids_prev/count_prev,
-            // and grid_clear processes the union of both lists — a genuine one-substep
-            // grace period. See active_block_swap_main's doc comment in particle_sort.wgsl
-            // for the full reasoning, including a first attempt at this fix that was wrong
-            // (reset happened in the same substep it was used in, giving zero actual grace
-            // period).
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("active_block_refresh"),
-                timestamp_writes: self.profile_writes(0),
-            });
-            pass.set_bind_group(0, bg, &[]);
-            pass.set_bind_group(1, &self.contact_bind_group, &[]);
-            pass.set_bind_group(2, &self.thermal_bind_group, &[]);
-            pass.set_pipeline(&self.pipelines.active_block_swap);
-            pass.dispatch_workgroups(1, 1, 1); // 1 workgroup of 256 == NUM_BLOCKS
-            pass.set_pipeline(&self.pipelines.particle_sort_clear);
-            pass.dispatch_workgroups(1, 1, 1); // 1 workgroup of 256 == NUM_BLOCKS
-            pass.set_pipeline(&self.pipelines.particle_sort_count);
-            pass.dispatch_workgroups(particle_wg, 1, 1);
-            pass.set_pipeline(&self.pipelines.particle_sort_compact);
-            pass.dispatch_workgroups(1, 1, 1); // 1 workgroup of 256 == NUM_BLOCKS
-        }
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("grid_clear"),
-                timestamp_writes: self.profile_writes(1),
-            });
-            pass.set_pipeline(&self.pipelines.grid_clear);
-            pass.set_bind_group(0, bg, &[]);
-            pass.set_bind_group(1, &self.contact_bind_group, &[]);
-            pass.set_bind_group(2, &self.thermal_bind_group, &[]);
-            // GPU sparse grid Phase 1: one workgroup per potential active-block slot, for
-            // EACH of the two lists (this substep's + last substep's grace period) — fixed
-            // worst-case size (2 * NUM_BLOCKS), not grid_res-dependent anymore. Most slots
-            // beyond their list's real count exit immediately via the shader's own guard.
-            // See grid_clear.wgsl.
-            pass.dispatch_workgroups(2 * NUM_BLOCKS as u32, 1, 1);
-        }
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("p2g"),
-                timestamp_writes: self.profile_writes(2),
-            });
-            pass.set_pipeline(&self.pipelines.p2g);
-            pass.set_bind_group(0, bg, &[]);
-            pass.set_bind_group(1, &self.contact_bind_group, &[]);
-            pass.set_bind_group(2, &self.thermal_bind_group, &[]);
-            pass.dispatch_workgroups(particle_wg, 1, 1);
-        }
-        // Skipped entirely (not just an empty loop body) when NO particle anywhere has
-        // `contact_group != 0` this frame -- mirrors CPU's `Grid::has_contact_activity()`
-        // gate exactly (`gather_contact_point_cloud` in `transfer.rs` is a documented no-op
-        // in that case). See `contact_active`'s doc (computed in `step_frame`) for the real
-        // measured cost this avoids (37.5%/5.66ms of a substep on a pure fluid scene).
-        if contact_active {
-            // Multi-field contact (GPU port, first slice) -- must run strictly after p2g
-            // (reads grip mass p2g just scattered) and strictly before grid_update, same
-            // ordering CPU's own step.rs enforces between scatter_particles_to_grid,
-            // gather_contact_point_cloud, and update_velocities. A real, separate compute
-            // pass (not folded into p2g_main itself) specifically so this barrier is
-            // enforced -- see p2g.wgsl's gather_contact_points_main doc.
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("gather_contact_points"),
-                timestamp_writes: self.profile_writes(3),
-            });
-            pass.set_pipeline(&self.pipelines.gather_contact_points);
-            pass.set_bind_group(0, bg, &[]);
-            pass.set_bind_group(1, &self.contact_bind_group, &[]);
-            pass.set_bind_group(2, &self.thermal_bind_group, &[]);
-            pass.dispatch_workgroups(particle_wg, 1, 1);
-        }
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("grid_update"),
-                timestamp_writes: self.profile_writes(4),
-            });
-            pass.set_pipeline(&self.pipelines.grid_update);
-            pass.set_bind_group(0, bg, &[]);
-            pass.set_bind_group(1, &self.contact_bind_group, &[]);
-            pass.set_bind_group(2, &self.thermal_bind_group, &[]);
-            // GPU sparse grid Phase 2: same active-block dispatch pattern as grid_clear (see
-            // grid_update.wgsl's doc comment) -- was the last remaining O(grid_res²)-dispatch
-            // pass; now bounded to occupied blocks (+ one substep's grace period) instead.
-            pass.dispatch_workgroups(2 * NUM_BLOCKS as u32, 1, 1);
-        }
-        // Skipped entirely under the same `contact_active` gate as `gather_contact_points`
-        // above -- safe ONLY because `g2p.wgsl` itself is gated on the identical flag (see
-        // `contact_active`'s doc): when false, G2P reads the plain `grid` velocity directly
-        // instead of `resolved_rest_v`/`resolved_grip_v`, so this pass never needing to have
-        // populated them is correct, not just "probably fine" -- both gates were added
-        // together, mirroring CPU's single `contact_active` check in `transfer.rs` exactly.
-        if contact_active {
-            // Multi-field contact (GPU port) -- must run after grid_update (needs the
-            // DECODED, gravity-applied total velocity grid_update just produced) and
-            // before g2p (which will read the resolved velocities this pass writes),
-            // same ordering CPU's own step.rs enforces between update_velocities and
-            // resolve_contact. See resolve_contact.wgsl's resolve_contact_main doc.
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("resolve_contact"),
-                timestamp_writes: self.profile_writes(5),
-            });
-            pass.set_pipeline(&self.pipelines.resolve_contact);
-            pass.set_bind_group(0, bg, &[]);
-            pass.set_bind_group(1, &self.contact_bind_group, &[]);
-            pass.set_bind_group(2, &self.thermal_bind_group, &[]);
-            pass.dispatch_workgroups(2 * NUM_BLOCKS as u32, 1, 1);
-        }
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("g2p"),
-                timestamp_writes: self.profile_writes(6),
-            });
-            pass.set_pipeline(&self.pipelines.g2p);
-            pass.set_bind_group(0, bg, &[]);
-            pass.set_bind_group(1, &self.contact_bind_group, &[]);
-            pass.set_bind_group(2, &self.thermal_bind_group, &[]);
-            pass.dispatch_workgroups(particle_wg, 1, 1);
-        }
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("particles_update"),
-                timestamp_writes: self.profile_writes(7),
-            });
-            pass.set_pipeline(&self.pipelines.particles_update);
-            pass.set_bind_group(0, bg, &[]);
-            pass.set_bind_group(1, &self.contact_bind_group, &[]);
-            pass.set_bind_group(2, &self.thermal_bind_group, &[]);
-            pass.dispatch_workgroups(particle_wg, 1, 1);
-        }
-        // Skipped entirely (not just an empty loop body) when force_fields_main is
-        // provably a no-op for every particle this frame -- see force_fields_needed's
-        // doc comment above (step_frame) for the full reasoning and the real measured
-        // cost this avoids. When skipped, the velocity this pass would have re-clamped
-        // is exactly what g2p already clamped to (particles_update's only effect on v
-        // is multiplicative damping, never amplifying), so this is a correctness-
-        // preserving skip, not an approximation.
-        if force_fields_needed {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("force_fields"),
-                timestamp_writes: self.profile_writes(8),
-            });
-            pass.set_pipeline(&self.pipelines.force_fields);
-            pass.set_bind_group(0, bg, &[]);
-            pass.set_bind_group(1, &self.contact_bind_group, &[]);
-            pass.set_bind_group(2, &self.thermal_bind_group, &[]);
-            pass.dispatch_workgroups(particle_wg, 1, 1);
-        }
-        // Day-night/ambient thermal diffusion (GPU port) — skipped ENTIRELY (not just
-        // early-returning per-thread) when no thermal system is attached, same
-        // dispatch-skip discipline as contact_active/force_fields_needed above. Runs
-        // after force_fields, matching CPU's own `ThermalDiffusion::apply` ordering
-        // ("after force fields, before state projection") — fully decoupled from
-        // mechanics (operates only on particle.temperature), so exact ordering
-        // relative to force_fields doesn't affect correctness, just matches CPU's own
-        // call site for consistency.
-        if thermal_active {
-            let grid_res = self.config.grid_res as u32;
-            let cell_wg = (grid_res * grid_res).div_ceil(64);
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("thermal_clear"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.pipelines.thermal_clear);
-                pass.set_bind_group(0, bg, &[]);
-                pass.set_bind_group(1, &self.contact_bind_group, &[]);
-                pass.set_bind_group(2, &self.thermal_bind_group, &[]);
-                pass.dispatch_workgroups(cell_wg, 1, 1);
-            }
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("thermal_p2g"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.pipelines.thermal_p2g);
-                pass.set_bind_group(0, bg, &[]);
-                pass.set_bind_group(1, &self.contact_bind_group, &[]);
-                pass.set_bind_group(2, &self.thermal_bind_group, &[]);
-                pass.dispatch_workgroups(particle_wg, 1, 1);
-            }
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("thermal_normalize_laplacian"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.pipelines.thermal_normalize_laplacian);
-                pass.set_bind_group(0, bg, &[]);
-                pass.set_bind_group(1, &self.contact_bind_group, &[]);
-                pass.set_bind_group(2, &self.thermal_bind_group, &[]);
-                pass.dispatch_workgroups(cell_wg, 1, 1);
-            }
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("thermal_g2p"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.pipelines.thermal_g2p);
-                pass.set_bind_group(0, bg, &[]);
-                pass.set_bind_group(1, &self.contact_bind_group, &[]);
-                pass.set_bind_group(2, &self.thermal_bind_group, &[]);
-                pass.dispatch_workgroups(particle_wg, 1, 1);
-            }
-        }
-        if let Some(profiling) = &self.profiling {
-            let n = PROFILE_PASS_LABELS.len() as u32;
-            encoder.resolve_query_set(&profiling.query_set, 0..n * 2, &profiling.resolve_buf, 0);
-            encoder.copy_buffer_to_buffer(
-                &profiling.resolve_buf,
-                0,
-                &profiling.readback_buf,
-                0,
-                (n * 2) as u64 * 8,
-            );
-        }
-    }
 }
+
+// Live-adjustable params (add/clear_force_field_gpu, set_grip_direction/
+// friction, attach_thermal_gpu, set_thermal_ambient, attach_resource_field_gpu)
+// split into sibling module live_params.rs (declared in solver/mod.rs);
+// encode_substep (the 7-8 per-substep compute passes) split into sibling
+// module encode_substep.rs -- was ~440 combined of this file's ~1000 lines.
+// step_frame (above) is the one thing that stays here, per this file's own
+// top-of-file doc comment on why it's the highest-risk slice.

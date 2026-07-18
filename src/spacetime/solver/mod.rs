@@ -138,7 +138,8 @@ pub(crate) fn initialize_particles(
                     contact_group: 0,
                     sleeping: 0,
                     pinned: 0,
-                    _pad: [0; 2],
+                    scalar_field: 0.0,
+                    _pad: 0,
                 });
             }
 

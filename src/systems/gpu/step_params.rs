@@ -548,3 +548,74 @@ impl GpuThermalParams {
 }
 
 const _: () = assert!(core::mem::size_of::<GpuThermalParams>() == 16);
+
+/// Generic reaction-diffusion resource field — GPU mirror of `ScalarDiffusionField`
+/// (`src/energy/thermodynamics/scalar_field.rs`), specialized to the ONE real source
+/// term its own CPU test module actually uses: logistic growth (Verhulst 1838,
+/// `dφ/dt = r·φ·(1−φ/K)`). Same real PDE shape as `GpuThermalParams` (scatter ->
+/// normalize -> Laplacian+reaction -> gather), its own separate group/buffers AND its
+/// own separate carrier field (`particle.scalar_field`, not `particle.temperature`) --
+/// composes freely with `GpuThermalParams` in the same scene (real fix, 2026-07-17;
+/// they used to share `temperature` and could never both be attached at once).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuResourceParams {
+    /// Diffusivity D, grid-units²/s -- spatial spread rate.
+    pub diffusivity: f32,
+    /// Value assigned to empty cells (no particle mass) and domain boundaries.
+    pub ambient: f32,
+    /// Logistic growth rate r, 1/s.
+    pub resource_r: f32,
+    /// Logistic carrying capacity K.
+    pub resource_k: f32,
+    /// 0 = no resource system attached (default) -- skips all 4 passes entirely.
+    pub enabled: u32,
+    pub _pad: [u32; 3],
+}
+
+impl GpuResourceParams {
+    pub fn disabled() -> Self {
+        Self {
+            diffusivity: 0.0,
+            ambient: 0.0,
+            resource_r: 0.0,
+            resource_k: 0.0,
+            enabled: 0,
+            _pad: [0; 3],
+        }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<GpuResourceParams>() == 32);
+
+/// ASFLIP (Fei, Guo, Wu, Huang, Gao 2021, "Revisiting Integration in the Material Point
+/// Method: A Scheme for Easier Separation and Less Dissipation") -- GPU mirror of
+/// `SimConfig::asflip_blend`. `enabled == 0` (the default, every existing scene) makes
+/// `grid_update.wgsl` skip the pre-force velocity snapshot write entirely and the fused
+/// `g2p_asflip_fused.wgsl` pass never gets dispatched (see `SubstepGates::asflip_active`)
+/// -- zero cost, byte-identical behavior to before ASFLIP existed, matching every other
+/// opt-in GPU subsystem's own gate.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuAsflipParams {
+    /// Blend factor [0, 1] -- see `SimConfig::asflip_blend`'s own doc for the real
+    /// derivation and the ~0.97 reference value (`nepluno/pyasflip`).
+    pub blend: f32,
+    /// 0 = ASFLIP disabled (default) -- skips the snapshot write and the fused G2P+
+    /// position pass, falling back to the ordinary split g2p/particles_update passes
+    /// unchanged. 1 = attached and active.
+    pub enabled: u32,
+    pub _pad: [u32; 2],
+}
+
+impl GpuAsflipParams {
+    pub fn disabled() -> Self {
+        Self {
+            blend: 0.0,
+            enabled: 0,
+            _pad: [0; 2],
+        }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<GpuAsflipParams>() == 16);

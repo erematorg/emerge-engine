@@ -5,6 +5,8 @@ use crate::particle::Particle;
 use crate::solver::config::SimConfig;
 
 mod device_lost;
+mod encode_substep;
+mod live_params;
 mod particles;
 mod profiling;
 mod queries;
@@ -15,8 +17,8 @@ mod step;
 use super::buffers::GpuBuffers;
 use super::pipeline::SimPipelines;
 use super::step_params::{
-    GpuDirectionalGripParams, GpuFieldEntry, GpuImpulseEntry, GpuThermalParams, MAX_MATERIALS,
-    MAX_SLEEP_WAKE_TAGS,
+    GpuAsflipParams, GpuDirectionalGripParams, GpuFieldEntry, GpuImpulseEntry, GpuResourceParams,
+    GpuThermalParams, MAX_MATERIALS, MAX_SLEEP_WAKE_TAGS,
 };
 
 /// Workgroup sizes — must match `@workgroup_size(...)` in the WGSL shaders.
@@ -120,6 +122,25 @@ pub struct GpuSimulation {
     /// all 4 thermal passes entirely, every existing scene pays nothing. Set via
     /// `attach_thermal_gpu`/`set_thermal_ambient`.
     thermal_params: GpuThermalParams,
+    /// `heat_capacity` as passed to `attach_thermal_gpu`, retained CPU-side only for
+    /// `phase_transition`'s real latent-heat debit (`ΔT = latent_heat / heat_capacity`,
+    /// mirrors CPU's `Simulation::phase_transition`) -- NOT baked into `thermal_params`,
+    /// whose `alpha` field already folds it into the diffusion coefficient and can't be
+    /// un-folded back out. `None` until `attach_thermal_gpu` is called, matching CPU's
+    /// `self.thermal.is_none()` gate (no thermal model configured = no debit applied).
+    thermal_heat_capacity: Option<f32>,
+    /// Group 3 (resource regrowth subsystem) bind group — built exactly once, see
+    /// `SimPipelines::make_resource_bind_group`'s doc.
+    resource_bind_group: wgpu::BindGroup,
+    /// Live resource-regrowth state — `enabled: 0` (default) skips all 4 resource
+    /// passes entirely. Set via `attach_resource_field_gpu`.
+    resource_params: GpuResourceParams,
+    /// Live ASFLIP state — `enabled: 0` (default) makes `step_frame` dispatch the
+    /// ordinary split g2p/particles_update pair unchanged; `enabled: 1` dispatches
+    /// `g2p_asflip_fused` instead (see `SubstepGates::asflip_active`, `encode_substep.rs`).
+    /// Shares `resource_bind_group` (group 3) — see `SimPipelines::new`'s module doc
+    /// comment on why. Set via `attach_asflip_gpu`.
+    asflip_params: GpuAsflipParams,
     /// Real spatial acceleration for `particles_near`/`count_near`/`group_centroid` --
     /// ported from `solver::Simulation`'s already-proven `SpatialHash` (was previously
     /// wired into the CPU-only `Simulation` but not `GpuSimulation`, meaning every
@@ -302,6 +323,9 @@ impl GpuSimulation {
         // Thermal group's buffers are also all fixed grid_res²-sized -- same reasoning.
         let thermal_bind_group = pipelines.make_thermal_bind_group(&device, &buffers);
         let thermal_params = GpuThermalParams::disabled();
+        let resource_bind_group = pipelines.make_resource_bind_group(&device, &buffers);
+        let resource_params = GpuResourceParams::disabled();
+        let asflip_params = GpuAsflipParams::disabled();
 
         let mut spatial_hash = crate::solver::spatial_hash::SpatialHash::new(config.grid_cell_size);
         spatial_hash.rebuild(
@@ -338,6 +362,10 @@ impl GpuSimulation {
             contact_bind_group,
             thermal_bind_group,
             thermal_params,
+            thermal_heat_capacity: None,
+            resource_bind_group,
+            resource_params,
+            asflip_params,
             spatial_hash: std::cell::RefCell::new(spatial_hash),
             spatial_hash_dirty: std::cell::Cell::new(false),
             grip_params,

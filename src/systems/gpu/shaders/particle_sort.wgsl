@@ -43,7 +43,8 @@ struct Particle {
     contact_group:        u32,
     sleeping:             u32,
     pinned:               u32,
-    _pad:                 array<u32, 2>,
+    scalar_field:         f32,
+    _pad:                 u32,
 }
 
 struct StepParams {
