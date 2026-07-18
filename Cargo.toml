@@ -81,6 +81,10 @@ name = "basic_showcase_gpu"
 required-features = ["render"]
 
 [[example]]
+name = "material_sandbox_gpu"
+required-features = ["render"]
+
+[[example]]
 name = "render_physics"
 required-features = ["render"]
 
