@@ -172,6 +172,8 @@ fn bench_g2p(c: &mut Criterion) {
                         vel_limit,
                         apic_blend: 1.0,
                         active_count: fx.n,
+                        pre_force_snapshot: None,
+                        asflip_blend: 0.0,
                     },
                 );
             });
