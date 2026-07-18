@@ -18,6 +18,7 @@ use crate::particle::{Particle, Particles};
 
 const RENDER_SHADER: &str = include_str!("shaders/render_particles.wgsl");
 const PREP_SHADER: &str = include_str!("shaders/prep_instances.wgsl");
+const GRID_VOLUME_SHADER: &str = include_str!("shaders/grid_volume.wgsl");
 const PREP_WG: u32 = 64;
 
 // ── Color mode ────────────────────────────────────────────────────────────────
@@ -36,6 +37,36 @@ pub enum ColorMode {
     /// unused slot after ByActivation's implicit WGSL else-branch) so the GPU shader's
     /// existing fallback `else` can keep meaning ByActivation without renumbering it.
     ByScalarField = 6,
+}
+
+/// Mirrors `grid_volume.wgsl`'s `GridVolumeParams` -- see that shader's own doc for
+/// the real technique (samples the solver's own P2G mass field directly instead of
+/// per-particle splats).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct GridVolumeParams {
+    sx: f32,
+    tx: f32,
+    sy: f32,
+    ty: f32,
+    grid_res: u32,
+    mass_floor: f32,
+    material_mass_enabled: u32,
+    _pad1: f32,
+}
+const _: () = assert!(mem::size_of::<GridVolumeParams>() == 32);
+
+/// Bundles `render_grid_volume`'s buffer args -- same real precedent as
+/// `spacetime::transfer::P2GParticleState` (a struct instead of a suppressed
+/// argument-count lint).
+pub struct GridVolumeSource<'a> {
+    /// `GpuSimulation::grid_buffer()`.
+    pub grid: &'a wgpu::Buffer,
+    /// `GpuSimulation::material_mass_buffer()` -- pass it regardless of whether
+    /// `attach_grid_material_render_gpu` was called; `material_mass_enabled` gates
+    /// whether the shader actually reads it.
+    pub material_mass: &'a wgpu::Buffer,
+    pub material_mass_enabled: bool,
 }
 
 // ── GPU-side structs (must match WGSL) ────────────────────────────────────────
@@ -105,6 +136,16 @@ pub struct Renderer {
     prep_bgl: wgpu::BindGroupLayout,
     render_config_buf: wgpu::Buffer,
     optical_table_buf: wgpu::Buffer,
+
+    grid_volume_pipeline: wgpu::RenderPipeline,
+    grid_volume_bgl: wgpu::BindGroupLayout,
+    grid_volume_params_buf: wgpu::Buffer,
+    /// Cached ortho projection + grid_res (set by `set_camera`) -- lets
+    /// `render_grid_volume` take just (device, queue, grid_buf, material_mass_buf,
+    /// view, clear) instead of repeating width/height/grid_res, keeping it under
+    /// clippy's argument-count lint.
+    cached_ortho: (f32, f32, f32, f32),
+    cached_grid_res: u32,
 
     scratch: Vec<InstanceData>,
     color_mode: ColorMode,
@@ -314,6 +355,65 @@ impl Renderer {
             cache: None,
         });
 
+        // Grid-volume pipeline (samples the solver's own grid mass field) -----------
+        let grid_volume_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("grid_volume_params"),
+            size: mem::size_of::<GridVolumeParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let grid_volume_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("grid_volume_bgl"),
+            entries: &[
+                bgl_storage_ro(0, wgpu::ShaderStages::FRAGMENT),
+                bgl_uniform(1, wgpu::ShaderStages::FRAGMENT),
+                bgl_uniform(2, wgpu::ShaderStages::FRAGMENT),
+                bgl_storage_ro(3, wgpu::ShaderStages::FRAGMENT),
+            ],
+        });
+
+        let grid_volume_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("grid_volume"),
+            source: wgpu::ShaderSource::Wgsl(GRID_VOLUME_SHADER.into()),
+        });
+
+        let grid_volume_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("grid_volume_pipeline"),
+            layout: Some(
+                &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: None,
+                    bind_group_layouts: &[&grid_volume_bgl],
+                    push_constant_ranges: &[],
+                }),
+            ),
+            vertex: wgpu::VertexState {
+                module: &grid_volume_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &grid_volume_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: output_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
         Self {
             render_pipeline,
             render_bind_group,
@@ -326,6 +426,11 @@ impl Renderer {
             prep_pipeline,
             prep_bgl,
             render_config_buf,
+            grid_volume_pipeline,
+            grid_volume_bgl,
+            grid_volume_params_buf,
+            cached_ortho: (1.0, 0.0, 1.0, 0.0),
+            cached_grid_res: 1,
             optical_table_buf,
             scratch: Vec::with_capacity(cap),
             color_mode: ColorMode::ByMaterial,
@@ -340,7 +445,7 @@ impl Renderer {
 
     /// Call at init and on every resize.
     pub fn set_camera(
-        &self,
+        &mut self,
         queue: &wgpu::Queue,
         grid_res: u32,
         width: u32,
@@ -355,6 +460,8 @@ impl Renderer {
         } else {
             (2.0 / gr, -1.0, 2.0 * aspect / gr, -aspect)
         };
+        self.cached_ortho = (sx, tx, sy, ty);
+        self.cached_grid_res = grid_res;
         queue.write_buffer(
             &self.camera_buffer,
             0,
@@ -480,6 +587,103 @@ impl Renderer {
         enc.copy_buffer_to_buffer(&self.storage_instances, 0, &self.instance_buffer, 0, bytes);
         // Render: draw instanced quads from the vertex buffer.
         self.draw_pass(&mut enc, output_view, clear, particle_count);
+        queue.submit(std::iter::once(enc.finish()));
+    }
+
+    // ── Grid-volume render path ────────────────────────────────────────────────
+
+    /// Renders the solver's own grid mass field directly (see `grid_volume.wgsl`'s
+    /// own doc for the real technique). Requires `set_camera` to have been called
+    /// first (same as `render_gpu` needs for its own bind group) -- reuses the
+    /// identical cached orthographic projection/grid_res so both modes line up on
+    /// screen without re-deriving them.
+    pub fn render_grid_volume(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        source: GridVolumeSource,
+        output_view: &wgpu::TextureView,
+        clear: bool,
+    ) {
+        let (sx, tx, sy, ty) = self.cached_ortho;
+        queue.write_buffer(
+            &self.grid_volume_params_buf,
+            0,
+            bytemuck::bytes_of(&GridVolumeParams {
+                sx,
+                tx,
+                sy,
+                ty,
+                grid_res: self.cached_grid_res,
+                mass_floor: 1e-4,
+                material_mass_enabled: source.material_mass_enabled as u32,
+                _pad1: 0.0,
+            }),
+        );
+        write_optical_table(
+            queue,
+            &self.optical_table_buf,
+            &self.sigma_a,
+            &self.sigma_s,
+            &self.specular_r0,
+        );
+
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("grid_volume_bg"),
+            layout: &self.grid_volume_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: source.grid.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.grid_volume_params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.optical_table_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: source.material_mass.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("render_grid_volume"),
+        });
+        let load = if clear {
+            wgpu::LoadOp::Clear(wgpu::Color {
+                r: 0.05,
+                g: 0.05,
+                b: 0.08,
+                a: 1.0,
+            })
+        } else {
+            wgpu::LoadOp::Load
+        };
+        {
+            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("render_grid_volume"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: output_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            rp.set_pipeline(&self.grid_volume_pipeline);
+            rp.set_bind_group(0, &bg, &[]);
+            rp.draw(0..3, 0..1);
+        }
         queue.submit(std::iter::once(enc.finish()));
     }
 

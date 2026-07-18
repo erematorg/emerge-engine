@@ -5,7 +5,8 @@
 //! `step.rs` per that file's own "highest-risk, done last and alone" doc.
 
 use super::super::step_params::{
-    GpuAsflipParams, GpuFieldEntry, GpuResourceParams, GpuThermalParams, MAX_FORCE_FIELDS,
+    GpuAsflipParams, GpuFieldEntry, GpuMaterialMassParams, GpuResourceParams, GpuThermalParams,
+    MAX_FORCE_FIELDS,
 };
 use super::GpuSimulation;
 
@@ -162,6 +163,30 @@ impl GpuSimulation {
             self.resource_bind_group = self
                 .pipelines
                 .make_resource_bind_group(&self.device, &self.buffers);
+        }
+    }
+
+    /// Enable `ColorMode::GridVolume`'s per-cell per-material mass tracking --
+    /// real, opt-in cost (an extra P2G atomic scatter + grid_clear zeroing every
+    /// substep), off by default. Without this, grid-volume rendering still works
+    /// but shades every occupied cell with one material's optics (see
+    /// `grid_volume.wgsl`'s own doc for that honest limitation).
+    ///
+    /// On first call, grows `buffers.material_mass` from its placeholder to real
+    /// `grid_res² x MAX_RENDER_MATERIAL_SLOTS` size and rebuilds `contact_bind_group`
+    /// -- mirrors `attach_asflip_gpu`'s exact lazy-allocation pattern and the same
+    /// real OOM-avoidance reasoning (`buffers.rs`'s `material_mass` doc).
+    pub fn attach_grid_material_render_gpu(&mut self) {
+        self.material_mass_params = GpuMaterialMassParams {
+            enabled: 1,
+            _pad: [0; 3],
+        };
+        if !self.buffers.material_mass_grown {
+            self.buffers
+                .grow_material_mass(&self.device, self.config.grid_res);
+            self.contact_bind_group = self
+                .pipelines
+                .make_contact_bind_group(&self.device, &self.buffers);
         }
     }
 }

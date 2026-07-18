@@ -619,3 +619,32 @@ impl GpuAsflipParams {
 }
 
 const _: () = assert!(core::mem::size_of::<GpuAsflipParams>() == 16);
+
+/// Number of per-cell material-mass render slots -- matches `render::OpticalTable`'s
+/// own real 16-slot cap exactly (that's the actual bottleneck on how many materials
+/// can be visually distinguished anyway, independent of `MAX_MATERIAL_SLOTS`'s larger
+/// 64-material solver cap). `material_id >= 16` collides into slot `material_id % 16`,
+/// same convention `Renderer::set_optical_params` already uses.
+pub const MAX_RENDER_MATERIAL_SLOTS: u32 = 16;
+
+/// Opt-in per-cell per-material mass accumulator for `ColorMode::GridVolume`'s
+/// material-aware coloring (see `grid_volume.wgsl`'s own doc). 0 = disabled
+/// (default) -- P2G skips the extra atomic scatter entirely, zero cost, byte-
+/// identical to before this existed, same gate convention as `GpuAsflipParams`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuMaterialMassParams {
+    pub enabled: u32,
+    pub _pad: [u32; 3],
+}
+
+impl GpuMaterialMassParams {
+    pub fn disabled() -> Self {
+        Self {
+            enabled: 0,
+            _pad: [0; 3],
+        }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<GpuMaterialMassParams>() == 16);

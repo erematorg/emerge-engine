@@ -54,6 +54,19 @@ const BLOCK_THREADS_PER_DIM: u32 = 16u;
 // 256-entry size doesn't match this pass's per-CELL iteration.
 @group(1) @binding(12) var<storage, read_write> grip_grid:               array<Cell>;
 
+struct MaterialMassParams {
+    enabled: u32,
+    _pad0:   u32,
+    _pad1:   u32,
+    _pad2:   u32,
+}
+// `ColorMode::GridVolume`'s opt-in per-cell per-material mass accumulator -- cleared
+// here alongside grid/grip_grid so P2G's atomic scatter starts from zero every
+// substep, same as they do. Real cost only when enabled (see the gate below).
+const MAX_RENDER_MATERIAL_SLOTS: u32 = 16u;
+@group(1) @binding(30) var<storage, read_write> material_mass:        array<f32>;
+@group(1) @binding(31) var<uniform>              material_mass_params: MaterialMassParams;
+
 // Dispatch: (2 * NUM_BLOCKS, 1, 1) workgroups, every frame, fixed — worst case (every block
 // active, in both lists) never overflows. workgroup_id.x is a SLOT, not a block ID. Slots
 // 0..NUM_BLOCKS index THIS substep's active_block_ids; slots NUM_BLOCKS..2*NUM_BLOCKS index
@@ -104,6 +117,12 @@ fn grid_clear_main(
             grip_grid[idx].momentum = vec2<f32>(0.0, 0.0);
             grip_grid[idx].mass     = 0.0;
             grip_grid[idx]._pad     = 0.0;
+            if material_mass_params.enabled != 0u {
+                let mm_base = idx * MAX_RENDER_MATERIAL_SLOTS;
+                for (var s: u32 = 0u; s < MAX_RENDER_MATERIAL_SLOTS; s++) {
+                    material_mass[mm_base + s] = 0.0;
+                }
+            }
             x += BLOCK_THREADS_PER_DIM;
         }
         y += BLOCK_THREADS_PER_DIM;

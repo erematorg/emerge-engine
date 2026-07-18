@@ -252,6 +252,14 @@ impl SimPipelines {
                     storage_entry(18),
                     // 19: grip_params — directional grip friction, resolve_contact.wgsl.
                     uniform_entry(19),
+                    // 30/31: material_mass / material_mass_params — `ColorMode::
+                    // GridVolume`'s opt-in per-cell per-material mass accumulator
+                    // (P2G writes it). Shares this group purely for bind-group-count
+                    // economy (WebGPU's 4-group baseline is already fully used, same
+                    // reason ASFLIP shares group 3 with resource regrowth) — nothing
+                    // to do with contact thematically.
+                    storage_entry(30),
+                    uniform_entry(31),
                 ],
             });
 

@@ -10,7 +10,7 @@ extern crate emerge_engine as emerge;
 use std::sync::Arc;
 
 use emerge::diagnostics::log_frame_gpu;
-use emerge::render::{ColorMode, Renderer};
+use emerge::render::{ColorMode, GridVolumeSource, Renderer};
 use emerge::{
     CorotatedMaterial, GpuSimulation, MaterialRegistry, NeoHookeanMaterial, SimConfig, SpawnRegion,
     ViscoelasticMaterial, build_particles,
@@ -49,6 +49,10 @@ struct State {
     frame: u64,
     fps_timer: std::time::Instant,
     fps_frames: u64,
+    /// Toggle with G -- compares the new grid-volume render (see
+    /// `render_grid_volume`'s own doc) against the default per-particle splat mode,
+    /// live on the exact same running sim.
+    grid_volume_mode: bool,
 }
 
 fn make_sim_data(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) -> GpuSimulation {
@@ -119,9 +123,20 @@ impl State {
         };
         surface.configure(&device, &sc);
         let sim = make_sim_data(Arc::new(device), Arc::new(queue));
+        // REAL BUG FOUND 2026-07-18, NOT YET ROOT-CAUSED: enabling
+        // `attach_grid_material_render_gpu()` here corrupted the actual simulation
+        // (particles scattered/exploded even in the ordinary per-particle splat
+        // render mode, not just grid-volume mode) -- confirmed via a direct A/B,
+        // proving it's a real bug in the new P2G/grid_clear material-mass scatter
+        // path, not a rendering-side issue. Left disabled/disclosed rather than
+        // shipped broken; grid-volume rendering's core mechanism (bilinear-smoothed
+        // single-material density) is unaffected and stays real and verified.
         let mut renderer = Renderer::new(sim.device(), sim.particle_count(), fmt);
         renderer.set_camera(sim.queue(), GRID as u32, size.width, size.height, 0.6, true);
         renderer.set_color_mode(ColorMode::ByMaterial);
+        // Distinct optics per material slot (aesthetic choice, not cited) -- lets
+        // grid-volume mode's per-cell dominant-material coloring actually show a
+        // visible difference between the three materials, not three identical greys.
         println!(
             "jellies GPU: {} particles  |  LMB push  RMB pull  R reset  Q quit",
             sim.particle_count()
@@ -137,6 +152,7 @@ impl State {
             frame: 0,
             fps_timer: std::time::Instant::now(),
             fps_frames: 0,
+            grid_volume_mode: false,
         }
     }
 
@@ -199,14 +215,28 @@ impl State {
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        self.renderer.render_gpu(
-            self.sim.device(),
-            self.sim.queue(),
-            self.sim.particle_buffer(),
-            self.sim.particle_count(),
-            &view,
-            true,
-        );
+        if self.grid_volume_mode {
+            self.renderer.render_grid_volume(
+                self.sim.device(),
+                self.sim.queue(),
+                GridVolumeSource {
+                    grid: self.sim.grid_buffer(),
+                    material_mass: self.sim.material_mass_buffer(),
+                    material_mass_enabled: false,
+                },
+                &view,
+                true,
+            );
+        } else {
+            self.renderer.render_gpu(
+                self.sim.device(),
+                self.sim.queue(),
+                self.sim.particle_buffer(),
+                self.sim.particle_count(),
+                &view,
+                true,
+            );
+        }
         output.present();
     }
 }
@@ -248,6 +278,10 @@ impl ApplicationHandler for App {
             } => match key {
                 KeyCode::Escape | KeyCode::KeyQ => el.exit(),
                 KeyCode::KeyR => s.reset(),
+                KeyCode::KeyG => {
+                    s.grid_volume_mode = !s.grid_volume_mode;
+                    println!("grid_volume_mode={} (G to toggle)", s.grid_volume_mode);
+                }
                 _ => {}
             },
             WindowEvent::Resized(sz) => s.resize(sz.width, sz.height),

@@ -95,10 +95,14 @@ impl SimPipelines {
     }
 
     /// Build the group-1 (contact subsystem) bind group. Unlike `make_bind_group`, this
-    /// takes no `step_params` slot and is built exactly ONCE for a `GpuSimulation`'s
-    /// whole lifetime — none of its buffers are particle-count-scaled, so `spawn_region`
-    /// reallocating `buffers.particles` never invalidates it. See the module doc comment
-    /// on the bind-group-layout split for why this is a separate group at all.
+    /// takes no `step_params` slot and, like every buffer it originally bound, is
+    /// particle-count-independent — `spawn_region` reallocating `buffers.particles`
+    /// never invalidates it. One exception since `material_mass` joined this group
+    /// (bind-group economy, see its own binding comment): that buffer IS replaced once,
+    /// lazily, on first `attach_grid_material_render_gpu` call, so this bind group must
+    /// be rebuilt then too — mirrors `attach_asflip_gpu` rebuilding `resource_bind_group`
+    /// for the exact same reason. See the module doc comment on the bind-group-layout
+    /// split for why this is a separate group at all.
     pub fn make_contact_bind_group(
         &self,
         device: &wgpu::Device,
@@ -139,6 +143,14 @@ impl SimPipelines {
                 wgpu::BindGroupEntry {
                     binding: 19,
                     resource: buffers.grip_params.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 30,
+                    resource: buffers.material_mass.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 31,
+                    resource: buffers.material_mass_params.as_entire_binding(),
                 },
             ],
         })

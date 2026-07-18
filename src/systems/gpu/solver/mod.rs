@@ -17,8 +17,8 @@ mod step;
 use super::buffers::GpuBuffers;
 use super::pipeline::SimPipelines;
 use super::step_params::{
-    GpuAsflipParams, GpuDirectionalGripParams, GpuFieldEntry, GpuImpulseEntry, GpuResourceParams,
-    GpuThermalParams, MAX_MATERIALS, MAX_SLEEP_WAKE_TAGS,
+    GpuAsflipParams, GpuDirectionalGripParams, GpuFieldEntry, GpuImpulseEntry,
+    GpuMaterialMassParams, GpuResourceParams, GpuThermalParams, MAX_MATERIALS, MAX_SLEEP_WAKE_TAGS,
 };
 
 /// Workgroup sizes — must match `@workgroup_size(...)` in the WGSL shaders.
@@ -141,6 +141,11 @@ pub struct GpuSimulation {
     /// Shares `resource_bind_group` (group 3) — see `SimPipelines::new`'s module doc
     /// comment on why. Set via `attach_asflip_gpu`.
     asflip_params: GpuAsflipParams,
+    /// Live `ColorMode::GridVolume` material-mass state -- `enabled: 0` (default)
+    /// skips the extra P2G scatter and grid_clear zeroing entirely. Shares
+    /// `contact_bind_group` (group 1) — see `SimPipelines::make_contact_bind_group`'s
+    /// doc for why. Set via `attach_grid_material_render_gpu`.
+    material_mass_params: GpuMaterialMassParams,
     /// Real spatial acceleration for `particles_near`/`count_near`/`group_centroid` --
     /// ported from `solver::Simulation`'s already-proven `SpatialHash` (was previously
     /// wired into the CPU-only `Simulation` but not `GpuSimulation`, meaning every
@@ -326,6 +331,7 @@ impl GpuSimulation {
         let resource_bind_group = pipelines.make_resource_bind_group(&device, &buffers);
         let resource_params = GpuResourceParams::disabled();
         let asflip_params = GpuAsflipParams::disabled();
+        let material_mass_params = GpuMaterialMassParams::disabled();
 
         let mut spatial_hash = crate::solver::spatial_hash::SpatialHash::new(config.grid_cell_size);
         spatial_hash.rebuild(
@@ -366,6 +372,7 @@ impl GpuSimulation {
             resource_bind_group,
             resource_params,
             asflip_params,
+            material_mass_params,
             spatial_hash: std::cell::RefCell::new(spatial_hash),
             spatial_hash_dirty: std::cell::Cell::new(false),
             grip_params,
@@ -498,6 +505,16 @@ impl GpuSimulation {
     /// Consumers (e.g. LP's metaball renderer) can bind this read-only in their own compute pass.
     pub fn grid_buffer(&self) -> &wgpu::Buffer {
         &self.buffers.grid
+    }
+
+    /// The live GPU per-material mass buffer for `ColorMode::GridVolume`'s
+    /// material-aware coloring. Layout: `array<f32>`, `grid_res² x
+    /// MAX_RENDER_MATERIAL_SLOTS` entries, cell-major then slot-minor (`[cell_idx *
+    /// MAX_RENDER_MATERIAL_SLOTS + material_id % MAX_RENDER_MATERIAL_SLOTS]`). Only
+    /// meaningful after `attach_grid_material_render_gpu` -- before that, this reads
+    /// the (tiny, placeholder-sized) never-written buffer.
+    pub fn material_mass_buffer(&self) -> &wgpu::Buffer {
+        &self.buffers.material_mass
     }
 
     /// Register a material, auto-assigning the next available ID.

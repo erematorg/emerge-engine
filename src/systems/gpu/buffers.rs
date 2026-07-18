@@ -21,8 +21,8 @@ use std::mem;
 
 use super::step_params::{
     ContactDebugParams, GpuAsflipParams, GpuDirectionalGripParams, GpuFieldsParams,
-    GpuImpulseParams, GpuResourceParams, GpuSleepWakeParams, GpuStepParams, GpuThermalParams,
-    MAX_CONTACT_POINTS_PER_BLOCK, NUM_BLOCKS,
+    GpuImpulseParams, GpuMaterialMassParams, GpuResourceParams, GpuSleepWakeParams, GpuStepParams,
+    GpuThermalParams, MAX_CONTACT_POINTS_PER_BLOCK, MAX_RENDER_MATERIAL_SLOTS, NUM_BLOCKS,
 };
 use crate::materials::MaterialParams;
 use crate::particle::Particle;
@@ -205,6 +205,23 @@ pub struct GpuBuffers {
     /// lets `attach_asflip_gpu` skip re-allocating (and rebuilding the bind group that
     /// references it) on every call, only the first.
     pub asflip_snapshot_grown: bool,
+    /// `ColorMode::GridVolume`'s opt-in per-cell per-material mass accumulator (see
+    /// `grid_volume.wgsl`'s own doc for the real technique). Real config uniform,
+    /// same always-present-but-cheap-when-unused pattern as `grip_params`.
+    pub material_mass_params: wgpu::Buffer,
+    /// Dense `grid_res² × MAX_RENDER_MATERIAL_SLOTS × f32` per-material mass
+    /// accumulator, same fixed-point atomic scatter convention as `grid` itself.
+    /// LAZILY allocated, same real reason `asflip_snapshot` is (this is
+    /// `MAX_RENDER_MATERIAL_SLOTS`x the size of the main grid's own mass field --
+    /// unconditionally allocating it for every `GpuSimulation`, the vast majority of
+    /// which never call `attach_grid_material_render_gpu`, would repeat the exact
+    /// OOM risk already found and fixed for ASFLIP). Starts at
+    /// `MATERIAL_MASS_PLACEHOLDER_BYTES` (never read/written while
+    /// `material_mass_params.enabled == 0`).
+    pub material_mass: wgpu::Buffer,
+    /// `true` once `material_mass` has been grown to its real size -- mirrors
+    /// `asflip_snapshot_grown`.
+    pub material_mass_grown: bool,
 }
 
 /// `asflip_snapshot`'s pre-attach size -- large enough to satisfy wgpu's nonzero-buffer
@@ -212,6 +229,11 @@ pub struct GpuBuffers {
 /// size (gated on `asflip_params.enabled`), so its exact value doesn't matter beyond
 /// "nonzero and 8-byte aligned for vec2<f32>".
 const ASFLIP_SNAPSHOT_PLACEHOLDER_BYTES: u64 = 8;
+
+/// `material_mass`'s pre-attach size -- same rationale as
+/// `ASFLIP_SNAPSHOT_PLACEHOLDER_BYTES` (nonzero for wgpu, never actually touched while
+/// disabled).
+const MATERIAL_MASS_PLACEHOLDER_BYTES: u64 = 4;
 
 impl GpuBuffers {
     pub fn new(
@@ -460,6 +482,19 @@ impl GpuBuffers {
             mapped_at_creation: false,
         });
 
+        let material_mass_params = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mpm_material_mass_params"),
+            size: mem::size_of::<GpuMaterialMassParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let material_mass = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mpm_material_mass"),
+            size: MATERIAL_MASS_PLACEHOLDER_BYTES,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
         Self {
             particles,
             grid,
@@ -494,6 +529,9 @@ impl GpuBuffers {
             asflip_params,
             asflip_snapshot,
             asflip_snapshot_grown: false,
+            material_mass_params,
+            material_mass,
+            material_mass_grown: false,
         }
     }
 
@@ -513,6 +551,25 @@ impl GpuBuffers {
             mapped_at_creation: false,
         });
         self.asflip_snapshot_grown = true;
+    }
+
+    /// Grow `material_mass` from its placeholder to real
+    /// `grid_res² x MAX_RENDER_MATERIAL_SLOTS` size -- called once, by
+    /// `GpuSimulation::attach_grid_material_render_gpu` on first use. No-op if already
+    /// grown. Caller must rebuild the contact bind group afterward (its identity
+    /// changes) -- mirrors `grow_asflip_snapshot` exactly.
+    pub fn grow_material_mass(&mut self, device: &wgpu::Device, grid_res: usize) {
+        if self.material_mass_grown {
+            return;
+        }
+        self.material_mass = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mpm_material_mass"),
+            size: (grid_res * grid_res * MAX_RENDER_MATERIAL_SLOTS as usize * mem::size_of::<f32>())
+                as u64,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        self.material_mass_grown = true;
     }
 
     pub fn upload_particles(&self, queue: &wgpu::Queue, particles: &[Particle]) {
@@ -561,6 +618,10 @@ impl GpuBuffers {
 
     pub fn upload_asflip_params(&self, queue: &wgpu::Queue, params: &GpuAsflipParams) {
         queue.write_buffer(&self.asflip_params, 0, bytemuck::bytes_of(params));
+    }
+
+    pub fn upload_material_mass_params(&self, queue: &wgpu::Queue, params: &GpuMaterialMassParams) {
+        queue.write_buffer(&self.material_mass_params, 0, bytemuck::bytes_of(params));
     }
 }
 

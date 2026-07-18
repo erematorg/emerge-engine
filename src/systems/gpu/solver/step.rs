@@ -216,6 +216,12 @@ impl GpuSimulation {
             .upload_asflip_params(&self.queue, &self.asflip_params);
         let asflip_active = self.asflip_params.enabled != 0;
 
+        // `ColorMode::GridVolume` material-mass tracking — same upload pattern, real
+        // per-substep cost (an extra P2G atomic scatter + grid_clear zeroing) only
+        // when `attach_grid_material_render_gpu` has been called.
+        self.buffers
+            .upload_material_mass_params(&self.queue, &self.material_mass_params);
+
         // Force-sleep/force-wake-by-tag — minimal hook for LP's future chunk system.
         // Uploaded every frame (zeroed when nothing's pending, same as ff_params above)
         // and read once per substep in force_fields.wgsl; cleared after upload since

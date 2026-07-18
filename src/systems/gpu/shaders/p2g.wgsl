@@ -80,6 +80,11 @@ const NUM_FLOOR:            f32 = 1e-6;
 // MOM_ATOMIC_SCALE=1e5 gives 1e-5 precision — 100× better than 1e3, avoids overflow at min_dt=0.001.
 const MASS_ATOMIC_SCALE:    f32 = 1000000.0;
 const MOM_ATOMIC_SCALE:     f32 = 100000.0;
+// Matches render::step_params::MAX_RENDER_MATERIAL_SLOTS exactly (Rust-side source of
+// truth) -- render::OpticalTable's own real 16-slot cap, not MAX_MATERIALS' larger
+// 64-material solver cap. material_id >= 16 collides into slot material_id % 16, same
+// convention Renderer::set_optical_params already uses.
+const MAX_RENDER_MATERIAL_SLOTS: u32 = 16u;
 // Multi-field contact (GPU port, first slice) — must match
 // `step_params::MAX_CONTACT_POINTS_PER_BLOCK` (Rust-side source of truth, sizes the
 // `contact_points` buffer at construction) exactly, same duplicated-constant
@@ -104,6 +109,18 @@ override NUM_BLOCKS_PER_DIM: u32;
 @group(1) @binding(12) var<storage, read_write> grip_grid_atomic:     array<atomic<i32>>;
 @group(1) @binding(13) var<storage, read_write> contact_points:       array<vec4<f32>>;
 @group(1) @binding(14) var<storage, read_write> contact_point_counts: array<atomic<u32>>;
+
+struct MaterialMassParams {
+    enabled: u32,
+    _pad0:   u32,
+    _pad1:   u32,
+    _pad2:   u32,
+}
+// `ColorMode::GridVolume`'s opt-in per-cell per-material mass accumulator -- see
+// buffers.rs's `material_mass` doc. Shares group 1 purely for bind-group economy
+// (same reason ASFLIP shares group 3), nothing to do with contact thematically.
+@group(1) @binding(30) var<storage, read_write> material_mass_atomic: array<atomic<i32>>;
+@group(1) @binding(31) var<uniform>              material_mass_params: MaterialMassParams;
 
 // Exact copy of particle_sort.wgsl's block_index — WGSL has no cross-file includes, so
 // this is duplicated the same way MASS_ATOMIC_SCALE etc. already are across shader
@@ -329,6 +346,9 @@ fn atomic_addf_mom(idx: u32, val: f32) {
 fn grip_atomic_addf_mass(idx: u32, val: f32) {
     atomicAdd(&grip_grid_atomic[idx], i32(round(val * MASS_ATOMIC_SCALE)));
 }
+fn material_mass_atomic_addf(idx: u32, val: f32) {
+    atomicAdd(&material_mass_atomic[idx], i32(round(val * MASS_ATOMIC_SCALE)));
+}
 fn grip_atomic_addf_mom(idx: u32, val: f32) {
     atomicAdd(&grip_grid_atomic[idx], i32(round(val * MOM_ATOMIC_SCALE)));
 }
@@ -413,6 +433,15 @@ fn p2g_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 grip_atomic_addf_mom(base4 + 0u, apic_mom.x + stress_mom.x);
                 grip_atomic_addf_mom(base4 + 1u, apic_mom.y + stress_mom.y);
                 grip_atomic_addf_mass(base4 + 2u, mass_w);
+            }
+
+            // `ColorMode::GridVolume`'s opt-in per-cell per-material mass scatter --
+            // real, gated cost: skipped entirely (branch not taken) when disabled,
+            // matching every other opt-in GPU subsystem's zero-cost-when-unused gate.
+            if material_mass_params.enabled != 0u {
+                let cell_idx = u32(cy) * res + u32(cx);
+                let slot = p.material_id % MAX_RENDER_MATERIAL_SLOTS;
+                material_mass_atomic_addf(cell_idx * MAX_RENDER_MATERIAL_SLOTS + slot, mass_w);
             }
         }
     }
