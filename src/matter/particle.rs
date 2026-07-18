@@ -98,8 +98,8 @@ pub struct Particle {
     /// Dirichlet BC in continuum-mechanics terms, not a hack). Real motivating case: a
     /// terrain slab with no pinned particles is an ordinary free body that slowly drifts
     /// under the accumulated reaction force of everything standing/walking on it (real,
-    /// measured live -- terrain centroid crept y=3.8->7.1 over one `walking_creature`
-    /// run); a thin pinned "bedrock" layer under the free top layer anchors the whole
+    /// measured live -- terrain centroid crept y=3.8->7.1 over one foothold-seeking
+    /// locomotion prototype run); a thin pinned "bedrock" layer under the free top layer anchors the whole
     /// body while the top layer still deforms naturally underfoot.
     pub pinned: u32,
     /// Generic second scalar carrier -- for any `ScalarDiffusionField`-shaped quantity

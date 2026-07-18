@@ -636,8 +636,8 @@ impl State {
             // CPG), and `RatchetFrictionBoundary`'s hardcoded default
             // `easy_direction=Vec2::X` gave that unbiased crawl a real, fast,
             // dominant direction from frame 1 -- a "neutral" state that wasn't
-            // actually neutral. `walking_creature.rs` already established the right
-            // pattern for this elsewhere in the project: "only replans... while a
+            // actually neutral. An earlier foothold-seeking locomotion prototype
+            // already established the right pattern for this: "only replans... while a
             // direction is actively held; with no input, legs simply stop and
             // rest" -- basic_creature never applied that same gate. Fixed:
             // muscle activation (and the CPG clock itself) only run while
