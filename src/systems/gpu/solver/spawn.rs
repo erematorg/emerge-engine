@@ -65,6 +65,14 @@ impl GpuSimulation {
         });
 
         self.particle_count = n;
+        // Real bug fix (2026-07-18): re-arm the sleep-warmup window (see
+        // `last_spawn_frame`'s own doc) so freshly-spawned particles get the same
+        // "don't sleep-score yet" grace period the initial construction batch
+        // already got, instead of getting the real sleep_threshold applied at
+        // v=0 on their very first substep -- confirmed live as the actual cause
+        // of `material_sandbox_gpu`'s painted particles never responding to
+        // gravity (Force impulses still worked, since that's a separate wake path).
+        self.last_spawn_frame = self.frame_index;
         self.pending_readback = None; // old staging is gone
         self.buffers.upload_particles(&self.queue, &self.particles);
         // buffers.particles was just reallocated above -- cached bind groups reference

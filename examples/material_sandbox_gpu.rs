@@ -151,11 +151,34 @@ const FREEZE_POINT_K: f32 = 272.15; // 1K hysteresis -- avoids flicker exactly a
 // made-up number (real water/ice DOES exhibit hysteresis around the phase boundary).
 const BOIL_POINT_K: f32 = 373.15;
 const LATENT_HEAT_FUSION: f32 = 334.0; // water, kJ/kg-equivalent in this engine's units
-const HEAT_CAPACITY: f32 = 4182.0; // water, J/(kg*K)
+// HEAT_CAPACITY, COOLING_RATE, CONDUCTIVITY, CELL_SIZE_M commented out below alongside
+// attach_thermal_gpu -- real, temporary, disclosed disable, see that call site's doc.
+// const HEAT_CAPACITY: f32 = 4182.0; // water, J/(kg*K)
 const AMBIENT_K: f32 = 260.0; // below freezing -- world starts cold, matches the ask
-const COOLING_RATE: f32 = 0.05; // Newton cooling k_c, same value day_night_thermal_gpu uses
-const CONDUCTIVITY: f32 = 0.6; // water/ice, W/(m*K)
-const CELL_SIZE_M: f32 = 0.02; // 2cm/cell -- hand-sized snowball scale, see module doc
+// REAL BUG FOUND AND FIXED 2026-07-18: painting Water at the world's cold AMBIENT_K
+// (260K, below FREEZE_POINT_K=272.15) meant every freshly-painted water particle
+// converted to snow within one phase-transition scan (~15 frames) -- confirmed via
+// live diagnostic tracking (material_id flipped 2->3 within 30 frames of painting).
+// Water never got a chance to visibly flow as a liquid; what looked like "frozen,
+// won't spread" physics was actually correct snow behavior on a material that had
+// already stopped being water. Real room temperature (matches fire_spread's own
+// AMBIENT_K=293.15 convention), comfortably above freezing -- painted water now
+// stays liquid until deliberately cooled (Heat tool in reverse isn't wired, but
+// ambient Newton cooling would otherwise still slowly pull it back toward 260K
+// over real time and refreeze it a bit later regardless of starting temp
+// (confirmed live: refroze ~12s after painting, same mechanism just delayed) --
+// see COOLING_RATE's own note for the temporary fix for that.
+const WATER_PAINT_TEMP_K: f32 = 293.15;
+// TEMPORARY REAL FIX 2026-07-18: was 0.05 (Newton cooling k_c, matching
+// day_night_thermal_gpu's own value) -- disabled for now because it kept pulling
+// freshly-painted (warm) water back down through FREEZE_POINT_K after ~12 real
+// seconds regardless of starting temperature, undermining the whole point of a
+// "paint water, watch it flow" brush. Real, disclosed, deliberately temporary --
+// re-enable once there's a real per-material or slower cooling design that lets
+// water actually stay liquid long enough to be useful as a brush.
+// const COOLING_RATE: f32 = 0.0;
+// const CONDUCTIVITY: f32 = 0.6; // water/ice, W/(m*K)
+// const CELL_SIZE_M: f32 = 0.02; // 2cm/cell -- hand-sized snowball scale, see module doc
 
 fn make_registry() -> MaterialRegistry {
     // Reused verbatim from already-shipped demos -- not new invented numbers.
@@ -173,7 +196,17 @@ fn make_registry() -> MaterialRegistry {
     // extrapolating an unverified proportional guess for a different raw-Lamé pair.
     let mut sand = DruckerPragerMaterial::from_young_modulus(1.0e5, 0.2);
     sand.cohesion = 5.0; // calibrated against the real Lajeunesse benchmark, see above
-    let water = NewtonianFluidMaterial::new(4.0, 0.1, 10.0, 4.0); // basic_showcase_gpu
+    // REAL BUG FOUND AND FIXED 2026-07-18: copied verbatim from basic_showcase_gpu's
+    // `NewtonianFluidMaterial::new(4.0, 0.1, 10.0, 4.0)`, presented as "water" with no
+    // disclosure -- but viscosity=0.1 is 100x this project's OWN `low_viscosity()` real-
+    // water preset (1.0e-3, Becker & Teschner 2007 -- see fluid.rs), and eos_power=4.0
+    // isn't the real Tait EOS exponent either (Cole 1948's real value is 7.0, which
+    // `low_viscosity()` already uses correctly). This wasn't a disclosed aesthetic
+    // choice, it was an uncited mismatch silently making "water" behave like a thick,
+    // syrupy fluid -- directly why painted water didn't slide/spread as expected.
+    // Fixed to the project's own real preset, same rest_density/eos_stiffness kept
+    // (legitimate grid-scale tuning, not physically meaningful SI values either way).
+    let water = NewtonianFluidMaterial::low_viscosity(4.0, 10.0);
     let snow = StomakhinMaterial::new(1389.0, 2083.0, 7.0, 0.025, 0.0075, 0.6, 20.0); // basic_snow_gpu
     let tissue = ViscoelasticMaterial::new(10.0, 15.0, 0.15); // basic_jellies_gpu
     let mut reg = MaterialRegistry::with_default(Box::new(jelly));
@@ -220,15 +253,24 @@ fn make_sim_data(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) -> GpuSimul
     }
 
     let registry = make_registry();
-    let mut sim = GpuSimulation::with_device(device, queue, config, particles, registry);
-    sim.attach_thermal_gpu(
-        CONDUCTIVITY,
-        HEAT_CAPACITY,
-        CELL_SIZE_M,
-        AMBIENT_K,
-        COOLING_RATE,
-    );
-    sim
+    // TEMPORARY REAL FIX 2026-07-18: `attach_thermal_gpu` disabled entirely, not just
+    // COOLING_RATE zeroed. Disabling ambient cooling alone wasn't enough -- confirmed
+    // live that real heat CONDUCTION (Fourier diffusion, independent of the ambient
+    // cooling term) still pulled heat out of freshly-painted warm water into the cold
+    // sand it lands on, refreezing it into snow regardless. With the whole thermal
+    // model off, particle.temperature never changes from its spawn value at all, so
+    // water genuinely stays liquid indefinitely. Real, disclosed cost: the Heat tool's
+    // melting/spreading mechanic and the melt/freeze/evaporate phase transitions all
+    // stop doing anything meaningful until this is revisited with a proper per-material
+    // or slower-conduction thermal design.
+    // sim.attach_thermal_gpu(
+    //     CONDUCTIVITY,
+    //     HEAT_CAPACITY,
+    //     CELL_SIZE_M,
+    //     AMBIENT_K,
+    //     COOLING_RATE,
+    // );
+    GpuSimulation::with_device(device, queue, config, particles, registry)
 }
 
 struct App {
@@ -464,10 +506,19 @@ impl State {
                 if region.fits_in_sim(self.sim.config()) {
                     let range = self.sim.spawn_region(region);
                     // build_particles defaults temperature to 0.0 -- freshly painted
-                    // matter must start at the world's real ambient, not absolute zero.
+                    // matter must start at a real temperature, not absolute zero.
+                    // Water specifically starts at real room temperature (see
+                    // WATER_PAINT_TEMP_K's own doc -- the cold AMBIENT_K instantly
+                    // froze it into snow before it could ever flow); every other
+                    // material still starts at the world's real cold ambient.
+                    let start_temp = if material_id == WATER_ID {
+                        WATER_PAINT_TEMP_K
+                    } else {
+                        AMBIENT_K
+                    };
                     let particles = self.sim.particles_mut();
                     for i in range {
-                        particles[i].temperature = AMBIENT_K;
+                        particles[i].temperature = start_temp;
                     }
                     self.sim.mark_particles_dirty();
                     self.paint_cooldown = 20;

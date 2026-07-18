@@ -160,13 +160,20 @@ impl GpuSimulation {
         // Bullet all require sustained low velocity before sleeping, never an instant
         // single-frame check). Can't add a per-particle timer here (Particle has no
         // spare bytes left), so this is the simulation-level equivalent: don't let
-        // anything sleep-score for the first few frames after construction, giving
-        // real dynamics a chance to start. Once any particle exists, GPU has no
-        // incremental add API (everything is introduced at construction), so this
-        // covers every particle that will ever exist in this simulation, not just the
-        // initial batch.
+        // anything sleep-score for the first few frames after the most recent spawn,
+        // giving real dynamics a chance to start.
+        //
+        // REAL BUG FOUND AND FIXED 2026-07-18: this used to check `frame_index` alone,
+        // under the assumption "GPU has no incremental add API... this covers every
+        // particle that will ever exist" -- false for any scene that calls
+        // `spawn_region` live, mid-session (e.g. `material_sandbox_gpu`'s paint tool).
+        // A particle painted long after frame 10 got the real `sleep_threshold` applied
+        // on its very first substep at v=0, trivially satisfying it and freezing it
+        // asleep before gravity ever touched it -- confirmed live (Force impulses still
+        // moved it, a separate wake path). Fixed by re-arming this window from
+        // `last_spawn_frame` (updated by `spawn_region`) instead of frame 0 alone.
         const SLEEP_WARMUP_FRAMES: u64 = 10;
-        let step_config = if self.frame_index <= SLEEP_WARMUP_FRAMES {
+        let step_config = if self.frame_index <= self.last_spawn_frame + SLEEP_WARMUP_FRAMES {
             SimConfig {
                 sleep_threshold: 0.0,
                 ..self.config

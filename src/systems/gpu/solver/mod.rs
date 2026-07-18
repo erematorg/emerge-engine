@@ -52,6 +52,19 @@ pub struct GpuSimulation {
     last_sub_dt: f32,
     last_substeps: usize,
     frame_index: u64,
+    /// `frame_index` at the most recent `spawn_region` call (0 = only the initial
+    /// construction batch exists). REAL BUG FOUND 2026-07-18: `step_frame`'s sleep-
+    /// warmup window (`SLEEP_WARMUP_FRAMES`) used to check `frame_index` alone,
+    /// under the explicit (but, for a live-spawning scene, false) assumption that
+    /// "GPU has no incremental add API... this covers every particle that will
+    /// ever exist." A particle spawned live (e.g. `material_sandbox_gpu`'s paint
+    /// tool) long after frame 10 got the real `sleep_threshold` applied on its
+    /// very first substep at v=0, trivially satisfying it and marking it asleep
+    /// before gravity ever touched it -- frozen in place forever, confirmed live
+    /// (Force impulses still moved it, since that's a separate wake path).
+    /// Tracked here so the warmup window can re-arm on every spawn, not just once
+    /// at construction.
+    last_spawn_frame: u64,
     /// GPU force-field entries — uploaded to the force_fields_params uniform each substep.
     force_field_entries: Vec<GpuFieldEntry>,
     /// Frame counter used to stride CPU readbacks when all materials are GPU-resident.
@@ -352,6 +365,7 @@ impl GpuSimulation {
             last_sub_dt: config.dt,
             last_substeps: 0,
             frame_index: 0,
+            last_spawn_frame: 0,
             force_field_entries: Vec::new(),
             readback_frame: 0,
             readback_stride: 1,
