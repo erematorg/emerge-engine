@@ -85,7 +85,7 @@ pub enum PlasticityModel {
 
     /// µ(I)-rheology rate-dependent granular flow (Cicoira et al. DPMui, see
     /// `MuIRheologyMaterial`'s own doc for the full, corrected citation).
-    /// Better for dense granular at high shear rates. CPU-only.
+    /// Better for dense granular at high shear rates. CPU + GPU.
     /// → `MuIRheologyMaterial`
     GranularRateDependent {
         /// Static friction angle `[degrees]`.
@@ -102,7 +102,7 @@ pub enum PlasticityModel {
     },
 
     /// Tensile cutoff + exponential softening (Rankine criterion).
-    /// Models brittle fracture under tension. CPU-only.
+    /// Models brittle fracture under tension. CPU + GPU.
     /// → `RankineMaterial`
     Brittle {
         /// Tensile strength `[Pa]`. Fracture initiates above this.
@@ -150,6 +150,17 @@ pub struct FluidGranular {
 }
 
 impl FluidGranular {
+    // REAL API FIX (2026-07-19): these three presets used to share their exact
+    // names (`saturated_loam`/`consolidated_clay`/`cytoplasmic`) with
+    // `GranularFluidMaterial`'s own, DIFFERENT presets in `granular_fluid.rs`
+    // (zero-arg fixed-SI-literature-value here vs. parameterized
+    // `(young_modulus, poisson_ratio)` there) -- a real ambiguity risk, not
+    // just a style nit. Suffixed `_preset` to mark these as the fixed-value
+    // convenience layer; `GranularFluidMaterial`'s parameterized versions
+    // (same names, no suffix) are the unambiguous, SI-consistent primary entry
+    // point -- use those directly unless you specifically want this property
+    // family's fixed literature-style defaults.
+
     /// Saturated loam — yields easily, flows slowly under sustained load.
     ///
     /// HONEST DISCLOSURE (audit 2026-07-17, same finding as `GranularFluidMaterial`'s
@@ -163,7 +174,7 @@ impl FluidGranular {
     /// implicit "this is measured" claim than a dimensionless test parameter would, so
     /// this needs the same honest flag: real conversion math, unverified specific
     /// numbers, not yet a literature-sourced material.
-    pub fn saturated_loam() -> Self {
+    pub fn saturated_loam_preset() -> Self {
         Self {
             rho_kg_m3: 1800.0,
             bulk_modulus_pa: 2.0e5,
@@ -179,7 +190,7 @@ impl FluidGranular {
     ///
     /// Same honest disclosure as `saturated_loam` above: real conversion mechanism,
     /// unverified specific SI values.
-    pub fn consolidated_clay() -> Self {
+    pub fn consolidated_clay_preset() -> Self {
         Self {
             rho_kg_m3: 2000.0,
             bulk_modulus_pa: 8.0e5,
@@ -197,7 +208,7 @@ impl FluidGranular {
     /// unverified specific SI values (though `e_pa=500` is at least in the right real
     /// ballpark per AFM cytoplasm-stiffness literature -- not yet tied to a specific
     /// paper).
-    pub fn cytoplasmic() -> Self {
+    pub fn cytoplasmic_preset() -> Self {
         Self {
             rho_kg_m3: 1050.0,
             bulk_modulus_pa: 2.0e4,
@@ -418,6 +429,6 @@ mod _ref {
         let _ = STIFF_BRITTLE.material(&config);
         let _ = LOW_VISCOSITY_FLUID.material(&config);
         let _ = VISCOPLASTIC_FLUID.material(&config);
-        let _ = FluidGranular::saturated_loam().material(&config);
+        let _ = FluidGranular::saturated_loam_preset().material(&config);
     }
 }

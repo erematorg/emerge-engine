@@ -60,6 +60,19 @@ pub struct SimSnapshot {
     /// Wall-clock time breakdown for the last `step()` call. All values in microseconds.
     /// Accumulated across all substeps — divide by `substeps_last_step` for per-substep cost.
     pub timing: StepTiming,
+    /// Total kinetic energy (sum of `0.5 * mass * |v|^2`) across all particles.
+    /// Real, generic sanity signal for ANY scene: should decay toward a steady value
+    /// under damping (viscous/plastic materials) or oscillate boundedly for a purely
+    /// elastic one — unbounded growth with no external force driving it is a real bug,
+    /// not just "high energy."
+    pub total_kinetic_energy: f32,
+    /// Max speed among particles with `Particle::pinned != 0`. Should read exactly 0.0
+    /// for any scene using pinned/Dirichlet anchors — G2P forces `v=0` on pinned
+    /// particles every substep (see `transfer.rs`). Nonzero here means the pinning
+    /// mechanism itself is broken (a real engine bug), not a scene-tuning issue —
+    /// added specifically so this class of bug is directly observable instead of
+    /// inferred indirectly from a body slowly drifting.
+    pub max_pinned_particle_speed: f32,
 }
 
 /// Wall-clock timing breakdown for one `step()` call (sum of all substeps).
@@ -124,6 +137,10 @@ pub fn collect_snapshot_particles_only(
         snap.total_particle_mass += p.mass;
         snap.total_particle_momentum += p.mass * p.v;
         snap.max_particle_speed = snap.max_particle_speed.max(p.v.length());
+        snap.total_kinetic_energy += 0.5 * p.mass * p.v.length_squared();
+        if p.pinned != 0 {
+            snap.max_pinned_particle_speed = snap.max_pinned_particle_speed.max(p.v.length());
+        }
         if deformation_j.is_finite() {
             snap.min_deformation_j = snap.min_deformation_j.min(deformation_j);
             snap.max_deformation_j = snap.max_deformation_j.max(deformation_j);
@@ -242,6 +259,10 @@ pub fn collect_snapshot(
         snapshot.total_particle_mass += mass;
         snapshot.total_particle_momentum += mass * v;
         snapshot.max_particle_speed = snapshot.max_particle_speed.max(v.length());
+        snapshot.total_kinetic_energy += 0.5 * mass * v.length_squared();
+        if particles.pinned[i] != 0 {
+            snapshot.max_pinned_particle_speed = snapshot.max_pinned_particle_speed.max(v.length());
+        }
 
         if deformation_j.is_finite() {
             snapshot.min_deformation_j = snapshot.min_deformation_j.min(deformation_j);

@@ -38,6 +38,8 @@ pub use crate::{
 
     Fluid,
     FluidGranular,
+    // Per-material stats + logging
+    FrameLogger,
     FrictionBoundary,
     FromSI,
     GranularFluidMaterial,
@@ -54,6 +56,7 @@ pub use crate::{
     MaterialHandle,
     MaterialModel,
     MaterialParams,
+    MaterialStats,
     MuIRheologyMaterial,
     NBodyGravityField,
     NaccMaterial,
@@ -81,6 +84,9 @@ pub use crate::{
     SlipBoundary,
     SpawnRegion,
     SpawnShape,
+    StabilityStatus,
+    StabilityThresholds,
+    StepTiming,
     StomakhinMaterial,
     // Thermodynamics
     ThermalConfig,
@@ -95,10 +101,17 @@ pub use crate::{
     // Particle construction helpers
     build_particles,
     collect_snapshot,
+    collect_snapshot_particles_only,
+    evaluate_stability,
     gravity_to_grid,
 
     lame_from_si,
     lame_from_young,
+    log_frame,
+    log_frame_full,
+    log_frame_gpu,
+    per_material_stats,
+    per_material_stats_of,
     rankine_damage_estimate,
 };
 

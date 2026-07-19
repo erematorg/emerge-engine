@@ -102,6 +102,10 @@ name = "mixture_sand_water"
 required-features = ["render"]
 
 [[example]]
+name = "basic_plant"
+required-features = ["render"]
+
+[[example]]
 name = "basic_jellies"
 required-features = ["render"]
 

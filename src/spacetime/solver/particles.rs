@@ -25,6 +25,15 @@ impl Simulation {
     /// model is configured (`with_thermal`/`set_thermal`), debits `temperature` by
     /// `latent_heat / heat_capacity` for every transitioned particle — see
     /// `MaterialModel::latent_heat` for the sign convention.
+    ///
+    /// Real bug fixed 2026-07-19: this used to leave every material-specific plastic
+    /// field (`hardening_scale`, `friction_hardening`, `plastic_volume_ratio`, etc.)
+    /// untouched across the swap, so a transitioned particle silently inherited stale
+    /// state from its OLD material, reinterpreted under the new material's own
+    /// semantics for that same field (e.g. Rankine's damage accumulator read as
+    /// Drucker-Prager's friction accumulator). Now calls the new material's own
+    /// `init_particle` right after the swap, exactly like `reinit_all_particle_state`
+    /// and `add_body` already do for every other material-assignment path.
     pub fn phase_transition<F>(&mut self, predicate: F, new_material_id: u32)
     where
         F: Fn(&Particle) -> bool,
@@ -43,6 +52,9 @@ impl Simulation {
                 if let (true, Some(cp)) = (latent_heat != 0.0, heat_capacity) {
                     self.particles.temperature[i] -= latent_heat / cp;
                 }
+                let mut p = self.particles.get(i);
+                self.materials.get(new_material_id).init_particle(&mut p);
+                self.particles.set(i, p);
             }
         }
     }

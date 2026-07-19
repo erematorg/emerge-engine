@@ -224,6 +224,19 @@ impl Simulation {
                 field.prepare(&self.particles);
             }
             for i in 0..self.active_count {
+                // Dirichlet/kinematic anchor (`Particle::pinned`): must stay at v=0,
+                // matching G2P's own unconditional pinned branch just before this pass.
+                // Force fields ran AFTER G2P with no pinned check, silently un-zeroing
+                // pinned particles' velocity every substep -- P2G then scatters that as
+                // real momentum next substep (`scatter_particles_to_grid` doesn't special-
+                // case pinned particles either, since a pinned particle's mass/stress
+                // SHOULD still be felt by neighbors, just not its velocity). A supposedly-
+                // fixed anchor was quietly injecting wind-driven momentum into the grid
+                // every substep -- a real, confirmed root cause of long-horizon energy
+                // injection at every pinned+force-field composition, not just this scene.
+                if self.particles.pinned[i] != 0 {
+                    continue;
+                }
                 let mut dv = Vec2::ZERO;
                 for (_, field) in &fields {
                     dv += field.acceleration(&self.particles, i);
@@ -235,6 +248,9 @@ impl Simulation {
             // creature bursts, planetary impacts) must not enter P2G with >1 cell/substep.
             let vel_limit = self.config.grid_cell_size / sub_dt;
             for i in 0..self.active_count {
+                if self.particles.pinned[i] != 0 {
+                    continue;
+                }
                 let spd = self.particles.v[i].length();
                 if spd > vel_limit {
                     self.particles.v[i] *= vel_limit / spd;
@@ -267,6 +283,13 @@ impl Simulation {
                         if let (true, Some(cp)) = (latent_heat != 0.0, heat_capacity) {
                             self.particles.temperature[i] -= latent_heat / cp;
                         }
+                        // See `Simulation::phase_transition`'s doc: reset
+                        // material-specific plastic state to the new material's
+                        // own defaults instead of silently inheriting the old
+                        // material's stale values under a different meaning.
+                        let mut p = self.particles.get(i);
+                        self.materials.get(new_id).init_particle(&mut p);
+                        self.particles.set(i, p);
                         break;
                     }
                 }

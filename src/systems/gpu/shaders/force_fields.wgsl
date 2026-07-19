@@ -153,6 +153,16 @@ fn force_fields_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // entirely (`for i in 0..self.active_count`). No writeback needed: nothing changes.
     if p.sleeping != 0u { return; }
 
+    // Dirichlet/kinematic anchor (`Particle::pinned`): must stay at v=0, matching
+    // g2p.wgsl's own unconditional pinned branch earlier in the same substep. This
+    // pass runs AFTER g2p with no pinned check, silently un-zeroing pinned
+    // particles' velocity every substep — p2g.wgsl then scatters that as real
+    // momentum next substep (p2g doesn't special-case pinned particles either,
+    // since a pinned particle's mass/stress should still be felt by neighbors,
+    // just not its velocity). Mirrors the real CPU bug fixed the same way in
+    // step.rs's force-fields loop.
+    if p.pinned != 0u { return; }
+
     let dt = step_params.dt;
 
     // force_fields.count == 0u is handled by the loop condition below (i < count

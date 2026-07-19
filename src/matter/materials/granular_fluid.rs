@@ -52,6 +52,37 @@ pub struct GranularFluidMaterial {
 }
 
 impl GranularFluidMaterial {
+    /// Raw field constructor, for consistency with every other material struct
+    /// in this crate (`sand.rs`/`fluid.rs`/`snow.rs`/etc. all have a `::new()`
+    /// — this was the sole exception). Takes the physically-meaningful
+    /// parameters directly; the remaining numerical-stability fields default
+    /// to the same values the `saturated_loam` preset already uses (eos_power
+    /// 7.0 = standard near-incompressible Tait EOS, pressure_floor 0.0 = no
+    /// tensile). For a ready-made preset, prefer `saturated_loam`/
+    /// `consolidated_clay`/`cytoplasmic` instead.
+    pub fn new(
+        lambda: f32,
+        mu: f32,
+        rest_density: f32,
+        eos_stiffness: f32,
+        hardening_exponent: f32,
+        compression_limit: f32,
+    ) -> Self {
+        Self {
+            mu,
+            lambda,
+            rest_density,
+            eos_stiffness,
+            eos_power: 7.0,
+            hardening_exponent,
+            compression_limit,
+            stretch_limit: 0.01,
+            min_plastic_jacobian: 0.2,
+            max_plastic_jacobian: 3.0,
+            pressure_floor: 0.0,
+        }
+    }
+
     /// Saturated loam: eos_stiffness=200, ξ=5, θ_c=0.4 — yields easily, flows under load.
     ///
     /// HONEST DISCLOSURE (audit 2026-07-17): the constitutive LAW above (Tait EOS +

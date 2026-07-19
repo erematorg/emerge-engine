@@ -61,7 +61,7 @@ impl FrameLogger {
             };
 
         let mut line = format!(
-            "{{\"frame\":{},\"dt\":{:.4},\"active\":{},\"sleeping\":{},\"substeps\":{},\"cfl\":{:.4},\"j\":[{:.4},{:.4}],\"health\":\"{}\"",
+            "{{\"frame\":{},\"dt\":{:.4},\"active\":{},\"sleeping\":{},\"substeps\":{},\"cfl\":{:.4},\"j\":[{:.4},{:.4}],\"ke\":{:.4},\"health\":\"{}\"",
             frame,
             dt,
             snap.active_count,
@@ -70,8 +70,21 @@ impl FrameLogger {
             snap.cfl_number,
             snap.min_deformation_j,
             snap.max_deformation_j,
+            snap.total_kinetic_energy,
             health,
         );
+
+        // Real, generic sanity check: any pinned/Dirichlet-anchored particle should
+        // read exactly v=0 (see `SimSnapshot::max_pinned_particle_speed`'s own doc) —
+        // only emitted when the scene actually uses `Particle::pinned` (nonzero here
+        // means either real motion at an anchor -- a genuine engine bug -- or, more
+        // often, that no particle is pinned at all, in which case this stays absent).
+        if snap.max_pinned_particle_speed > 0.0 {
+            line.push_str(&format!(
+                ",\"pinned_v\":{:.6}",
+                snap.max_pinned_particle_speed
+            ));
+        }
 
         // Optional warn fields — only when non-zero.
         if snap.vel_clamp_count > 0 {

@@ -50,6 +50,57 @@ fn collect_and_evaluate_basic_snapshot() {
 }
 
 #[test]
+fn snapshot_reports_kinetic_energy_and_pinned_particle_speed() {
+    // Real, direct check for the two diagnostics fields added 2026-07-19
+    // (see `project_basic_plant_forcing_function_2026-07-19` memory): total
+    // kinetic energy must match the exact sum of 0.5*m*|v|^2, and a pinned
+    // particle's own speed must be surfaced separately -- this is the sanity
+    // signal that catches a broken `Particle::pinned` mechanism directly,
+    // rather than inferring it from a body slowly drifting.
+    let config = make_config(8);
+
+    let free = Particle {
+        x: Vec2::new(4.0, 4.0),
+        v: Vec2::new(3.0, 0.0),
+        mass: 2.0,
+        initial_volume: 1.0,
+        volume: 1.0,
+        density: 1.0,
+        ..Particle::zeroed()
+    };
+    let pinned = Particle {
+        x: Vec2::new(5.0, 4.0),
+        v: Vec2::new(0.0, 0.4), // real bug if nonzero in a truly pinned scene
+        mass: 1.0,
+        initial_volume: 1.0,
+        volume: 1.0,
+        density: 1.0,
+        pinned: 1,
+        ..Particle::zeroed()
+    };
+    let particles = Particles::from(vec![free, pinned]);
+
+    let mut grid = Grid::new(config.grid_res);
+    grid.add_mass_momentum(IVec2::new(4, 4), 2.0, Vec2::new(6.0, 0.0));
+    grid.add_mass_momentum(IVec2::new(5, 4), 1.0, Vec2::new(0.0, 0.4));
+
+    let snapshot = collect_snapshot(0, &particles, &grid, &config, config.dt, 1);
+
+    let expected_ke = 0.5 * 2.0 * 3.0f32.powi(2) + 0.5 * 1.0 * 0.4f32.powi(2);
+    assert!(
+        (snapshot.total_kinetic_energy - expected_ke).abs() < 1e-5,
+        "expected KE={expected_ke}, got {}",
+        snapshot.total_kinetic_energy
+    );
+    assert!(
+        (snapshot.max_pinned_particle_speed - 0.4).abs() < 1e-5,
+        "expected max_pinned_particle_speed=0.4 (the pinned particle's own speed, \
+         ignoring the faster free particle), got {}",
+        snapshot.max_pinned_particle_speed
+    );
+}
+
+#[test]
 fn empty_particle_snapshot_is_unhealthy() {
     let config = make_config(8);
     let grid = Grid::new(config.grid_res);

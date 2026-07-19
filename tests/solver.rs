@@ -367,6 +367,81 @@ fn phase_transition_switches_material_ids() {
     assert_eq!(fluid_count + jelly_count, solver.particles().len());
 }
 
+/// Sets a distinctive, material-specific value in `init_particle` so a real test
+/// can tell whether a phase transition re-ran it or silently carried over
+/// whatever the particle had under its OLD material.
+#[derive(Debug, Default)]
+struct SentinelMaterial(f32);
+
+impl emerge::MaterialModel for SentinelMaterial {
+    fn init_particle(&self, particle: &mut Particle) {
+        particle.friction_hardening = self.0;
+    }
+}
+
+#[test]
+fn phase_transition_reinitializes_material_specific_state() {
+    // Real bug fixed 2026-07-19: `phase_transition` used to only swap
+    // `material_id` (+ optional latent-heat temperature debit), leaving every
+    // other material-specific scalar (`friction_hardening` here) as whatever
+    // the OLD material had left behind -- silently reinterpreted under the
+    // NEW material's own semantics for that same field. This asserts the new
+    // material's `init_particle` actually runs after the swap.
+    const NEW_ID: u32 = 1;
+    let mut solver = Simulation::new(small_solver_config(), small_spawn_config(16.0))
+        .with_default_material(Box::new(SentinelMaterial(0.0)))
+        .with_material(NEW_ID, Box::new(SentinelMaterial(42.0)));
+
+    // Simulate real accumulated plastic state under the OLD material.
+    for f in solver.particles_mut().friction_hardening.iter_mut() {
+        *f = 999.0;
+    }
+
+    solver.phase_transition(|_| true, NEW_ID);
+
+    for p in solver.particles().iter() {
+        assert_eq!(p.material_id, NEW_ID);
+        assert_eq!(
+            p.friction_hardening, 42.0,
+            "phase_transition must call the new material's init_particle instead of \
+             carrying over stale state from the old material"
+        );
+    }
+}
+
+#[test]
+fn add_phase_rule_reinitializes_material_specific_state() {
+    // Same real bug as `phase_transition_reinitializes_material_specific_state`,
+    // but the OTHER code path that used to skip `init_particle` after a
+    // material_id swap: the automatic every-substep rule loop in `step()`.
+    const NEW_ID: u32 = 1;
+    let mut solver = Simulation::new(small_solver_config(), small_spawn_config(16.0))
+        .with_default_material(Box::new(SentinelMaterial(0.0)))
+        .with_material(NEW_ID, Box::new(SentinelMaterial(42.0)))
+        .with_phase_rule(|p| {
+            if p.material_id == 0 {
+                Some(NEW_ID)
+            } else {
+                None
+            }
+        });
+
+    for f in solver.particles_mut().friction_hardening.iter_mut() {
+        *f = 999.0;
+    }
+
+    solver.step();
+
+    for p in solver.particles().iter() {
+        assert_eq!(p.material_id, NEW_ID);
+        assert_eq!(
+            p.friction_hardening, 42.0,
+            "add_phase_rule's automatic transition must call the new material's \
+             init_particle instead of carrying over stale state from the old material"
+        );
+    }
+}
+
 /// Real trophic/predation composition: a "prey" material converts to an "eaten"
 /// material within a predator's sensing range, at a rate driven by `saturating_uptake`
 /// (Holling Type II / Michaelis-Menten / Monod -- see its doc) applied to LOCAL PREY
@@ -798,6 +873,72 @@ fn linear_drag_field_matches_analytical_relaxation() {
         rel_err < 0.1,
         "LinearDragField velocity should match the analytical exponential relaxation: \
          avg_v={avg_v:?} expected={expected:?} rel_err={rel_err:.3}"
+    );
+}
+
+/// REAL BUG, FOUND AND FIXED (2026-07-19): force fields were applied to every particle
+/// in `0..active_count` with no `pinned` check, in both `step.rs`'s CPU loop and
+/// `force_fields.wgsl`'s GPU kernel — silently un-zeroing a pinned (Dirichlet-anchor)
+/// particle's velocity right after G2P had just forced it to exactly zero, one substep
+/// earlier in the very same pipeline. `scatter_particles_to_grid`/`p2g.wgsl` don't (and
+/// shouldn't) special-case pinned particles' velocity contribution — a pinned particle's
+/// mass/stress must still be felt by neighbors — so that spurious nonzero velocity got
+/// scattered as real momentum into the grid the next substep: a supposedly-fixed anchor
+/// was quietly injecting external-force-driven momentum every substep, a real,
+/// general-purpose engine bug for ANY `Particle::pinned` + force field composition, not
+/// specific to any one scene. This is the load-bearing regression test for that fix: a
+/// pinned particle under an active force field must have EXACTLY v=0 after a full step,
+/// while an otherwise-identical unpinned particle in the same field genuinely responds.
+#[test]
+fn pinned_particles_stay_at_zero_velocity_under_force_fields() {
+    let config = SimConfig {
+        gravity: Vec2::ZERO,
+        ..small_solver_config()
+    };
+    let spawn = small_spawn_config(16.0);
+    let field = LinearDragField::new(Vec2::new(3.0, 0.0), 2.0, LinearDragField::ALL_MATERIALS);
+
+    let mut solver = Simulation::new(config, spawn)
+        .with_default_material(Box::new(NeoHookeanMaterial::new(10.0, 20.0)))
+        .with_force_field(Box::new(field));
+
+    // Pin exactly the particles left of center; leave the rest free.
+    {
+        let particles = solver.particles_mut();
+        for i in 0..particles.len() {
+            if particles.x[i].x < 16.0 {
+                particles.pinned[i] = 1;
+            }
+        }
+    }
+
+    solver.step_n(10);
+
+    let particles = solver.particles();
+    let mut saw_pinned = false;
+    let mut saw_unpinned_moved = false;
+    for p in particles.iter() {
+        if p.pinned != 0 {
+            saw_pinned = true;
+            assert_eq!(
+                p.v,
+                Vec2::ZERO,
+                "pinned particle must stay at EXACTLY v=0 under an active force field, \
+                 not just small — found v={:?}",
+                p.v
+            );
+        } else if p.v.length() > 0.1 {
+            saw_unpinned_moved = true;
+        }
+    }
+    assert!(
+        saw_pinned,
+        "test setup should have pinned at least one particle"
+    );
+    assert!(
+        saw_unpinned_moved,
+        "unpinned particles should genuinely respond to the drag field, \
+         confirming the field itself is active (not a vacuous pass)"
     );
 }
 

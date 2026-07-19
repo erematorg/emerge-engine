@@ -186,4 +186,4 @@ pub use gpu::{GpuFieldEntry, GpuFieldsParams, GpuSimulation, MAX_FORCE_FIELDS, f
 
 // Render backend
 #[cfg(feature = "render")]
-pub use render::{ColorMode, Renderer};
+pub use render::{ColorMode, GridVolumeSource, Renderer};
