@@ -3822,18 +3822,14 @@ fn fluid_geostatic_confined_boundary_impulse_ledger_2x2() {
         for (mode, label) in modes {
             let (mut solver, rho0, b, gamma, gravity, surface_y) =
                 confined_hydrostatic_test_scene_unprestressed();
-            let init_label;
-            let init_residual;
-            if discrete {
+            let (init_label, init_residual) = if discrete {
                 let (_, residual) =
                     apply_discrete_vertical_geostatic_equilibrium(&mut solver, rho0, b, gamma);
-                init_label = "discrete";
-                init_residual = residual;
+                ("discrete", residual)
             } else {
                 apply_geostatic_prestress(&mut solver, rho0, b, gamma, gravity, surface_y);
-                init_label = "analytic";
-                init_residual = f64::NAN;
-            }
+                ("analytic", f64::NAN)
+            };
             solver.enable_boundary_impulse_diagnostic(mode);
             let initial_x_span = {
                 let min = solver

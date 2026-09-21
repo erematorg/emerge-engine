@@ -227,7 +227,9 @@ fn main() {
         )
         .expect("write header");
         let lit = pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|p| p[0] as u32 + p[1] as u32 + p[2] as u32 > 120)
             .count();
         println!("{mode}: wrote {path}, {lit} pixels above background");
