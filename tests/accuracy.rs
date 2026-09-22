@@ -4448,7 +4448,9 @@ fn physical_props_produce_valid_params() {
         model: PlasticityModel::CamClay {
             friction: 1.2,
             cohesion: 0.1,
-            hardening_factor: 2.0,
+            compression_index: 0.12,
+            swelling_index: 0.023,
+            void_ratio: 1.7,
         },
     };
     assert!(

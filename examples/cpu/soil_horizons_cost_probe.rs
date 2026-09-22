@@ -32,7 +32,7 @@ fn main() {
             1,
             Box::new(GranularFluidMaterial::saturated_loam(1200.0, 0.3)),
         )
-        .with_material(2, Box::new(NaccMaterial::wet_soil(1800.0, 0.3)))
+        .with_material(2, Box::new(NaccMaterial::kaolin(1800.0, 0.3)))
         .with_material(3, Box::new(DruckerPragerMaterial::dilatant(2400.0, 0.3)))
         .with_boundary(Box::new(SlipBoundary::new(config.boundary_thickness)));
     // (id, thickness, density ratio, bottom), bottom up, as in the scene.

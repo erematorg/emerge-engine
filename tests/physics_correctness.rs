@@ -4257,7 +4257,7 @@ fn nacc_preconsolidates_more_under_deeper_self_weight() {
         ..SpawnRegion::for_sim(&config)
     };
     let mut solver = Simulation::new(config, spawn)
-        .with_default_material(Box::new(NaccMaterial::wet_soil(600.0, 0.3)))
+        .with_default_material(Box::new(NaccMaterial::kaolin(600.0, 0.3)))
         .with_boundary(Box::new(SlipBoundary::new(2)));
 
     solver.step_n(600);

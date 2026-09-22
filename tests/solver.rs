@@ -714,8 +714,8 @@ fn permafrost_thaws_at_freezing_point_with_real_latent_heat_debit() {
         config.grid_res,
     );
 
-    let frozen = NaccMaterial::wet_soil(900.0 * 8.0, 0.3);
-    let thawed = WithLatentHeat::new(NaccMaterial::wet_soil(900.0, 0.3), LATENT_HEAT_FUSION);
+    let frozen = NaccMaterial::kaolin(900.0 * 8.0, 0.3);
+    let thawed = WithLatentHeat::new(NaccMaterial::kaolin(900.0, 0.3), LATENT_HEAT_FUSION);
 
     let mut solver = Simulation::new(config, small_spawn_config(16.0))
         .with_default_material(Box::new(frozen))
@@ -777,8 +777,8 @@ fn permafrost_thaws_at_freezing_point_with_real_latent_heat_debit() {
 #[test]
 fn frozen_ground_resists_a_strike_more_than_thawed_ground() {
     let config = small_solver_config(); // real default gravity -- see below for why
-    let frozen_mat = NaccMaterial::wet_soil(900.0 * 8.0, 0.3);
-    let thawed_mat = NaccMaterial::wet_soil(900.0, 0.3);
+    let frozen_mat = NaccMaterial::kaolin(900.0 * 8.0, 0.3);
+    let thawed_mat = NaccMaterial::kaolin(900.0, 0.3);
 
     // NACC's elastic predictor bug fix (2026-07-31, `nacc.rs::update_particle`)
     // exposed that this test's ORIGINAL zero-gravity setup was measuring a
@@ -3287,7 +3287,7 @@ fn gpu_simulation_rejects_a_real_nacc_material() {
         dt: 0.002,
         ..SimConfig::default()
     };
-    let material = NaccMaterial::soft_clay(5.0e4, 0.3);
+    let material = NaccMaterial::kaolin(5.0e4, 0.3);
     let cpu =
         Simulation::new(config, small_spawn_config(16.0)).with_default_material(Box::new(material));
 
@@ -3332,7 +3332,7 @@ fn sand_mui_stable_after_many_steps() {
 
 #[test]
 fn nacc_stable_after_many_steps() {
-    let nacc = NaccMaterial::soft_clay(5.0e4, 0.3);
+    let nacc = NaccMaterial::kaolin(5.0e4, 0.3);
     let config = SimConfig {
         gravity: Vec2::new(0.0, -0.3),
         ..small_solver_config()

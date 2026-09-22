@@ -236,6 +236,14 @@ name = "bingham_cost_probe"
 path = "examples/cpu/bingham_cost_probe.rs"
 
 [[example]]
+name = "nacc_law_probe"
+path = "examples/cpu/nacc_law_probe.rs"
+
+[[example]]
+name = "nacc_cost_probe"
+path = "examples/cpu/nacc_cost_probe.rs"
+
+[[example]]
 name = "mui_cost_probe"
 path = "examples/cpu/mui_cost_probe.rs"
 

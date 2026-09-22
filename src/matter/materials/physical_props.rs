@@ -124,8 +124,12 @@ pub enum PlasticityModel {
         friction: f32,
         /// Cohesion β. 0.0 = no tensile strength (standard soil).
         cohesion: f32,
-        /// Hardening factor ξ. 0.0 = perfect plasticity (no cap growth).
-        hardening_factor: f32,
+        /// Compression index λ of the soil's oedometer curve.
+        compression_index: f32,
+        /// Swelling index κ of the same curve.
+        swelling_index: f32,
+        /// Void ratio e at the reference state.
+        void_ratio: f32,
     },
 }
 
@@ -397,9 +401,19 @@ pub struct NaccProps {
     /// Cohesion β (0.0 = no tensile strength). NOT an SI quantity, passed
     /// through unconverted.
     pub cohesion: f32,
-    /// Hardening factor ξ (0.0 = perfect plasticity, no hardening). NOT an
-    /// SI quantity, passed through unconverted.
-    pub hardening_factor: f32,
+    /// Compression index λ of the soil's own oedometer curve (slope of the
+    /// normal compression line in e against ln p'). Dimensionless.
+    pub compression_index: f32,
+    /// Swelling index κ of the same curve (unload-reload slope), usually a
+    /// third to a fifth of the compression index. Dimensionless.
+    pub swelling_index: f32,
+    /// Void ratio e at the reference state, so the hardening exponent is
+    /// `(1 + e) / (compression_index - swelling_index)`.
+    pub void_ratio: f32,
+    /// Preconsolidation pressure in Pa, the largest mean effective stress
+    /// the soil has carried before (oedometer test, Casagrande 1936). 0.0 =
+    /// a soil that has never been loaded.
+    pub preconsolidation_pa: f32,
 }
 
 #[derive(Debug, Clone, Copy)]

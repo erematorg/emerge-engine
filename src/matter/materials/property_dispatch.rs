@@ -103,13 +103,18 @@ impl Elastoplastic {
             CamClay {
                 friction,
                 cohesion,
-                hardening_factor,
+                compression_index,
+                swelling_index,
+                void_ratio,
             } => Box::new(NaccMaterial::from_physical(
                 &NaccProps {
                     elastic: self.elastic,
                     friction,
                     cohesion,
-                    hardening_factor,
+                    compression_index,
+                    swelling_index,
+                    void_ratio,
+                    preconsolidation_pa: 0.0,
                 },
                 config,
             )),
@@ -402,14 +407,17 @@ mod particle_mass_tests {
             nu: 0.3,
             rho_kg_m3: 1800.0,
         };
-        let (friction, cohesion, hardening_factor) = (1.2, 0.1, 2.0);
+        let (friction, cohesion) = (1.2, 0.1);
+        let (compression_index, swelling_index, void_ratio) = (0.12, 0.023, 1.7);
 
         let via_dispatch = Elastoplastic {
             elastic,
             model: PlasticityModel::CamClay {
                 friction,
                 cohesion,
-                hardening_factor,
+                compression_index,
+                swelling_index,
+                void_ratio,
             },
         }
         .material(&config);
@@ -419,7 +427,10 @@ mod particle_mass_tests {
                 elastic,
                 friction,
                 cohesion,
-                hardening_factor,
+                compression_index,
+                swelling_index,
+                void_ratio,
+                preconsolidation_pa: 0.0,
             },
             &config,
         );
@@ -443,7 +454,9 @@ mod particle_mass_tests {
             model: PlasticityModel::CamClay {
                 friction,
                 cohesion,
-                hardening_factor,
+                compression_index,
+                swelling_index,
+                void_ratio,
             },
         };
         assert!((ep.particle_mass(spacing, &config) - expected_mass).abs() < 1e-9);

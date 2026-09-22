@@ -360,6 +360,36 @@ re-read of the 17 materials.
   real hardware too. The instance buffers hold correct data, so the fault is
   in the draw pass or in quads about 2 pixels wide at that scale; which one
   is not known. Both stay ignored with that reason.
+- The Cam-Clay soil model carries four disclosed approximations, all in
+  `src/matter/materials/nacc.rs`:
+  - Its elastic response uses a constant bulk modulus. Real Cam-Clay
+    stiffness is proportional to the pressure (`K = v p / kappa`), so a
+    soil near a free surface is modelled far too stiff elastically.
+  - On the dry side of the yield ellipse (an overconsolidated soil being
+    sheared) the softening is still evaluated at the start of the step,
+    unlike the cap and the wet side. Backward Euler is ill-posed there:
+    strain softening loses uniqueness, and at a real clay's hardening
+    exponent the residual has no root. Measured with the old sinh law, a
+    single sheared step could erase the whole preconsolidation; it needs
+    re-measuring under the exponential law.
+  - The 2D friction slope M comes from sparkl's own dimension-reduced
+    relation `M = 4.619 sin(phi) / (3 - sin(phi))`, not from a measurement
+    in plane strain, so a soil's triaxial friction angle reaches the model
+    through an unverified mapping.
+  - p0 never falls below `kappa * 1e-5`, a numerical floor. For a stiff
+    material that floor is larger than the soil's own overburden, so it acts
+    as a hidden preconsolidation rather than a neutral guard. The frozen
+    block of `examples/cpu/permafrost.rs` sits exactly there: its p0 reads
+    43.3 against the 1.5 it carries, and the own-weight preconsolidation the
+    scene computes (2.35) never applies. That scene's frozen ground not
+    yielding is therefore the clamp holding, not measured frozen-soil
+    memory, and must not be read as frozen soil validated.
+- The engine holds one Cam-Clay parameter set (`NaccMaterial::kaolin`),
+  measured on spestone kaolin at Cambridge and cross-checked against a
+  second, independent kaolin set, which sits 2.4 times away in hardening
+  exponent. Any other soil has to pass its own oedometer numbers through
+  `NaccProps`: presets for soils without measurements were removed rather
+  than kept unsourced, peat included.
 - About a hundred comments point to notes that live outside the repository
   (working notes from past sessions). They should be rewritten to cite the
   code, a test or this file, or dropped.
