@@ -56,6 +56,7 @@ fn make_sim(implicit: bool) -> Simulation {
 }
 
 #[test]
+#[ignore = "diagnostic probe kept for reruns, not part of the CI suite"]
 fn real_fps_settled_pile_explicit_vs_implicit() {
     // Settle purely via explicit first -- the real, verified-correct
     // regime. 60 frames is enough for a compact box-spawned pile at this

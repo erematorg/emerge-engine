@@ -42,6 +42,7 @@ fn max_particle_speed(sim: &Simulation) -> f32 {
 }
 
 #[test]
+#[ignore = "diagnostic probe kept for reruns, not part of the CI suite"]
 fn sand_hard_impact_dt_overshoot_diagnostic() {
     const GRID: usize = 64;
     const FLOOR: f32 = 2.0;

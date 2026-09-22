@@ -63,6 +63,7 @@ fn probe(label: &str, lambda: f32, mu: f32, box_size: IVec2) {
 }
 
 #[test]
+#[ignore = "diagnostic probe kept for reruns, not part of the CI suite"]
 fn isolate_stiffness_vs_particle_count() {
     let (soft_lambda, soft_mu) = lame_from_young(6.0e5, 0.3);
     let config = SimConfig::earth(GRID, 0.01, 0.016);

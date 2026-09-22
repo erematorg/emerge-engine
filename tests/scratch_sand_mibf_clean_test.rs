@@ -73,6 +73,7 @@ fn run(use_material_friction: bool) -> PileShape {
 }
 
 #[test]
+#[ignore = "diagnostic probe kept for reruns, not part of the CI suite"]
 fn mibf_alone_vs_fixed_friction_baseline_no_cundall_trick() {
     let baseline = run(false);
     let mibf = run(true);

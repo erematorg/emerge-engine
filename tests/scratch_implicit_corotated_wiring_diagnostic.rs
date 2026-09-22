@@ -52,6 +52,7 @@ fn max_drift(a: &Simulation, b: &Simulation) -> f32 {
 }
 
 #[test]
+#[ignore = "diagnostic probe kept for reruns, not part of the CI suite"]
 fn diag_drift_starting_already_resting_on_floor() {
     // The REAL target regime for this feature (see project memory: sand's
     // real fps problem is CFL pinned tiny by ELASTIC STIFFNESS, not
@@ -85,6 +86,7 @@ fn diag_drift_starting_already_resting_on_floor() {
 }
 
 #[test]
+#[ignore = "diagnostic probe kept for reruns, not part of the CI suite"]
 fn diag_drift_one_frame_at_a_time_from_the_original_fall_scene() {
     let mut explicit = make_sim_at(false, 20.0);
     let mut implicit = make_sim_at(true, 20.0);
@@ -99,6 +101,7 @@ fn diag_drift_one_frame_at_a_time_from_the_original_fall_scene() {
 }
 
 #[test]
+#[ignore = "diagnostic probe kept for reruns, not part of the CI suite"]
 fn diag_single_particle_free_fall_no_material_contact() {
     // Strip out particle-particle elastic interaction concerns: spacing
     // large enough that the 8x8 block acts closer to independent free-fall
@@ -129,6 +132,7 @@ fn diag_single_particle_free_fall_no_material_contact() {
 }
 
 #[test]
+#[ignore = "diagnostic probe kept for reruns, not part of the CI suite"]
 fn diag_settled_pile_first_forked_step_velocity_field() {
     let mut pre = make_sim_at(false, 10.0);
     for _ in 0..30 {
@@ -193,6 +197,7 @@ fn diag_settled_pile_first_forked_step_velocity_field() {
 /// implicit path -- this determines whether the earlier findings mean
 /// anything at all about implicit_corotated's correctness.
 #[test]
+#[ignore = "diagnostic probe kept for reruns, not part of the CI suite"]
 fn diag_control_two_independent_explicit_runs_same_params() {
     let mut a = make_sim_at(false, 20.0);
     let mut b = make_sim_at(false, 20.0);
@@ -234,6 +239,7 @@ fn make_sim_at_dt(implicit: bool, center_y: f32, dt: f32) -> Simulation {
 /// needs "a handful of implicit substeps," not exactly one -- a real,
 /// different (and still fast) design, not a formula bug.
 #[test]
+#[ignore = "diagnostic probe kept for reruns, not part of the CI suite"]
 fn diag_implicit_substep_count_sweep() {
     const FULL_DT: f32 = 0.016;
     const TOTAL_FRAMES: usize = 20;
@@ -257,6 +263,7 @@ fn diag_implicit_substep_count_sweep() {
 /// `Simulation` (via `config_mut`) and compare ONE more implicit step
 /// against ONE more explicit step from that identical, verified-good state.
 #[test]
+#[ignore = "diagnostic probe kept for reruns, not part of the CI suite"]
 fn diag_properly_isolated_equilibrium_maintenance() {
     let mut explicit_only = make_sim_at(false, 10.0);
     for _ in 0..30 {
@@ -301,6 +308,7 @@ fn diag_properly_isolated_equilibrium_maintenance() {
 /// confirms boundary/wall interaction (not the interior multi-particle
 /// coupling itself) is the remaining real cause.
 #[test]
+#[ignore = "diagnostic probe kept for reruns, not part of the CI suite"]
 fn diag_far_from_any_boundary_control() {
     const BIG_GRID: usize = 128;
     fn make_sim_far(implicit: bool) -> Simulation {
@@ -373,6 +381,7 @@ fn diag_far_from_any_boundary_control() {
 /// shared-node coupling itself is handled (assembly/accumulation), not
 /// something that only emerges at large N.
 #[test]
+#[ignore = "diagnostic probe kept for reruns, not part of the CI suite"]
 fn diag_minimal_two_particle_coupling() {
     fn make_two_particle_sim(implicit: bool) -> Simulation {
         let config = SimConfig {

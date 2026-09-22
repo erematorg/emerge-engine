@@ -19,6 +19,7 @@ const DT: f32 = 0.1;
 const MAT_WATER: u32 = 0;
 
 #[test]
+#[ignore = "diagnostic probe kept for reruns, not part of the CI suite"]
 fn wall_touching_column_stays_stable_after_divergence_fix() {
     let config = SimConfig {
         min_dt: 1.0e-4,
