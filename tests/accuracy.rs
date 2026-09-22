@@ -210,6 +210,7 @@ fn sand_angle_of_repose_is_physical() {
 /// evidence the missing boundary friction, not some deeper collapse-
 /// dynamics issue, was what forced such a low value in the first place.
 #[test]
+#[ignore = "slow: about 5 min in the CI debug profile, runs in the slow-tests workflow"]
 fn sand_collapse_with_phase_gated_relaxation_after_dynamics() {
     // Local, WIDER grid than the shared module GRID=64 -- that domain is
     // only just barely large enough for the baseline test's own dynamics
@@ -1695,6 +1696,7 @@ fn diag_preshaped_pile_with_realistic_jitter_still_holds() {
 /// requires the structural (non-local/Cosserat) direction, not another
 /// numerics patch of this shape.
 #[test]
+#[ignore = "slow: about 6 min in the CI debug profile, runs in the slow-tests workflow"]
 fn sand_preshaped_pile_at_30deg_holds_its_slope() {
     let target_angle: f32 = 30.0;
     let height = 12.0; // cells (2x the original 6 -- confirms result is resolution-independent)
@@ -1800,6 +1802,7 @@ fn sand_preshaped_pile_at_30deg_holds_its_slope() {
 /// question of whether confinement itself was load-bearing for this result
 /// is answered -- see the FIFTEENTH FINDING test immediately below: it is not.
 #[test]
+#[ignore = "slow: about 5 min in the CI debug profile, runs in the slow-tests workflow"]
 fn confined_pile_with_cundall_damping_reaches_real_repose_angle() {
     let target_angle: f32 = 30.0;
     let height = 12.0f32;
@@ -1878,6 +1881,7 @@ fn confined_pile_with_cundall_damping_reaches_real_repose_angle() {
 /// 12000/25000/50000/100000 steps, zero drift -- a genuine fixed point, not a
 /// slow ongoing creep that happens to be small over 6000 steps.
 #[test]
+#[ignore = "slow: about 6 min in the CI debug profile, runs in the slow-tests workflow"]
 fn unconfined_pile_with_cundall_damping_reaches_real_repose_angle() {
     let target_angle: f32 = 30.0;
     let height = 12.0f32;
@@ -2077,6 +2081,7 @@ fn sand_pile_built_by_slow_pour_holds_real_repose_angle() {
 /// passing is NOT a claim the repose target is met, only that a real,
 /// disclosed experiment ran and produced a real, recorded number.
 #[test]
+#[ignore = "slow: about 11 min in the CI debug profile, runs in the slow-tests workflow"]
 fn sand_pile_built_by_slow_pour_with_phase_gated_damping() {
     const POUR_GRID: usize = 128;
     const POUR_DT: f32 = 0.016;
@@ -5271,6 +5276,7 @@ fn post_event_relax_switch_step_sensitivity() {
 /// they plateau at genuinely different angles, that's (b) -- switch_step is
 /// a real, load-bearing physical parameter, not just a convenience knob.
 #[test]
+#[ignore = "slow: over 43 min in the CI debug profile, runs in the slow-tests workflow"]
 fn post_event_relax_switch_step_long_horizon_convergence_comparison() {
     const LOCAL_GRID: usize = 128;
 
@@ -5367,6 +5373,7 @@ fn post_event_relax_switch_step_long_horizon_convergence_comparison() {
 /// real, honest reason a switch is needed -- reported either way, not
 /// assumed.
 #[test]
+#[ignore = "slow: about 22 min in the CI debug profile, runs in the slow-tests workflow"]
 fn post_event_relax_constant_damping_from_start_no_switch() {
     const LOCAL_GRID: usize = 128;
     let config = SimConfig {
@@ -5440,6 +5447,7 @@ fn post_event_relax_constant_damping_from_start_no_switch() {
 /// that is a genuine fix. If it just slides like plain DP, that's a real,
 /// honest negative result too -- reported either way.
 #[test]
+#[ignore = "slow: over 44 min in the CI debug profile, runs in the slow-tests workflow"]
 fn mu_i_rheology_column_collapse_natural_arrest_check() {
     use emerge::MuIRheologyMaterial;
     const LOCAL_GRID: usize = 128;

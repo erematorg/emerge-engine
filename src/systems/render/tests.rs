@@ -23,6 +23,7 @@ fn headless_device() -> (wgpu::Device, wgpu::Queue) {
 /// `sigma_s` must render differently (see prep_instances.wgsl's ByPhysics
 /// branch for the real single-scattering-albedo derivation this mirrors).
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn scattering_changes_by_physics_color() {
     let (device, queue) = headless_device();
     let mut r = Renderer::new(&device, 16, wgpu::TextureFormat::Rgba8UnormSrgb);
@@ -48,6 +49,7 @@ fn scattering_changes_by_physics_color() {
 /// Real specular Fresnel reflectance must actually change ByPhysics's output --
 /// same check as scattering, for the R0 term.
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn specular_r0_changes_by_physics_color() {
     let (device, queue) = headless_device();
     let mut r = Renderer::new(&device, 16, wgpu::TextureFormat::Rgba8UnormSrgb);
@@ -76,6 +78,7 @@ fn specular_r0_changes_by_physics_color() {
 /// stayed in sync (a mismatch here would show up as a wgpu validation panic,
 /// not a silent bug).
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn renderer_construction_and_optical_upload_survive_extended_table() {
     let (device, queue) = headless_device();
     let mut r = Renderer::new(&device, 16, wgpu::TextureFormat::Rgba8UnormSrgb);
@@ -85,6 +88,7 @@ fn renderer_construction_and_optical_upload_survive_extended_table() {
 }
 
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn physical_contract_drives_cpu_beer_lambert_in_si() {
     let (device, queue) = headless_device();
     let mut r = Renderer::new(&device, 1, wgpu::TextureFormat::Rgba8UnormSrgb);
@@ -123,6 +127,7 @@ fn physical_contract_drives_cpu_beer_lambert_in_si() {
 /// path. Read back the compute-generated instance directly, avoiding the
 /// unrelated tiny-quad rasterization limitation documented below.
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn physical_contract_drives_gpu_particle_beer_lambert_in_si() {
     use crate::gpu::GpuSimulation;
     use crate::{MaterialRegistry, NeoHookeanMaterial, SimConfig};
@@ -209,6 +214,7 @@ fn physical_contract_drives_gpu_particle_beer_lambert_in_si() {
 /// an offscreen texture. Proves the whole pipeline survives, not just that
 /// `Renderer::new` compiles the shader in isolation.
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn render_gpu_survives_scattering_and_specular_end_to_end() {
     use crate::gpu::GpuSimulation;
     use crate::{MaterialRegistry, NeoHookeanMaterial, SimConfig, SpawnRegion, build_particles};
@@ -285,6 +291,7 @@ fn render_gpu_survives_scattering_and_specular_end_to_end() {
 /// Planck (tested separately at 0.03), 8-bit quantization, and the shader's
 /// f32 arithmetic against the CPU's f64.
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn gpu_blackbody_emission_matches_planck_on_the_cpu() {
     use crate::energy::radiation::blackbody_linear_srgb;
     use crate::gpu::GpuSimulation;
@@ -384,6 +391,7 @@ fn gpu_blackbody_emission_matches_planck_on_the_cpu() {
 /// and its specular. Two materials identical except for `sigma_s`, and two
 /// identical except for `R0`, must each render differently.
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn si_contract_path_keeps_scattering_and_fresnel() {
     use crate::render::{PhysicalRenderContract, PhysicalRenderContractParams};
 
@@ -443,6 +451,7 @@ fn si_contract_path_keeps_scattering_and_fresnel() {
 /// Same cold scene twice, at ambient temperature throughout, differing only
 /// by whether the material declares a luminous emission.
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn luminescent_material_lights_the_scene_without_being_hot() {
     use crate::gpu::GpuSimulation;
     use crate::materials::registry::MaterialRegistry;
@@ -557,6 +566,7 @@ fn luminescent_material_lights_the_scene_without_being_hot() {
 /// the real GPU pipeline rather than in isolation: a hotter body renders
 /// bluer, not redder.
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn gpu_thermal_emission_gets_bluer_with_temperature() {
     use crate::gpu::GpuSimulation;
     use crate::{MaterialRegistry, NeoHookeanMaterial, SimConfig, SpawnRegion, build_particles};
@@ -1075,6 +1085,7 @@ fn readback_f32_blocking(
 /// whole 6-pass pipeline (clear/splat/convert/12x iterate/render) survives
 /// together, not just that each shader entry point compiles in isolation.
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn render_surface_reconstruction_survives_end_to_end() {
     use crate::gpu::GpuSimulation;
     use crate::{MaterialRegistry, NeoHookeanMaterial, SimConfig, SpawnRegion, build_particles};
@@ -1162,6 +1173,7 @@ fn render_surface_reconstruction_survives_end_to_end() {
 /// noise or an all-zero buffer that would otherwise still pass the
 /// survives-end-to-end smoke test above.
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn render_surface_reconstruction_produces_real_density_near_particles() {
     use crate::gpu::GpuSimulation;
     use crate::{MaterialRegistry, NeoHookeanMaterial, SimConfig, SpawnRegion, build_particles};
@@ -1262,6 +1274,7 @@ fn render_surface_reconstruction_produces_real_density_near_particles() {
 /// (see `curvature_flow.wgsl`'s own "two-phase extension" doc) only works
 /// if the filter itself is correct.
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn dual_phase_reconstruction_keeps_two_materials_in_their_own_phase_buffer() {
     use crate::gpu::GpuSimulation;
     use crate::{MaterialRegistry, NeoHookeanMaterial, SimConfig, SpawnRegion, build_particles};
@@ -1393,6 +1406,7 @@ fn dual_phase_reconstruction_keeps_two_materials_in_their_own_phase_buffer() {
 /// fallback (the exact bug this shipped to fix: 3 real materials in
 /// `basic_jellies_gpu.rs` all rendering as one undifferentiated color).
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn n_material_surface_reconstruction_colors_each_material_distinctly() {
     use crate::gpu::GpuSimulation;
     use crate::{MaterialRegistry, NeoHookeanMaterial, SimConfig, SpawnRegion, build_particles};
@@ -1622,6 +1636,7 @@ fn n_material_surface_reconstruction_colors_each_material_distinctly() {
 /// materials' optics, strictly between the two pure values, not a coin-flip
 /// winner.
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn n_material_blend_produces_real_weighted_average_at_a_mixed_cell() {
     use crate::gpu::GpuSimulation;
     use crate::{MaterialRegistry, NeoHookeanMaterial, SimConfig, SpawnRegion, build_particles};
@@ -1784,6 +1799,7 @@ fn n_material_blend_produces_real_weighted_average_at_a_mixed_cell() {
 /// bias -- proving the asymmetry comes from F, not from a directional bug
 /// in the splat loop itself.
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn anisotropic_splat_widens_footprint_along_stretched_axis() {
     use crate::gpu::GpuSimulation;
     use crate::{MaterialRegistry, NeoHookeanMaterial, SimConfig, SpawnRegion, build_particles};
@@ -1921,6 +1937,7 @@ fn anisotropic_splat_widens_footprint_along_stretched_axis() {
 /// on for `dt: 0.1` not to change their own unrelated assertions when their
 /// particles happen to be at rest).
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn velocity_stretch_widens_footprint_along_motion_direction() {
     use crate::gpu::GpuSimulation;
     use crate::{MaterialRegistry, NeoHookeanMaterial, SimConfig, SpawnRegion, build_particles};
@@ -2053,6 +2070,7 @@ fn velocity_stretch_widens_footprint_along_motion_direction() {
 /// reads back an actual rendered pixel to confirm the color genuinely
 /// changes, not just that the shader compiles.
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn grid_volume_scattering_and_specular_change_rendered_color() {
     use crate::gpu::GpuSimulation;
     use crate::{MaterialRegistry, NeoHookeanMaterial, SimConfig, SpawnRegion, build_particles};
@@ -2170,6 +2188,7 @@ fn grid_volume_scattering_and_specular_change_rendered_color() {
 /// across the two renders -- an end-to-end proof the shader itself now uses
 /// the channel, not just that it compiles.
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn grid_volume_blackbody_emission_brightens_hot_cells() {
     let (device, queue) = headless_device();
     let grid_res = 8u32;
@@ -2270,6 +2289,7 @@ fn grid_volume_blackbody_emission_brightens_hot_cells() {
 /// (shallow) vs a tall column all the way to the domain edge (deep). The
 /// deep scene must render measurably darker at the same query point.
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn grid_volume_column_depth_darkens_deep_regions_more_than_shallow() {
     let (device, queue) = headless_device();
     let grid_res = 24u32;
@@ -2375,6 +2395,7 @@ fn grid_volume_column_depth_darkens_deep_regions_more_than_shallow() {
 /// two grid halves with different dominant material slots must render
 /// their own distinct configured color, not both default to slot 0.
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn grid_volume_dominant_material_colors_regions_distinctly() {
     let (device, queue) = headless_device();
     let grid_res = 8u32;
@@ -2484,6 +2505,7 @@ fn grid_volume_dominant_material_colors_regions_distinctly() {
 /// `curvature_flow.wgsl`'s single-phase `fs_main` -- the other fragment
 /// shader that just received the same optical-parity port.
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn curvature_flow_scattering_and_specular_change_rendered_color() {
     use crate::gpu::GpuSimulation;
     use crate::{MaterialRegistry, NeoHookeanMaterial, SimConfig, SpawnRegion, build_particles};
@@ -2686,6 +2708,7 @@ fn diagnose_curvature_flow_edge_hair_pixels() {
 /// the whole splat/convert/curvature-flow pipeline, not just a hardcoded
 /// color.
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn curvature_flow_blackbody_emission_brightens_hot_cluster() {
     use crate::gpu::GpuSimulation;
     use crate::{MaterialRegistry, NeoHookeanMaterial, SimConfig, SpawnRegion, build_particles};
@@ -2789,6 +2812,7 @@ fn curvature_flow_blackbody_emission_brightens_hot_cluster() {
 /// than 3000K at the default 3000K exposure anchor. An ambient body still
 /// radiates, it just radiates far less, and `T^4` says how much less.
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn light_diffusion_builds_up_real_glow_over_multiple_frames() {
     use crate::gpu::GpuSimulation;
     use crate::{MaterialRegistry, NeoHookeanMaterial, SimConfig, SpawnRegion, build_particles};
@@ -2905,6 +2929,7 @@ fn light_diffusion_builds_up_real_glow_over_multiple_frames() {
 /// side is genuinely warmer than the cold side (the diffusion recovered real
 /// temperature, not noise).
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn curvature_flow_thermal_diffusion_stays_finite_and_separates_hot_from_cold() {
     use crate::gpu::GpuSimulation;
     use crate::{MaterialRegistry, NeoHookeanMaterial, SimConfig, SpawnRegion, build_particles};
@@ -3072,6 +3097,7 @@ fn readback_i32_total(device: &wgpu::Device, queue: &wgpu::Queue, buf: &wgpu::Bu
 /// same real structural factor the shader itself uses, not a second,
 /// independently-tuned tolerance.
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn curvature_flow_volume_correction_matches_true_particle_mass() {
     use crate::gpu::GpuSimulation;
     use crate::{MaterialRegistry, NeoHookeanMaterial, SimConfig, SpawnRegion, build_particles};
@@ -3210,6 +3236,7 @@ fn curvature_flow_volume_correction_matches_true_particle_mass() {
 /// first transition from raw splat to first-smoothed -- real data for
 /// narrowing the search, not a synthetic guess.
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn curvature_flow_mass_growth_scales_with_iteration_count() {
     use crate::gpu::GpuSimulation;
     use crate::{MaterialRegistry, NeoHookeanMaterial, SimConfig, SpawnRegion, build_particles};
@@ -3321,6 +3348,7 @@ fn curvature_flow_mass_growth_scales_with_iteration_count() {
 /// finite across many steps -- proving the real damping (`WAVE_DAMPING`)
 /// actually bounds it rather than letting continuous forcing blow it up.
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn wave_field_is_excited_by_real_density_and_stays_bounded() {
     use crate::gpu::GpuSimulation;
     use crate::matter::materials::MaterialModel;
@@ -3440,6 +3468,7 @@ fn wave_field_is_excited_by_real_density_and_stays_bounded() {
 /// excitation source -- the object's own unchanging edge -- never goes
 /// away).
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn curvature_flow_wave_field_decays_once_density_stops_changing() {
     use crate::gpu::GpuSimulation;
     use crate::matter::materials::MaterialModel;
@@ -3566,6 +3595,7 @@ fn curvature_flow_wave_field_decays_once_density_stops_changing() {
 /// which can't easily be forced to hover in one exact gap across several
 /// frames) to isolate the hysteresis logic itself.
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn visibility_hysteresis_does_not_flicker_in_the_gap_between_thresholds() {
     let (device, queue) = headless_device();
     let mut r = Renderer::new(&device, 1, wgpu::TextureFormat::Rgba8UnormSrgb);
@@ -3672,6 +3702,7 @@ fn visibility_hysteresis_does_not_flicker_in_the_gap_between_thresholds() {
 /// `bitcast<f32>`), not a plain f32 density array -- the test buffer below
 /// mirrors that layout directly rather than reusing `surface_a_buf`.
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn grid_visibility_hysteresis_does_not_flicker_in_the_gap_between_thresholds() {
     let (device, queue) = headless_device();
     let mut r = Renderer::new(&device, 1, wgpu::TextureFormat::Rgba8UnormSrgb);
@@ -3789,6 +3820,7 @@ fn grid_visibility_hysteresis_does_not_flicker_in_the_gap_between_thresholds() {
 /// itself is "acceptable" -- that judgment is still open, tracked
 /// separately, not asserted here as settled.
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn surface_reconstruction_does_not_flicker_over_many_deterministic_frames() {
     use crate::gpu::GpuSimulation;
     use crate::{MaterialRegistry, NeoHookeanMaterial, SimConfig, SpawnRegion, build_particles};
@@ -3996,6 +4028,7 @@ mod curvature_iterate_stability {
     /// 357x over 12 iterations; the shipped value must keep it bounded with
     /// real margin, not just barely under 1.0.
     #[test]
+    #[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
     fn flat_noisy_field_does_not_amplify() {
         const RES: i32 = 48;
         const ITERATIONS: usize = 12;
@@ -4029,6 +4062,7 @@ mod curvature_iterate_stability {
     /// job. A sharp 90-degree corner (the real free-surface case) must still
     /// round off measurably after iteration, not sit inert.
     #[test]
+    #[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
     fn sharp_corner_still_rounds() {
         const RES: i32 = 48;
         const ITERATIONS: usize = 12;
@@ -4077,6 +4111,7 @@ mod curvature_iterate_stability {
 /// real geometric invariants here rather than re-deriving the same formula
 /// (which would just duplicate a bug into its own test).
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn screen_to_grid_is_exact_inverse_of_set_camera_at_any_aspect_ratio() {
     let (device, queue) = headless_device();
     let fmt = wgpu::TextureFormat::Rgba8UnormSrgb;
@@ -4137,6 +4172,7 @@ fn screen_to_grid_is_exact_inverse_of_set_camera_at_any_aspect_ratio() {
 /// ratios, not re-derived independently (which would just duplicate a bug
 /// into its own test, same discipline as the sibling test above).
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn grid_to_screen_is_exact_inverse_of_screen_to_grid_at_any_aspect_ratio() {
     let (device, queue) = headless_device();
     let fmt = wgpu::TextureFormat::Rgba8UnormSrgb;
@@ -4187,6 +4223,7 @@ fn grid_to_screen_is_exact_inverse_of_screen_to_grid_at_any_aspect_ratio() {
 /// 125% that actually exposed the bug, and 200%), not just the one that
 /// happened to be on hand at debug time.
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn grid_to_screen_points_divides_out_the_real_dpi_scale_factor() {
     let (device, queue) = headless_device();
     let fmt = wgpu::TextureFormat::Rgba8UnormSrgb;
@@ -4236,6 +4273,7 @@ fn grid_to_screen_points_divides_out_the_real_dpi_scale_factor() {
 /// and that it's darkening (approaching the material's own absorption-only
 /// color), not brightening.
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn wetness_darkens_by_physics_color_via_refractive_index() {
     let (device, queue) = headless_device();
     let mut r = Renderer::new(&device, 16, wgpu::TextureFormat::Rgba8UnormSrgb);
@@ -4271,6 +4309,7 @@ fn wetness_darkens_by_physics_color_via_refractive_index() {
 /// feature existed. Real safety property: this mechanism must never
 /// silently activate for materials that never opted in.
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn wetness_darkening_is_inert_without_refractive_index_opt_in() {
     let (device, queue) = headless_device();
     let mut r = Renderer::new(&device, 16, wgpu::TextureFormat::Rgba8UnormSrgb);
@@ -4303,6 +4342,7 @@ fn wetness_darkening_is_inert_without_refractive_index_opt_in() {
 /// already-known cost, or something specifically wrong with the sand
 /// wiring" with real numbers instead of guessing.
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn diag_surface_reconstruction_real_cost_vs_grid_volume_and_particles() {
     use crate::gpu::GpuSimulation;
     use crate::{DruckerPragerMaterial, MaterialRegistry, SimConfig, SpawnRegion, build_particles};

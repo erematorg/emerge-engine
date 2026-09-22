@@ -287,6 +287,7 @@ fn j_stays_positive_sand() {
 }
 
 #[test]
+#[ignore = "slow: about 9 min in the CI debug profile, runs in the slow-tests workflow"]
 fn j_stays_positive_granular_fluid() {
     let mud = GranularFluidMaterial::saturated_loam(1.0e5, 0.2);
     // Same real re-tuning as `mass_is_conserved_granular_fluid` above, same
@@ -491,6 +492,7 @@ fn granular_fluid_stress_symmetric() {
 /// onto a rigid floor, every real per-particle invariant (finite state,
 /// `J=V/V0`, `rho*V=m`) checked every step, not just "didn't crash."
 #[test]
+#[ignore = "slow: about 3 min in the CI debug profile, runs in the slow-tests workflow"]
 fn granular_fluid_survives_hard_impact() {
     const GRID: usize = 64;
     const FLOOR: f32 = 2.0;
@@ -5210,6 +5212,7 @@ fn cpg_oscillator_does_not_die_within_50_steps() {
 /// term is required too -- without it, higher viscosity inverts the deformation
 /// gradient within ~500 steps.
 #[test]
+#[ignore = "slow: about 16 min in the CI debug profile, runs in the slow-tests workflow"]
 fn neohookean_viscosity_prevents_compaction_ratchet() {
     const GRID: usize = 96;
     const DT: f32 = 0.1;
@@ -5747,6 +5750,7 @@ fn pinned_particles_stay_fixed_under_gravity_and_impact() {
 /// FEM/MPM corner stress concentration, not a remaining contact leak (contact only
 /// engages at the snake's bottom face).
 #[test]
+#[ignore = "slow: over 38 min in the CI debug profile, runs in the slow-tests workflow"]
 fn drucker_prager_volumetric_floor_holds_over_long_passive_settle() {
     const GRID: usize = 128;
     const DT: f32 = 0.1;
@@ -5864,6 +5868,7 @@ fn drucker_prager_volumetric_floor_holds_over_long_passive_settle() {
 /// Baumgarte's correction fires hardest at first impact (largest `gap`). Same 16,000
 /// -step duration and assertion bar as the passive-settle test above.
 #[test]
+#[ignore = "slow: over 35 min in the CI debug profile, runs in the slow-tests workflow"]
 fn drucker_prager_volumetric_floor_holds_under_heavy_impact_and_long_settle() {
     const GRID: usize = 128;
     const DT: f32 = 0.1;
@@ -5964,6 +5969,7 @@ fn drucker_prager_volumetric_floor_holds_under_heavy_impact_and_long_settle() {
 /// test is narrower: the terrain's volumetric floor and solver stability must hold
 /// under continuous, large-scale internal driving stress, not just at rest.
 #[test]
+#[ignore = "slow: over 37 min in the CI debug profile, runs in the slow-tests workflow"]
 fn drucker_prager_volumetric_floor_holds_under_active_locomotion_at_larger_scale() {
     const GRID: usize = 192;
     const DT: f32 = 0.1;
@@ -6850,6 +6856,7 @@ fn diag_wet_sand_cohesion_spread_after_realistic_pour() {
 /// whether the viscosity term itself measurably slows dry sand while it's
 /// actively moving, not just while it's ringing down afterward.
 #[test]
+#[ignore = "slow: about 3 min in the CI debug profile, runs in the slow-tests workflow"]
 fn diag_elastic_viscosity_effect_on_active_dry_flow_speed() {
     let config = SimConfig {
         boundary_thickness: 3,
@@ -7035,6 +7042,7 @@ fn diag_apply_radial_force(
 /// Each scenario traces KE and aggregate displacement the same way the
 /// original push-test does, so results are directly comparable.
 #[test]
+#[ignore = "slow: about 8 min in the CI debug profile, runs in the slow-tests workflow"]
 fn diag_stress_test_all_real_interaction_scenarios() {
     let config = SimConfig {
         boundary_thickness: 3,
@@ -7162,6 +7170,7 @@ fn diag_stress_test_all_real_interaction_scenarios() {
 /// corrected diffusivity (1.67e-4 SI), and the real corrected friction
 /// angle (33 deg) -- every fix shipped tonight, combined, under load.
 #[test]
+#[ignore = "slow: about 3 min in the CI debug profile, runs in the slow-tests workflow"]
 fn diag_wet_sand_push_combined_never_tested_before() {
     let config = SimConfig {
         boundary_thickness: 3,
@@ -7555,6 +7564,7 @@ fn diag_lifted_chunk_dispersion_from_surface_with_strong_pull() {
 /// real, tested default -- not a guess -- and to check whether the
 /// slider's own max needs raising too.
 #[test]
+#[ignore = "slow: about 4 min in the CI debug profile, runs in the slow-tests workflow"]
 fn diag_push_weights_sweep_real_lift_within_ui_range() {
     let config = SimConfig {
         boundary_thickness: 3,
@@ -8236,6 +8246,7 @@ fn cavitating_fluid_survives_hard_impact() {
 /// real collagenous-tissue density (denser than water, matching real
 /// collagen content).
 #[test]
+#[ignore = "slow: about 18 min in a local debug run, runs in the slow-tests workflow"]
 fn no_compression_tendon_hangs_taut_survives_pull_and_extreme_impulse() {
     const GRID: usize = 64;
     const DT: f32 = 0.02;

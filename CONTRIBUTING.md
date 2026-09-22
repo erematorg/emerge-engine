@@ -189,6 +189,26 @@ cargo test --all-features -j 2
 `cargo test --features gpu` alone (no `render`/`experimental`) is unaffected; only
 the full `--all-features` combination needs the `-j 2` cap.
 
+### Tests the CI does not run
+
+**GPU tests need real hardware.** Software adapters (lavapipe, D3D12 WARP) give
+verdicts that differ from real GPUs, so CI does not judge the GPU path. Run these
+by hand on a machine with a real GPU:
+
+```sh
+cargo test --profile quick --features gpu --test gpu -- --test-threads=1
+cargo test --profile quick --features render --lib -- --ignored systems::render::tests systems::gpu::solver::device_lost_tests
+```
+
+**Slow tests run on demand.** Long-horizon correctness tests that would push a CI
+shard past its 45-minute limit in the debug profile are marked
+`#[ignore = "slow: ..."]`. The `slow tests` workflow (Actions tab, "Run workflow")
+runs them in the quick profile; the exact list lives in
+`.github/workflows/slow-tests.yml` and can be run locally the same way.
+
+**Diagnostic probes** (`tests/scratch_*.rs`) are kept for reruns and are all
+ignored; run one with `--ignored --nocapture` and its name.
+
 ---
 
 ## Benchmarks

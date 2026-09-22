@@ -30,6 +30,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
+  # Slow long-horizon tests are ignored here and run on demand by
+  # slow-tests.yml.
+  #
   # Split by test target instead of one sequential run of all 24 test
   # binaries. Previously a single job ran `cargo test` then
   # `cargo test --all-features` back to back, i.e. every binary twice, in
@@ -81,7 +84,7 @@ jobs:
           - shard: rest
             args: >-
               --test autonomous_locomotion --test diagnostics
-              --test extensibility --test gpu --test orbital_mechanics
+              --test extensibility --test orbital_mechanics
               --test particle_neighbor_momentum_transfer
               --test perf_particle_scaling --test self_gravitating_body
               --test stress
@@ -89,13 +92,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # gpu/render tests need a Vulkan adapter. ubuntu-latest has no GPU and no
-      # software Vulkan driver by default -- without lavapipe, every GPU test
-      # panics on request_adapter().expect(...). windows-latest gets D3D12 WARP
-      # from the OS itself, no extra install needed.
-      - name: install software Vulkan driver (lavapipe)
-        if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
+      # No GPU tests here: software adapters (lavapipe, D3D12 WARP) disagree
+      # with real GPUs, so the GPU suite runs by hand on real hardware (see
+      # CONTRIBUTING.md, "Tests the CI does not run").
       # -j 2: building every integration test binary against
       # gpu+render+experimental at full parallelism can exhaust available
       # memory and crash the linker (STATUS_STACK_BUFFER_OVERRUN, confirmed

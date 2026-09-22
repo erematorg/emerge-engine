@@ -1,0 +1,54 @@
+name: slow tests
+
+# Long-horizon correctness tests that would push a regular CI shard past its
+# 45-minute limit in the debug profile. They are ignored in the regular suite
+# (`#[ignore = "slow: ..."]`) and run here on demand, in the quick profile.
+# Keep each list in sync with the tests marked slow in its file.
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  slow:
+    name: slow tests (${{ matrix.suite }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: accuracy
+            target: accuracy
+            tests: >-
+              mu_i_rheology_column_collapse_natural_arrest_check
+              post_event_relax_switch_step_long_horizon_convergence_comparison
+              post_event_relax_constant_damping_from_start_no_switch
+              sand_pile_built_by_slow_pour_with_phase_gated_damping
+              sand_preshaped_pile_at_30deg_holds_its_slope
+              unconfined_pile_with_cundall_damping_reaches_real_repose_angle
+              confined_pile_with_cundall_damping_reaches_real_repose_angle
+              sand_collapse_with_phase_gated_relaxation_after_dynamics
+          - suite: physics
+            target: physics_correctness
+            tests: >-
+              drucker_prager_volumetric_floor_holds_over_long_passive_settle
+              drucker_prager_volumetric_floor_holds_under_active_locomotion_at_larger_scale
+              drucker_prager_volumetric_floor_holds_under_heavy_impact_and_long_settle
+              neohookean_viscosity_prevents_compaction_ratchet
+              j_stays_positive_granular_fluid
+              diag_stress_test_all_real_interaction_scenarios
+              diag_push_weights_sweep_real_lift_within_ui_range
+              granular_fluid_survives_hard_impact
+              diag_elastic_viscosity_effect_on_active_dry_flow_speed
+              diag_wet_sand_push_combined_never_tested_before
+              no_compression_tendon_hangs_taut_survives_pull_and_extreme_impulse
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: test (${{ matrix.suite }}, slow set)
+        run: >-
+          cargo test --profile quick --all-features -j 2 --test ${{ matrix.target }}
+          -- --ignored --exact ${{ matrix.tests }}
