@@ -1,26 +1,23 @@
 # Known Limitations - emerge
 
-This document tracks places where emerge's design runs into a **genuinely
-open problem in the published computational-physics / numerical-methods
-literature**. Not our own bugs, not untested code paths, not a TODO we
-haven't gotten to yet. Those belong in GitHub issues, where this project
-already tracks them.
+This document has two parts.
 
-The bar for an entry here is the same bar as something like the
-Navier-Stokes existence-and-smoothness problem: not "we personally
-couldn't solve it," but "real, named, published sources show the wider
-field hasn't solved it either." Every entry must cite sources that
-themselves say, or show through a multi-year line of publications, that
-the specific question is still open. A source about the general topic is
-not enough on its own.
+**Open research questions** track places where emerge's design runs into a
+**genuinely open problem in the published computational-physics or
+numerical-methods literature**: not our own bugs, not untested code paths.
+The bar is the same as for something like the Navier-Stokes
+existence-and-smoothness problem: not "we personally couldn't solve it," but
+"real, named, published sources show the wider field hasn't solved it
+either." Every entry must cite sources that themselves say, or show through
+a multi-year line of publications, that the specific question is still open.
 
-**What does NOT belong here:** an unimplemented feature, an untested
-material combination, a config flag with no code behind it, a constant we
-chose by testing rather than deriving, a bug we haven't traced yet. Those
-are real and worth tracking, but they are ours to fix, not questions
-science hasn't answered yet. They live in GitHub issues instead.
+**The gap registry** (at the end) tracks work the engine knows it has not
+done yet: deferred on purpose, left out of the current plan, not audited, or
+found in passing and not fixed. Those gaps are ours to fix, not the field's
+to solve. They are listed here, each with its source, so that none of them
+silently disappears and each can be picked up later with better research.
 
-**Rule for every entry:**
+**Rule for every open research question:**
 1. The open question itself, stated plainly.
 2. Real, dated, named sources, quoting the part where they say or show
    the question is unresolved. Not just a citation for background.
@@ -34,80 +31,12 @@ science hasn't answered yet. They live in GitHub issues instead.
 
 ## Open
 
-### 1. No general stability rule exists for APIC under fast, large motion
+### 1. (Closed)
 
-**The question.** Explicit MPM fluid and solid simulations use a transfer
-scheme called APIC to move information between particles and the grid.
-Is there a time-step-independent rule that guarantees this scheme stays
-stable (no runaway growth) once particles are moving fast and deforming a
-lot, not just sitting near rest? As of the sources below, no such rule
-exists in the published literature.
-
-**Sources, quoted.**
-- Bai and Schroeder, *"Stability analysis of explicit MPM,"* Computer
-  Graphics Forum 41(8), 2022. Sections 3.13-3.14 prove, for a simplified
-  near-rest single-particle case, that "there is no time step bound for
-  which a single-particle simulation with... APIC will be stable for any
-  combination of time step sizes." A real, formal impossibility result.
-  Their own analysis stays restricted to configurations near rest
-  (deformation close to identity). It does not extend to large
-  deformation or fast motion, and we found no later paper that does.
-- Sun, Shinar and Schroeder, *"Effective time step restrictions for
-  explicit MPM simulation,"* SCA 2020, Section 8: "We derived the
-  single-particle instability case for PIC transfers; we leave a full
-  APIC treatment for future work." The authors of the one existing
-  fluid-specific stability formula say plainly, in print, that the
-  general APIC case (their own formula only covers plain PIC, no affine
-  term) stays unsolved.
-- We independently re-derived and numerically checked this ourselves
-  (2026-09-17). Both an isolated particle and a dense, periodic lattice,
-  tested against this engine's real quadratic B-spline kernel, come out
-  provably stable at any coefficient we tried. The real instability we
-  hit only shows up once particles move fast during an actual impact,
-  exactly the regime the two papers above never cover. This confirms the
-  gap is real rather than just repeating the citation.
-
-**What we found in this engine.** Our own water splash demo (GPU) would
-disintegrate into scattered droplets on violent impact instead of
-splashing and settling. Bisecting the history pinned this to one exact
-commit that made an unrelated volume-tracking formula more exact, not
-less. That fix was correct on its own; it simply stopped a small,
-pre-existing numerical noise from being accidentally smoothed away. The
-real growth traces to the particle's own affine velocity state (the
-quantity APIC uses to carry local motion) amplifying itself through the
-repeated grid round trip during a violent event. It shows up on GPU and
-barely on CPU, because GPU's stricter time-step safety check forces far
-more, much smaller steps for the same real second of simulation, letting
-the same small growth compound many more times before the frame ends.
-
-**What emerge does because this is unresolved.** A shear-relaxation term
-in the GPU fluid transfer (`src/systems/gpu/shaders/g2p.wgsl`, around
-line 408). Its *shape* is grounded in a real, cited idea (from Lewin et
-al., "Position Based MPM," SIGGRAPH 2024): damp only the shear part of
-the affine state, the part with no direct physical meaning of its own,
-and leave rotation and volume change untouched. The two actual numbers
-used (a baseline damping fraction and a hard ceiling) were reached by
-testing against the real demo, not derived from a formula, because no
-formula in the sources above produces them. GPU only; the CPU solver has
-no equivalent yet.
-
-Two later attempts to make this damping smarter (only engage once a real
-excursion looks dangerous, or scale by real elapsed time instead of by
-substep count) were each tried, measured with a real coherence check --
-does the fluid stay one connected body, or do particles end up isolated
-from every neighbor -- and reverted: both let real fragmentation back in
-that the flat, unconditional version does not show, confirmed live, not
-assumed (`examples/gpu/fragmentation_check_gpu.rs` holds the real check).
-The flat version's own real cost is real too: a fluid body that lands
-correctly but does not visibly keep relaxing afterward. Between a fluid
-that freezes in a safe shape and one that quietly loses particles, the
-frozen one is the honest choice until a real fix for the underlying
-question exists -- not a preference, a measured trade every stronger or
-gated variant tried so far has landed on the wrong side of.
-
-**What would close this.** A published stability analysis of APIC that
-covers real deformation and real particle speed, the way Bai and
-Schroeder's 2022 paper covers the near-rest case.
+The former entry 1, "no general stability rule exists for APIC under fast,
+large motion," turned out to describe two GPU implementation bugs, not an
+open question. See "The GPU water splash disintegrated on impact" under
+Resolved. Numbering is kept so that references to entry 2 stay valid.
 
 ---
 
@@ -234,6 +163,31 @@ instability, is not on this list and is not acceptable here.
 
 ## Resolved
 
+### The GPU water splash disintegrated on impact
+
+**What was wrong.** Two GPU implementation bugs. On the AMD Vulkan driver
+used for development, reading one element of a matrix held in a local copy
+of a struct (`p.m[1][1]`) returned another column, so the fluid's volume
+change followed shear instead of compression. Separately, the GPU summed
+grid mass and momentum as fixed-point integers, which silently dropped every
+contribution smaller than half a quantum at small time steps.
+
+**What actually fixed it.** Matrices are passed by value to small helper
+functions (`trace2`, `det2`, `frob2_sq`) before being indexed, and the main
+grid accumulates in exact floating point with a compare-and-swap loop. The
+shear-damping workaround this entry used to describe was deleted.
+
+**What remains.** The broader question, a published stability analysis of
+APIC under large and fast deformation, may still be open in the literature,
+but it was not what broke this scene. For the simplest case there is a
+measured bound: an isolated particle stays bounded up to a time step of
+0.80 dx/c_p and diverges at 0.85 (Poisson ratio 0.3), close to the
+single-particle value sqrt((lambda + 2 mu) / (2 (lambda + mu))) = 0.84.
+The other read forms of the driver bug were not tested one by one, and the
+secondary GPU grids still use fixed point.
+
+---
+
 ### The water splash used to collapse into a paper-thin layer, then explode
 
 **What was wrong.** Water's pressure formula has a floor: pressure is
@@ -283,31 +237,73 @@ just on a different field.
 **What actually fixed it.** Routed both the shear and the bulk viscosity
 through the engine's own existing, correct conversion function. Checked
 against the full fluid test suite (all still pass) and separately
-confirmed this fix alone does not solve the splash instability in entry 1
-above. The real molecular viscosity, even corrected, is far too small on
+confirmed this fix alone does not solve the GPU splash disintegration
+(resolved separately, above). The real molecular viscosity, even corrected, is far too small on
 its own to explain or calm that particular runaway.
 
 **Closed:** 2026-09-17.
 
 ---
 
-## Not tracked here (see GitHub issues instead)
+## Gap registry
 
-Real, disclosed engineering gaps found while chasing the two open problems
-above. Kept in issue tracking, not this document, because they are ours to
-fix, not the field's to solve.
+### Deferred by the core implementation plan
 
-- Two fluid-like materials (cavitating fluid, boiling mixture) share entry
-  1's safety gate without being individually tested against it.
-- Entry 1's fix lives only in the GPU shader, with no CPU equivalent.
-- A config flag for letting calm regions take bigger time steps was
-  removed on 2026-09-17. It had no real code behind it, left over from an
-  earlier rewrite that was undone for unrelated reasons. A direct
-  feasibility check confirmed the idea's own precondition, a genuinely
-  calm region next to a violent one, does not hold on our current fluid
-  scenes anyway. If rebuilt, it should follow the real Fang et al. 2018
-  algorithm, on a scene where that precondition actually holds.
+- **Pressure projection** (`Grid::project_fluid_incompressibility`, off by
+  default). Four mechanisms were measured. The divergence it corrects is
+  read with empty cells as velocity zero, so a droplet in free fall shows a
+  divergence that is entirely fabricated. The velocity correction divides by
+  the nodal mass at partly filled surface nodes while the solve assumes the
+  average density. The 0.2 relaxation masks an unstable operator: the full
+  correction grows an injected divergence up to 6.2 times on a second pass.
+  Fluid, air and wall are classified by mass thresholds and the domain edge
+  instead of geometry. Consequence: the wall-contact column survives 120
+  frames only with J at the [0.5, 2.0] safety clamp from about frame 20, so
+  the frame rates quoted for it (about 30 to 90 fps on CPU, 188 fps on GPU)
+  measure cost, not a valid run. The fix is a rebuild on the standard
+  formulation: a liquid level set from the particles, solid fractions at the
+  wall's real position, a ghost-fluid free surface, consistent discrete
+  operators and a conjugate-gradient solve (Bridson, *Fluid Simulation for
+  Computer Graphics*; Batty, Bertails and Bridson 2007; Gibou et al. 2002;
+  `apic2d` as a reference implementation). The experiments and their
+  toggles live on the fork branch `archive/pressure-rhs-audit-2026-09-21`.
+- **Time convergence and energy lost per substep.** With APIC, a free
+  elastic block keeps 0.69, 0.51 and 0.37 of its energy after the same
+  physical time at 256, 1024 and 4096 steps (the exact answer is 1.0):
+  smaller steps mean more artificial damping. ASFLIP, available through
+  `asflip_blend`, does not fix it: 0.53 at blend 0.5, and at blend 0.97 it
+  creates energy (1.16 at 4096 steps). Candidates: PolyPIC (Fu et al. 2017),
+  which lowers the loss per transfer without changing the order, and an
+  energy-momentum consistent implicit MPM (Love and Sulsky 2006), which
+  conserves energy by construction at the cost of an implicit solve. The
+  energy lost per step will be published next to the CFL safety factor.
+- **3D.** The code is 2D throughout (about 2,400 `Vec2`, 840 `Mat2` and 250
+  `IVec2` uses, 440 WGSL 2D types, no dimension abstraction). A
+  per-dimension type alias would be the first seam; nothing else is planned.
 
----
+### Not audited yet
 
-*Last updated: 2026-09-17.*
+Rendering (`systems/render`); the radiation and optics code (its tests were
+read, not the code); rod biology (growth, gravitropism, networks,
+plasticity); electromagnetics and acoustics; orbital mechanics; the
+information measures; the remaining thermodynamics (granular fluidity,
+Cosserat field, water saturation); diagnostics; the particle store; the
+grip, ratchet, heightmap and kinematic-obstacle boundaries; a law-by-law
+re-read of the 17 materials.
+
+### Found during the core audit, outside the current plan
+
+- Positions and velocities are in cells while physical inputs use
+  `dx_meters`, and `grid_cell_size` is always 1.0; several docs warn about
+  mixing the two. A typed unit split would remove the trap.
+- Force fields add no time-step bound of their own. Harmless for smooth
+  fields, unsafe if a stiff one (short-range Coulomb, stiff confinement) is
+  added.
+- The differentiable solver (`spacetime::diff`) is a second, separate
+  physics (signed muscles, sticky floor, no gradient through the kernel
+  weights' position dependence), so a gait trained there must be re-checked
+  in the runtime solver.
+- The electric potential field relaxes with a fixed number of Jacobi
+  iterations chosen by the caller, with no convergence test.
+- Explicit Euler in the LNN controller is stable only while the time step
+  stays well below the neuron time constants; nothing checks it.
