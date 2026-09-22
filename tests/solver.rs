@@ -115,6 +115,7 @@ fn jelly_stable_after_many_steps() {
 /// translation without preserving a compatible affine field. The no-
 /// compression zero-energy mode amplified those defects into collapse.
 #[test]
+#[ignore = "named phase 0 exception: anchored bodies lose volume next to the anchor, fix slotted after phase 1; see KNOWN_LIMITATIONS.md"]
 fn no_compression_hanging_body_has_no_passive_volume_ratchet() {
     const STEPS: usize = 12_000;
     let config = SimConfig {

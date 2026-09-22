@@ -281,6 +281,35 @@ its own to explain or calm that particular runaway.
   `IVec2` uses, 440 WGSL 2D types, no dimension abstraction). A
   per-dimension type alias would be the first seam; nothing else is planned.
 
+### Named exception to the phase 0 CI gate
+
+- **Anchored bodies lose volume next to the anchor.**
+  `no_compression_hanging_body_has_no_passive_volume_ratchet` (`tests/solver.rs`)
+  is ignored under this name only; the fix is slotted right after phase 1
+  of the core plan, before phase 2. Measured with
+  `tests/scratch_no_compression_drift_horizon.rs` (same scene, 30 000 steps):
+  - Mean J - 1 falls steadily, about 7e-8 per step: -0.00225 with one
+    thread, -0.00206 with four; max |J - 1| reaches 0.011 and keeps growing.
+    The test failed on Linux only because summation order moved its
+    12 000-step reading (0.0030) past the bound; on Windows the same run
+    reads 0.0018 to 0.0028 depending on the thread count.
+  - No gravity: no drift at all. Half the frame time: the same drift per
+    simulated second, so it is a process in physical time, not an error
+    accumulated per step.
+  - An ordinary NeoHookean body hanging from the same pinned particles
+    drifts too (mean J - 1 -0.00075 at 30 000 steps, max 0.0125); the same
+    body resting on the floor is stable (-0.000016 from 6 000 to 30 000
+    steps). The cause is the pinned-particle anchor, and the tension-only
+    material amplifies it about 3 times.
+  - The body does not move (centre of mass constant to 1e-5 cells, the
+    anchor carries the weight). The volume is lost in the band one to two
+    cells below the anchor line, where free particles share constrained
+    nodes: their F keeps compressing while their positions stay fixed.
+  - Constraining only nodes whose mass is at least half anchored reduces
+    the drift (-0.00128 and -0.00060) but does not stop it. The general
+    treatment of essential boundaries (Cortis et al. 2018, IJNME 113) is
+    the reference for the real fix.
+
 ### Not audited yet
 
 Rendering (`systems/render`); the radiation and optics code (its tests were
