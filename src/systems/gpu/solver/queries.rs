@@ -29,13 +29,15 @@ impl GpuSimulation {
     /// Grid-side fields (mass error, momentum error, active cells) are zero -- GPU grid is
     /// not readable on CPU. All particle-side fields are exact.
     pub fn diagnostics_snapshot(&self) -> crate::diagnostics::SimSnapshot {
-        crate::diagnostics::collect_snapshot_particles_only(
+        let mut snapshot = crate::diagnostics::collect_snapshot_particles_only(
             self.frame_index,
             &self.particles,
             &self.config,
             self.last_sub_dt,
             self.last_substeps,
-        )
+        );
+        snapshot.sim_time_dropped = self.last_sim_time_dropped;
+        snapshot
     }
 
     /// Iterate over (index, &Particle) pairs within `radius` grid-cells of `center`.

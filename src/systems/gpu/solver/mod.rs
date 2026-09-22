@@ -64,7 +64,13 @@ pub struct GpuSimulation {
     /// buffer's actual end.
     particle_capacity: usize,
     last_sub_dt: f32,
+    /// Substeps the GPU actually ran in the last frame whose stats were read back
+    /// (see `sync_frame_stats`), not the count encoded for it.
     last_substeps: usize,
+    /// Frame time the GPU could not advance in that same frame.
+    last_sim_time_dropped: f32,
+    /// Frame stats readback begun at the end of the last `step_frame`.
+    pending_frame_stats: Option<ReadbackResult>,
     /// One-frame-lagged max particle speed -- mirrors CPU's own
     /// `Simulation::last_max_particle_speed` exactly (same convention, same
     /// consumer: `SimConfig::fluid_near_wall_compression_mach_margin`'s
@@ -374,6 +380,8 @@ impl GpuSimulation {
             particle_capacity: particle_count,
             last_sub_dt: config.dt,
             last_substeps: 0,
+            last_sim_time_dropped: 0.0,
+            pending_frame_stats: None,
             last_max_particle_speed: 0.0,
             frame_index: 0,
             last_spawn_frame: 0,

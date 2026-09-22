@@ -5804,4 +5804,59 @@ mod gpu_tests {
              zero tension resistance otherwise"
         );
     }
+
+    /// A calm frame: the GPU reports the substeps it really ran, within the
+    /// configured budget, and no dropped time.
+    #[test]
+    fn gpu_frame_stats_report_executed_substeps_without_dropped_time() {
+        if !gpu_available() {
+            return;
+        }
+        let config = small_config();
+        let particles = spawn_disk(&config, Vec2::splat(16.0), 0);
+        let registry =
+            MaterialRegistry::with_default(Box::new(NeoHookeanMaterial::new(100.0, 50.0)));
+        let mut solver = block_on(GpuSimulation::new(config, particles, registry));
+        for _ in 0..5 {
+            solver.step_frame();
+        }
+        solver.sync_particles_blocking();
+        let substeps = solver.last_substeps();
+        assert!(
+            (1..=config.max_substeps_per_step).contains(&substeps),
+            "executed substeps must be counted: got {substeps}"
+        );
+        assert!(
+            solver.last_sim_time_dropped() <= 1.0e-9,
+            "a calm frame must advance its whole dt: dropped {}",
+            solver.last_sim_time_dropped()
+        );
+    }
+
+    /// A stiff solid over a long frame with a two-substep budget cannot cover
+    /// the frame: the GPU must report the time it did not advance instead of
+    /// dropping it silently.
+    #[test]
+    fn gpu_frame_stats_report_dropped_time_when_substeps_run_out() {
+        if !gpu_available() {
+            return;
+        }
+        let config = SimConfig {
+            max_substeps_per_step: 2,
+            ..SimConfig::standard(32, 0.1, Vec2::new(0.0, -0.3))
+        };
+        let particles = spawn_disk(&config, Vec2::splat(16.0), 0);
+        let registry =
+            MaterialRegistry::with_default(Box::new(NeoHookeanMaterial::new(1.0e5, 5.0e4)));
+        let mut solver = block_on(GpuSimulation::new(config, particles, registry));
+        solver.step_frame();
+        solver.sync_particles_blocking();
+        let dropped = solver.last_sim_time_dropped();
+        assert_eq!(solver.last_substeps(), 2, "both budgeted substeps run");
+        assert!(
+            dropped > 0.0 && dropped < config.dt,
+            "the frame's unadvanced time must be reported: dropped {dropped} of {}",
+            config.dt
+        );
+    }
 }

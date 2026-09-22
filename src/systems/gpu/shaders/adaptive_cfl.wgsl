@@ -16,6 +16,8 @@
 // When the frame's time is spent, `adaptive_dt[0]` becomes 0 and every pass of the
 // remaining encoded substeps returns immediately (the CPU encodes a fixed, slightly
 // generous substep count -- it cannot know in advance how far the GPU will tighten).
+// `[3]` and `[4]` accumulate the time and the number of substeps actually executed,
+// which the CPU reads back as the frame's real substep count and dropped time.
 
 struct StepParams {
     grid_res:           u32,
@@ -36,7 +38,7 @@ struct StepParams {
 }
 
 @group(0) @binding(3) var<uniform>             step_params: StepParams;
-@group(2) @binding(37) var<storage, read_write> adaptive_dt: array<atomic<u32>, 4>;
+@group(2) @binding(37) var<storage, read_write> adaptive_dt: array<atomic<u32>, 5>;
 
 // Below this, a leftover slice of frame time is dropped rather than stepped: the same
 // "honest dropped time" the CPU loop already reports when it runs out of substeps.
@@ -44,6 +46,14 @@ const DT_EPSILON: f32 = 1.0e-9;
 
 @compute @workgroup_size(1, 1, 1)
 fn cfl_commit_main() {
+    // `[0]` still holds the dt of the substep that just ran (0 if it was one of the
+    // frame's spare encoded substeps), so what was really executed is counted here.
+    let just_ran = bitcast<f32>(atomicLoad(&adaptive_dt[0]));
+    if just_ran > 0.0 {
+        let executed = bitcast<f32>(atomicLoad(&adaptive_dt[3])) + just_ran;
+        atomicStore(&adaptive_dt[3], bitcast<u32>(executed));
+        atomicAdd(&adaptive_dt[4], 1u);
+    }
     let bound = bitcast<f32>(atomicLoad(&adaptive_dt[2]));
     let remaining = bitcast<f32>(atomicLoad(&adaptive_dt[1]));
     var next = min(bound, step_params.dt_cap);
@@ -58,6 +68,4 @@ fn cfl_commit_main() {
     atomicStore(&adaptive_dt[0], bitcast<u32>(next));
     atomicStore(&adaptive_dt[1], bitcast<u32>(max(remaining - next, 0.0)));
     atomicStore(&adaptive_dt[2], bitcast<u32>(3.4e38));
-    let advanced = bitcast<f32>(atomicLoad(&adaptive_dt[3])) + next;
-    atomicStore(&adaptive_dt[3], bitcast<u32>(advanced));
 }

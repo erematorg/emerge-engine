@@ -255,7 +255,6 @@ impl GpuSimulation {
             sub_dts[0].min(self.config.dt),
             self.config.dt,
         );
-        self.last_substeps = encoded_substeps;
         self.last_sub_dt = sub_dts.last().copied().unwrap_or(self.config.dt);
         self.frame_index += 1;
         let cfl_scan_ns = cfl_scan_start.elapsed().as_secs_f32() * 1.0e9;
@@ -614,6 +613,18 @@ impl GpuSimulation {
         // Pump wgpu callbacks so any in-flight mapping can complete.
         self.device.poll(wgpu::PollType::Poll).ok();
 
+        // The real substep count and dropped time come from the GPU's own time
+        // accounting, read back without blocking: one frame late unless the caller
+        // waits with `sync_frame_stats`. If the previous readback is still in flight
+        // the GPU is more than a frame behind and this frame's stats are skipped.
+        self.collect_frame_stats();
+        if self.pending_frame_stats.is_none() && !self.is_device_lost() {
+            self.pending_frame_stats = Some(
+                self.buffers
+                    .begin_frame_stats_readback(&self.device, &self.queue),
+            );
+        }
+
         // Check if a previous async readback completed -- Ok, Err, or still pending.
         // Every completion path must explicitly unmap regardless of Ok/Err -- an
         // unhandled Err leaves the staging buffer mapped forever (finish_readback, the
@@ -706,6 +717,39 @@ impl GpuSimulation {
         let readback_ns = readback_start.elapsed().as_secs_f32() * 1.0e9;
         let total_ns = total_start.elapsed().as_secs_f32() * 1.0e9;
         self.last_cpu_timings = (cfl_scan_ns, encode_ns, submit_ns, readback_ns, total_ns);
+    }
+
+    /// Wait for the GPU to finish the last stepped frame and read its real substep
+    /// count and dropped time into `last_substeps` / `last_sim_time_dropped`, which are
+    /// otherwise one frame behind (`step_frame` never blocks on them).
+    pub fn sync_frame_stats(&mut self) {
+        if self.pending_frame_stats.is_some() && !self.is_device_lost() {
+            self.device.poll(wgpu::PollType::wait_indefinitely()).ok();
+        }
+        self.collect_frame_stats();
+    }
+
+    /// Apply a completed frame stats readback, if there is one. Never blocks.
+    fn collect_frame_stats(&mut self) {
+        let done = self
+            .pending_frame_stats
+            .as_ref()
+            .and_then(|flag| flag.lock().ok().and_then(|mut g| g.take()));
+        let Some(result) = done else {
+            return;
+        };
+        self.pending_frame_stats = None;
+        if self.is_device_lost() {
+            return;
+        }
+        if result.is_err() {
+            self.readback_error_count += 1;
+            self.buffers.abandon_frame_stats_readback();
+            return;
+        }
+        let stats = self.buffers.finish_frame_stats_readback();
+        self.last_substeps = stats.executed_substeps as usize;
+        self.last_sim_time_dropped = stats.dropped_time;
     }
 }
 

@@ -348,12 +348,6 @@ re-read of the 17 materials.
   `diag_repeated_phase_transitions_do_not_cause_cumulative_instability`) are
   ignored for that reason. Choosing the law is a physics decision: Coulomb
   friction fits a granular skeleton, a liquid needs no-slip or Navier slip.
-- The GPU reports as "substeps taken" the number it encodes, which includes a
-  15 % margin, so one planned substep reads as two. Seven single-substep
-  CPU/GPU parity tests in `tests/solver.rs` fail on real hardware for that
-  reason alone (they require exactly one substep). Counting the substeps the
-  GPU actually executes is also what the missing GPU dropped-time counter
-  needs.
 - Two renderer tests (`render_gpu_produces_visible_particle_pixels_not_just_clear_color`
   and its CPU control) find no particle pixel in a 64x64 headless render, on
   real hardware too. The instance buffers hold correct data, so the fault is

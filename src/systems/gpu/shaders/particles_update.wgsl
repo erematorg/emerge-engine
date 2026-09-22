@@ -118,7 +118,7 @@ fn has_model(model: u32, m: u32) -> bool {
 // This substep's timestep and velocity cap, decided on the GPU at the end of the previous
 // substep -- see `adaptive_cfl.wgsl`. `substep_dt()`/`vel_limit` are the CPU's
 // frame-start values and are NOT authoritative any more (the GPU may only tighten them).
-@group(2) @binding(37) var<storage, read_write> adaptive_dt: array<atomic<u32>, 4>;
+@group(2) @binding(37) var<storage, read_write> adaptive_dt: array<atomic<u32>, 5>;
 
 // Cached per invocation: this is an atomic storage load, and reading it at every use
 // site cost ~40% of a substep (measured: 0.29 -> 0.41ms per substep on the dam break).

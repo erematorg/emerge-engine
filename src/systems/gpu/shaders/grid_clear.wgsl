@@ -50,7 +50,7 @@ override BLOCK_THREADS_PER_DIM: u32 = 16u;
 
 // This substep's timestep, decided on the GPU (see adaptive_cfl.wgsl). Zero means this
 // encoded substep is spare capacity and must do nothing.
-@group(2) @binding(37) var<storage, read_write> adaptive_dt: array<atomic<u32>, 4>;
+@group(2) @binding(37) var<storage, read_write> adaptive_dt: array<atomic<u32>, 5>;
 
 var<private> substep_dt_cache: f32 = -1.0;
 

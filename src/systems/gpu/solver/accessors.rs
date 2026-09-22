@@ -224,9 +224,16 @@ impl GpuSimulation {
         self.last_sub_dt
     }
 
-    /// Number of substeps run during the most recent `step_frame` call.
+    /// Substeps the GPU actually ran, for the most recent frame whose stats have been
+    /// read back: the previous frame, or the last one after `sync_frame_stats`.
     pub fn last_substeps(&self) -> usize {
         self.last_substeps
+    }
+
+    /// Simulated time the GPU could not advance in that same frame, because the
+    /// encoded substeps ran out before the frame's time did.
+    pub fn last_sim_time_dropped(&self) -> f32 {
+        self.last_sim_time_dropped
     }
 
     /// Total frames stepped since creation.

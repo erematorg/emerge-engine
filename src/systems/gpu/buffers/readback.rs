@@ -8,7 +8,73 @@ use std::mem;
 use super::GpuBuffers;
 use crate::particle::Particle;
 
+/// What the GPU's own time accounting says about the last stepped frame, read
+/// from `adaptive_dt` (see that buffer's slot layout).
+pub struct FrameStats {
+    /// Simulated time the frame's substeps actually advanced.
+    pub executed_time: f32,
+    /// Substeps that actually ran (spare encoded substeps are not counted).
+    pub executed_substeps: u32,
+    /// Frame time left unadvanced when the encoded substeps ran out.
+    pub dropped_time: f32,
+}
+
 impl GpuBuffers {
+    /// Copy `adaptive_dt` to its staging buffer and start mapping it. Non-blocking;
+    /// the returned flag is set when the copy is readable. Must follow the frame's
+    /// last substep submission on the same queue.
+    pub fn begin_frame_stats_readback(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> std::sync::Arc<std::sync::Mutex<Option<Result<(), wgpu::BufferAsyncError>>>> {
+        use std::sync::{Arc, Mutex};
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("mpm_frame_stats_copy"),
+        });
+        encoder.copy_buffer_to_buffer(
+            &self.adaptive_dt,
+            0,
+            &self.frame_stats_staging,
+            0,
+            self.adaptive_dt.size(),
+        );
+        queue.submit(std::iter::once(encoder.finish()));
+        let flag: Arc<Mutex<Option<Result<(), wgpu::BufferAsyncError>>>> =
+            Arc::new(Mutex::new(None));
+        let flag_cb = flag.clone();
+        self.frame_stats_staging
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |r| {
+                *flag_cb
+                    .lock()
+                    .expect("emerge: GPU frame stats flag poisoned") = Some(r);
+            });
+        flag
+    }
+
+    /// Read the mapped frame stats and unmap. Call only after the flag from
+    /// `begin_frame_stats_readback` reported `Ok`.
+    pub fn finish_frame_stats_readback(&self) -> FrameStats {
+        let slots: [u32; 8] = {
+            let view = self.frame_stats_staging.slice(..).get_mapped_range();
+            bytemuck::pod_read_unaligned(&view)
+        };
+        self.frame_stats_staging.unmap();
+        FrameStats {
+            executed_time: f32::from_bits(slots[3]),
+            executed_substeps: slots[4],
+            // `[0]` is the dt chosen for a substep that was never encoded, `[1]` what
+            // was still left after it: together, the time this frame did not advance.
+            dropped_time: f32::from_bits(slots[0]) + f32::from_bits(slots[1]),
+        }
+    }
+
+    /// Unmap after a failed frame stats mapping.
+    pub fn abandon_frame_stats_readback(&self) {
+        self.frame_stats_staging.unmap();
+    }
+
     /// Begin an async GPU → CPU readback. Non-blocking -- returns a shared flag set when done.
     /// Caller polls the flag each frame via `try_lock` + `take`. Staging buffer must be idle.
     pub fn begin_readback(
