@@ -102,6 +102,8 @@ impl MaterialModel for MyMaterial {
         viscous_cfl: f32,
     ) -> f32 { ... }
     fn needs_cpu_update(&self) -> bool { false }
+    // `Some(reason)` makes `GpuSimulation` refuse this material.
+    fn gpu_unsupported_reason(&self) -> Option<&'static str> { None }
 }
 ```
 
@@ -124,7 +126,7 @@ Re-export from `mod.rs` and add to `src/prelude.rs`.
 
 ### 3. `src/systems/gpu/shaders/p2g.wgsl`
 
-Add `case 14u` to the Kirchhoff stress `switch`. If the material is CPU-only, return zero stress and set `needs_cpu_update = true` in Rust.
+Add `case 14u` to the Kirchhoff stress `switch`. If the material has no GPU law yet, leave the shaders alone and override `gpu_unsupported_reason` in Rust instead: `GpuSimulation` then refuses to start with it rather than running another law in its place.
 
 ### 4. `src/systems/gpu/shaders/particles_update.wgsl`
 

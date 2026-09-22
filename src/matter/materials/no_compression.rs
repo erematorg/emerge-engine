@@ -104,6 +104,12 @@ impl MaterialModel for NoCompressionMaterial {
         ConstitutiveModel::NoCompression
     }
 
+    fn gpu_unsupported_reason(&self) -> Option<&'static str> {
+        Some(
+            "NoCompressionMaterial has no GPU stress path (issue #29): the shaders have no case for it and there is no CPU fallback, so it would run with zero stress",
+        )
+    }
+
     fn kirchhoff_stress(&self, particles: &Particles, i: usize) -> Mat2 {
         let f = particles.deformation_gradient[i];
         let j = f.determinant();

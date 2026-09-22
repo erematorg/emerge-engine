@@ -447,6 +447,12 @@ impl MaterialModel for BoilingMixtureMaterial {
         ConstitutiveModel::Fluid
     }
 
+    fn gpu_unsupported_reason(&self) -> Option<&'static str> {
+        Some(
+            "BoilingMixtureMaterial has no GPU stress path: it uploads as a plain Tait fluid, so the GPU would run without its liquid-vapour equation of state",
+        )
+    }
+
     // Same real F/V/rho contract as `CavitatingFluidMaterial` -- see this
     // module's own top doc: the fixed liquid reference stays the
     // bookkeeping anchor, `rho_eq(x)` only ever enters the pressure law.
@@ -609,6 +615,13 @@ mod tests {
         p.deformation_gradient = Mat2::from_diagonal(Vec2::splat(s));
         p.friction_hardening = x;
         p
+    }
+
+    #[test]
+    fn gpu_refuses_the_boiling_mixture() {
+        let material = BoilingMixtureMaterial::from_table(&real_table(), 1.0, 0.0, 0.5, 8.0);
+        let reason = material.gpu_unsupported_reason();
+        assert!(reason.is_some_and(|r| r.starts_with("BoilingMixtureMaterial")));
     }
 
     /// Real, direct anchor: at `x=0`, `J=1` (equilibrium liquid), pressure

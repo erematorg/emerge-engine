@@ -542,6 +542,12 @@ impl MaterialModel for BinghamFluidMaterial {
         self.shear_modulus > 0.0
     }
 
+    fn gpu_unsupported_reason(&self) -> Option<&'static str> {
+        (self.shear_modulus > 0.0).then_some(
+            "BinghamFluidMaterial with a shear modulus (the elastoviscoplastic branch) has no GPU stress path: the GPU runs the viscous fluid law and the per-frame CPU update advances only half the simulated time",
+        )
+    }
+
     fn params(&self) -> MaterialParams {
         MaterialParams {
             model: ConstitutiveModel::Fluid as u32,

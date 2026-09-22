@@ -340,6 +340,12 @@ impl MaterialModel for IdealGasMaterial {
         ConstitutiveModel::Gas
     }
 
+    fn gpu_unsupported_reason(&self) -> Option<&'static str> {
+        Some(
+            "IdealGasMaterial has no GPU stress path: the shaders have no gas case, so it would run with zero pressure",
+        )
+    }
+
     /// Seeds the exact analytical rest state, same contract
     /// `NewtonianFluidMaterial::init_particle` establishes (`V0=m/ρ0`,
     /// `ρ=ρ0/J`) -- plus `temperature`, which a strict fluid never needs

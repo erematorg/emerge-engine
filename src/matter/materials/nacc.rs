@@ -479,6 +479,12 @@ impl MaterialModel for NaccMaterial {
         true
     }
 
+    fn gpu_unsupported_reason(&self) -> Option<&'static str> {
+        Some(
+            "NaccMaterial has no GPU stress path: it uploads as NeoHookean, so the GPU runs kappa ln(J) instead of Cam-Clay's kappa/2 (J^2 - 1); use GranularFluidMaterial for a GPU granular-fluid scene",
+        )
+    }
+
     fn timestep_bound(
         &self,
         density: f32,

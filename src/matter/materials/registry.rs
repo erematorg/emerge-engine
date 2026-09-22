@@ -367,6 +367,15 @@ impl MaterialRegistry {
         (material_id as usize) < self.materials.len()
     }
 
+    /// First registered material the GPU solver cannot run, with the reason
+    /// it gives (see `MaterialModel::gpu_unsupported_reason`).
+    pub fn first_gpu_unsupported(&self) -> Option<(u32, &'static str)> {
+        self.materials
+            .iter()
+            .enumerate()
+            .find_map(|(id, m)| m.gpu_unsupported_reason().map(|reason| (id as u32, reason)))
+    }
+
     /// Returns true if any registered material requires a CPU plasticity pass each substep.
     /// Used by the GPU solver to skip the download+update loop when all plasticity is on GPU.
     pub fn any_needs_cpu_update(&self) -> bool {
@@ -526,5 +535,67 @@ mod von_mises_tests {
             (vm - expected).abs() < 1.0e-4,
             "vm={vm}, expected {expected}"
         );
+    }
+}
+
+#[cfg(test)]
+mod gpu_support_tests {
+    use super::*;
+    use crate::materials::{
+        BinghamFluidMaterial, IdealGasMaterial, NaccMaterial, NeoHookeanMaterial,
+        NewtonianFluidMaterial, NoCompressionMaterial,
+    };
+
+    fn gpu_ready_registry() -> MaterialRegistry {
+        let mut registry =
+            MaterialRegistry::with_default(Box::new(NeoHookeanMaterial::new(2000.0, 4000.0)));
+        registry.insert(
+            1,
+            Box::new(NewtonianFluidMaterial::low_viscosity(1.0, 50.0)),
+        );
+        registry.insert(
+            2,
+            Box::new(BinghamFluidMaterial::new(1000.0, 0.5, 5000.0, 7.0, 100.0)),
+        );
+        registry
+    }
+
+    #[test]
+    fn gpu_supported_materials_pass_the_check() {
+        assert_eq!(gpu_ready_registry().first_gpu_unsupported(), None);
+    }
+
+    #[test]
+    fn each_unsupported_material_is_refused_by_name_and_slot() {
+        let mut elastoviscoplastic = BinghamFluidMaterial::new(1000.0, 0.5, 5000.0, 7.0, 100.0);
+        elastoviscoplastic.shear_modulus = 2000.0;
+        let config = crate::SimConfig::earth(64, 0.01, 0.001);
+        let cases: [(Box<dyn MaterialModel>, &str); 4] = [
+            (Box::new(elastoviscoplastic), "BinghamFluidMaterial"),
+            (
+                Box::new(NaccMaterial::new(3000.0, 2000.0, 1.2, 0.0, 2.0)),
+                "NaccMaterial",
+            ),
+            (
+                Box::new(NoCompressionMaterial::new(2000.0, 4000.0)),
+                "NoCompressionMaterial",
+            ),
+            (
+                Box::new(IdealGasMaterial::air(1.2, 293.15, &config)),
+                "IdealGasMaterial",
+            ),
+        ];
+        for (material, name) in cases {
+            let mut registry = gpu_ready_registry();
+            registry.insert(3, material);
+            let (id, reason) = registry
+                .first_gpu_unsupported()
+                .unwrap_or_else(|| panic!("{name} must be refused on the GPU"));
+            assert_eq!(id, 3);
+            assert!(
+                reason.starts_with(name),
+                "reason must name {name}: {reason}"
+            );
+        }
     }
 }

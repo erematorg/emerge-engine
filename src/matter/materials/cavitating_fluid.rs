@@ -133,6 +133,12 @@ impl MaterialModel for IsothermalCavitatingFluidMaterial {
         ConstitutiveModel::Fluid
     }
 
+    fn gpu_unsupported_reason(&self) -> Option<&'static str> {
+        Some(
+            "IsothermalCavitatingFluidMaterial has no GPU stress path: it uploads as a plain Tait fluid, so the GPU would run without cavitation",
+        )
+    }
+
     /// Same real contract as `NewtonianFluidMaterial::init_particle` --
     /// see that method's own doc for why a strict fluid must set
     /// `initial_volume`/`volume`/`density` exactly here (V0=m/rho0,
@@ -282,14 +288,8 @@ impl MaterialModel for IsothermalCavitatingFluidMaterial {
         false
     }
 
-    /// Real, disclosed limitation: NOT yet wired for GPU -- this material
-    /// is CPU-only for now, same real "CPU correctness first, GPU port
-    /// second" standing rule `IdealGasMaterial` was built under. If this
-    /// material is ever registered with a `GpuSimulation`, it will be
-    /// silently misread as a zero-stiffness `NewtonianFluidMaterial` --
-    /// real, disclosed, NOT YET guarded against at construction; a real,
-    /// loud rejection or a genuine new GPU constitutive branch is the
-    /// correct fix, not attempted here.
+    /// CPU-only: on the GPU this material would upload as a plain Tait
+    /// fluid, so `GpuSimulation` refuses it (`gpu_unsupported_reason`).
     ///
     /// Real, disclosed correction (2026-08-30): `params()` is NOT purely
     /// GPU-facing metadata -- `eos_power`
@@ -457,6 +457,12 @@ impl CavitatingFluidMaterial {
 impl MaterialModel for CavitatingFluidMaterial {
     fn constitutive_model(&self) -> ConstitutiveModel {
         ConstitutiveModel::Fluid
+    }
+
+    fn gpu_unsupported_reason(&self) -> Option<&'static str> {
+        Some(
+            "CavitatingFluidMaterial has no GPU stress path: it uploads as a plain Tait fluid, so the GPU would run without cavitation",
+        )
     }
 
     fn init_particle(&self, particle: &mut Particle) {
@@ -883,6 +889,24 @@ mod tests {
              rest={:?} compressing={:?}",
             stress_rest.x_axis.x,
             stress_compressing.x_axis.x
+        );
+    }
+
+    #[test]
+    fn gpu_refuses_both_cavitating_fluids() {
+        let table = real_table();
+        let isothermal =
+            IsothermalCavitatingFluidMaterial::new(table.reconstruct(300.0), 1.0, 1.0e-3, 0.5, 8.0);
+        let coupled = CavitatingFluidMaterial::new(table, 1.0, 1.0e-3, 0.5, 8.0);
+        assert!(
+            isothermal
+                .gpu_unsupported_reason()
+                .is_some_and(|r| r.starts_with("IsothermalCavitatingFluidMaterial"))
+        );
+        assert!(
+            coupled
+                .gpu_unsupported_reason()
+                .is_some_and(|r| r.starts_with("CavitatingFluidMaterial"))
         );
     }
 
