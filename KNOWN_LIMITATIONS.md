@@ -319,16 +319,22 @@ re-read of the 17 materials.
   `diag_repeated_phase_transitions_do_not_cause_cumulative_instability`) are
   ignored for that reason. Choosing the law is a physics decision: Coulomb
   friction fits a granular skeleton, a liquid needs no-slip or Navier slip.
+- The GPU reports as "substeps taken" the number it encodes, which includes a
+  15 % margin, so one planned substep reads as two. Seven single-substep
+  CPU/GPU parity tests in `tests/solver.rs` fail on real hardware for that
+  reason alone (they require exactly one substep). Counting the substeps the
+  GPU actually executes is also what the missing GPU dropped-time counter
+  needs.
 - About a hundred comments point to notes that live outside the repository
   (working notes from past sessions). They should be rewritten to cite the
   code, a test or this file, or dropped.
 
 ### Coverage the CI no longer provides
 
-- **GPU path.** The GPU suite (`tests/gpu.rs`) and the 45 library tests that
-  need a GPU adapter run only by hand on real hardware, because software
-  adapters give different verdicts. A change that breaks the GPU path is only
-  caught when someone runs them.
+- **GPU path.** The GPU suite (`tests/gpu.rs`), the 43 library tests and the
+  11 `tests/solver.rs` tests that need a GPU adapter run only by hand on real
+  hardware, because software adapters give different verdicts. A change that
+  breaks the GPU path is only caught when someone runs them.
 - **Slow long-horizon tests.** Tests that would push a CI shard past 45
   minutes in the debug profile are ignored in the regular suite and run on
   demand through `.github/workflows/slow-tests.yml`, in the quick profile,

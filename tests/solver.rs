@@ -2217,6 +2217,7 @@ fn gravity_well_cutoff_prevents_far_particles_from_moving() {
 /// physically equivalent but particle-ID-permuted.
 #[cfg(feature = "gpu")]
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn gpu_cpu_parity() {
     use emerge::gpu::GpuSimulation;
     use emerge::materials::MaterialRegistry;
@@ -2289,6 +2290,7 @@ fn gpu_cpu_parity() {
 /// for that tighter, CPU-only proof of the formula itself).
 #[cfg(feature = "gpu")]
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn von_mises_gpu_cpu_single_substep_matches_with_imposed_shear() {
     use emerge::gpu::GpuSimulation;
     use emerge::materials::MaterialRegistry;
@@ -2399,6 +2401,7 @@ fn von_mises_gpu_cpu_single_substep_matches_with_imposed_shear() {
 /// return mapping on CPU and GPU.
 #[cfg(feature = "gpu")]
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn rankine_gpu_cpu_single_substep_matches_with_imposed_tension() {
     use emerge::gpu::GpuSimulation;
     use emerge::materials::MaterialRegistry;
@@ -2476,6 +2479,7 @@ fn rankine_gpu_cpu_single_substep_matches_with_imposed_tension() {
 /// increment, Jp accumulation, and hardening update on CPU and GPU.
 #[cfg(feature = "gpu")]
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn snow_gpu_cpu_single_substep_matches_with_imposed_compression() {
     use emerge::gpu::GpuSimulation;
     use emerge::materials::MaterialRegistry;
@@ -2573,6 +2577,7 @@ fn snow_gpu_cpu_single_substep_matches_with_imposed_compression() {
 /// extensions from the comparison.
 #[cfg(feature = "gpu")]
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn drucker_prager_gpu_cpu_single_substep_matches_with_imposed_shear() {
     use emerge::gpu::GpuSimulation;
     use emerge::materials::MaterialRegistry;
@@ -2648,6 +2653,7 @@ fn drucker_prager_gpu_cpu_single_substep_matches_with_imposed_shear() {
 /// three mechanisms advances identically on CPU and GPU.
 #[cfg(feature = "gpu")]
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn granular_fluid_gpu_cpu_single_substep_matches_with_imposed_compression() {
     use emerge::gpu::GpuSimulation;
     use emerge::materials::MaterialRegistry;
@@ -2734,6 +2740,7 @@ fn granular_fluid_gpu_cpu_single_substep_matches_with_imposed_compression() {
 /// an open, ignored diagnostic rather than silently dropped.
 #[cfg(feature = "gpu")]
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn von_mises_gpu_cpu_bounded_agreement_under_soft_contact() {
     use emerge::gpu::GpuSimulation;
     use emerge::materials::MaterialRegistry;
@@ -2865,6 +2872,7 @@ fn von_mises_gpu_cpu_bounded_agreement_under_soft_contact() {
 /// previously-missing coverage, not a formality.
 #[cfg(feature = "gpu")]
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn elastic_family_gpu_cpu_single_substep_matches_under_combined_shear_and_spin() {
     use emerge::gpu::GpuSimulation;
     use emerge::materials::MaterialRegistry;
@@ -3033,6 +3041,7 @@ fn diag_von_mises_gpu_cpu_diverges_under_violent_impact() {
 /// closed-form tests for that tighter, CPU-only proof of the formula.
 #[cfg(feature = "gpu")]
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn bingham_gpu_cpu_single_substep_matches_with_imposed_shear() {
     use emerge::gpu::GpuSimulation;
     use emerge::materials::MaterialRegistry;
@@ -3118,6 +3127,7 @@ fn bingham_gpu_cpu_single_substep_matches_with_imposed_shear() {
 /// as an open, ignored diagnostic rather than silently dropped.
 #[cfg(feature = "gpu")]
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn bingham_gpu_cpu_bounded_agreement_under_soft_contact() {
     use emerge::gpu::GpuSimulation;
     use emerge::materials::MaterialRegistry;
@@ -3266,6 +3276,7 @@ fn diag_bingham_gpu_cpu_diverges_under_violent_impact() {
 #[cfg(feature = "gpu")]
 #[test]
 #[should_panic(expected = "NaccMaterial")]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn gpu_simulation_rejects_a_real_nacc_material() {
     use emerge::gpu::GpuSimulation;
     use emerge::materials::MaterialRegistry;

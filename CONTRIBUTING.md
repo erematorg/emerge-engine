@@ -198,6 +198,7 @@ by hand on a machine with a real GPU:
 ```sh
 cargo test --profile quick --features gpu --test gpu -- --test-threads=1
 cargo test --profile quick --features render --lib -- --ignored systems::render::tests systems::gpu::solver::device_lost_tests
+cargo test --profile quick --features gpu --test solver -- --ignored gpu
 ```
 
 **Slow tests run on demand.** Long-horizon correctness tests that would push a CI
