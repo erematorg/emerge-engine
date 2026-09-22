@@ -325,31 +325,32 @@ impl NaccMaterial {
 
         // Hardening: move p₀ to reduce y to zero. `β·p₀` generalized to
         // `cohesive_shift_pa` throughout -- see this function's own doc.
+        let mut y1 = y1;
         if self.hardening_enabled
             && p0 > 1.0e-4
             && p_tr < p0 - 1.0e-4
             && p_tr > -cohesive_shift_pa + 1.0e-4
         {
-            let p_c = (p0 - cohesive_shift_pa) * 0.5;
             let q_tr = (2.0_f32).sqrt() * s_tr.length();
-            let dir = Vec2::new(p_c - p_tr, -q_tr);
-            let dir = dir.normalize_or_zero();
-            let c = m * m * (p_c + cohesive_shift_pa) * (p_c - p0);
-            let b = m * m * dir.x * (2.0 * p_c - p0 + cohesive_shift_pa);
-            let a = m * m * dir.x * dir.x + (1.0 + 2.0 * beta) * dir.y * dir.y;
-            let discr = (b * b - 4.0 * a * c).max(0.0).sqrt();
-            let l1 = (-b + discr) / (2.0 * a);
-            let l2 = (-b - discr) / (2.0 * a);
-            let p1 = p_c + l1 * dir.x;
-            let p2 = p_c + l2 * dir.x;
-            let p_x = if (p_tr - p_c) * (p1 - p_c) > 0.0 {
-                p1
-            } else {
-                p2
+            // The return direction is the ray from the start-of-step centre
+            // through the trial state; only the hardening is taken at the end.
+            let centre = f64::from((p0 - cohesive_shift_pa) * 0.5);
+            let increment = |alpha_end: f64| {
+                self.ray_increment(alpha_end, centre, p_tr, q_tr, j_e_tr, cohesion_bonus_pa)
             };
-            let j_e_x = (-2.0 * p_x / self.kappa + 1.0).abs().max(1.0e-8_f32).sqrt();
-            if j_e_x > 1.0e-4 {
-                alpha += (j_e_tr / j_e_x).ln();
+            let start = increment(f64::from(alpha));
+            if start < 0.0 {
+                // Wet side: the soil hardens. Evaluated at the end of the step,
+                // as on the cap, so the surface the stress is projected onto is
+                // the hardened one (see `ray_increment`).
+                let alpha_end = self.hardened_alpha(f64::from(alpha), start, increment);
+                alpha = alpha_end as f32;
+                let p0_end = self.kappa * (1.0e-5 + (xi * (-alpha).max(0.0)).sinh());
+                let shift_end = beta * p0_end + cohesion_bonus_pa;
+                y1 = m * m * (p_tr + shift_end) * (p_tr - p0_end);
+            } else if start.is_finite() {
+                // Dry side: softening, still evaluated at the start of the step.
+                alpha += start as f32;
             }
         }
 
@@ -362,6 +363,96 @@ impl NaccMaterial {
 
         let sv_new = Vec2::new(b_n1.x.max(1.0e-8_f32).sqrt(), b_n1.y.max(1.0e-8_f32).sqrt());
         (reconstruct(u, sv_new, vt), alpha)
+    }
+
+    /// Plastic volume change the shear-and-compression branch gives one step,
+    /// `ln(j_tr / J_x)`: `J_x` is where the ray from `centre` (on the p axis)
+    /// through the trial state `(p_tr, q_tr)` meets the ellipse whose
+    /// preconsolidation pressure comes from `alpha_end`. Negative on the wet
+    /// side of the ellipse (hardening), positive on the dry side. Infinite
+    /// when the ray does not reach a usable volume ratio, in which case alpha
+    /// is left unchanged.
+    fn ray_increment(
+        &self,
+        alpha_end: f64,
+        centre: f64,
+        p_tr: f32,
+        q_tr: f32,
+        j_tr: f32,
+        cohesion_bonus_pa: f32,
+    ) -> f64 {
+        let kappa = f64::from(self.kappa);
+        let m_sq = f64::from(self.friction) * f64::from(self.friction);
+        let beta = f64::from(self.cohesion);
+        let p0 =
+            kappa * (1.0e-5 + (f64::from(self.hardening_factor) * (-alpha_end).max(0.0)).sinh());
+        let shift = beta * p0 + f64::from(cohesion_bonus_pa);
+        let (p_tr, q_tr) = (f64::from(p_tr), f64::from(q_tr));
+        let p_c = centre;
+        let (dx, dy) = (p_c - p_tr, -q_tr);
+        let len = (dx * dx + dy * dy).sqrt();
+        if len <= 0.0 {
+            return f64::INFINITY;
+        }
+        let (dx, dy) = (dx / len, dy / len);
+        let c = m_sq * (p_c + shift) * (p_c - p0);
+        let b = m_sq * dx * (2.0 * p_c + shift - p0);
+        let a = m_sq * dx * dx + (1.0 + 2.0 * beta) * dy * dy;
+        let discr = (b * b - 4.0 * a * c).max(0.0).sqrt();
+        let p1 = p_c + (-b + discr) / (2.0 * a) * dx;
+        let p2 = p_c + (-b - discr) / (2.0 * a) * dx;
+        let p_x = if (p_tr - p_c) * (p1 - p_c) > 0.0 {
+            p1
+        } else {
+            p2
+        };
+        let j_x = (1.0 - 2.0 * p_x / kappa).abs().max(1.0e-16).sqrt();
+        if j_x > 1.0e-4 {
+            (f64::from(j_tr) / j_x).ln()
+        } else {
+            f64::INFINITY
+        }
+    }
+
+    /// End-of-step alpha on the wet side: the root of
+    /// `alpha_end = alpha + ray_increment(alpha_end)` along a fixed ray.
+    /// Hardened ellipses are nested, so along that ray the increment grows
+    /// monotonically with hardening: the residual decreases strictly, the
+    /// start-of-step answer `alpha + start` lies beyond the root, and the
+    /// root is bracketed between it and `alpha`. Solved in f64 by the Illinois
+    /// variant of false position, which keeps the bracket and converges in a
+    /// few iterations.
+    fn hardened_alpha(&self, alpha: f64, start: f64, increment: impl Fn(f64) -> f64) -> f64 {
+        let residual = |a: f64| alpha + increment(a) - a;
+        let (mut lo, mut hi) = (alpha + start, alpha);
+        let (mut r_lo, mut r_hi) = (residual(lo), residual(hi));
+        if !(r_lo > 0.0 && r_hi < 0.0) {
+            return lo;
+        }
+        let mut kept_lo_last = None;
+        for _ in 0..40 {
+            let x = hi - r_hi * (hi - lo) / (r_hi - r_lo);
+            let r = residual(x);
+            if r > 0.0 {
+                lo = x;
+                r_lo = r;
+                if kept_lo_last == Some(false) {
+                    r_hi *= 0.5;
+                }
+                kept_lo_last = Some(false);
+            } else {
+                hi = x;
+                r_hi = r;
+                if kept_lo_last == Some(true) {
+                    r_lo *= 0.5;
+                }
+                kept_lo_last = Some(true);
+            }
+            if r == 0.0 || hi - lo <= 1.0e-12 * alpha.abs().max(1.0e-6) {
+                break;
+            }
+        }
+        0.5 * (lo + hi)
     }
 
     /// Volume ratio J at which a trial state beyond the cap comes to rest,
@@ -777,6 +868,57 @@ mod marginal_yield_tests {
                 assert!(
                     (p0 - p).abs() <= 1.0e-3 * p,
                     "xi={xi} step {step}: p0={p0} must equal the carried pressure p={p}"
+                );
+            }
+        }
+    }
+
+    /// Principal-stress summary `(p, |s|)` of a deformation gradient, with the
+    /// same formulas `project` uses.
+    fn p_and_shear(mat: &NaccMaterial, f: Mat2) -> (f32, f32) {
+        let (_, sigma, _) = svd2(f);
+        let sv_sq = Vec2::new(sigma.x * sigma.x, sigma.y * sigma.y);
+        let j = sigma.x * sigma.y;
+        let s = mat.mu / j * (sv_sq - Vec2::splat((sv_sq.x + sv_sq.y) * 0.5));
+        (pressure_from_j(mat.kappa, j), s.length())
+    }
+
+    /// Preconsolidation pressure of the (beta = 0) ellipse that passes through
+    /// the stress state `(p, |s|)`: solves `2 |s|^2 + M^2 p (p - p0) = 0`.
+    fn p0_through(mat: &NaccMaterial, p: f32, shear: f32) -> f32 {
+        p + 2.0 * shear * shear / (mat.friction * mat.friction * p)
+    }
+
+    /// Shear plus compression on the wet side of the ellipse: after the soil
+    /// hardens, the stress must sit on the hardened surface. The projection
+    /// keeps tr(B) rather than J, so even a fixed surface is missed slightly;
+    /// hardening must add nothing beyond that.
+    #[test]
+    fn wet_side_shear_lands_on_the_hardened_surface() {
+        for xi in [2.0_f32, 27.8] {
+            let mat = NaccMaterial::new(3000.0, 2000.0, 1.2, 0.0, xi);
+            let mut fixed = mat;
+            fixed.hardening_enabled = false;
+            for (a, b) in [(0.985_f32, 0.975_f32), (0.99, 0.965), (0.995, 0.96)] {
+                let f = Mat2::from_diagonal(Vec2::new(a, b));
+                let (p_tr, _) = p_and_shear(&mat, f);
+                let p0_start = 1.3 * p_tr;
+                let alpha = -((p0_start / mat.kappa - 1.0e-5).asinh()) / xi;
+
+                let (f_after, alpha_after) = mat.project(f, alpha, 0.0);
+                let (p, shear) = p_and_shear(&mat, f_after);
+                let p0 = mat.kappa * (1.0e-5 + (xi * (-alpha_after).max(0.0)).sinh());
+                let hardened_miss = (p0 / p0_through(&mat, p, shear) - 1.0).abs();
+
+                let (f_fixed, _) = fixed.project(f, alpha, 0.0);
+                let (pf, sf) = p_and_shear(&mat, f_fixed);
+                let projection_miss = (p0_start / p0_through(&mat, pf, sf) - 1.0).abs();
+
+                assert!(alpha_after < alpha, "the wet side must harden");
+                assert!(
+                    hardened_miss <= projection_miss + 1.0e-4,
+                    "xi={xi} F=diag({a}, {b}): hardened surface missed by {hardened_miss}, \
+                     the projection alone misses by {projection_miss}"
                 );
             }
         }
