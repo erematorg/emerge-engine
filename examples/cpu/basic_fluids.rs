@@ -179,7 +179,7 @@ fn make_sim() -> Simulation {
         // per outer step) -- still measured WORSE even at 67,600 particles
         // in a dedicated headless benchmark (52.9ms/step unsorted vs
         // 79.0ms/step sorted, +49%). Real, honest negative result on this
-        // engine's actual dev target (debug builds only, see CLAUDE.md) --
+        // engine's actual dev target (debug builds) --
         // the O(N log N) sort's real cost in an unoptimized build outweighs
         // the P2G cache-locality win the mechanism itself is real about.
         // Feature kept (opt-in, default `false`, fully tested/correct --
@@ -731,7 +731,7 @@ impl State {
     /// Rebuilds `particle_bridge_buf` from the CPU solver's current
     /// particles and uploads it -- first CPU demo to drive the curvature-
     /// flow dual-phase surface path (`RenderMode::Surface`). `Particle` is
-    /// already `repr(C)`/`Pod` (GPU-uploadable by design, see CLAUDE.md's
+    /// already `repr(C)`/`Pod` (GPU-uploadable by design, see `Particle`'s
     /// own struct doc), so this is a direct `bytemuck::cast_slice` of the
     /// AoS view `Particles::iter()` already produces elsewhere (e.g.
     /// `Renderer::render`'s own per-particle loop) -- no new layout work,

@@ -1489,7 +1489,7 @@ impl Simulation {
 
         // ── Phase rules + sleep scoring ───────────────────────────────────────
         let t5 = std::time::Instant::now();
-        // Per-substep by default (CLAUDE.md's documented contract). A scene
+        // Per-substep by default (`add_phase_rule`'s documented contract). A scene
         // whose rules are thermodynamic -- which cannot change within a frame,
         // since diffusion advances once per `step()` -- can opt into
         // once-per-step via `SimConfig::phase_rules_once_per_step` and skip

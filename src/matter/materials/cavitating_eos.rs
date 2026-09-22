@@ -320,8 +320,7 @@ fn mixture_derivative_raw(
 /// `f32`'s own ~1.19e-7 relative precision next to `1.0`, so
 /// `1.0-ratio^2` rounds to EXACTLY `1.0`, giving `x_cut=1.0` and this
 /// whole function returning exactly `0.0` -- not a small-but-real cutoff,
-/// a total loss of the analytic answer. Computed in `f64` instead (matches
-/// Codex's own general "precompute in f64" guidance) -- `f64`'s ~2.2e-16
+/// a total loss of the analytic answer. Computed in `f64` instead: `f64`'s ~2.2e-16
 /// relative precision keeps `1.0-ratio^2` real and nonzero for any
 /// physically sane `c_min/s_max` ratio this module's own real materials
 /// use.
@@ -1627,7 +1626,7 @@ mod tests {
     /// exercise -- band existence, real density ordering, monotonic
     /// pressure, C^1 junction continuity, and finite/positive patch
     /// derivatives. A dense sweep BETWEEN table nodes is exactly what a
-    /// single-`T` test cannot catch (Codex's own point) -- this sweep is
+    /// single-`T` test cannot catch -- this sweep is
     /// the real, direct construction at each sampled `T`, not yet a table
     /// lookup (the table itself is real, separate, still-open work).
     #[test]

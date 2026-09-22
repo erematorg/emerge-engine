@@ -2310,7 +2310,7 @@ fn hydrostatic_test_scene_unprestressed(eos_power: f32) -> (Simulation, f32, f32
 /// `bottom_contact_y` exposes the bottom row's exact sub-cell position
 /// within the real, doubly-valid safe window (`1.0<=y<2.0`) as a genuine
 /// input, for `fluid_geostatic_prestress_contact_position_sensitivity_sweep`
-/// (Codex's own step 1, 2026-08-31) to test whether the exact position --
+/// (review step 1) to test whether the exact position --
 /// and therefore the exact B-spline weight fraction landing on the one
 /// constrained node -- affects the real, measured onset of the bounce.
 /// Uses this scene's own original reference `c0^2=350`; see
@@ -2325,7 +2325,7 @@ fn hydrostatic_test_scene_unprestressed_at(
 
 /// Real, fully-parameterized scene builder -- `reference_c0_squared`
 /// exposes the material's own real acoustic stiffness as a genuine input
-/// (Codex's own step 3, 2026-08-31): this benchmark's own original 350
+/// (review step 3): this benchmark's own original 350
 /// gives a real dimensionless `gH/c0^2~=0.32` (VERY compressible), ~200x
 /// more compressible than `phase_states_gui.rs`'s own real water
 /// (`c_l=180`, `gH/c0^2~=0.0015`) -- so this lets a caller check whether
@@ -2394,7 +2394,7 @@ fn hydrostatic_test_scene_unprestressed_full(
     // ever stably occupy without being silently re-snapped upward every
     // step. The real, doubly-valid window for genuine, STABLE contact is
     // therefore `1.0 <= y < 2.0`, not achievable via `box_center` alone.
-    // Fixed per Codex's own suggested alternative: spawn at the legal
+    // Fixed per the review's suggested alternative: spawn at the legal
     // minimum (bottom edge = boundary_thickness = 2.0), then directly
     // translate every particle's own position down afterward (bypassing
     // spawn-time validation, which only runs at construction) -- landing
@@ -2865,8 +2865,8 @@ fn fluid_geostatic_prestress_linear_eos_control_open_gap() {
     );
 }
 
-/// Real isolation of this benchmark's own quadrature convention (Codex's
-/// step 2, 2026-08-31): same nonlinear (`eos_power=7`) scene, same real
+/// Real isolation of this benchmark's own quadrature convention (review
+/// step 2): same nonlinear (`eos_power=7`) scene, same real
 /// hydrostatic profile, only the prestress INITIALIZATION convention
 /// differs -- `apply_geostatic_prestress` (uniform mass, current volume
 /// varies with depth) vs `apply_geostatic_prestress_mass_varying` (uniform
@@ -2996,8 +2996,8 @@ type GeostaticPrestressInitFn = fn(&mut Simulation, f32, f32, f32, f32, f32);
 
 /// Real settling trajectory: `mean_hydrostatic_rel_err` AND the column's own
 /// center-of-mass vertical velocity, recorded at real checkpoints (not just
-/// a single after-50-steps snapshot) -- Codex's own step 5 request
-/// (2026-08-31), the real, decisive way to see whether an early free-fall
+/// a single after-50-steps snapshot) -- review step 5,
+/// the real, decisive way to see whether an early free-fall
 /// signature is present (large `|v_com|` at small step counts, decaying
 /// toward zero) versus a genuine, from-the-start equilibrium (small
 /// `|v_com|` throughout).
@@ -3034,7 +3034,7 @@ fn measure_settling_trajectory(
     results
 }
 
-/// Real 2x2 settling-trajectory table (Codex's own step 4+5, 2026-08-31):
+/// Real 2x2 settling-trajectory table (review steps 4 and 5):
 /// gamma in {1.0, 7.0} x quadrature convention in {uniform_mass,
 /// mass_varying}, error AND center-of-mass velocity recorded at real
 /// checkpoints, on the now-genuinely-contacting scene (see
@@ -3064,8 +3064,8 @@ fn measure_settling_trajectory(
 /// large, real, physically-correct bounce if the discrete force field
 /// isn't a PERFECT cancellation, and `dynamic_viscosity=1.0e-3` may simply
 /// be too small to damp it out within a few hundred steps) is a real,
-/// open question this table alone does not settle -- flagged for Codex's
-/// own read before any further, larger investigation.
+/// open question this table alone does not settle -- flagged for review
+/// before any further, larger investigation.
 #[test]
 #[ignore = "diagnostic table for the open gap above, not a pass/fail regression guard -- \
             prints the full settling trajectory (error + center-of-mass velocity at real \
@@ -3106,14 +3106,14 @@ fn fluid_geostatic_prestress_settling_trajectory_2x2_table() {
     }
 }
 
-/// Real, cheap contact-position sensitivity sweep (Codex's own step 1,
-/// 2026-08-31): same scene, same `gamma=7`, only the bottom row's exact
+/// Real, cheap contact-position sensitivity sweep (review step 1):
+/// same scene, same `gamma=7`, only the bottom row's exact
 /// sub-cell position within the real, doubly-valid safe window
 /// (`1.0<=y<2.0`, see `hydrostatic_test_scene_unprestressed`'s own doc)
 /// changes. Each position gives a DIFFERENT real B-spline weight fraction
 /// on the one constrained node (node 1) -- `axis_weights(d)`'s own `w0`
 /// term, `d=y-floor(y)-0.5` -- so this directly tests whether the
-/// `SlipBoundary` reaction's own thin, sub-resolved weighting (Codex's
+/// `SlipBoundary` reaction's own thin, sub-resolved weighting (review
 /// finding: only 12.5% of the row's weight reaches the wall at y=1.5) is
 /// what's driving the bounce, independent of any P2G pressure-gradient
 /// question.
@@ -3152,8 +3152,8 @@ fn fluid_geostatic_prestress_contact_position_sensitivity_sweep() {
     }
 }
 
-/// Real demo-representative-stiffness control (Codex's own step 3,
-/// 2026-08-31): identical scene/geometry/contact-fix, only `c0^2` changes
+/// Real demo-representative-stiffness control (review step 3):
+/// identical scene/geometry/contact-fix, only `c0^2` changes
 /// -- this benchmark's own original 350 (real dimensionless
 /// `gH/c0^2~=0.32`, VERY compressible) vs `c_l=180` (real, sourced from
 /// `phase_states_gui.rs`'s own water sound speed convention, matching
@@ -3227,7 +3227,7 @@ fn fluid_geostatic_prestress_demo_representative_stiffness_control() {
     );
 }
 
-/// Real isothermal A/B (Codex's own step 3, 2026-08-31, revised order):
+/// Real isothermal A/B (review step 3, revised order):
 /// `NewtonianFluidMaterial` (Tait + the real, already-known-flawed
 /// `pressure_floor` ratchet) vs `IsothermalCavitatingFluidMaterial` at a
 /// fixed 300K (via `cavitating_water_material` -- does NOT need

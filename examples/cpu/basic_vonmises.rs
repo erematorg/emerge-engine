@@ -161,8 +161,8 @@ fn make_sim(gravity_fraction: f32) -> Simulation {
     // threshold (steel vs. clay differ in E, not only in sigma_Y/E) -- so
     // "stiff" now gets a genuinely higher lambda/mu (5x), which raises its
     // own c and lowers its impact-induced strain directly, on top of the
-    // same real yield/mu ratio range CLAUDE.md's own cited lava/clay values
-    // use (~0.3%-5%). Gravity also cut further for a gentler, resolvable
+    // same real yield/mu ratio range `VonMisesMaterial`'s own cited lava/clay
+    // values use (~0.3%-5%). Gravity also cut further for a gentler, resolvable
     // impact rather than another shock.
     let soft = VonMisesMaterial::new(LAMBDA, MU, MU * 0.01);
     // Real regression fix (calibration, found by the scripted stress test):
