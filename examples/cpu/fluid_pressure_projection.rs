@@ -4,11 +4,16 @@ extern crate emerge_engine as emerge;
 mod gui_common;
 
 use egui_wgpu::ScreenDescriptor;
-/// Live proof of tonight's real fix (see `MEMORY.md` -- fluid-recovery notes,
-/// Round 9): an exact DCT/Fourier pressure projection (Stam 1999, "Stable
-/// Fluids") replaces the stiff Tait EOS for strict WC-MPM fluids, removing
-/// the acoustic-CFL wall that made SUSTAINED wall contact (a puddle resting
-/// against a floor/wall) either explode or crawl at ~1fps.
+/// Demo of the DCT/Fourier pressure projection (Stam 1999, "Stable Fluids")
+/// that replaces the stiff Tait EOS for strict WC-MPM fluids, removing the
+/// acoustic CFL limit that made sustained wall contact (a puddle resting
+/// against a floor or wall) either explode or crawl at ~1 fps.
+///
+/// Known limitation: in this wall-contact scene the volume ratio J reaches
+/// the [0.5, 2.0] safety clamp from about frame 20 and stays there. The run
+/// survives (no NaN, no particle lost), but it is not a physically valid
+/// incompressible flow; see the pressure projection entry in
+/// `KNOWN_LIMITATIONS.md`.
 ///
 /// Deliberately a SEPARATE, minimal example rather than a change to
 /// `basic_fluids.rs`: that demo's water->ice phase transition uses
@@ -52,10 +57,10 @@ fn make_sim() -> Simulation {
         // contact violent transient (water starting ~2 cells from the wall)
         // now genuinely needs slightly more than 150 substeps in its worst
         // single frame (~frame 20) before it settles -- confirmed bounded,
-        // not divergent: a 2000-cap run completes all 120 frames cleanly,
-        // recovering to a cheap ~15ms/frame steady state immediately after
-        // the peak (avg 16.5fps over the full run, dominated by that one
-        // transient). 400 gives real headroom over the observed peak without
+        // not divergent: a 2000-cap run completes all 120 frames without
+        // NaN, recovering to ~15ms/frame right after the peak (avg 16.5 fps
+        // over the run; J is clamped for most of it, see the file doc).
+        // 400 gives real headroom over the observed peak without
         // masking a genuine runaway the way an unbounded cap would (this
         // strict-fluid path still fails loud, see step.rs's own panic doc,
         // if 400 is ever insufficient).

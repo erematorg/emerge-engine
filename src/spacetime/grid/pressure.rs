@@ -11,15 +11,15 @@
 //! variable-mobility Jacobi solve `mixture::pressure` already proves out for
 //! the two-phase case, later upgraded to Gauss-Seidel with SOR (Young 1954)
 //! -- neither stabilized the hardest real target scene (a near-full-domain-
-//! height water column starting already against a wall, see MEMORY.md's
-//! fluid-recovery notes, Round 9). Root cause, confirmed by direct
+//! height water column starting already against a wall, see the pressure
+//! projection entry in `KNOWN_LIMITATIONS.md`). Root cause, confirmed by direct
 //! measurement, not guessed: a BETTER-converged iterative solve made the
 //! blowup WORSE, not better -- ruling out "just needs more iterations" and
 //! pointing at the variable-mobility formulation itself: a free-surface
 //! cell's `alpha=1/mass` is unbounded, and even with a safety floor on the
 //! CORRECTION step, that same unboundedness distorts the SOLVED PRESSURE
 //! FIELD every cell's gradient reads from. A LATER real retry with a
-//! bounded, floored alpha (see git history / MEMORY.md) confirmed the SAME
+//! bounded, floored alpha (see git history) confirmed the SAME
 //! "more accurate = worse" signature persists even once alpha is bounded --
 //! real, convergent evidence (six independent solver/parameter
 //! combinations, all tonight) that the actual limiting factor is the
@@ -112,8 +112,8 @@ impl Grid {
         // per-call fixed overhead of running DCT-forward/eigen-solve/filter/
         // DCT-inverse/GS-refine TWICE (once per component) outweighs the
         // smaller-box savings at this particle-count/box-size regime, even
-        // with hashing no longer the bottleneck. Real, disclosed, reverted
-        // -- not attempted further; see MEMORY.md.
+        // with hashing no longer the bottleneck. Reverted, not attempted
+        // further.
         const MIN_ABSOLUTE_MASS_FOR_CORRECTION: f32 = 1.0e-3;
         let h = cell_width.max(1.0e-6);
         let res = self.resolution as i32;
@@ -137,8 +137,7 @@ impl Grid {
         // one run -- a single scalar can't represent both materials, so
         // confining its use to where the algorithm structurally requires a
         // constant (the spectral solve) is the real fix, not a full
-        // MGPCG-style variable-coefficient rewrite (still real future work,
-        // see fluid_solver_perf_reality_check memory, but no longer
+        // MGPCG-style variable-coefficient rewrite (still future work, but no longer
         // blocking a correctness improvement today).
         let mass_avg: f32 = {
             let (sum, count) = self.dirty.iter().fold((0.0f32, 0u32), |(s, c), &idx| {
@@ -178,23 +177,15 @@ impl Grid {
         // so their divergence is naturally zero; harmless, no special-casing
         // needed (same property the old full-domain version relied on).
         //
-        // TRIED AND REVERTED (2026-09-17): swapping this for
-        // `velocity_at_or_extrapolated` (matching the real, precedented fix
-        // already used for the ordinary G2P gather stencil, `grid/mod.rs`'s
-        // own 2026-08-13 doc) was a real, reasoned attempt at the
-        // wall-free-pool instability (see `tests/scratch_falling_droplet_pressure_projection_check.rs`'s
-        // own doc for the full falling-droplet gate this was meant to
-        // close). Measured, not assumed: it did NOT fix the falling-droplet
-        // case (`J` still hit the [0.5,2.0] clamp on step 1, `max_speed`
-        // got WORSE, 100->198) AND it broke the one scene this solver was
-        // already proven to work on (`tests/scratch_wall_contact_regression_check_after_divergence_fix.rs`:
-        // a hard panic, "adaptive timestep cannot advance," within the very
-        // first step). A clean net negative on both fronts -- reverted
-        // here. The wall-free-pool instability's real root cause stays
-        // open; this specific mechanism (empty-neighbor zero-fallback in
-        // the divergence RHS) was a real, tested, and REJECTED hypothesis,
-        // not merely an untested guess -- worth recording so a future
-        // session doesn't re-try the identical idea from scratch.
+        // Tried and reverted: swapping this for `velocity_at_or_extrapolated`
+        // cleans the fluid cells but leaves the same fake divergence on the
+        // air cells next to the body, which the solve keeps as unknowns (see
+        // the surface classification below). J still hit the [0.5, 2.0]
+        // clamp on the falling-droplet gate
+        // (`tests/scratch_falling_droplet_pressure_projection_check.rs`).
+        // Computing the divergence on fluid cells only removes that source
+        // but exposes further defects of this solve; the measured list is in
+        // the pressure projection entry of `KNOWN_LIMITATIONS.md`.
         let mut rhs = vec![0.0f32; nx * ny];
         for lx in 0..nx {
             for ly in 0..ny {
@@ -208,10 +199,8 @@ impl Grid {
             }
         }
 
-        // TEMP DEBUG (2026-08-15, real root-cause hunt for the wall-free
-        // instability, see project_vortex_siphon_saga_2026-08-15.md memory
-        // -- gated behind an env var so it costs nothing normally, remove
-        // once the real cause is found).
+        // Debug output for the wall-free-pool investigation, gated behind an
+        // env var so it costs nothing normally.
         if std::env::var("EMERGE_DEBUG_PRESSURE").is_ok() {
             let (mut rmin, mut rmax) = (f32::MAX, f32::MIN);
             for &v in &rhs {
@@ -404,28 +393,19 @@ impl Grid {
         // decimal digit on an already-negligible residual. Consistent
         // across every sampled frame, calm or violent -- not cherry-picked.
         //
-        // RAISED 5 -> 10 (2026-08-15), real measured result, not a guess:
-        // that convergence dump above was against this module's own
-        // wall-contact scene alone. Investigating a SEPARATE, real
-        // wall-free instability (see below) led to re-testing this
-        // constant against BOTH scene types -- and it's a genuine, solid
-        // win for the ALREADY-proven wall-contact scene specifically:
-        // `diag_pressure_projection_timing.rs`'s exact hard scene went
-        // from a consistently-measured 16.2-16.5fps (at 5 sweeps) to
-        // 30.1-30.6fps (at 10 sweeps) -- confirmed across 3 independent
-        // runs, not a fluke. Real mechanism: more refinement per pressure
-        // solve means a more precisely divergence-free velocity field,
-        // which means less residual-error-driven CFL escalation
-        // downstream -- paying a bit more fixed cost per solve buys back
-        // far more in substeps avoided. Classic real numerical-methods
-        // trade-off, empirically a clear net win here.
+        // Raised from 5 to 10: on the wall-contact column scene
+        // (`diag_pressure_projection_timing.rs`) the frame rate went from
+        // 16.2-16.5 fps to 30.1-30.6 fps, because a better-converged
+        // correction triggers fewer CFL refinements. Those figures measure
+        // cost only: in that scene J sits at the [0.5, 2.0] safety clamp
+        // from about frame 20 onward, so they are not the frame rate of a
+        // valid incompressible run.
         //
         // Did NOT fix a separate, real, wall-free-pool instability this
         // constant was ORIGINALLY suspected to cause (a resting pool with
         // free-surface/Dirichlet p=0 on its entire perimeter, no wall to
         // anchor the solve at all, shows a real large initialization spike,
-        // max_speed 100-250 -- see memory
-        // project_vortex_siphon_saga_2026-08-15.md for the full isolation).
+        // max_speed 100-250).
         // That hypothesis is now DISPROVEN by direct A/B: raising sweeps
         // 5->10 left the wall-free scene's peak just as high (207 vs 144)
         // and, if anything, slightly slower to decay afterward. The
@@ -474,8 +454,7 @@ impl Grid {
                         // a mixed water (rest_density=0.1)/mud
                         // (rest_density=4.0, 40x apart) scene showed
                         // `mass_avg` itself swinging 1.0->11.5 across one
-                        // run (see fluid_solver_perf_reality_check memory)
-                        // -- a single global alpha_const can't be right for
+                        // run -- a single global alpha_const can't be right for
                         // both materials at once, so it was wrong for
                         // whichever one it didn't happen to match that
                         // frame. `local_mass[local_idx]` is this cell's own
@@ -541,7 +520,7 @@ impl Grid {
             // simplification (module doc) is still an approximation of the
             // real local mass, so the correction it implies isn't exactly
             // the true one either. Real, measured sweep on the actual hard
-            // wall-contact scene (MEMORY.md Round 9): 0.1 avoided explosion
+            // wall-contact column scene: 0.1 avoided explosion
             // but left so much residual divergence per substep that the
             // uncorrected part silently accumulated into each particle's own
             // J integration instead (a separate crash: `tait_pressure`'s
@@ -579,8 +558,7 @@ impl Grid {
             // reach near-empty placeholder cells this loop already skips via
             // its own `continue`). Same real motivation as that pass: a
             // mixed-density scene (water/mud, 40x apart) measurably broke
-            // under the old shared-global-average correction -- see
-            // fluid_solver_perf_reality_check memory.
+            // under the old shared-global-average correction.
             let cell_alpha = 1.0 / mass;
             if let Some(cell) = self.cells.get_mut(&idx) {
                 cell.momentum -= cell_alpha * grad_p;
@@ -659,8 +637,7 @@ mod fluid_pressure_projection_tests {
     /// couldn't tell cells apart by mass at all, so it applied the same
     /// correction strength everywhere regardless -- root-caused this
     /// session against a real water/mud scene (`mass_avg` measured swinging
-    /// 1.0->11.5 over one run, see `fluid_solver_perf_reality_check`
-    /// memory).
+    /// 1.0->11.5 over one run).
     ///
     /// (An earlier version of this test compared divergence-residual
     /// REDUCTION RATIOS instead of velocity-change magnitude, expecting
