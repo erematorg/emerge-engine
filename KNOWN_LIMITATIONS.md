@@ -348,6 +348,13 @@ re-read of the 17 materials.
   `diag_repeated_phase_transitions_do_not_cause_cumulative_instability`) are
   ignored for that reason. Choosing the law is a physics decision: Coulomb
   friction fits a granular skeleton, a liquid needs no-slip or Navier slip.
+- `nacc_preconsolidates_more_under_deeper_self_weight` (`tests/physics_correctness.rs`)
+  is ignored. Its column is spawned without its self-weight stress and
+  rebounds after release; with no cohesion (beta = 0) every tensile state
+  resets the preconsolidation pressure, so mean alpha ends positive at every
+  depth (shallow 0.132, deep 0.259). The ordering the test expects held only
+  while the cap return over-hardened compaction. It should be rechecked once
+  bodies spawn in equilibrium (the spawn contract in the core plan).
 - Two renderer tests (`render_gpu_produces_visible_particle_pixels_not_just_clear_color`
   and its CPU control) find no particle pixel in a 64x64 headless render, on
   real hardware too. The instance buffers hold correct data, so the fault is

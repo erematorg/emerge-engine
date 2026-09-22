@@ -284,12 +284,16 @@ impl NaccMaterial {
 
         // Case A: past max cap (over-consolidation / compressive failure).
         if p_tr > p0 {
-            let j_n1 = (-2.0 * p0 / self.kappa + 1.0).max(1.0e-8_f32).sqrt();
+            let j_old_cap = (-2.0 * p0 / self.kappa + 1.0).max(1.0e-8_f32).sqrt();
+            let j_n1 = if self.hardening_enabled {
+                let (j_n1, compaction) = self.cap_return(j_e_tr, j_old_cap, alpha);
+                alpha -= compaction;
+                j_n1
+            } else {
+                j_old_cap
+            };
             let sv_new = j_n1.powf(0.5); // J^(1/2) since d=2
             let sigma_new = Vec2::splat(sv_new);
-            if self.hardening_enabled {
-                alpha += (j_e_tr / j_n1).ln();
-            }
             return (reconstruct(u, sigma_new, vt), alpha);
         }
 
@@ -358,6 +362,48 @@ impl NaccMaterial {
 
         let sv_new = Vec2::new(b_n1.x.max(1.0e-8_f32).sqrt(), b_n1.y.max(1.0e-8_f32).sqrt());
         (reconstruct(u, sv_new, vt), alpha)
+    }
+
+    /// Volume ratio J at which a trial state beyond the cap comes to rest,
+    /// with the hardening evaluated at the end of the step (backward Euler,
+    /// Simo & Hughes 1998, ch. 3): the carried pressure `kappa/2 (1 - J^2)`
+    /// must equal `p0` hardened by this same step's plastic compaction
+    /// `u = ln(J / j_tr)`. Hardening evaluated at the start of the step
+    /// instead leaves p0 above the carried pressure by `(xi - 1)` times the
+    /// overshoot, so the soil would remember a load it never carried.
+    ///
+    /// The residual decreases and is concave in `u`, and it is <= 0 at the
+    /// old cap (`j_old_cap`, no hardening), so Newton started there converges
+    /// monotonically to the root. Returns J and `u`; `u` comes straight from
+    /// the f64 solve because `ln(J / j_tr)` of a ratio this close to 1 loses
+    /// most of its digits in f32.
+    fn cap_return(&self, j_tr: f32, j_old_cap: f32, alpha: f32) -> (f32, f32) {
+        let kappa = f64::from(self.kappa);
+        let xi = f64::from(self.hardening_factor);
+        let (j_tr, alpha) = (f64::from(j_tr), f64::from(alpha));
+        let mut u = (f64::from(j_old_cap) / j_tr).ln();
+        if u <= 0.0 {
+            return (j_old_cap, 0.0);
+        }
+        for _ in 0..30 {
+            let j_sq = j_tr * j_tr * (2.0 * u).exp();
+            let compaction = u - alpha;
+            let (p0, dp0_du) = if compaction > 0.0 {
+                (
+                    kappa * (1.0e-5 + (xi * compaction).sinh()),
+                    kappa * xi * (xi * compaction).cosh(),
+                )
+            } else {
+                (kappa * 1.0e-5, 0.0)
+            };
+            let residual = 0.5 * kappa * (1.0 - j_sq) - p0;
+            let step = residual / (-kappa * j_sq - dp0_du);
+            u = (u - step).max(0.0);
+            if step.abs() < 1.0e-12 {
+                break;
+            }
+        }
+        ((j_tr * u.exp()) as f32, u as f32)
     }
 }
 
@@ -656,12 +702,22 @@ mod marginal_yield_tests {
         let mut outside = rate_particle(Mat2::IDENTITY, alpha);
         let outside_rate = Mat2::from_diagonal(Vec2::splat(sigma_outside.ln() / dt));
         run_rate_step(&mat, &mut outside, outside_rate, dt);
+        // The cap hardens during the step, so the state comes to rest between
+        // the old cap and the trial, exactly on the hardened cap.
+        let j_after = outside.deformation_gradient[0].determinant();
+        let alpha_after = outside.log_volume_strain[0];
+        let p0_after = mat.kappa * (1.0e-5 + (mat.hardening_factor * -alpha_after).sinh());
+        let p_after = pressure_from_j(mat.kappa, j_after);
         assert!(
-            (outside.deformation_gradient[0].determinant() - j_cap).abs() < 3.0e-6,
-            "trial beyond the cap must project to its analytical J: expected={j_cap}, got={}",
-            outside.deformation_gradient[0].determinant()
+            j_after < j_cap && j_after > j_outside - 3.0e-6,
+            "trial beyond the cap must stop between the trial J={j_outside} and the old cap \
+             J={j_cap}, got {j_after}"
         );
-        assert!(outside.log_volume_strain[0] < alpha);
+        assert!(
+            (p_after - p0_after).abs() <= 1.0e-3 * p0_after,
+            "the state must sit on the hardened cap: p={p_after} p0={p0_after}"
+        );
+        assert!(alpha_after < alpha);
     }
 
     /// A trial state comfortably INSIDE the yield ellipse (real confining
@@ -703,6 +759,60 @@ mod marginal_yield_tests {
             alpha_after, alpha,
             "alpha must not change on an elastic step"
         );
+    }
+
+    /// On virgin isotropic loading the soil sits on its cap, so after every
+    /// step its preconsolidation pressure must equal the pressure it carries:
+    /// p0 remembers the largest load, never more.
+    #[test]
+    fn virgin_loading_keeps_p0_equal_to_the_carried_pressure() {
+        for xi in [0.5_f32, 2.0, 27.8] {
+            let mat = NaccMaterial::new(3000.0, 2000.0, 1.2, 0.0, xi);
+            let (mut f, mut alpha) = (Mat2::IDENTITY, 0.0_f32);
+            for step in 0..40 {
+                f = Mat2::from_diagonal(Vec2::splat(0.9995)) * f;
+                (f, alpha) = mat.project(f, alpha, 0.0);
+                let p = pressure_from_j(mat.kappa, f.determinant());
+                let p0 = mat.kappa * (1.0e-5 + (xi * (-alpha).max(0.0)).sinh());
+                assert!(
+                    (p0 - p).abs() <= 1.0e-3 * p,
+                    "xi={xi} step {step}: p0={p0} must equal the carried pressure p={p}"
+                );
+            }
+        }
+    }
+
+    /// Preconsolidation is a memory: unloading and reloading back to the
+    /// previous maximum stays elastic, and the soil yields only beyond it.
+    #[test]
+    fn reloading_is_elastic_until_the_previous_maximum() {
+        let mat = NaccMaterial::new(3000.0, 2000.0, 1.2, 0.0, 2.0);
+        let squeeze = Mat2::from_diagonal(Vec2::splat(0.9995));
+        let release = Mat2::from_diagonal(Vec2::splat(0.9995_f32.recip()));
+        let (mut f, mut alpha) = (Mat2::IDENTITY, 0.0_f32);
+        for _ in 0..40 {
+            (f, alpha) = mat.project(squeeze * f, alpha, 0.0);
+        }
+        let alpha_max_load = alpha;
+        for _ in 0..20 {
+            (f, alpha) = mat.project(release * f, alpha, 0.0);
+        }
+        for _ in 0..20 {
+            (f, alpha) = mat.project(squeeze * f, alpha, 0.0);
+        }
+        assert!(
+            (alpha - alpha_max_load).abs() < 1.0e-6,
+            "unload-reload to the previous maximum must stay elastic: \
+             alpha {alpha_max_load} -> {alpha}"
+        );
+        (f, alpha) = mat.project(squeeze * squeeze * f, alpha, 0.0);
+        let p = pressure_from_j(mat.kappa, f.determinant());
+        let p0 = mat.kappa * (1.0e-5 + (mat.hardening_factor * (-alpha).max(0.0)).sinh());
+        assert!(
+            alpha < alpha_max_load,
+            "loading past the maximum must yield"
+        );
+        assert!((p0 - p).abs() <= 1.0e-3 * p, "p0={p0} p={p}");
     }
 
     /// Real behavioral distinctness, not just a different field value: after the
