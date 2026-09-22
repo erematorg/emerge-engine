@@ -325,6 +325,11 @@ re-read of the 17 materials.
   reason alone (they require exactly one substep). Counting the substeps the
   GPU actually executes is also what the missing GPU dropped-time counter
   needs.
+- Two renderer tests (`render_gpu_produces_visible_particle_pixels_not_just_clear_color`
+  and its CPU control) find no particle pixel in a 64x64 headless render, on
+  real hardware too. The instance buffers hold correct data, so the fault is
+  in the draw pass or in quads about 2 pixels wide at that scale; which one
+  is not known. Both stay ignored with that reason.
 - About a hundred comments point to notes that live outside the repository
   (working notes from past sessions). They should be rewritten to cite the
   code, a test or this file, or dropped.
