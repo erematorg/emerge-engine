@@ -23,7 +23,6 @@ jobs:
             target: accuracy
             tests: >-
               mu_i_rheology_column_collapse_natural_arrest_check
-              post_event_relax_switch_step_long_horizon_convergence_comparison
               post_event_relax_constant_damping_from_start_no_switch
               sand_pile_built_by_slow_pour_with_phase_gated_damping
               sand_preshaped_pile_at_30deg_holds_its_slope

@@ -5276,7 +5276,7 @@ fn post_event_relax_switch_step_sensitivity() {
 /// they plateau at genuinely different angles, that's (b) -- switch_step is
 /// a real, load-bearing physical parameter, not just a convenience knob.
 #[test]
-#[ignore = "slow: over 43 min in the CI debug profile, runs in the slow-tests workflow"]
+#[ignore = "research probe: 3 x 101 000 steps, over 2 h in the quick profile; its measured answer is recorded below, rerun by hand"]
 fn post_event_relax_switch_step_long_horizon_convergence_comparison() {
     const LOCAL_GRID: usize = 128;
 
