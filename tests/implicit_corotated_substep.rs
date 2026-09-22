@@ -13,7 +13,8 @@ use emerge::{SimConfig, Simulation, SlipBoundary, SpawnRegion};
 use glam::{IVec2, Vec2};
 
 const GRID: usize = 32;
-const MAT_SAND: u32 = 1;
+// Slot 0: the only material registered, through `with_default_material`.
+const MAT_SAND: u32 = 0;
 
 fn make_sand() -> DruckerPragerMaterial {
     let mut m = DruckerPragerMaterial::cohesionless(6.0e5, 0.3);
