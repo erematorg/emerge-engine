@@ -66,7 +66,21 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 const GRID: usize = 64;
-const DT: f32 = 0.1;
+/// Simulated time per rendered frame. The CFL condition of these four
+/// materials asks for about 49 substeps per 0.1 of simulated time, whatever
+/// the cursor does, so the old 0.1 per frame could not fit its 16-substep
+/// budget and the solver stopped on the first frame. Measured headless
+/// (`soil_horizons_cost_probe`, release):
+///
+/// ```text
+///   0.1   per frame   48.4 substeps   239 ms    4 fps
+///   0.02  per frame   10.0 substeps    35 ms   29 fps
+///   0.01  per frame    5.0 substeps    21 ms   49 fps (45 under the strongest press)
+/// ```
+///
+/// 0.01 leaves the budget three times the need. Materials are unchanged; the
+/// scene plays slower instead.
+const DT: f32 = 0.01;
 const SPACING: f32 = 0.5;
 
 const O_ID: u32 = 0;
@@ -93,7 +107,9 @@ const B_THICKNESS: f32 = 14.0;
 const C_THICKNESS: f32 = 16.0;
 
 const DIG_RADIUS: f32 = 4.0;
-const DIG_STRENGTH: f32 = 10.0;
+/// Velocity change per unit of simulated time, applied as `DIG_RATE * DT`
+/// each frame so digging does not depend on the frame time.
+const DIG_RATE: f32 = 100.0;
 
 // Real footstep-force probe: hold F at the cursor to press straight down, like a
 // creature's foot loading the ground. PRESS_RADIUS approximates a real footprint
@@ -404,9 +420,9 @@ impl State {
     fn update_and_render(&mut self, window: &Window) {
         if self.lmb || self.rmb {
             let mag = if self.lmb {
-                DIG_STRENGTH
+                DIG_RATE * DT
             } else {
-                -DIG_STRENGTH
+                -DIG_RATE * DT
             };
             self.sim
                 .apply_radial_impulse(self.cursor_grid(), DIG_RADIUS, mag);

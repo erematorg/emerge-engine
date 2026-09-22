@@ -403,6 +403,10 @@ path = "examples/cpu/permafrost.rs"
 required-features = ["render"]
 
 [[example]]
+name = "soil_horizons_cost_probe"
+path = "examples/cpu/soil_horizons_cost_probe.rs"
+
+[[example]]
 name = "soil_horizons"
 path = "examples/cpu/soil_horizons.rs"
 required-features = ["render"]
