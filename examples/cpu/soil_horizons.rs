@@ -11,7 +11,7 @@ mod gui_common;
 ///                                     (closest existing loose/low-cohesion preset)
 ///   A (mineral+organic topsoil)   -> GranularFluidMaterial::saturated_loam
 ///                                     ("loam" IS the real A-horizon texture class)
-///   B (clay-illuviated subsoil)   -> NaccMaterial::wet_soil (Cam-Clay -- real clay
+///   B (clay-illuviated subsoil)   -> NaccMaterial::kaolin (Cam-Clay -- real clay
 ///                                     accumulation zone)
 ///   C (weathered parent material) -> DruckerPragerMaterial::dilatant (denser,
 ///                                     closer to intact rock than A/O)
@@ -82,6 +82,7 @@ const GRID: usize = 64;
 /// scene plays slower instead.
 const DT: f32 = 0.01;
 const SPACING: f32 = 0.5;
+const GRAVITY_MAGNITUDE: f32 = 0.3;
 
 const O_ID: u32 = 0;
 const A_ID: u32 = 1;
@@ -105,6 +106,14 @@ const O_THICKNESS: f32 = 2.0;
 const A_THICKNESS: f32 = 8.0;
 const B_THICKNESS: f32 = 14.0;
 const C_THICKNESS: f32 = 16.0;
+
+/// Mean stress a layer already carries from everything above it, in grid
+/// units: the weight per cell of each layer above plus half of its own,
+/// times gravity, turned into a mean stress with Jaky's earth-pressure
+/// coefficient at rest, `K0 = 1 - sin(phi')`, so `p = sigma_v (1 + K0)/2`
+/// in plane strain. A soil in place has carried this for a long time, so
+/// its clay starts preconsolidated under it instead of as fresh slurry.
+const CLAY_FRICTION_ANGLE_SIN: f32 = 0.436; // kaolin, 25.9 degrees
 
 const DIG_RADIUS: f32 = 4.0;
 /// Velocity change per unit of simulated time, applied as `DIG_RATE * DT`
@@ -169,7 +178,7 @@ fn make_sim() -> Simulation {
         // SimConfig::earth) -- tuned down for a calmer, more legible demo at this
         // grid scale, same disclosed convention `basic_showcase.rs`/`fire_spread.rs`
         // already use.
-        gravity: Vec2::new(0.0, -0.3),
+        gravity: Vec2::new(0.0, -GRAVITY_MAGNITUDE),
         ..SimConfig::earth(GRID, 0.01, DT)
     };
 
@@ -191,7 +200,15 @@ fn make_sim() -> Simulation {
     // module doc's A-horizon note).
     let a_horizon = GranularFluidMaterial::saturated_loam(1200.0, 0.3);
     // B: clay-illuviated subsoil -- Non-Associated Cam-Clay, real wet-clay regime.
-    let b_horizon = NaccMaterial::wet_soil(1800.0, 0.3);
+    let mut b_horizon = NaccMaterial::kaolin(1800.0, 0.3);
+    // Areal density is a spawn's own particle mass over its cell area, and
+    // the B horizon lies under O and A plus half of itself.
+    let areal = |ratio: f32| ratio / (SPACING * SPACING);
+    let sigma_v = GRAVITY_MAGNITUDE
+        * (areal(O_DENSITY_RATIO) * O_THICKNESS
+            + areal(A_DENSITY_RATIO) * A_THICKNESS
+            + areal(B_DENSITY_RATIO) * B_THICKNESS * 0.5);
+    b_horizon.initial_preconsolidation = sigma_v * (2.0 - CLAY_FRICTION_ANGLE_SIN) * 0.5;
     // C: weathered parent material -- denser, closer to intact rock.
     let c_horizon = DruckerPragerMaterial::dilatant(2400.0, 0.3);
 
