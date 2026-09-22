@@ -1,6 +1,7 @@
 //! 2D finite-difference wave equation solver.
 //!
-//! Solves ∂²u/∂t² = c²(∂²u/∂x² + ∂²u/∂y²) using explicit Euler time integration.
+//! Solves ∂²u/∂t² = c²(∂²u/∂x² + ∂²u/∂y²) with the explicit second-order
+//! central scheme in time (leapfrog: u_next = 2u - u_prev + c²dt²∇²u).
 //!
 //! # Applications in LP
 //! - Pressure waves through terrain (seismic, explosions)

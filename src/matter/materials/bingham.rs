@@ -532,12 +532,12 @@ impl MaterialModel for BinghamFluidMaterial {
     /// The elastoviscoplastic branch has no WGSL counterpart: `params()`
     /// uploads `ConstitutiveModel::Fluid`, and `p2g.wgsl`'s fluid arm reads
     /// the rate of strain, not the stored elastic strain this branch keeps
-    /// in `F`. Asking for the CPU update at least keeps `F` and the plastic
-    /// state on the real yield surface every substep, exactly the
-    /// arrangement already documented for `NaccMaterial`; the stress
-    /// feeding that same substep's transfer is still the fluid one. Stated
-    /// plainly rather than left to be discovered: this branch is CPU-only
-    /// until the shader gains a matching arm.
+    /// in `F`. On the GPU the CPU update does not rescue it: it runs once
+    /// per frame with a single substep's dt, and re-uploading its copy makes
+    /// the GPU simulation advance at half speed (a free fall reaches -49.0
+    /// instead of -98.1 cells/s after 0.1 s). The stress feeding the
+    /// transfer is still the fluid one. This branch is CPU-only until the
+    /// shader gains a matching arm.
     fn needs_cpu_update(&self) -> bool {
         self.shear_modulus > 0.0
     }

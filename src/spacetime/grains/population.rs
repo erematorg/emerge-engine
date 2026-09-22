@@ -3,12 +3,9 @@
 //! convention throughout) integrated via real semi-implicit Euler, with
 //! contacts resolved by `contact_law`'s real, cited force law.
 //!
-//! Deliberately NOT coupled to the shared MPM grid yet (see `spacetime::grains`
-//! module doc's own status note) -- this is the "prove the piece in isolation"
-//! stage, mirroring exactly how this session's Cosserat work proved its own
-//! kinematics/field math standalone before any grid wiring. Grid coupling
-//! and the packing-fraction oracle deciding where grains are needed are
-//! separate, later phases.
+//! This type integrates the grains themselves. Coupling to the shared MPM
+//! grid lives in `coupling.rs` and the packing-fraction oracle that decides
+//! where grains are needed in `oracle.rs`.
 //!
 //! Real, disclosed simplification for CPU-first correctness (per this
 //! project's own standing "CPU correctness first, GPU port second" rule):
