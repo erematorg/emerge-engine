@@ -307,3 +307,29 @@ re-read of the 17 materials.
   iterations chosen by the caller, with no convergence test.
 - Explicit Euler in the LNN controller is stable only while the time step
   stays well below the neuron time constants; nothing checks it.
+- `MaterialRegistry::get` maps an unregistered material id to slot 0 with
+  only a debug assertion, so outside debug builds a scene that spawns an
+  unregistered id silently runs the wrong material. Four
+  `implicit_corotated_substep` tests did exactly that until they were fixed.
+- `FrictionBoundary` declares no wall law for strict weakly compressible
+  fluids (`is_strict_wc_mpm_fluid_compatible` keeps its `false` default), so
+  a strict-fluid scene with a friction floor stops on the solver's
+  compatibility assertion. Two `physics_correctness` diagnostics
+  (`diag_phase_transition_under_load_causes_stress_discontinuity`,
+  `diag_repeated_phase_transitions_do_not_cause_cumulative_instability`) are
+  ignored for that reason. Choosing the law is a physics decision: Coulomb
+  friction fits a granular skeleton, a liquid needs no-slip or Navier slip.
+- About a hundred comments point to notes that live outside the repository
+  (working notes from past sessions). They should be rewritten to cite the
+  code, a test or this file, or dropped.
+
+### Coverage the CI no longer provides
+
+- **GPU path.** The GPU suite (`tests/gpu.rs`) and the 45 library tests that
+  need a GPU adapter run only by hand on real hardware, because software
+  adapters give different verdicts. A change that breaks the GPU path is only
+  caught when someone runs them.
+- **Slow long-horizon tests.** Tests that would push a CI shard past 45
+  minutes in the debug profile are ignored in the regular suite and run on
+  demand through `.github/workflows/slow-tests.yml`, in the quick profile,
+  where debug assertions are off.
