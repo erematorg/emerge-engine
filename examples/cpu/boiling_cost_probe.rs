@@ -202,9 +202,8 @@ fn main() {
         dt as f64 / (ms / 1000.0),
         (ms / 1000.0) / dt as f64
     );
-    for slot in 0..3 {
+    for (slot, x) in QUALITY.into_iter().enumerate() {
         let (n, mass, rho, spread, _) = column(&sim, slot);
-        let x = QUALITY[slot];
         let expected = material.rho_eq_kg_m3(x);
         println!(
             "  x={x:.2}: {n} particles, {:.3} kg, measured {rho:7.1} kg/m3 against the rule's {expected:7.1} ({:+.2} %), c_mix {:5.1} m/s, {spread:.1} cells across",
