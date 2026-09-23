@@ -24,9 +24,9 @@ fn step_seconds() -> f32 {
 const RHO: f32 = 1000.0;
 const ETA: f32 = 0.5;
 const FLOOR: f32 = 2.0;
-const COLUMN: IVec2 = IVec2::new(4, 20);
+const COLUMN: IVec2 = IVec2::new(10, 20);
 const YIELD_STRAIN: f32 = 0.05;
-const YIELDS: [f32; 3] = [2.0, 60.0, 400.0];
+const YIELDS: [f32; 3] = [2.0, 60.0, 1200.0];
 const COLUMN_X: [f32; 3] = [12.0, 32.0, 52.0];
 
 /// `BINGHAM_PROBE_ELASTIC=0` measures the purely viscous branch instead, so

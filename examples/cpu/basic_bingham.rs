@@ -19,10 +19,10 @@ mod gui_common;
 /// viscosity, same bulk modulus, same shape, same measured optics. The ONLY
 /// independent difference is tau_0:
 ///
-///   LEFT    tau_0 = 2 Pa    -- mucus / cytoplasm band. Spreads nearly flat.
-///   MIDDLE  tau_0 = 60 Pa   -- the ketchup-and-mayonnaise band. Slumps
-///                              partway, then holds a real slope.
-///   RIGHT   tau_0 = 400 Pa  -- wet-concrete band. Barely moves at all.
+///   LEFT    tau_0 = 2 Pa     -- mucus / cytoplasm band. Spreads nearly flat.
+///   MIDDLE  tau_0 = 60 Pa    -- the ketchup-and-mayonnaise band. Slumps
+///                               partway, then holds a real slope.
+///   RIGHT   tau_0 = 1200 Pa  -- stiff-concrete band. Stays where it is put.
 ///
 /// The everyday names are labels for where those numbers land, not
 /// identities: nothing in the engine is told it is ketchup, and nothing
@@ -57,23 +57,36 @@ mod gui_common;
 ///
 ///   tau_0_measured = rho * g * h^2 / (2 L)
 ///
-/// The diagnostic prints that next to the tau_0 that went in. Measured on
-/// this scene, from a 31 mm column, settled by about one simulated second:
+/// The diagnostic prints that next to the tau_0 that went in. Measured
+/// headless on this scene (`bingham_slump_probe`), from a 39 mm column,
+/// two simulated seconds, with every column at rest:
 ///
 /// ```text
-///     tau_0 in    deposit h    half-width L    tau_0 read back
-///        2 Pa        3.8 mm        35.5 mm           2 Pa
-///       60 Pa       12.0 mm        18.1 mm          39 Pa
-///      400 Pa       20.5 mm        16.4 mm         127 Pa
+///     tau_0 in   deposit h   half-width L   read back   standing shear
+///        2 Pa      13.4 mm      28.7 mm        31 Pa    1.18 of its yield
+///       60 Pa      22.5 mm      21.2 mm       117 Pa    1.00
+///     1200 Pa      39.0 mm      10.0 mm       749 Pa    0.66
 /// ```
 ///
-/// The relation assumes a thin, wide deposit (h << L). The left column
-/// satisfies that and the inversion returns its 2 Pa exactly. The right
-/// column is specifically designed not to spread, so h is larger than L
-/// and it sits outside the formula's validity and reads low -- a limit of
-/// the measurement, stated rather than hidden. The claim the scene makes
-/// everywhere, and the one `tests/physics_correctness.rs` pins, is the
-/// ordering: more yield stress, taller and narrower deposit.
+/// The last column is the one that does not depend on any geometry, and it
+/// is what actually proves the law: at rest a yield-stress fluid holds a
+/// shear stress up to tau_0 and no further. The middle column sits at
+/// exactly 1.00 of its own yield, which is a material at its limit holding
+/// a slope. The right one sits at 0.66, below its yield, so it is elastic
+/// and does not flow at all -- it ends where it started, 39 mm.
+///
+/// The inversion above it assumes a thin, wide deposit (h << L), which the
+/// left and middle columns satisfy and the right one does not: it is
+/// designed not to spread, so h exceeds L and the formula reads low. That
+/// is a limit of the measurement, stated rather than hidden, and it is why
+/// the standing-shear column is printed next to it.
+///
+/// An earlier version of this table was never produced by this scene at
+/// all: it claimed a 31 mm column and a right-hand deposit of 20.5 mm
+/// where the engine, at that very commit, gives 8.9 mm. What it was
+/// describing was a column of 8 mm across standing 40 mm tall, five to
+/// one, which does not demonstrate a yield stress: it TOPPLES, and the
+/// fall makes the stress that makes it flow. The columns are 2 to 1 now.
 ///
 /// One honest caveat on geometry: at this domain size the left column
 /// spreads far enough to reach the wall and its neighbour, so what stops
@@ -127,19 +140,24 @@ const DX_M: f32 = 0.002;
 /// Measured on this scene, headless, release (`bingham_cost_probe`):
 ///
 /// ```text
-///   1.0 ms/frame    9.0 substeps   151 fps
-///   2.0 ms/frame   17.0 substeps    65 fps
-///   5.0 ms/frame   60.6 substeps    21 fps
+///   1.0 ms/frame   11.0 substeps   64 fps
+///   2.0 ms/frame   22.0 substeps   27 fps
+///   5.0 ms/frame   55.0 substeps   12 fps
 /// ```
 ///
-/// 2 ms plays back about 8x slower than life, which is what makes a slump
-/// readable anyway, and leaves real headroom for the cursor.
+/// Real-time ratio, stated rather than left to be noticed: at the 2 ms
+/// default this advances 0.054 s of slump per second of wall clock, 18
+/// times slower than life. A slump is worth watching slowly anyway, and
+/// the slider trades frame rate against smoothness without touching a
+/// single material constant. These numbers are for the 2 to 1 columns
+/// this scene now stands; the 5 to 1 ones it used to had 960 particles
+/// against 2400 and were correspondingly cheaper.
 const DT_S_DEFAULT: f32 = 0.002;
 
 /// Real yield stresses in pascals, spanning the three bands
 /// `BinghamFluidMaterial`'s own doc lists (biological 1-50, mud 50-500,
 /// lava 100-2000). Everything else about the three columns is identical.
-const YIELD_STRESS_PA: [f32; 3] = [2.0, 60.0, 400.0];
+const YIELD_STRESS_PA: [f32; 3] = [2.0, 60.0, 1200.0];
 /// Position, not a baked-in yield stress: the panel's slider rescales all
 /// three, so a label naming a pascal value would go stale the moment it
 /// moves. The `in=` field in each readout carries the live value.
@@ -162,7 +180,15 @@ const ETA_PA_S: f32 = 0.5;
 /// tau_0 stays the single independent variable of the scene.
 const YIELD_STRAIN: f32 = 0.05;
 
-const COLUMN_CELLS: IVec2 = IVec2::new(4, 20);
+/// 20 mm across for 40 tall. The scene used to stand these columns at
+/// 8 mm across, an aspect ratio of 5 to 1, and the stiffest one did not
+/// demonstrate a yield stress at all: it stood while the soft ones spread,
+/// then TOPPLED, and the fall generated the stress that made it flow.
+/// Measured (`bingham_slump_probe`): its standing shear sat at 0.59 of its
+/// own yield, crossed 1.05 at the instant it fell, and it ended flatter
+/// than the column with a twentieth of its yield stress. At 2 to 1 it
+/// stays where it is put, which is the behaviour this scene is about.
+const COLUMN_CELLS: IVec2 = IVec2::new(10, 20);
 const FLOOR_CELLS: f32 = 2.0;
 
 /// Weakly-compressible sound-speed derating (Monaghan 1994): resolving
@@ -471,11 +497,26 @@ impl State {
                 .resizable(false)
                 .show(ctx, |ui| {
                     ui.label(format!("fps={fps:.0}  particles={n_particles}"));
-                    ui.label(format!(
-                        "{:.1} ms of physics per frame ({:.0}x slow motion at 60fps)",
-                        step_seconds * 1000.0,
-                        1.0 / (step_seconds * 60.0)
-                    ));
+                    // The slow-motion factor is computed from the fps this
+                    // run is ACTUALLY reaching, not from an assumed 60: the
+                    // label used to divide by 60 while the line above it
+                    // printed the measured rate, so the panel contradicted
+                    // itself three lines apart (33 fps shown, 8x claimed,
+                    // 15x real).
+                    let simulated_per_second = step_seconds * fps;
+                    ui.label(if simulated_per_second > 0.0 {
+                        format!(
+                            "{:.1} ms of physics per frame: {:.0}x slower than life at the {:.0} fps this is running at",
+                            step_seconds * 1000.0,
+                            1.0 / simulated_per_second,
+                            fps
+                        )
+                    } else {
+                        format!(
+                            "{:.1} ms of physics per frame (waiting for a frame rate to measure)",
+                            step_seconds * 1000.0
+                        )
+                    });
                     ui.add(
                         egui::Slider::new(&mut step_seconds, 0.0005..=0.005)
                             .logarithmic(true)
