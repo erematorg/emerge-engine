@@ -323,6 +323,19 @@ after that, measured on the anchored body of
   Pradhana correction needs a scene where the volume gain it corrects is
   physical.
 
+### The DX12 teardown sometimes kills the process
+
+`tests/gpu_parity.rs` ends about one run in nine with Windows exit code
+0xc0000409 (FAST_FAIL), after the test harness has already printed its
+result. Measured attribution rather than an assumption: 2 aborts in 18
+runs on DX12, 0 in 20 on Vulkan, the matrix printing identical numbers
+on both backends, and the existing 52-test GPU suite never showing it.
+Nothing of this engine's runs at teardown (no `unsafe`, no `Drop` in
+`systems::gpu`), and with `RUST_BACKTRACE=full` and wgpu logging on
+there is no panic, no backtrace and no validation warning, so it is not
+a Rust panic reaching abort. Consequence: the parity matrix stays a
+manual test on real hardware and must not gate CI on DX12.
+
 ### Not audited yet
 
 Rendering (`systems/render`); the radiation and optics code (its tests were
