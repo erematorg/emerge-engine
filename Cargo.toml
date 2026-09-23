@@ -262,6 +262,15 @@ name = "boiling_cost_probe"
 path = "examples/cpu/boiling_cost_probe.rs"
 
 [[example]]
+name = "basic_cavitation"
+path = "examples/cpu/basic_cavitation.rs"
+required-features = ["render"]
+
+[[example]]
+name = "cavitation_cost_probe"
+path = "examples/cpu/cavitation_cost_probe.rs"
+
+[[example]]
 name = "mui_cost_probe"
 path = "examples/cpu/mui_cost_probe.rs"
 
