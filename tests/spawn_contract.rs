@@ -86,10 +86,22 @@ fn both_spawn_paths_give_a_body_the_same_initial_volume() {
 /// actually occupies -- initial volume multiplies stress directly, so a V0
 /// three times too large is a column three times too stiff.
 ///
-/// The bar is 35 %: a twelve-cell column with a free surface and one
-/// particle per half cell is a coarse discretisation of a continuum, and
-/// this test is here to catch a factor of three, not to measure
-/// convergence.
+/// The bar is 35 % because this column is a coarse discretisation of a
+/// continuum, not because 14 % was accepted on faith. The same physical
+/// column, 6 by 12 cm, was run at three cell sizes
+/// (`tests/scratch_column_convergence.rs`):
+///
+/// ```text
+///   cell size   particles   measured    analytic   off by
+///    1.00 cm       288      -760.2 Pa   -881.3     -13.7 %
+///    0.50 cm      1152      -820.0 Pa   -880.9      -6.9 %
+///    0.25 cm      4608      -849.3 Pa   -880.5      -3.5 %
+/// ```
+///
+/// Halving the cells halves the error, twice over: first order, which is
+/// what a discretisation error looks like and what a residual defect does
+/// not. This test stays coarse on purpose, to catch a factor of three in
+/// a second rather than to measure convergence.
 #[test]
 fn a_settled_column_carries_its_own_weight() {
     let (mut sim, first) = two_columns();
