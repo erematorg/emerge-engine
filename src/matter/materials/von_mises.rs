@@ -3,8 +3,8 @@ use glam::{Mat2, Vec2};
 use crate::materials::physical_props::{DuctileProps, FromSI, scale_lame, scale_stress};
 use crate::materials::svd::svd2;
 use crate::materials::utils::{
-    LOG_CLAMP, MIN_J, corotated_elastic_stress, deformation_increment_exp, elastic_wave_dt,
-    hencky_strains, lame_from_young, reconstruct_f,
+    LOG_CLAMP, MIN_J, advance_deformation_gradient, carried_volume_ratio, corotated_elastic_stress,
+    elastic_wave_dt, hencky_strains, lame_from_young, reconstruct_f,
 };
 use crate::materials::{ConstitutiveModel, MaterialModel, MaterialParams};
 use crate::particle::{ParticleUpdateCtx, Particles};
@@ -161,8 +161,11 @@ impl MaterialModel for VonMisesMaterial {
         // still operates on whatever F_trial it's handed, so this isolates
         // the kinematic integration as the ONLY variable, matching the
         // basic_vonmises.rs live-drift investigation this is testing against.
-        let f_trial =
-            deformation_increment_exp(dt * *ctx.velocity_gradient) * *ctx.deformation_gradient;
+        let (f_trial, _) = advance_deformation_gradient(
+            *ctx.deformation_gradient,
+            dt * *ctx.velocity_gradient,
+            carried_volume_ratio(*ctx.volume, ctx.initial_volume),
+        );
         let (u, sigma, vt) = svd2(f_trial);
 
         let eps = hencky_strains(sigma);

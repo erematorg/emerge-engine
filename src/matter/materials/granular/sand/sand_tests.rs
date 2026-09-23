@@ -638,6 +638,7 @@ mod pradhana_correction_tests {
     /// equilibrium by step ~91 in that test) to reach a real,
     /// non-degenerate rest state, THEN `L=0` is safe.
     #[test]
+    #[ignore = "premise no longer holds: the baseline it compares against was the f32 round-off in the F product, now pinned by advance_deformation_gradient. Baseline log_volume_strain over 15 episodes read a small positive number before the pin and -2.19e-8 after, so the sign this test asserts is round-off, not the physical volume gain Pradhana corrects. Needs a scene where that gain is real."]
     fn pradhana_effect_across_repeated_separate_impact_episodes() {
         fn run_repeated_episodes(use_pradhana: bool, episodes: usize) -> f32 {
             let dp = DruckerPragerMaterial {

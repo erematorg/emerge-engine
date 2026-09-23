@@ -3,7 +3,8 @@ use glam::{Mat2, Vec2};
 use crate::materials::physical_props::{BinghamProps, FromSI, scale_stress, scale_visc};
 use crate::materials::svd::svd2;
 use crate::materials::utils::{
-    LOG_CLAMP, MIN_J, deformation_increment_exp, elastic_wave_dt, hencky_strains, reconstruct_f,
+    LOG_CLAMP, MIN_J, advance_deformation_gradient, carried_volume_ratio, elastic_wave_dt,
+    hencky_strains, reconstruct_f,
 };
 use crate::materials::{ConstitutiveModel, MaterialModel, MaterialParams};
 use crate::particle::{Particle, ParticleUpdateCtx, Particles};
@@ -308,8 +309,11 @@ impl BinghamFluidMaterial {
     /// purely viscous branch it imposes no viscous timestep restriction of
     /// its own.
     fn update_elastoviscoplastic(&self, ctx: &mut ParticleUpdateCtx, dt: f32) {
-        let f_trial =
-            deformation_increment_exp(dt * *ctx.velocity_gradient) * *ctx.deformation_gradient;
+        let (f_trial, _) = advance_deformation_gradient(
+            *ctx.deformation_gradient,
+            dt * *ctx.velocity_gradient,
+            carried_volume_ratio(*ctx.volume, ctx.initial_volume),
+        );
         let (u, sigma, vt) = svd2(f_trial);
 
         let eps = hencky_strains(sigma);

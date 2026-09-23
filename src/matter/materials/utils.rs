@@ -45,6 +45,16 @@ pub(crate) const MIN_J: f32 = 1e-6;
 /// eigenvalues.  Series expansions remove the removable singularity at zero.
 #[inline]
 pub(crate) fn deformation_increment_exp(dt_velocity_gradient: Mat2) -> Mat2 {
+    deformation_increment_exp_with_det(dt_velocity_gradient).0
+}
+
+/// The same increment, returning its determinant from the closed form
+/// rather than from the matrix: `det(exp(A)) = exp(tr A)` exactly, and
+/// `exp(tr A)` is already computed here as the scalar prefactor, so the
+/// caller gets the volume change for free instead of re-deriving it from
+/// four rounded entries.
+#[inline]
+fn deformation_increment_exp_with_det(dt_velocity_gradient: Mat2) -> (Mat2, f32) {
     // glam is column-major: [[a,b],[c,d]] is stored as columns (a,c),(b,d).
     let a = dt_velocity_gradient.x_axis.x;
     let b = dt_velocity_gradient.y_axis.x;
@@ -71,7 +81,88 @@ pub(crate) fn deformation_increment_exp(dt_velocity_gradient: Mat2) -> Mat2 {
     };
 
     let traceless = dt_velocity_gradient - Mat2::from_diagonal(Vec2::splat(half_trace));
-    half_trace.exp() * (Mat2::IDENTITY * even + traceless * odd)
+    let scale = half_trace.exp();
+    (
+        scale * (Mat2::IDENTITY * even + traceless * odd),
+        scale * scale,
+    )
+}
+
+/// The volume ratio a particle is already carrying, read from `volume`
+/// rather than recomputed from `det(F)`: near the identity that
+/// determinant is a cancelling difference, and reading it back every step
+/// is what `advance_deformation_gradient`'s own doc measures as the worse
+/// of the two options.
+///
+/// Zero means the particle is not carrying a usable volume yet (a bare
+/// `Particle::zeroed()`, or a state written before `volume` was set), and
+/// `advance_deformation_gradient` then falls back to `det(F)` for that
+/// one step rather than pinning the volume to a floor.
+#[inline]
+pub(crate) fn carried_volume_ratio(volume: f32, initial_volume: f32) -> f32 {
+    if initial_volume > 0.0 && volume > 0.0 {
+        volume / initial_volume
+    } else {
+        0.0
+    }
+}
+
+/// One substep of `dF/dt = L F`, with the volume taken from the
+/// continuity equation instead of from round-off.
+///
+/// `deformation_increment_exp` is exact in exact arithmetic, but the
+/// product `exp(dt L) F` is not: in f32 each step loses about a tenth of
+/// an ULP of determinant, always the same way. Measured on one particle
+/// driven by a prescribed oscillation of zero trace, with no solver, no
+/// grid and no gravity (`tests/scratch_f_rounding_horizon.rs`), where
+/// `ln det F` must stay at zero: after 900 000 steps it reads -2.8e-3
+/// with the plain product and +3e-14 when the same formula runs in f64,
+/// so the gap is precision, not the scheme. A body that keeps
+/// oscillating (one hanging from an anchor, which nothing damps) turns
+/// that into visible, one-way volume loss.
+///
+/// `det(exp(dt L)) = exp(dt tr L)` fixes the step's volume ratio before
+/// any arithmetic happens, so the volume is carried multiplicatively and
+/// the product is rescaled onto it; only the shape then carries
+/// round-off. Same probe, same 900 000 steps: -6e-8, one ULP. Rescaling
+/// onto `det(F)` re-read each step instead is measurably WORSE
+/// (-4.0e-3): near the identity that determinant is a cancelling
+/// difference, and feeding it back amplifies its own noise.
+///
+/// Returns the advanced `F` and the volume ratio it now has. A material
+/// that then projects `F` plastically changes the volume for a physical
+/// reason and takes its own `det` afterwards, as it already did.
+#[inline]
+pub(crate) fn advance_deformation_gradient(
+    f_old: Mat2,
+    dt_velocity_gradient: Mat2,
+    carried_volume_ratio: f32,
+) -> (Mat2, f32) {
+    let (increment, increment_det) = deformation_increment_exp_with_det(dt_velocity_gradient);
+    let product = increment * f_old;
+    let base = if carried_volume_ratio > 0.0 {
+        carried_volume_ratio
+    } else {
+        f_old.determinant()
+    };
+    let carried = base * increment_det;
+    let det = product.determinant();
+    if carried > 0.0 && det > 0.0 {
+        // Analytically `det(product) == det(f_old) * increment_det`, so
+        // this ratio is not the step's own volume change: it is whatever
+        // disagreement the carried volume and `det(F)` already had.
+        // Round-off is a few parts in 1e7, so anything past a part in
+        // 1e3 means the two are genuinely out of step -- a state this
+        // correction must not silently repair by rescaling F.
+        const MAX_PINNED_CORRECTION: f32 = 1.0e-3;
+        let ratio = carried / det;
+        if (ratio - 1.0).abs() <= MAX_PINNED_CORRECTION {
+            return (product * ratio.sqrt(), carried);
+        }
+    }
+    // Degenerate, inverted, or already inconsistent: leave the product
+    // alone and let the caller's own floor handle it, as before.
+    (product, det)
 }
 
 /// Floor on Rankine's exponentially-softened effective tensile strength, as a
