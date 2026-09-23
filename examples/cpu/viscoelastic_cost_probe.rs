@@ -36,7 +36,6 @@ fn main() {
             box_size: BLOCK_CELLS,
             box_center: Vec2::new(BLOCK_X[slot], 20.0),
             material_id: mat,
-            precompute_initial_volumes: true,
             initial_velocity_scale: 0.0,
             ..SpawnRegion::for_sim(&config)
         }

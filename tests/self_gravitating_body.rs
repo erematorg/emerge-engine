@@ -103,7 +103,6 @@ fn make_body() -> Simulation {
         shape: SpawnShape::Disk { radius: r_grid },
         position_jitter: 0.1,
         mass_override: Some(mass_per_particle),
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
 

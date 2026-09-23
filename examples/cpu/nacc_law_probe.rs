@@ -81,7 +81,6 @@ fn soil_horizons() {
             box_size: IVec2::new(48, thickness as i32),
             box_center: Vec2::new(32.0, y_bottom + thickness * 0.5),
             material_id,
-            precompute_initial_volumes: true,
             mass_override: Some(density_ratio),
             ..SpawnRegion::for_sim(&config)
         });
@@ -145,7 +144,6 @@ fn permafrost(frozen_start: bool) {
         box_size: IVec2::new(32, 20),
         box_center: Vec2::new(32.0, 12.0),
         material_id: id,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     });
     for t in sim.particles_mut().temperature.iter_mut() {

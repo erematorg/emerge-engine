@@ -231,8 +231,7 @@ fn render_gpu_survives_scattering_and_specular_end_to_end() {
             .at(glam::Vec2::splat(16.0))
             .disk(4.0)
             .spacing(0.5)
-            .material(0)
-            .precompute_volumes(),
+            .material(0),
     );
     let registry = MaterialRegistry::with_default(Box::new(NeoHookeanMaterial::new(100.0, 50.0)));
     let sim =
@@ -320,8 +319,7 @@ fn gpu_blackbody_emission_matches_planck_on_the_cpu() {
                 .at(glam::Vec2::splat(16.0))
                 .disk(6.0)
                 .spacing(0.5)
-                .material(0)
-                .precompute_volumes(),
+                .material(0),
         );
         for p in particles.iter_mut() {
             p.temperature = temperature;
@@ -496,8 +494,7 @@ fn luminescent_material_lights_the_scene_without_being_hot() {
                 .at(glam::Vec2::splat(16.0))
                 .disk(4.0)
                 .spacing(0.5)
-                .material(0)
-                .precompute_volumes(),
+                .material(0),
         );
         // Cold throughout: nothing here may glow by being hot.
         for p in particles.iter_mut() {
@@ -585,8 +582,7 @@ fn gpu_thermal_emission_gets_bluer_with_temperature() {
                 .at(glam::Vec2::splat(16.0))
                 .disk(6.0)
                 .spacing(0.5)
-                .material(0)
-                .precompute_volumes(),
+                .material(0),
         );
         for p in particles.iter_mut() {
             p.temperature = temperature;
@@ -685,8 +681,7 @@ fn render_gpu_produces_visible_particle_pixels_not_just_clear_color() {
             .at(glam::Vec2::splat(16.0))
             .disk(6.0)
             .spacing(0.5)
-            .material(0)
-            .precompute_volumes(),
+            .material(0),
     );
     let registry = MaterialRegistry::with_default(Box::new(NeoHookeanMaterial::new(100.0, 50.0)));
     let sim =
@@ -800,8 +795,7 @@ fn render_cpu_produces_visible_particle_pixels_control() {
             .at(glam::Vec2::splat(16.0))
             .disk(6.0)
             .spacing(0.5)
-            .material(0)
-            .precompute_volumes(),
+            .material(0),
     );
     let _registry = MaterialRegistry::with_default(Box::new(NeoHookeanMaterial::new(100.0, 50.0)));
     assert!(!particles.is_empty(), "test setup must spawn particles");
@@ -1102,8 +1096,7 @@ fn render_surface_reconstruction_survives_end_to_end() {
             .at(glam::Vec2::splat(16.0))
             .disk(4.0)
             .spacing(0.5)
-            .material(0)
-            .precompute_volumes(),
+            .material(0),
     );
     let registry = MaterialRegistry::with_default(Box::new(NeoHookeanMaterial::new(100.0, 50.0)));
     let sim =
@@ -1193,8 +1186,7 @@ fn render_surface_reconstruction_produces_real_density_near_particles() {
             .at(glam::Vec2::splat(16.0))
             .disk(3.0)
             .spacing(0.5)
-            .material(0)
-            .precompute_volumes(),
+            .material(0),
     );
     let registry = MaterialRegistry::with_default(Box::new(NeoHookeanMaterial::new(100.0, 50.0)));
     let sim =
@@ -1296,8 +1288,7 @@ fn dual_phase_reconstruction_keeps_two_materials_in_their_own_phase_buffer() {
             .at(glam::Vec2::new(8.0, 16.0))
             .disk(3.0)
             .spacing(0.5)
-            .material(0)
-            .precompute_volumes(),
+            .material(0),
     );
     particles.extend(build_particles(
         &config,
@@ -1305,8 +1296,7 @@ fn dual_phase_reconstruction_keeps_two_materials_in_their_own_phase_buffer() {
             .at(glam::Vec2::new(24.0, 16.0))
             .disk(3.0)
             .spacing(0.5)
-            .material(1)
-            .precompute_volumes(),
+            .material(1),
     ));
     let mut registry =
         MaterialRegistry::with_default(Box::new(NeoHookeanMaterial::new(100.0, 50.0)));
@@ -1428,8 +1418,7 @@ fn n_material_surface_reconstruction_colors_each_material_distinctly() {
             .at(glam::Vec2::new(5.0, 16.0))
             .disk(2.0)
             .spacing(0.5)
-            .material(0)
-            .precompute_volumes(),
+            .material(0),
     );
     particles.extend(build_particles(
         &config,
@@ -1437,8 +1426,7 @@ fn n_material_surface_reconstruction_colors_each_material_distinctly() {
             .at(glam::Vec2::new(16.0, 16.0))
             .disk(2.0)
             .spacing(0.5)
-            .material(1)
-            .precompute_volumes(),
+            .material(1),
     ));
     particles.extend(build_particles(
         &config,
@@ -1446,8 +1434,7 @@ fn n_material_surface_reconstruction_colors_each_material_distinctly() {
             .at(glam::Vec2::new(27.0, 16.0))
             .disk(2.0)
             .spacing(0.5)
-            .material(2)
-            .precompute_volumes(),
+            .material(2),
     ));
     let mut registry =
         MaterialRegistry::with_default(Box::new(NeoHookeanMaterial::new(100.0, 50.0)));
@@ -1659,8 +1646,7 @@ fn n_material_blend_produces_real_weighted_average_at_a_mixed_cell() {
             .at(glam::Vec2::new(14.0, 16.0))
             .disk(3.0)
             .spacing(0.5)
-            .material(0)
-            .precompute_volumes(),
+            .material(0),
     );
     particles.extend(build_particles(
         &config,
@@ -1668,8 +1654,7 @@ fn n_material_blend_produces_real_weighted_average_at_a_mixed_cell() {
             .at(glam::Vec2::new(18.0, 16.0))
             .disk(3.0)
             .spacing(0.5)
-            .material(1)
-            .precompute_volumes(),
+            .material(1),
     ));
     let mut registry =
         MaterialRegistry::with_default(Box::new(NeoHookeanMaterial::new(100.0, 50.0)));
@@ -1827,8 +1812,7 @@ fn anisotropic_splat_widens_footprint_along_stretched_axis() {
                 .at(glam::Vec2::splat(16.0))
                 .disk(1.5)
                 .spacing(0.5)
-                .material(0)
-                .precompute_volumes(),
+                .material(0),
         );
         for p in &mut particles {
             p.deformation_gradient = f;
@@ -1957,8 +1941,7 @@ fn velocity_stretch_widens_footprint_along_motion_direction() {
                 .at(glam::Vec2::splat(16.0))
                 .disk(1.5)
                 .spacing(0.5)
-                .material(0)
-                .precompute_volumes(),
+                .material(0),
         );
         for p in &mut particles {
             p.v = velocity;
@@ -2088,8 +2071,7 @@ fn grid_volume_scattering_and_specular_change_rendered_color() {
             .at(glam::Vec2::splat(16.0))
             .disk(4.0)
             .spacing(0.5)
-            .material(0)
-            .precompute_volumes(),
+            .material(0),
     );
     let registry = MaterialRegistry::with_default(Box::new(NeoHookeanMaterial::new(100.0, 50.0)));
     let mut sim =
@@ -2523,8 +2505,7 @@ fn curvature_flow_scattering_and_specular_change_rendered_color() {
             .at(glam::Vec2::splat(16.0))
             .disk(4.0)
             .spacing(0.5)
-            .material(0)
-            .precompute_volumes(),
+            .material(0),
     );
     let registry = MaterialRegistry::with_default(Box::new(NeoHookeanMaterial::new(100.0, 50.0)));
     let sim =
@@ -2611,8 +2592,7 @@ fn diagnose_curvature_flow_edge_hair_pixels() {
             .at(glam::Vec2::splat(16.0))
             .disk(8.0)
             .spacing(0.5)
-            .material(0)
-            .precompute_volumes(),
+            .material(0),
     );
     let registry = MaterialRegistry::with_default(Box::new(NeoHookeanMaterial::new(10.0, 20.0)));
     let sim =
@@ -2729,8 +2709,7 @@ fn curvature_flow_blackbody_emission_brightens_hot_cluster() {
                 .at(glam::Vec2::splat(16.0))
                 .disk(4.0)
                 .spacing(0.5)
-                .material(0)
-                .precompute_volumes(),
+                .material(0),
         );
         for p in particles.iter_mut() {
             p.temperature = temp_k;
@@ -2833,8 +2812,7 @@ fn light_diffusion_builds_up_real_glow_over_multiple_frames() {
                 .at(glam::Vec2::splat(16.0))
                 .disk(4.0)
                 .spacing(0.5)
-                .material(0)
-                .precompute_volumes(),
+                .material(0),
         );
         for p in particles.iter_mut() {
             p.temperature = temp_k;
@@ -2949,7 +2927,6 @@ fn curvature_flow_thermal_diffusion_stays_finite_and_separates_hot_from_cold() {
             box_size: glam::IVec2::new(12, 12),
             box_center: glam::Vec2::new(10.0, 16.0),
             material_id: 0,
-            precompute_initial_volumes: true,
             rng_seed: 1,
             ..SpawnRegion::for_sim(&config)
         },
@@ -2964,7 +2941,6 @@ fn curvature_flow_thermal_diffusion_stays_finite_and_separates_hot_from_cold() {
             box_size: glam::IVec2::new(12, 12),
             box_center: glam::Vec2::new(22.0, 16.0),
             material_id: 0,
-            precompute_initial_volumes: true,
             rng_seed: 2,
             ..SpawnRegion::for_sim(&config)
         },
@@ -3115,8 +3091,7 @@ fn curvature_flow_volume_correction_matches_true_particle_mass() {
             .at(glam::Vec2::splat(16.0))
             .disk(6.0)
             .spacing(0.5)
-            .material(0)
-            .precompute_volumes(),
+            .material(0),
     );
     let true_particle_mass_sum: f32 = particles.iter().map(|p| p.mass).sum();
 
@@ -3254,8 +3229,7 @@ fn curvature_flow_mass_growth_scales_with_iteration_count() {
             .at(glam::Vec2::splat(16.0))
             .disk(6.0)
             .spacing(0.5)
-            .material(0)
-            .precompute_volumes(),
+            .material(0),
     );
     let registry = MaterialRegistry::with_default(Box::new(NeoHookeanMaterial::new(100.0, 50.0)));
     let sim =
@@ -3369,8 +3343,7 @@ fn wave_field_is_excited_by_real_density_and_stays_bounded() {
             .at(glam::Vec2::splat(16.0))
             .disk(4.0)
             .spacing(0.5)
-            .material(0)
-            .precompute_volumes(),
+            .material(0),
     );
     // Real fix: the wave field only ever excites for materials that
     // genuinely behave like a fluid (`owns_deformation_volume_state()`,
@@ -3489,8 +3462,7 @@ fn curvature_flow_wave_field_decays_once_density_stops_changing() {
             .at(glam::Vec2::splat(16.0))
             .disk(4.0)
             .spacing(0.5)
-            .material(0)
-            .precompute_volumes(),
+            .material(0),
     );
     // Real fix -- same root cause as `wave_field_is_excited_by_real_
     // density_and_stays_bounded`'s own doc: a real fluid material, plus the
@@ -3840,8 +3812,7 @@ fn surface_reconstruction_does_not_flicker_over_many_deterministic_frames() {
             .spacing(0.5)
             .material(0)
             .jitter(0.15)
-            .rng_seed(42)
-            .precompute_volumes(),
+            .rng_seed(42),
     );
     let registry = MaterialRegistry::with_default(Box::new(NeoHookeanMaterial::new(100.0, 50.0)));
     let mut sim =
@@ -4361,8 +4332,7 @@ fn diag_surface_reconstruction_real_cost_vs_grid_volume_and_particles() {
             .at(glam::Vec2::new(32.0, 20.0))
             .disk(20.0)
             .spacing(0.5)
-            .material(0)
-            .precompute_volumes(),
+            .material(0),
     );
     let registry =
         MaterialRegistry::with_default(Box::new(DruckerPragerMaterial::new(100.0, 50.0)));

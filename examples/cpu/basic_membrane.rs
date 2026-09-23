@@ -240,7 +240,6 @@ fn make_sim(lambda: f32, mu: f32) -> Simulation {
         spacing: SPACING,
         box_size: IVec2::new(6, 6),
         box_center: Vec2::new(GRID as f32 * 0.5, GRID as f32 * 0.5),
-        precompute_initial_volumes: true,
         initial_velocity_scale: 0.0,
         mass_override: Some(mass_grid),
         ..SpawnRegion::for_sim(&config)

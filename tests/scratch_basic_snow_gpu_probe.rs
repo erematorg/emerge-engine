@@ -67,7 +67,6 @@ mod gpu_probe {
             box_size: IVec2::new((BALL_R * 2.0) as i32, (BALL_R * 2.0) as i32),
             box_center: center,
             material_id: mat,
-            precompute_initial_volumes: true,
             rng_seed: seed,
             mass_override: Some(mass_grid),
             ..SpawnRegion::for_sim(&config)

@@ -320,7 +320,6 @@ fn main() {
         box_center: Vec2::splat(config.grid_res as f32 * 0.5),
         material_id: ICE_ID,
         mass_override: Some(mass_for(ICE_RHO_KG_M3)),
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
 

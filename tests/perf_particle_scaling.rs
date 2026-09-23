@@ -31,7 +31,6 @@ fn diag_sand_single_material_particle_scaling() {
             box_size: IVec2::new(side, side),
             box_center: Vec2::new(GRID as f32 * 0.5, GRID as f32 * 0.5),
             material_id: 0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         let sand = DruckerPragerMaterial::new(10_000.0, 15_000.0);
@@ -81,7 +80,6 @@ fn diag_mixture_two_material_particle_scaling() {
             box_size: IVec2::new(side, side),
             box_center: Vec2::new(GRID as f32 * 0.4, GRID as f32 * 0.3),
             material_id: 0,
-            precompute_initial_volumes: true,
             mass_override: Some(1.8),
             ..SpawnRegion::for_sim(&config)
         };
@@ -90,7 +88,6 @@ fn diag_mixture_two_material_particle_scaling() {
             box_size: IVec2::new(side, side),
             box_center: Vec2::new(GRID as f32 * 0.6, GRID as f32 * 0.6),
             material_id: 1,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         let sand = WithMixturePhase::new(

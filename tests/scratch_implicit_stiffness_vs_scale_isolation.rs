@@ -33,7 +33,6 @@ fn make_sim(lambda: f32, mu: f32, box_size: IVec2) -> Simulation {
         box_size,
         box_center: Vec2::new(32.0, 20.0),
         material_id: MAT_SAND,
-        precompute_initial_volumes: true,
         position_jitter: 0.5,
         rng_seed: 11,
         mass_override: Some(mass_grid),

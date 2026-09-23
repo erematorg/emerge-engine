@@ -513,7 +513,6 @@ fn granular_fluid_survives_hard_impact() {
         box_size: IVec2::new(side, side),
         box_center: Vec2::new(GRID as f32 * 0.5, FLOOR + drop_height),
         initial_velocity_scale: 0.0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
 
@@ -623,7 +622,6 @@ fn rankine_rock_comparison_survives_repeated_strikes_with_real_relative_damage()
             box_size: IVec2::new(12, 12),
             box_center: Vec2::new(x_center, 10.0),
             material_id,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&sim.config().clone())
         };
         let _ = sim.add_body(spawn);
@@ -1612,7 +1610,6 @@ fn bingham_mud_stays_standing_under_gravity() {
         box_size: IVec2::new(SIDE, SIDE),
         box_center: Vec2::new(GRID as f32 * 0.5, FLOOR + SIDE as f32 * 0.5),
         initial_velocity_scale: 0.0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     }
     .mass_from(&props, &config);
@@ -1711,7 +1708,6 @@ fn bingham_lava_survives_hard_impact() {
         box_size: IVec2::new(side, side),
         box_center: Vec2::new(GRID as f32 * 0.5, FLOOR + drop_height),
         initial_velocity_scale: 0.0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
 
@@ -1940,7 +1936,6 @@ fn fluid_impact_shows_real_free_surface_splash_separation() {
         box_size: IVec2::new(side, side),
         box_center: Vec2::new(GRID as f32 * 0.5, FLOOR + drop_height),
         initial_velocity_scale: 0.0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
 
@@ -2059,7 +2054,6 @@ fn fluid_to_solid_transition_does_not_spring() {
         box_size: IVec2::new(6, 6),
         box_center: center,
         initial_velocity_scale: 0.0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
 
@@ -2414,7 +2408,6 @@ fn hydrostatic_test_scene_unprestressed_full(
         // box_size is in grid units directly. 12-unit-tall column.
         box_size: IVec2::new(20, 12),
         box_center: Vec2::new(32.0, SPAWN_BOTTOM_Y + 12.0 * 0.5),
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let translate_into_contact = |solver: &mut Simulation| {
@@ -2500,7 +2493,6 @@ fn confined_hydrostatic_test_scene_unprestressed() -> (Simulation, f32, f32, f32
         // side-wall support instead of opening into an empty 20-cell gap.
         box_size: IVec2::new(60, 12),
         box_center: Vec2::new(32.0, SPAWN_BOTTOM_Y + 6.0),
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let mut solver = Simulation::new(config, spawn)
@@ -3283,7 +3275,6 @@ fn fluid_geostatic_prestress_isothermal_cavitating_vs_newtonian_ab() {
         box_size: IVec2::new(20, COLUMN_HEIGHT_CELLS as i32),
         box_center: Vec2::new(32.0, SPAWN_BOTTOM_Y + COLUMN_HEIGHT_CELLS * 0.5),
         material_id: 0,
-        precompute_initial_volumes: true,
         initial_velocity_scale: 0.0,
         ..SpawnRegion::for_sim(&cavitating_config)
     };
@@ -4058,7 +4049,6 @@ fn pressure_trends_upward_with_depth<M: MaterialModel + Clone + 'static>(materia
         spacing: 0.5,
         box_size: IVec2::new(20, 12),
         box_center: Vec2::new(32.0, 10.0),
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let mut solver = Simulation::new(config, spawn)
@@ -4253,7 +4243,6 @@ fn nacc_preconsolidates_more_under_deeper_self_weight() {
         spacing: 0.5,
         box_size: IVec2::new(16, 60),
         box_center: Vec2::new(64.0, 34.0),
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let mut solver = Simulation::new(config, spawn)
@@ -4691,7 +4680,6 @@ fn muscle_creature_stays_bounded_at_full_activation() {
         box_size: IVec2::new(24, 6),
         box_center: body_center,
         material_id: 0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let mut sim = Simulation::new(config, spawn)
@@ -4764,7 +4752,6 @@ fn grip_friction_locomotion_sweep() {
             box_size: IVec2::new(24, 6),
             box_center: body_center,
             material_id: 0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         let mut sim = Simulation::new(config, spawn)
@@ -4887,7 +4874,6 @@ fn ratchet_friction_produces_real_directed_locomotion() {
         box_size: IVec2::new(24, 6),
         box_center: body_center,
         material_id: 0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let mut sim = Simulation::new(config, spawn)
@@ -4984,7 +4970,6 @@ fn ratchet_easy_direction_is_live_and_reversible() {
         box_size: IVec2::new(24, 6),
         box_center: body_center,
         material_id: 0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let ratchet = std::sync::Arc::new(RatchetFrictionBoundary::new(4, 0.1, 0.95, Vec2::X));
@@ -5076,7 +5061,6 @@ fn drucker_prager_volumetric_floor_prevents_unphysical_contact_collapse() {
             box_size: IVec2::new(48, 8),
             box_center: Vec2::new(32.0, 8.0),
             material_id: 0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         let rest_mat: Box<dyn emerge::materials::MaterialModel> =
@@ -5100,7 +5084,6 @@ fn drucker_prager_volumetric_floor_prevents_unphysical_contact_collapse() {
             box_size: IVec2::new(8, 8),
             box_center: Vec2::new(32.0, 14.0),
             material_id: grip_mat_id.0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(sim.config())
         };
         let _ = sim.add_body(grip_spawn);
@@ -5234,7 +5217,6 @@ fn neohookean_viscosity_prevents_compaction_ratchet() {
         box_size: IVec2::new(24, 6),
         box_center: body_center,
         material_id: 0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let ratchet = std::sync::Arc::new(RatchetFrictionBoundary::new(4, 0.1, 0.95, Vec2::X));
@@ -5330,7 +5312,6 @@ fn multi_field_contact_produces_real_coulomb_slip_and_stick() {
             box_size: IVec2::new(6, 6),
             box_center: Vec2::new(32.0, 11.6),
             material_id: 0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         let mut sim = Simulation::new(config, block_spawn)
@@ -5352,7 +5333,6 @@ fn multi_field_contact_produces_real_coulomb_slip_and_stick() {
             box_size: IVec2::new(48, 8),
             box_center: Vec2::new(32.0, 8.0),
             material_id: floor_mat_id.0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(sim.config())
         };
         let _ = sim.add_body(floor_spawn);
@@ -5433,7 +5413,6 @@ fn directional_contact_grip_is_real_and_direction_aware() {
             box_size: IVec2::new(6, 6),
             box_center: Vec2::new(32.0, 11.6),
             material_id: 0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         let grip = std::sync::Arc::new(emerge::DirectionalContactGrip::new(
@@ -5459,7 +5438,6 @@ fn directional_contact_grip_is_real_and_direction_aware() {
             box_size: IVec2::new(48, 8),
             box_center: Vec2::new(32.0, 8.0),
             material_id: floor_mat_id.0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(sim.config())
         };
         let _ = sim.add_body(floor_spawn);
@@ -5659,7 +5637,6 @@ fn pinned_particles_stay_fixed_under_gravity_and_impact() {
         box_size: IVec2::new(8, 8),
         box_center: Vec2::splat(16.0),
         material_id: 0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let mut sim = Simulation::new(config, spawn)
@@ -5769,7 +5746,6 @@ fn drucker_prager_volumetric_floor_holds_over_long_passive_settle() {
         box_size: IVec2::new(100, 12),
         box_center: Vec2::new(64.0, 10.0),
         material_id: 0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let mut sim = Simulation::new(config, terrain_spawn)
@@ -5787,7 +5763,6 @@ fn drucker_prager_volumetric_floor_holds_over_long_passive_settle() {
         box_size: IVec2::new(36, 4),
         box_center: body_center,
         material_id: snake_mat_id.0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(sim.config())
     };
     let snake_range_start = terrain_count;
@@ -5886,7 +5861,6 @@ fn drucker_prager_volumetric_floor_holds_under_heavy_impact_and_long_settle() {
         box_size: IVec2::new(100, 12),
         box_center: Vec2::new(64.0, 10.0),
         material_id: 0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let mut sim = Simulation::new(config, terrain_spawn)
@@ -5904,7 +5878,6 @@ fn drucker_prager_volumetric_floor_holds_under_heavy_impact_and_long_settle() {
         box_size: IVec2::new(48, 8), // doubled thickness vs. the 36x4 baseline test
         box_center: body_center,
         material_id: snake_mat_id.0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(sim.config())
     };
     let snake_range_start = terrain_count;
@@ -5988,7 +5961,6 @@ fn drucker_prager_volumetric_floor_holds_under_active_locomotion_at_larger_scale
         box_size: IVec2::new(150, 14), // 1.5x the baseline test's 100x12
         box_center: Vec2::new(96.0, 10.0),
         material_id: 0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let mut sim = Simulation::new(config, terrain_spawn)
@@ -6006,7 +5978,6 @@ fn drucker_prager_volumetric_floor_holds_under_active_locomotion_at_larger_scale
         box_size: IVec2::new(54, 6),
         box_center: body_center,
         material_id: snake_mat_id.0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(sim.config())
     };
     let snake_range_start = terrain_count;
@@ -6112,7 +6083,6 @@ fn pressurized_column_droops_less_than_unpressurized_under_self_weight() {
             box_size: IVec2::new(4, 16),
             box_center: Vec2::new(16.0, 12.0),
             material_id: 0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         let mut sim = Simulation::new(config, spawn).with_default_material(material);
@@ -6350,7 +6320,6 @@ fn diag_wcsph_unit_consistency_sweep_under_full_real_gravity() {
         box_size: IVec2::new(14, DEPTH_CELLS as i32),
         box_center: Vec2::new(32.0, 2.0 + DEPTH_CELLS * 0.5),
         material_id: 0,
-        precompute_initial_volumes: true,
         mass_override: Some(mass),
         ..SpawnRegion::for_sim(&config)
     };
@@ -6423,7 +6392,6 @@ fn self_weight_strain_is_spacing_independent() {
             box_size: IVec2::new(6, 10),
             box_center: Vec2::new(32.0, 8.0),
             material_id: 0,
-            precompute_initial_volumes: true,
             initial_velocity_scale: 0.0,
             ..SpawnRegion::for_sim(&config)
         };
@@ -6510,7 +6478,6 @@ fn sand_push_leaves_permanent_displacement_not_full_elastic_rebound() {
         box_size: IVec2::new(30, 16),
         box_center: Vec2::new(32.0, 12.0),
         material_id: 0,
-        precompute_initial_volumes: true,
         initial_velocity_scale: 0.0,
         rng_seed: 11,
         position_jitter: 0.5,
@@ -6634,7 +6601,6 @@ fn diag_elastic_viscosity_substep_cost_vs_baseline() {
         box_size: IVec2::new(30, 16),
         box_center: Vec2::new(32.0, 12.0),
         material_id: 0,
-        precompute_initial_volumes: true,
         initial_velocity_scale: 0.0,
         rng_seed: 11,
         position_jitter: 0.5,
@@ -6731,7 +6697,6 @@ fn diag_wet_sand_cohesion_spread_after_realistic_pour() {
         box_size: IVec2::new(30, 16),
         box_center: Vec2::new(32.0, 12.0),
         material_id: 0,
-        precompute_initial_volumes: true,
         initial_velocity_scale: 0.0,
         rng_seed: 11,
         position_jitter: 0.5,
@@ -6795,7 +6760,6 @@ fn diag_wet_sand_cohesion_spread_after_realistic_pour() {
                 box_size: IVec2::new(2, 1),
                 box_center: pour_center,
                 material_id: water_id.0,
-                precompute_initial_volumes: true,
                 initial_velocity_scale: 0.0,
                 rng_seed: 11,
                 ..SpawnRegion::for_sim(&config)
@@ -6870,7 +6834,6 @@ fn diag_elastic_viscosity_effect_on_active_dry_flow_speed() {
         box_size: IVec2::new(30, 16),
         box_center: Vec2::new(32.0, 12.0),
         material_id: 0,
-        precompute_initial_volumes: true,
         initial_velocity_scale: 0.0,
         rng_seed: 11,
         position_jitter: 0.5,
@@ -6970,7 +6933,6 @@ fn diag_compression_floor_trigger_rate_old_vs_new_threshold_passive_settle() {
         box_size: IVec2::new(30, 16),
         box_center: Vec2::new(32.0, 12.0),
         material_id: 0,
-        precompute_initial_volumes: true,
         initial_velocity_scale: 0.0,
         rng_seed: 11,
         position_jitter: 0.5,
@@ -7056,7 +7018,6 @@ fn diag_stress_test_all_real_interaction_scenarios() {
         box_size: IVec2::new(30, 16),
         box_center: Vec2::new(32.0, 12.0),
         material_id: 0,
-        precompute_initial_volumes: true,
         initial_velocity_scale: 0.0,
         rng_seed: 11,
         position_jitter: 0.5,
@@ -7183,7 +7144,6 @@ fn diag_wet_sand_push_combined_never_tested_before() {
         box_size: IVec2::new(30, 16),
         box_center: Vec2::new(32.0, 12.0),
         material_id: 0,
-        precompute_initial_volumes: true,
         initial_velocity_scale: 0.0,
         rng_seed: 11,
         position_jitter: 0.5,
@@ -7241,7 +7201,6 @@ fn diag_wet_sand_push_combined_never_tested_before() {
                 box_size: IVec2::new(2, 1),
                 box_center: pour_center,
                 material_id: water_id.0,
-                precompute_initial_volumes: true,
                 initial_velocity_scale: 0.0,
                 rng_seed: 11,
                 ..SpawnRegion::for_sim(&config)
@@ -7326,7 +7285,6 @@ fn diag_lifted_chunk_dispersion_not_just_retained_position() {
         box_size: IVec2::new(30, 16),
         box_center: Vec2::new(32.0, 12.0),
         material_id: 0,
-        precompute_initial_volumes: true,
         initial_velocity_scale: 0.0,
         rng_seed: 11,
         position_jitter: 0.5,
@@ -7449,7 +7407,6 @@ fn diag_lifted_chunk_dispersion_from_surface_with_strong_pull() {
         box_size: IVec2::new(30, 16),
         box_center: Vec2::new(32.0, 12.0),
         material_id: 0,
-        precompute_initial_volumes: true,
         initial_velocity_scale: 0.0,
         rng_seed: 11,
         position_jitter: 0.5,
@@ -7578,7 +7535,6 @@ fn diag_push_weights_sweep_real_lift_within_ui_range() {
         box_size: IVec2::new(30, 16),
         box_center: Vec2::new(32.0, 12.0),
         material_id: 0,
-        precompute_initial_volumes: true,
         initial_velocity_scale: 0.0,
         rng_seed: 11,
         position_jitter: 0.5,
@@ -7660,7 +7616,6 @@ fn diag_lmb_push_stability_at_new_stronger_default() {
         box_size: IVec2::new(30, 16),
         box_center: Vec2::new(32.0, 12.0),
         material_id: 0,
-        precompute_initial_volumes: true,
         initial_velocity_scale: 0.0,
         rng_seed: 11,
         position_jitter: 0.5,
@@ -7800,7 +7755,6 @@ fn diag_phase_transition_under_load_causes_stress_discontinuity() {
             box_size: IVec2::new(10, 24),
             box_center: Vec2::new(LOCAL_GRID as f32 * 0.5, 20.0),
             material_id: MAT_SAND,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         let sand = DruckerPragerMaterial::from_young_modulus(1.0e5, 0.2);
@@ -7950,7 +7904,6 @@ fn diag_repeated_phase_transitions_do_not_cause_cumulative_instability() {
         box_size: IVec2::new(10, 24),
         box_center: Vec2::new(LOCAL_GRID as f32 * 0.5, 20.0),
         material_id: MAT_SAND,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let sand = DruckerPragerMaterial::from_young_modulus(1.0e5, 0.2);
@@ -8104,7 +8057,6 @@ fn cavitating_fluid_at_rest_against_a_wall_shows_no_spontaneous_self_excitation(
         box_size: IVec2::new(16, 10),
         box_center: Vec2::new(16.0, 2.0 + 10.0 * 0.5),
         material_id: 0,
-        precompute_initial_volumes: true,
         initial_velocity_scale: 0.0,
         ..SpawnRegion::for_sim(&config)
     };
@@ -8185,7 +8137,6 @@ fn cavitating_fluid_survives_hard_impact() {
         box_size: IVec2::new(side, side),
         box_center: Vec2::new(GRID as f32 * 0.5, FLOOR + drop_height),
         initial_velocity_scale: 0.0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let mut solver = Simulation::new(config, spawn)
@@ -8288,7 +8239,6 @@ fn no_compression_tendon_hangs_taut_survives_pull_and_extreme_impulse() {
         box_size: IVec2::new(4, 20),
         box_center: Vec2::new(32.0, 45.0),
         material_id: 0,
-        precompute_initial_volumes: true,
         initial_velocity_scale: 0.0,
         mass_override: Some(mass_grid),
         ..SpawnRegion::for_sim(&config)
@@ -8420,7 +8370,6 @@ fn cavitating_fluid_avoids_the_flat_floor_materials_hard_clamp_spike_under_the_s
             box_size: IVec2::new(16, 10),
             box_center: Vec2::new(16.0, 2.0 + 10.0 * 0.5),
             material_id: 0,
-            precompute_initial_volumes: true,
             initial_velocity_scale: 0.0,
             ..SpawnRegion::for_sim(&config)
         };
@@ -8709,7 +8658,6 @@ fn run_cavitating_hydrostatic(cfg: &HydrostaticRunConfig) -> HydrostaticErrors {
         ),
         box_center,
         material_id: 0,
-        precompute_initial_volumes: true,
         initial_velocity_scale: 0.0,
         ..SpawnRegion::for_sim(&sim_config)
     };
@@ -9089,7 +9037,6 @@ fn boiling_mixture_volume_tracking_error_is_gravity_sensitive() {
             box_size: IVec2::new(10, 16),
             box_center: Vec2::new(16.0, 2.0 + 16.0 * 0.5),
             material_id: 0,
-            precompute_initial_volumes: true,
             initial_velocity_scale: 0.0,
             ..SpawnRegion::for_sim(&config)
         };
@@ -9385,7 +9332,6 @@ fn boiling_mixture_column_shows_real_hydrostatic_compression_by_depth() {
         box_size: IVec2::new(COLUMN_WIDTH as i32, COLUMN_HEIGHT as i32),
         box_center: Vec2::new(16.0, BOTTOM_Y + COLUMN_HEIGHT * 0.5),
         material_id: 0,
-        precompute_initial_volumes: true,
         initial_velocity_scale: 0.0,
         ..SpawnRegion::for_sim(&sim_config)
     };
@@ -9599,7 +9545,6 @@ fn boiling_mixture_confined_column_errors(
         box_size: IVec2::new(column_width as i32, COLUMN_HEIGHT as i32),
         box_center: Vec2::new(GRID_RES as f32 * 0.5, BOTTOM_Y + COLUMN_HEIGHT * 0.5),
         material_id: 0,
-        precompute_initial_volumes: true,
         initial_velocity_scale: 0.0,
         ..SpawnRegion::for_sim(&sim_config)
     };
@@ -9817,7 +9762,6 @@ fn boiling_mixture_confined_column_errors_at_resolution(
             bottom_y + column_height_cells * 0.5,
         ),
         material_id: 0,
-        precompute_initial_volumes: true,
         initial_velocity_scale: 0.0,
         ..SpawnRegion::for_sim(&sim_config)
     };
@@ -9973,7 +9917,6 @@ fn yield_stress_columns_slump_in_order_of_their_yield_stress() {
             box_size: COLUMN,
             box_center: Vec2::new(32.0, FLOOR + COLUMN.y as f32 * 0.5),
             material_id: 0,
-            precompute_initial_volumes: true,
             initial_velocity_scale: 0.0,
             ..SpawnRegion::for_sim(&config)
         }

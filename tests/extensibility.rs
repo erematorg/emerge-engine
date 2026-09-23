@@ -42,7 +42,6 @@ fn spawn(config: &SimConfig) -> SpawnRegion {
         spacing: 0.5,
         box_size: IVec2::new(8, 8),
         box_center: Vec2::new(24.0, 20.0),
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(config)
     }
 }

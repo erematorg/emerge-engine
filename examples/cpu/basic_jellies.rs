@@ -150,7 +150,6 @@ fn make_sim(p: &Params) -> Simulation {
         box_size: IVec2::new(14, 14),
         box_center: c,
         material_id: mat,
-        precompute_initial_volumes: true,
         initial_velocity_scale: 0.0,
         mass_override: Some(mass_grid),
         ..SpawnRegion::for_sim(&config)

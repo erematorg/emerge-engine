@@ -44,7 +44,6 @@ fn make_sim(implicit: bool) -> Simulation {
         box_size: IVec2::new(18, 14), // same real box as basic_sand.rs -> ~1008 particles
         box_center: Vec2::new(32.0, 20.0),
         material_id: MAT_LOOSE,
-        precompute_initial_volumes: true,
         position_jitter: 0.5,
         rng_seed: 11,
         mass_override: Some(mass_grid),

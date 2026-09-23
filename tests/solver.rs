@@ -70,7 +70,6 @@ fn step_keeps_particles_inside_domain() {
 #[test]
 fn precomputed_volumes_are_positive() {
     let spawn = SpawnRegion {
-        precompute_initial_volumes: true,
         ..SpawnRegion::default()
     };
     let solver = Simulation::new(SimConfig::default(), spawn);
@@ -128,7 +127,6 @@ fn no_compression_hanging_body_has_no_passive_volume_ratchet() {
         spacing: 0.5,
         box_size: IVec2::new(6, 6),
         box_center: Vec2::splat(32.0),
-        precompute_initial_volumes: true,
         initial_velocity_scale: 0.0,
         ..SpawnRegion::for_sim(&config)
     };
@@ -210,7 +208,6 @@ fn pinned_grid_support_transmits_reaction_to_connected_elastic_body() {
         spacing: 0.5,
         box_size: IVec2::new(6, 6),
         box_center: Vec2::splat(32.0),
-        precompute_initial_volumes: true,
         initial_velocity_scale: 0.0,
         ..SpawnRegion::for_sim(&config)
     };
@@ -3479,7 +3476,6 @@ fn sand_q_stays_bounded_once_settled() {
         spacing: 0.5,
         box_size: IVec2::new(18, 14),
         box_center: Vec2::new(32.0, 40.0),
-        precompute_initial_volumes: true,
         position_jitter: 0.5,
         rng_seed: 11,
         ..SpawnRegion::for_sim(&config)
@@ -3571,7 +3567,6 @@ fn build_mixture_scene(drag_coefficient: f32) -> Simulation {
         box_center: Vec2::new(16.0, 16.0),
         material_id: 0,
         initial_velocity_scale: 0.0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let fluid_spawn = SpawnRegion {
@@ -3580,7 +3575,6 @@ fn build_mixture_scene(drag_coefficient: f32) -> Simulation {
         box_center: Vec2::new(16.0, 16.0),
         material_id: 1,
         initial_velocity_scale: 0.0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let solid = WithMixturePhase::new(
@@ -3676,7 +3670,6 @@ fn diag_sand_only_no_mixture_long_horizon_erupts_or_not() {
         box_size: IVec2::new(56, 10),
         box_center: Vec2::new(48.0, 8.0),
         material_id: MAT_SAND,
-        precompute_initial_volumes: true,
         mass_override: Some(1.8),
         ..SpawnRegion::for_sim(&config)
     };
@@ -3787,7 +3780,6 @@ fn water_saturates_nearby_sand_through_the_real_solver() {
         box_center: Vec2::new(16.0, 16.0),
         material_id: 0,
         initial_velocity_scale: 0.0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     // Offset, not co-located: real "water sitting on sand" only wets the
@@ -3800,7 +3792,6 @@ fn water_saturates_nearby_sand_through_the_real_solver() {
         box_center: Vec2::new(16.0, 21.0),
         material_id: 1,
         initial_velocity_scale: 0.0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let sand = DruckerPragerMaterial {

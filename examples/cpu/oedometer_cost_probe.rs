@@ -75,7 +75,6 @@ fn main() {
             box_size: SAMPLE,
             box_center: Vec2::new(SAMPLE_X[slot], FLOOR + SAMPLE.y as f32 * 0.5),
             material_id: slot as u32,
-            precompute_initial_volumes: true,
             initial_velocity_scale: 0.0,
             ..SpawnRegion::for_sim(&config)
         }

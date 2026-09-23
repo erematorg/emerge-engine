@@ -123,7 +123,6 @@ fn make_sim() -> Simulation {
         box_size: IVec2::new(22, 14),
         box_center: Vec2::new(19.0, 9.0),
         material_id: SAND_ID,
-        precompute_initial_volumes: true,
         mass_override: Some(sand_mass),
         ..SpawnRegion::for_sim(&config)
     });
@@ -132,7 +131,6 @@ fn make_sim() -> Simulation {
         box_size: IVec2::new(22, 14),
         box_center: Vec2::new(45.0, 9.0),
         material_id: FLUID_ID,
-        precompute_initial_volumes: true,
         // Without this, mass falls back to `config.particle_mass` (1.0),
         // completely decoupled from the material's own rest_density=0.1
         // -- a real, separate gap found 2026-08-08 alongside the SI fix
@@ -146,7 +144,6 @@ fn make_sim() -> Simulation {
         box_size: IVec2::new(12, 12),
         box_center: Vec2::new(32.0, 46.0),
         material_id: ELASTIC_ID,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     });
     solver

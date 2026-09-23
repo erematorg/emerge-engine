@@ -51,7 +51,6 @@ fn wall_touching_column_stays_stable_after_divergence_fix() {
         box_center: center,
         material_id: MAT_WATER,
         initial_velocity_scale: 0.0,
-        precompute_initial_volumes: true,
         mass_override: Some(WATER_MASS),
         ..SpawnRegion::for_sim(&config)
     };

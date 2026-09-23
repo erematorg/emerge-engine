@@ -107,7 +107,6 @@ fn falling_droplet_with_no_wall_contact_stays_physically_bounded() {
         box_center: blob_center,
         material_id: MAT_WATER,
         initial_velocity_scale: 0.0,
-        precompute_initial_volumes: true,
         mass_override: Some(WATER_MASS),
         ..SpawnRegion::for_sim(&config)
     };
@@ -231,7 +230,6 @@ fn falling_droplet_at_validated_derated_gravity() {
         box_center: blob_center,
         material_id: MAT_WATER,
         initial_velocity_scale: 0.0,
-        precompute_initial_volumes: true,
         mass_override: Some(WATER_MASS),
         ..SpawnRegion::for_sim(&config)
     };

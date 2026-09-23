@@ -62,7 +62,6 @@ fn main() {
         box_size: IVec2::new(20, 20),
         box_center: Vec2::splat(config.grid_res as f32 * 0.5),
         material_id: WATER_ID,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
 

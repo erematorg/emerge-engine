@@ -775,7 +775,6 @@ mod hydrostatic_tests {
             box_size: IVec2::new(40, 12),
             box_center: Vec2::new(32.0, 9.0),
             material_id: 0,
-            precompute_initial_volumes: true,
             mass_override: Some(rest_density * spacing * spacing),
             ..SpawnRegion::for_sim(&config)
         };

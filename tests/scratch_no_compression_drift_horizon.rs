@@ -42,7 +42,6 @@ fn no_compression_drift_over_a_long_horizon() {
         spacing: 0.5,
         box_size: IVec2::new(6, 6),
         box_center: Vec2::splat(32.0),
-        precompute_initial_volumes: true,
         initial_velocity_scale: 0.0,
         ..SpawnRegion::for_sim(&config)
     };

@@ -251,7 +251,6 @@ fn make_sim() -> Simulation {
             box_size: IVec2::new(COLUMN_HALF_WIDTH * 2, thickness.round().max(1.0) as i32),
             box_center: Vec2::new(center_x, y_bottom + thickness * 0.5),
             material_id,
-            precompute_initial_volumes: true,
             mass_override: Some(density_ratio),
             ..SpawnRegion::for_sim(&config)
         };

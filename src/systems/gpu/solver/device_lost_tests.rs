@@ -49,7 +49,6 @@ fn step_frame_becomes_safe_noop_once_device_lost() {
         spacing: 0.5,
         box_size: IVec2::new(4, 4),
         box_center: Vec2::new(16.0, 16.0),
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let particles = crate::build_particles(&config, spawn);
@@ -128,7 +127,6 @@ fn uncaptured_destroyed_buffer_error_sets_device_lost_not_a_panic() {
         spacing: 0.5,
         box_size: IVec2::new(4, 4),
         box_center: Vec2::new(16.0, 16.0),
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let particles = crate::build_particles(&config, spawn);

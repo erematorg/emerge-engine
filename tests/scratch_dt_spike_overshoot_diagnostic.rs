@@ -59,7 +59,6 @@ fn sand_hard_impact_dt_overshoot_diagnostic() {
         box_size: IVec2::new(side, side),
         box_center: Vec2::new(GRID as f32 * 0.5, FLOOR + drop_height),
         initial_velocity_scale: 0.0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
 

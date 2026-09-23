@@ -37,7 +37,6 @@ fn make_sim(max_substeps_per_step: usize) -> Simulation {
         box_center: Vec2::new(32.0, 32.0),
         material_id: PREY_ID,
         initial_velocity_scale: 0.0,
-        precompute_initial_volumes: true,
         mass_override: Some(mass_grid),
         ..SpawnRegion::for_sim(&config)
     };
@@ -47,7 +46,6 @@ fn make_sim(max_substeps_per_step: usize) -> Simulation {
         box_center: Vec2::new(32.0, 32.0),
         material_id: PREDATOR_ID,
         initial_velocity_scale: 0.0,
-        precompute_initial_volumes: true,
         mass_override: Some(mass_grid),
         ..SpawnRegion::for_sim(&config)
     };

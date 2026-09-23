@@ -66,7 +66,6 @@ fn make_sim() -> (
         box_size: IVec2::new(36, 4),
         box_center: body_center,
         material_id: MAT_BODY,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let ratchet = Arc::new(RatchetFrictionBoundary::new(4, 0.1, 0.95, Vec2::X));

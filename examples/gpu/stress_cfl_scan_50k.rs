@@ -60,7 +60,6 @@ fn make_sim_data(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) -> GpuSimul
             spacing: 0.5,
             box_size: IVec2::splat(side),
             box_center: Vec2::splat(GRID as f32 * 0.5),
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         },
     );

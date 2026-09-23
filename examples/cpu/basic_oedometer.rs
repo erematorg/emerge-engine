@@ -174,7 +174,6 @@ fn make_sim(
             box_size: SAMPLE_CELLS,
             box_center: Vec2::new(SAMPLE_X[slot], FLOOR_CELLS + SAMPLE_CELLS.y as f32 * 0.5),
             material_id: slot as u32,
-            precompute_initial_volumes: true,
             initial_velocity_scale: 0.0,
             ..SpawnRegion::for_sim(&config)
         }

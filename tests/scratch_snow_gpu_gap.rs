@@ -81,7 +81,7 @@ mod probe {
             let mut cpu_min = f32::INFINITY;
             let mut gpu_min = f32::INFINITY;
             let (mut cpu_worst, mut gpu_worst) = (0usize, 0usize);
-            for i in 0..c.len() {
+            for (i, gp) in g.iter().enumerate().take(c.len()) {
                 let a = material.timestep_bound(
                     c.density[i],
                     c.hardening_scale[i],
@@ -94,8 +94,8 @@ mod probe {
                     cpu_worst = i;
                 }
                 let b = material.timestep_bound(
-                    g[i].density,
-                    g[i].hardening_scale,
+                    gp.density,
+                    gp.hardening_scale,
                     config.grid_cell_size,
                     config.material_cfl_coefficient,
                     config.viscous_timestep_coefficient,

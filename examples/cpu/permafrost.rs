@@ -154,7 +154,6 @@ fn make_sim() -> Simulation {
         box_size: BLOCK_CELLS,
         box_center: Vec2::new(32.0, 12.0),
         material_id: FROZEN_ID,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let _ = solver.add_body(spawn);

@@ -63,7 +63,6 @@ mod gpu_check {
             box_size: IVec2::new(16, 16),
             box_center: Vec2::new(cx, 48.0),
             material_id: mat,
-            precompute_initial_volumes: true,
             rng_seed: seed,
             mass_override: Some(mass_grid),
             ..SpawnRegion::for_sim(&config)

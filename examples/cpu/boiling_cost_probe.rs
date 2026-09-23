@@ -120,7 +120,6 @@ fn main() {
             initial_deformation_gradient: Mat2::from_diagonal(Vec2::splat(stretch)),
             material_id: 0,
             mass_override: Some(particle_mass),
-            precompute_initial_volumes: false,
             initial_velocity_scale: 0.0,
             ..SpawnRegion::for_sim(&config)
         }

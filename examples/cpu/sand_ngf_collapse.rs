@@ -137,7 +137,6 @@ fn make_sim(mode: Mode) -> Simulation {
         box_size: IVec2::new(8, 16),
         box_center: Vec2::new(GRID as f32 * 0.5, FLOOR_CELLS + 8.0),
         material_id: 0,
-        precompute_initial_volumes: true,
         mass_override: Some(mass_grid),
         ..SpawnRegion::for_sim(&config)
     };

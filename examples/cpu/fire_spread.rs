@@ -182,7 +182,6 @@ fn make_sim(fuel_kind: FuelKind) -> Simulation {
         box_size: IVec2::new(2 * PLANK_HALF_LEN, 2 * PLANK_HALF_HEIGHT),
         box_center: Vec2::new(GRID as f32 * 0.5, GRID as f32 * 0.4),
         material_id: FUEL_ID,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
 

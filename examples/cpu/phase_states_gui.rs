@@ -472,7 +472,6 @@ fn make_sim() -> (
         box_center: Vec2::new(config.grid_res as f32 * 0.5, config.grid_res as f32 * 0.22),
         material_id: ICE_ID,
         mass_override: Some(mass_for(ICE_RHO_KG_M3)),
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
 
@@ -510,8 +509,9 @@ fn make_sim() -> (
     // Real root fix (2026-08-28), found live tracing particle 15's melt-
     // triggered velocity spike (65+ grid-units/s within ~1s of melting):
     // `mass_override` above (`mass_for`) assumes every ice particle has the
-    // SAME nominal volume (`spacing^2`), but `precompute_initial_volumes`
-    // (real, correct for a solid with no analytical rest volume -- see
+    // SAME nominal volume (`spacing^2`), but the spawn's own volume
+    // measurement (real, correct for a solid with no analytical rest
+    // volume -- see
     // `fluid.rs`'s own doc on why STRICT fluids override this instead)
     // measures each particle's REAL volume via a kernel-density estimate,
     // which is legitimately LARGER for particles near the ice block's own

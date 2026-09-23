@@ -137,14 +137,12 @@ fn main() {
         spacing: 0.5,
         box_size: IVec2::new(16, 16),
         box_center: Vec2::new(24.0, 48.0),
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let sand_spawn = SpawnRegion {
         spacing: 0.5,
         box_size: IVec2::new(24, 12),
         box_center: Vec2::new(40.0, 40.0),
-        precompute_initial_volumes: true,
         material_id: SAND_ID,
         ..SpawnRegion::for_sim(&config)
     };

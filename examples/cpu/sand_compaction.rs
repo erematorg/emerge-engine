@@ -72,7 +72,6 @@ fn make_sim() -> Simulation {
         ),
         box_center: Vec2::new(cx, floor + 2.0 + height * 0.5),
         material_id: 0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let sand = DruckerPragerMaterial {

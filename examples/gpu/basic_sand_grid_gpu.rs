@@ -125,7 +125,6 @@ fn make_sim_data(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) -> (GpuSimu
         box_size: IVec2::new(18, 14),
         box_center: c,
         material_id: mat,
-        precompute_initial_volumes: true,
         rng_seed: seed,
         position_jitter: 0.5,
         ..SpawnRegion::for_sim(&config)

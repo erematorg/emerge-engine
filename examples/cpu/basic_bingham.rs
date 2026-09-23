@@ -237,7 +237,6 @@ fn make_sim(gravity_fraction: f32, yield_scale: f32) -> (Simulation, [BinghamFlu
             box_size: COLUMN_CELLS,
             box_center: Vec2::new(COLUMN_X[slot], FLOOR_CELLS + COLUMN_CELLS.y as f32 * 0.5),
             material_id: slot as u32,
-            precompute_initial_volumes: true,
             initial_velocity_scale: 0.0,
             ..SpawnRegion::for_sim(&config)
         }

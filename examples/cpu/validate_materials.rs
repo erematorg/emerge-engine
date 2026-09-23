@@ -46,7 +46,6 @@ fn spawn_at(center: Vec2, size: IVec2, spacing: f32, material_id: u32) -> SpawnR
         box_size: size,
         box_center: center,
         material_id,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config())
     }
 }
@@ -359,7 +358,6 @@ fn run_perf() {
             box_size: IVec2::splat(cells_per_side),
             box_center: Vec2::splat(32.0),
             material_id: 0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&cfg)
         };
 
@@ -417,7 +415,6 @@ fn run_scenarios() {
             box_size: IVec2::new(10, 10),
             box_center: Vec2::new(32.0, 50.0),
             material_id: 0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&cfg)
         };
 
@@ -434,7 +431,6 @@ fn run_scenarios() {
             box_size: IVec2::new(56, 6),
             box_center: Vec2::new(32.0, 6.0),
             material_id: 1,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&cfg)
         };
         let sand_mat = DruckerPragerMaterial::from_young_modulus(1e5, 0.2);
@@ -473,7 +469,6 @@ fn run_scenarios() {
             box_size: IVec2::new(14, 14),
             box_center: Vec2::new(32.0, 50.0),
             material_id: 0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config())
         };
         // rho=4.0, not 1.0 (real bug fixed 2026-07-26): matches this spawn's real
@@ -515,7 +510,6 @@ fn run_scenarios() {
             box_size: IVec2::new(6, 40),
             box_center: Vec2::new(32.0, 26.0),
             material_id: 0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config())
         };
         let sand = DruckerPragerMaterial::from_young_modulus(1e5, 0.2);
@@ -561,7 +555,6 @@ fn run_scenarios() {
             box_size: IVec2::new(50, 20),
             box_center: Vec2::new(32.0, 12.0),
             material_id: 1,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&cfg)
         };
         let mud = BinghamFluidMaterial::high_yield(1500.0, 1.0e4);
@@ -571,7 +564,6 @@ fn run_scenarios() {
             box_size: IVec2::new(8, 8),
             box_center: Vec2::new(32.0, 50.0),
             material_id: 0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&cfg)
         };
         let (lb, ub) = lame_from_young(2e5, 0.3);

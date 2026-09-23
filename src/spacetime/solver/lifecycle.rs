@@ -88,13 +88,19 @@ impl Simulation {
         let mut rng = LcgRng::new(spawn.rng_seed);
         let mut particles = Particles::from(initialize_particles(&config, spawn, &mut rng));
         let mut grid = Grid::new(config.grid_res);
-        if spawn.precompute_initial_volumes {
-            let n = particles.len();
-            // No MaterialRegistry exists yet at this point in construction (built
-            // just below) -- harmless: write_initial=true never reaches the
-            // material-aware clamp, see density.rs's own doc comment.
-            estimate_particle_volumes(&mut particles, &mut grid, None, n, true);
-        }
+        // Always, for every body: a particle's initial volume is measured
+        // from its own packing, never taken from a constant. `add_body`
+        // already did this unconditionally while this path asked a flag that
+        // defaulted to off, so a scene that left it alone gave its FIRST body
+        // `default_initial_volume` and every later one the measured value,
+        // 3.3 times smaller (`tests/spawn_contract.rs`). Initial volume
+        // multiplies stress directly, so those were not the same material.
+        //
+        // No MaterialRegistry exists yet at this point in construction (built
+        // just below) -- harmless: write_initial=true never reaches the
+        // material-aware clamp, see density.rs's own doc comment.
+        let n = particles.len();
+        estimate_particle_volumes(&mut particles, &mut grid, None, n, true);
         let materials = MaterialRegistry::with_default(Box::new(FallbackMaterial));
         let default_boundary: Box<dyn BoundaryCondition> =
             Box::new(SlipBoundary::new(config.boundary_thickness));

@@ -104,7 +104,6 @@ fn main() {
         box_center: Vec2::new(COLUMN_X[slot], COLUMN_Y),
         material_id: 0,
         mass_override: Some(particle_mass),
-        precompute_initial_volumes: false,
         initial_velocity_scale: 0.0,
         ..SpawnRegion::for_sim(&config)
     };

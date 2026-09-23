@@ -293,8 +293,8 @@ impl MaterialModel for NewtonianFluidMaterial {
     // `cac544b` file (confirmed: `git show 6234d06:...` has no override
     // either) -- but the CURRENT (non-reverted) engine's spawn contract
     // relies on materials that own their volume/density state to set them
-    // exactly here, overriding `SpawnRegion::precompute_initial_volumes`'s
-    // own kernel-density estimate (a real, legitimate default for materials
+    // exactly here, overriding the spawn's own kernel-density estimate
+    // (which every body now gets, a real, legitimate default for materials
     // that DON'T have an exact analytical initial state, but wrong for a
     // strict fluid, which does: V0 = mass/rest_density exactly). Without
     // this override, that kernel estimate was the only thing setting
