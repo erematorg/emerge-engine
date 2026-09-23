@@ -456,6 +456,11 @@ impl MaterialModel for BoilingMixtureMaterial {
     // Same real F/V/rho contract as `CavitatingFluidMaterial` -- see this
     // module's own top doc: the fixed liquid reference stays the
     // bookkeeping anchor, `rho_eq(x)` only ever enters the pressure law.
+    /// A scene that spawns this at a density other than the liquid
+    /// reference must set the lattice spacing AND
+    /// `SpawnRegion::initial_deformation_gradient` together -- see
+    /// `cavitating_eos`'s own module doc for the measured cost of
+    /// setting only one of the two.
     fn init_particle(&self, particle: &mut Particle) {
         let j = particle.deformation_gradient.determinant();
         particle.initial_volume = particle.mass / self.rest_density_grid;

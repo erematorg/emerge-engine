@@ -143,6 +143,11 @@ impl MaterialModel for IsothermalCavitatingFluidMaterial {
     /// see that method's own doc for why a strict fluid must set
     /// `initial_volume`/`volume`/`density` exactly here (V0=m/rho0,
     /// rho=rho0), not rely on `SpawnRegion`'s own kernel-density estimate.
+    /// A scene that spawns this at a density other than the liquid
+    /// reference must set the lattice spacing AND
+    /// `SpawnRegion::initial_deformation_gradient` together -- see
+    /// `cavitating_eos`'s own module doc for the measured cost of
+    /// setting only one of the two.
     fn init_particle(&self, particle: &mut Particle) {
         let j = particle.deformation_gradient.determinant();
         particle.initial_volume = particle.mass / self.rest_density_grid;
@@ -465,6 +470,11 @@ impl MaterialModel for CavitatingFluidMaterial {
         )
     }
 
+    /// A scene that spawns this at a density other than the liquid
+    /// reference must set the lattice spacing AND
+    /// `SpawnRegion::initial_deformation_gradient` together -- see
+    /// `cavitating_eos`'s own module doc for the measured cost of
+    /// setting only one of the two.
     fn init_particle(&self, particle: &mut Particle) {
         let j = particle.deformation_gradient.determinant();
         particle.initial_volume = particle.mass / self.rest_density_grid;

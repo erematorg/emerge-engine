@@ -4,6 +4,20 @@
 //! unmodified to WCMPM, since both are explicit, particle-based,
 //! density-from-deformation methods).
 //!
+//! # Laying a scene down on this EOS: both halves, or neither
+//!
+//! Every material in this family reads its density from `det(F)` and
+//! nothing else, while the grid reads it from how far apart the
+//! particles sit. A scene that wants a body at rest at a density other
+//! than the liquid reference has to set BOTH: the lattice spacing, so
+//! the grid sees that density, and `SpawnRegion::initial_deformation_
+//! gradient`, so the particle's own bookkeeping agrees. Either one alone
+//! is a pressure shock, not a scene: measured on the boiling mixture at
+//! a vapour quality of 0.19 (`examples/cpu/basic_boiling.rs`), spacing
+//! without the gradient throws particles at 151 m/s on the first frame,
+//! against 0.01 m/s once both are set. Nothing warns about it, because
+//! each half on its own is a legal state.
+//!
 //! Real gap this addresses (2026-08-30): confirmed live (water-jmax +
 //! divergence-decomposition diagnostics, `phase_states_gui.rs`, see
 //! project memory) that `NewtonianFluidMaterial`'s flat `pressure_floor`
