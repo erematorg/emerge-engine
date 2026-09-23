@@ -815,19 +815,17 @@ fn update_particle(p_idx: u32, pp: ptr<function, Particle>) {
     // This mirrors CPU estimate_density_and_volume_impl (density.rs) exactly.
     // p.density and p.volume already hold the correct values -- nothing to recompute here.
 
-    // No velocity damping for elastic/viscoelastic models (0, 2, 3, 9) -- APIC is
-    // energy-conserving and extra damping causes over-settling that leads to floor-compression
-    // instability. Plastic flow (snow, sand, VM, etc.) provides its own dissipation.
-    // For plasticity models we apply a very light damping as a boundary-edge safety margin.
-    // Model 1u (fluid) excluded: explicit viscosity already dissipates; extra damping slows flow.
-    // Light damping for plasticity models -- their explicit dissipation (yield, flow) is enough,
-    // but a small margin prevents edge-particle instability near boundaries.
-    // Elastic (2, 3) and fluid (0, 1) excluded -- APIC is energy-conserving; damping fights that.
-    // Viscoelastic (9) excluded: viscosity stress handles dissipation during deformation.
-    // Velocity damping would bleed into free-fall and make vis fall slower than other materials.
-    if mat.model != 0u && mat.model != 1u && mat.model != 2u && mat.model != 3u && mat.model != 9u {
-        p.v *= 0.999;
-    }
+    // No velocity damping anywhere, for any model. Plastic models used to
+    // get `v *= 0.999` here as a boundary-edge safety margin, which the CPU
+    // never had: `tests/gpu_parity.rs` measured what that cost in a scene
+    // carrying no stress at all, where the two paths can only differ in
+    // their transfer. In free fall the five plastic laws separated from the
+    // elastic ones by two orders of magnitude in velocity (4.1e-3 against
+    // 2e-5) purely because of this line. The comment it replaces said as
+    // much about viscoelastic -- damping "would bleed into free-fall and
+    // make vis fall slower than other materials" -- and then applied it to
+    // the plastic laws anyway. No commit ever introduced it with a
+    // measurement behind it: it survives from before a July file split.
 
     // Position update: x += v · dt  (v written by g2p pass)
     var new_x = p.x + p.v * dt;

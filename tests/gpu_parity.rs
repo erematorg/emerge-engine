@@ -253,19 +253,19 @@ mod parity {
     /// it read, with headroom for the run-to-run spread the GPU's own
     /// substep count shows. A cell with a `note` is a known gap, kept
     /// bounded rather than silenced: it fails the day it gets worse.
+    ///
+    /// Three rows that used to need a bound of their own no longer do.
+    /// Deleting the GPU's plastic velocity damping put the five plastic
+    /// laws back inside the ordinary bounds in free fall (velocity 4.1e-3
+    /// to 4.6e-5) and standing (position 1.55e-3 to 9.3e-5), and took most
+    /// of von Mises's unexplained compression drift with it (velocity
+    /// 0.178 to 7.7e-3). What is left of that one is inside the generic
+    /// bound and no longer has a row.
     struct Expect {
         position: f32,
         velocity: f32,
         note: Option<&'static str>,
     }
-
-    /// The GPU damps velocity on every plastic model (`v *= 0.999` in
-    /// `particles_update.wgsl`) and the CPU does not. Free fall proves it
-    /// is not the law: the scene carries no stress at all, and the same
-    /// five laws still separate from the elastic ones by two orders of
-    /// magnitude in velocity.
-    const GPU_PLASTIC_DAMPING: &str =
-        "GPU damps plastic models by 0.999 per substep, the CPU does not (phase 3)";
 
     fn expected(scene: Scene, law: &str) -> Expect {
         let free = |position, velocity, note| Expect {
@@ -273,10 +273,6 @@ mod parity {
             velocity,
             note,
         };
-        let plastic = matches!(
-            law,
-            "Snow" | "DruckerPrager" | "SandMuI" | "VonMises" | "Rankine"
-        );
         match (scene, law) {
             // Snow's own GPU gap, separate from the damping: under
             // compression it both answers differently and runs half the
@@ -286,13 +282,6 @@ mod parity {
                 7.0,
                 Some("GPU snow answers a compression differently and runs half the substeps"),
             ),
-            // Von Mises drifts under compression beyond what the damping
-            // explains, and nothing yet says why.
-            (Scene::UniaxialCompression, "VonMises") => free(
-                7.0e-3,
-                0.6,
-                Some("GPU von Mises answers a compression differently, cause unknown"),
-            ),
             // Bingham advances far less time than the CPU: 220 substeps
             // against 57 in free fall, 660 against 177 standing.
             (_, "BinghamFluid") => free(
@@ -300,10 +289,6 @@ mod parity {
                 5.0e-2,
                 Some("GPU Bingham executes about a third of the CPU's substeps"),
             ),
-            (Scene::FreeFall, _) if plastic => free(2.0e-4, 1.3e-2, Some(GPU_PLASTIC_DAMPING)),
-            (Scene::HydrostaticColumn, _) if plastic => {
-                free(5.0e-3, 1.2e-1, Some(GPU_PLASTIC_DAMPING))
-            }
             (Scene::FreeFall, _) => free(1.0e-5, 1.5e-4, None),
             (Scene::UniaxialCompression, _) => free(1.0e-3, 6.0e-2, None),
             (Scene::HydrostaticColumn, _) => free(3.0e-4, 8.0e-3, None),

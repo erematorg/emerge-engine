@@ -720,14 +720,10 @@ fn g2p_asflip_fused_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    // Light damping for plasticity models -- applied to BOTH v_store (p.v, persists for
-    // next g2p gather) and v_position (this substep's own position advance), same
-    // damping ratio, keeping ASFLIP's two velocities mutually consistent with how the
-    // single-velocity (non-ASFLIP) path already behaves under this damping.
-    if mat.model != 0u && mat.model != 1u && mat.model != 2u && mat.model != 3u && mat.model != 9u {
-        p.v *= 0.999;
-        v_position *= 0.999;
-    }
+    // No velocity damping here either, for the same measured reason as the
+    // fused pass's twin in `particles_update.wgsl`: see that file. This
+    // site damped BOTH of ASFLIP's velocities, so it cost the same in the
+    // position advance as in the stored velocity.
 
     // Position: x = x + v_position * dt -- v_position, NOT p.v, is ASFLIP's real point:
     // while separating (gamma=1) this equals p.v exactly; while compressing (gamma=0)
