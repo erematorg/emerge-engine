@@ -240,6 +240,15 @@ name = "nacc_law_probe"
 path = "examples/cpu/nacc_law_probe.rs"
 
 [[example]]
+name = "basic_oedometer"
+path = "examples/cpu/basic_oedometer.rs"
+required-features = ["render"]
+
+[[example]]
+name = "oedometer_cost_probe"
+path = "examples/cpu/oedometer_cost_probe.rs"
+
+[[example]]
 name = "nacc_cost_probe"
 path = "examples/cpu/nacc_cost_probe.rs"
 

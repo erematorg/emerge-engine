@@ -127,6 +127,13 @@ impl Elastoplastic {
     }
 }
 
+impl NaccProps {
+    /// See `Elastic::particle_mass` -- density lives in `self.elastic.rho_kg_m3`.
+    pub fn particle_mass(&self, spacing: f32, config: &crate::SimConfig) -> f32 {
+        self.elastic.particle_mass(spacing, config)
+    }
+}
+
 impl Viscoelastic {
     pub fn material(&self, config: &crate::SimConfig) -> Box<dyn MaterialModel> {
         Box::new(ViscoelasticMaterial::from_physical(self, config))
@@ -307,6 +314,7 @@ forward_particle_mass!(
     Fluid,
     BinghamProps,
     GranularProps,
+    NaccProps,
 );
 
 #[cfg(test)]
