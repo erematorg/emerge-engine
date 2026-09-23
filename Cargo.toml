@@ -253,6 +253,15 @@ name = "nacc_cost_probe"
 path = "examples/cpu/nacc_cost_probe.rs"
 
 [[example]]
+name = "basic_boiling"
+path = "examples/cpu/basic_boiling.rs"
+required-features = ["render"]
+
+[[example]]
+name = "boiling_cost_probe"
+path = "examples/cpu/boiling_cost_probe.rs"
+
+[[example]]
 name = "mui_cost_probe"
 path = "examples/cpu/mui_cost_probe.rs"
 
