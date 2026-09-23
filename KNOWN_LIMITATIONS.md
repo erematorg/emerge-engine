@@ -323,6 +323,33 @@ after that, measured on the anchored body of
   Pradhana correction needs a scene where the volume gain it corrects is
   physical.
 
+### GPU snow hardens differently at a body's edge
+
+Two measurements, months apart and from opposite directions, that are
+almost certainly the same defect:
+
+- A GPU compaction test found cohesion's differentiation about sixteen
+  times weaker than the CPU's: `jp_cohesive` 0.99793 against
+  `jp_loose` 0.99792, a 6e-6 gap where the CPU reliably shows 1e-4.
+  Correct direction, wrong magnitude
+  (`gpu_snow_compacts_and_cohesion_resists_compaction`, ignored with its
+  trail).
+- The parity matrix leaves snow as its one remaining gap: under uniaxial
+  compression the two paths end 9.8e-2 apart in position and 2.5 in
+  velocity. `tests/scratch_snow_gpu_gap.rs` narrows it: both sides run
+  ONE identical substep, after which the hardening and density fields
+  part at the body's EDGE while the middle stays identical to the digit.
+  Worst particle on CPU carries hardening 2.158 at density 0.255, on GPU
+  1.324 at 0.391. The GPU's looser timestep bound (2.34e-3 against
+  1.48e-3, so one substep against two) follows from that state, it does
+  not cause it.
+
+Both point at the same named suspect: the order in which the GPU clamps
+`hardening_scale`/`plastic_volume_ratio` relative to its F update, against
+the order `snow.rs` uses. That comparison is line-by-line reading of
+`snow_plasticity` in WGSL against the CPU law, not a measurement, and it
+is not done. Until it is, these are one entry rather than two.
+
 ### The DX12 teardown sometimes kills the process
 
 `tests/gpu_parity.rs` ends about one run in nine with Windows exit code
