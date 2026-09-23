@@ -308,7 +308,7 @@ after that, measured on the anchored body of
   `NeoHookeanMaterial`, which resists compression, is flat over the whole
   horizon (+0.000011, max 0.00085). Real cables and membranes are not
   purely tension-only either (bending stiffness, a small compressive
-  modulus); adding one is the candidate fix, and it is not built.
+  modulus); adding one is the candidate fix, and it is not built (issue #37).
 - **The pin is CPU only.** On GPU `volume` is rewritten every step by the
   g2p grid-mass gather, so it cannot carry the volume, and `Particle` is
   full at its asserted 128 bytes with no spare slot for a carrier. The GPU
