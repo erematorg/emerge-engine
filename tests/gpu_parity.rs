@@ -282,13 +282,11 @@ mod parity {
                 7.0,
                 Some("GPU snow answers a compression differently and runs half the substeps"),
             ),
-            // Bingham advances far less time than the CPU: 220 substeps
-            // against 57 in free fall, 660 against 177 standing.
-            (_, "BinghamFluid") => free(
-                2.0e-3,
-                5.0e-2,
-                Some("GPU Bingham executes about a third of the CPU's substeps"),
-            ),
+            // Bingham's only remaining row: its free-fall velocity gap sits
+            // just above the ordinary bound. It used to need a row in every
+            // scene, when the GPU raised its substep to `min_dt` and ran a
+            // third of the CPU's (57 against 220). Now it runs 209.
+            (Scene::FreeFall, "BinghamFluid") => free(1.0e-5, 7.5e-4, None),
             (Scene::FreeFall, _) => free(1.0e-5, 1.5e-4, None),
             (Scene::UniaxialCompression, _) => free(1.0e-3, 6.0e-2, None),
             (Scene::HydrostaticColumn, _) => free(3.0e-4, 8.0e-3, None),

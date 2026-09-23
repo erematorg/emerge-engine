@@ -60,7 +60,17 @@ fn cfl_commit_main() {
     if !(next > 0.0) {
         next = step_params.dt_cap;
     }
-    next = max(next, step_params.min_dt);
+    // No `max(next, min_dt)` here, deliberately. CPU's `cfl_bound` says it
+    // in its own words, and has a test named after it
+    // (`min_dt_never_raises_a_cfl_upper_bound`): "min_dt is intentionally
+    // not a floor. Raising a material/acoustic CFL upper bound changes the
+    // PDE integration; callers must substep, defer, or report inability to
+    // meet their work budget instead." This shader used to raise it, which
+    // is why a Bingham fluid whose own bound is 2e-4 ran at this scene's
+    // 1e-3 min_dt: three substeps a frame against the CPU's eleven, five
+    // times past its own CFL limit. A bound that really does fall below
+    // min_dt now runs out of the frame's encoded substeps instead, and the
+    // leftover time is reported as dropped, which is what the CPU does.
     next = min(next, remaining);
     if !(next > DT_EPSILON) {
         next = 0.0;
