@@ -30,11 +30,21 @@
 //! Read at Poisson 0.3, half a second, this block reaches `max |J - 1|` of
 //! 2e-4 and nothing diverges anywhere up to 1.20 times the analytic
 //! single-particle limit. That is not a stability verdict, it is a gentle
-//! scene: the acoustic bound never binds hard enough to break. The cost
-//! side is real and monotone (7 substeps a frame down to 3, 237 fps up to
-//! 832 between factors 0.4 and 1.0), and the energy column is flat at 83
-//! to 96 % with no trend, so on this scene the factor buys throughput and
-//! costs nothing measurable.
+//! scene: the acoustic bound never binds hard enough to break.
+//!
+//! The cost side that can be read is the substep count, 7 a frame down to
+//! 3 between factors 0.4 and 1.0, so a factor of 2.3. The frame rate in
+//! the same table is NOT that measurement: factors 0.9 and 1.0 run the
+//! identical 3.0 substeps and still read 575 against 832 fps, 45 % apart
+//! at equal work, so wall-clock timing on this machine carries at least
+//! that much noise and any speed-up quoted from it is partly that noise.
+//!
+//! The energy column spans 83 to 96 % in no order. The honest reading is
+//! that this measurement cannot detect an effect of the factor at that
+//! spread, which is not the same statement as the factor costing nothing:
+//! an effect smaller than 13 points would be invisible here. Saying
+//! "no trend" would claim the second while only having grounds for the
+//! first.
 //!
 //! Choosing a factor needs the other half: a scene violent enough for the
 //! bound to bind, which is the impact probe the core plan names next to
