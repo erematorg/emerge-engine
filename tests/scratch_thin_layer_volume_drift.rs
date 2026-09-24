@@ -55,27 +55,45 @@
 //!
 //! What is left is a one-way pressure ratchet, and that IS measured. A
 //! fluid clamps its pressure from below at `pressure_floor`, which
-//! `BinghamFluidMaterial::new` leaves at 0.0. A particle with J > 1 is
+//! `BinghamFluidMaterial::new` left at 0.0. A particle with J > 1 is
 //! below rest density, so its Tait pressure is negative and the clamp
-//! deletes it: every expanded particle in every slab is clamped (106 of
-//! 106, 167 of 167, 345 of 345, 655 of 655), at a mean deleted pressure
-//! of 1.2e5 to 2.0e5 in grid units. Expansion meets no restoring force,
-//! compression meets the full one, so noise ratchets volume upward.
+//! deleted it: every expanded particle in every slab was clamped (105 of
+//! 105, 657 of 657), at a mean asked-for tension of 510 to 830 Pa.
+//! Expansion met no restoring force, compression met the full one, so
+//! noise ratcheted volume upward.
 //!
-//! Lifting the clamp (`DRIFT_PRESSURE_FLOOR=-1e9`), as a diagnostic:
+//! `BinghamProps::cavitation_pressure_pa` is the fix, and
+//! `volume_drift_against_cavitation_pressure` below is what sized it.
+//! Sweeping the floor at five seconds, with the derived value marked:
 //!
 //! ```text
-//!   thickness   with clamp    lifted     worst |J-1| with   lifted
-//!     2 cells   +0.0717 %/s   -0.0009      0.0255           0.0041
-//!     4 cells   +0.0578 %/s   +0.0119      0.0470           0.0065
-//!     8 cells   +0.0557 %/s   +0.0056      0.0927           0.0146
+//!   floor Pa    2 cells                  16 cells
+//!               drift    clamped         drift     clamped   worst |J-1|
+//!         0    +0.0444   105/105        +0.0737   657/657      0.857
+//!      -140    +0.0041     5/147        -0.0127   124/564      0.047
+//!      -280    +0.0012     2/148        -0.0157    27/559      0.039   <- derived
+//!      -560    -0.0006     0/149        -0.0165     3/567      0.029
+//!     -1120    -0.0006     0/146        -0.0167     0/576      0.014
+//!     -2800    -0.0006     0/146        -0.0167     0/573      0.014
+//!    -10000    -0.0006     0/146        PANICKED, the timestep could not advance
 //! ```
 //!
-//! Five to eighty times less, sign inverted on the thinnest slab, and the
-//! skin drops from 1.00362 to 0.99999. It is a diagnostic and not a
-//! proposal: at sixteen cells the lifted run panics, unbounded tension
-//! letting a fluid pull on itself arbitrarily hard. A floor with a
-//! physical value is what the Newtonian twin already carries.
+//! The derived floor is where the ratchet stops being the dominant
+//! effect, a factor of ten short of where stability goes, and inside the
+//! 510 to 830 Pa band the fluid was asking for. None of that was tuned:
+//! it comes out of `2*gamma/R` at a measured surface tension and a
+//! measured bubble size. Note that -560 Pa behaves BETTER on every column
+//! of this table. It is not what the cited bound gives, so it is not what
+//! ships; this table is here so that choice stays visible.
+//!
+//! At twenty seconds and 2 ms a frame the slabs then read 0.99986,
+//! 0.99981, 0.99988, 0.99957 and 0.99875 at one, two, four, eight and
+//! sixteen cells, all flat to the fourth decimal and all below one, where
+//! before they climbed above it. Worst `|J - 1|` on the thickest: 0.79 to
+//! 0.86 at every window measured with no floor, 0.038 with one. The
+//! skin/interior split inverts too: 0.99955 against 0.99867 at sixteen
+//! cells, the interior now the more compacted, which is what bearing more
+//! load looks like.
 //!
 //!   cargo test --profile quick --all-features --test scratch_thin_layer_volume_drift -- --ignored --nocapture
 extern crate emerge_engine as emerge;
@@ -94,6 +112,9 @@ const FLOOR_CELLS: f32 = 2.0;
 const RHO_KG_M3: f32 = 1000.0;
 /// The soft column's own yield stress, the one that drifts.
 const YIELD_PA: f32 = 2.0;
+/// The slump scene's own bulk modulus, so the floor can be read as a
+/// fraction of the stiffness it is clamping.
+const BULK_PA: f32 = 78_480.0;
 const ETA_PA_S: f32 = 0.5;
 const YIELD_STRAIN: f32 = 0.05;
 const YOUNG_PA: f32 = 2.0e5;
@@ -209,25 +230,25 @@ fn volume_drift_against_layer_thickness() {
         };
         config.gravity *= gravity_fraction;
 
+        // The floor is an SI entry now, so the sweep moves the physical
+        // number and lets `from_physical` convert it, instead of poking a
+        // grid-unit field behind the constructor's back.
+        let floor_pa = env(
+            "DRIFT_FLOOR_PA",
+            BinghamProps::air_entrained_cavitation_pressure(),
+        );
         let props = BinghamProps {
             rho_kg_m3: RHO_KG_M3,
             eta_pa_s: ETA_PA_S,
-            bulk_modulus_pa: 78_480.0,
+            bulk_modulus_pa: BULK_PA,
             yield_stress_pa: YIELD_PA,
             shear_modulus_pa: if viscous {
                 0.0
             } else {
                 YIELD_PA / YIELD_STRAIN
             },
+            cavitation_pressure_pa: floor_pa,
         };
-        // A fluid's pressure is clamped from below at `pressure_floor`, and
-        // `BinghamFluidMaterial::new` leaves it at 0.0. A particle with
-        // J > 1 is below rest density, so its Tait pressure is negative and
-        // the clamp deletes it: no restoring force at all in extension,
-        // full restoring force in compression. Any symmetric noise in the
-        // divergence then ratchets volume UPWARD. Lowering the floor lets
-        // the same law pull back, which is the test.
-        let floor = env("DRIFT_PRESSURE_FLOOR", 0.0);
         let material: Box<dyn MaterialModel> = if neohookean {
             Box::new(NeoHookeanMaterial::from_young_modulus(YOUNG_PA, POISSON))
         } else if sand {
@@ -244,9 +265,7 @@ fn volume_drift_against_layer_thickness() {
                 bingham.eos_power,
             ))
         } else {
-            let mut bingham = BinghamFluidMaterial::from_physical(&props, &config);
-            bingham.pressure_floor = floor;
-            Box::new(bingham)
+            Box::new(BinghamFluidMaterial::from_physical(&props, &config))
         };
         // The same EOS the law uses, read back from the law's own fields so
         // this reports what the solver computed, not a second formula.
@@ -321,13 +340,148 @@ fn volume_drift_against_layer_thickness() {
                 .min(eos.rest_density * 2.0);
             let raw = eos.eos_stiffness * ((density / eos.rest_density).powf(eos.eos_power) - 1.0);
             raw_sum += f64::from(raw);
-            if raw < floor {
+            if raw < eos.pressure_floor {
                 clamped += 1;
             }
         }
         println!(
-            "            floor {floor}: {clamped} of {expanded} expanded particles have their pressure clamped, mean raw {:.3e}",
+            "            floor {floor_pa:.0} Pa ({:.3e} grid): {clamped} of {expanded} expanded particles clamped, mean raw {:.3e} grid",
+            eos.pressure_floor,
             raw_sum / expanded.max(1) as f64
         );
+    }
+}
+
+/// One slab run, reduced to what the cavitation sweep reads off it.
+struct SlabRun {
+    drift_percent_per_second: f64,
+    worst_j_minus_one: f32,
+    /// Particles above rest volume whose asked-for tension the floor cut.
+    clamped: usize,
+    expanded: usize,
+    /// Mean tension those expanded particles asked for, back in Pa, so it
+    /// can be compared against the floor that is clamping them.
+    mean_asked_pa: f64,
+}
+
+/// The yield-stress slab of the sweep above, at one thickness and one
+/// cavitation pressure. Panics out if the solver cannot advance, which is
+/// itself one of the results the sweep is after.
+fn run_slab(thickness: i32, floor_pa: f32, seconds: f32, dt: f32) -> SlabRun {
+    let config = SimConfig {
+        min_dt: 1.0e-6,
+        sleep_threshold: 0.0,
+        max_substeps_per_step: 256,
+        ..SimConfig::earth(GRID, DX_M, dt)
+    };
+    let props = BinghamProps {
+        rho_kg_m3: RHO_KG_M3,
+        eta_pa_s: ETA_PA_S,
+        bulk_modulus_pa: BULK_PA,
+        yield_stress_pa: YIELD_PA,
+        shear_modulus_pa: YIELD_PA / YIELD_STRAIN,
+        cavitation_pressure_pa: floor_pa,
+    };
+    let material = BinghamFluidMaterial::from_physical(&props, &config);
+    // The engine's own SI-to-grid factor, read back out of the engine
+    // rather than recomputed here, so this reports what the solver used.
+    let pa_per_grid = {
+        let mut gauge = props;
+        gauge.cavitation_pressure_pa = -1000.0;
+        -1000.0 / BinghamFluidMaterial::from_physical(&gauge, &config).pressure_floor
+    };
+    let eos = BinghamFluidMaterial::from_physical(&props, &config);
+    let spawn = SpawnRegion {
+        spacing: 0.5,
+        box_size: IVec2::new(WIDTH_CELLS, thickness),
+        box_center: Vec2::new(GRID as f32 * 0.5, FLOOR_CELLS + thickness as f32 * 0.5),
+        material_id: 0,
+        mass_override: Some(RHO_KG_M3 * (0.5 * DX_M).powi(2)),
+        initial_velocity_scale: 0.0,
+        ..SpawnRegion::for_sim(&config)
+    };
+    let mut sim = Simulation::new(config, spawn)
+        .with_default_material(Box::new(material))
+        .with_boundary(Box::new(SlipBoundary::new(config.boundary_thickness)));
+
+    sim.step();
+    let (start, _) = volume_state(&sim);
+    for _ in 0..(seconds / dt).round() as usize {
+        sim.step();
+    }
+    let (end, worst_j_minus_one) = volume_state(&sim);
+
+    let parts = sim.particles();
+    let (mut expanded, mut clamped, mut asked) = (0usize, 0usize, 0.0f64);
+    for i in 0..parts.len() {
+        if parts.deformation_gradient[i].determinant() <= 1.0 {
+            continue;
+        }
+        expanded += 1;
+        let density = parts.density[i]
+            .max(eos.min_density)
+            .min(eos.rest_density * 2.0);
+        let raw = eos.eos_stiffness * ((density / eos.rest_density).powf(eos.eos_power) - 1.0);
+        asked += f64::from(raw) * f64::from(pa_per_grid);
+        if raw < eos.pressure_floor {
+            clamped += 1;
+        }
+    }
+    SlabRun {
+        drift_percent_per_second: 100.0 * (end - start) / f64::from(seconds),
+        worst_j_minus_one,
+        clamped,
+        expanded,
+        mean_asked_pa: asked / expanded.max(1) as f64,
+    }
+}
+
+/// At which cavitation pressure does the ratchet stop, and at which does
+/// the thickest slab stop panicking?
+///
+/// `BinghamProps::cavitation_pressure_pa` is a measured coefficient, not a
+/// tuning knob, so this does not pick a value. It reports what each value
+/// does, so the one the constants derive can be read against its
+/// neighbours, against the tension the fluid is actually asking for, and
+/// against the bulk modulus it is a fraction of.
+///
+/// Two slabs: two cells, the thinnest that drifts, and sixteen, the one
+/// that panicked outright when the clamp was lifted entirely.
+///
+///   cargo test --profile quick --all-features --test scratch_thin_layer_volume_drift -- --ignored floor --nocapture
+#[test]
+#[ignore = "diagnostic probe kept for reruns, not part of the CI suite"]
+fn volume_drift_against_cavitation_pressure() {
+    let seconds = env("DRIFT_SECONDS", 5.0);
+    let dt = env("DRIFT_DT", 0.002);
+    let derived = BinghamProps::air_entrained_cavitation_pressure();
+    println!(
+        "bulk modulus {BULK_PA:.0} Pa, derived cavitation pressure {derived:.0} Pa, {:.4} of it",
+        derived.abs() / BULK_PA
+    );
+    println!(
+        "  floor Pa    thickness   drift per second   worst |J-1|   clamped/expanded   mean asked Pa"
+    );
+
+    for floor_pa in [
+        0.0f32, -56.0, -140.0, -280.0, -560.0, -1120.0, -2800.0, -10_000.0,
+    ] {
+        for thickness in [2i32, 16] {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_slab(thickness, floor_pa, seconds, dt)
+            }));
+            match outcome {
+                Ok(r) => println!(
+                    "  {floor_pa:>8.0}   {thickness:>6} cells   {:>14.5} %   {:>9.5}   {:>10}   {:>13.0}",
+                    r.drift_percent_per_second,
+                    r.worst_j_minus_one,
+                    format!("{}/{}", r.clamped, r.expanded),
+                    r.mean_asked_pa
+                ),
+                Err(_) => println!(
+                    "  {floor_pa:>8.0}   {thickness:>6} cells   PANICKED, the timestep could not advance"
+                ),
+            }
+        }
     }
 }
