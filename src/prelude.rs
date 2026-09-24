@@ -11,7 +11,7 @@
 pub use crate::{
     AabbConfinementField,
     ActivationStatsPlugin,
-    // Materials — all twelve (*Material types only)
+    // Materials — all fourteen (*Material types only)
     BinghamFluidMaterial,
     // Queries + density field export
     BodyState,
@@ -42,13 +42,17 @@ pub use crate::{
     FrameLogger,
     FrictionBoundary,
     FromSI,
+    GasMaterial,
     GranularFluidMaterial,
     GravityWellField,
     // Directional/phase-gated grip boundaries (shipped with the ratchet
-    // locomotion work) -- were missing from the prelude despite its own doc
-    // claiming full boundary-condition coverage; fixed 2026-07-08.
+    // locomotion work).
     GripFrictionBoundary,
     HeightmapBoundary,
+
+    // Kinematically-driven moving obstacle (position/velocity set live, no
+    // rigid-body dynamics of its own -- see feedback_engine_scope memory)
+    KinematicCircleBoundary,
 
     // Creature locomotion controller
     Lnn,
@@ -64,6 +68,8 @@ pub use crate::{
     NewtonianFluidMaterial,
     NoCompression,
     NoCompressionMaterial,
+    NoSlipBoundary,
+
     Particle,
     ParticleGroup,
     ParticleMass,
@@ -73,6 +79,7 @@ pub use crate::{
     PredictiveBoundary,
     Pressurized,
     RadialConfinementField,
+    RadianceField,
     RankineMaterial,
     RatchetFrictionBoundary,
     RollingPlugin,

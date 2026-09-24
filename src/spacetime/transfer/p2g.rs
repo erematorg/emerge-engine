@@ -1,26 +1,119 @@
 use glam::{IVec2, Mat2, Vec2};
+use rayon::prelude::*;
 
-use crate::grid::Grid;
 use crate::grid::kernel::{axis_weights_derivative, quadratic_weights};
+use crate::grid::{CellMap, Grid, flat_index};
 use crate::materials::registry::MaterialRegistry;
 use crate::particle::Particles;
 use crate::solver::config::KERNEL_D_INVERSE;
 
-use super::combined_kirchhoff_stress;
+use super::{combined_kirchhoff_stress, combined_kirchhoff_stress_from};
+
+/// Scatters ONE particle's mass/momentum contribution into a thread-local
+/// `CellMap` accumulator -- factored out of `scatter_particles_to_grid`'s
+/// fold closure so `scatter_particles_to_grid_sorted` (spatial-sort opt-in,
+/// see that function's own doc) can share the exact same per-particle math
+/// without duplicating it.
+fn scatter_one_into(
+    acc: &mut CellMap,
+    particles: &Particles,
+    materials: &MaterialRegistry,
+    dt: f32,
+    resolution: usize,
+    i: usize,
+) {
+    let material_id = particles.material_id[i];
+    let x = particles.x[i];
+    let mass_i = particles.mass[i];
+    let v_i = particles.v[i];
+    let c_i = particles.velocity_gradient[i];
+
+    // Enum-dispatch fast path (`MaterialRegistry::kirchhoff_stress`/
+    // `stress_volume`) instead of a `&dyn MaterialModel` vtable call --
+    // this loop runs every particle, every substep. `material` (the
+    // trait object) is still needed for the rarely-taken
+    // activation/pressure/strict-mode branches inside
+    // `combined_kirchhoff_stress_from` and the assert below.
+    let passive_tau = materials.kirchhoff_stress(material_id, particles, i);
+    let material = materials.get(material_id);
+    let stress = combined_kirchhoff_stress_from(passive_tau, material, particles, i);
+    let stress_coeff = -materials.stress_volume(material_id, particles, i) * KERNEL_D_INVERSE * dt;
+    if materials.owns_deformation_volume_state(material_id) {
+        assert!(
+            stress.x_axis.is_finite() && stress.y_axis.is_finite() && stress_coeff.is_finite(),
+            "strict WC-MPM particle {i} produced an unrepresentable stress impulse; reduce the timestep or use a pressure solver"
+        );
+    }
+
+    let weights = quadratic_weights(x);
+    for gx in 0..3 {
+        for gy in 0..3 {
+            let weight = weights.wx[gx] * weights.wy[gy];
+            let cell_pos = weights.base_cell + IVec2::new(gx as i32 - 1, gy as i32 - 1);
+            let Some(idx) = flat_index(cell_pos, resolution) else {
+                continue;
+            };
+            let cell_dist = cell_pos.as_vec2() - x + Vec2::splat(0.5);
+            let momentum =
+                weight * (mass_i * (v_i + c_i * cell_dist) + stress_coeff * (stress * cell_dist));
+            let entry = acc.entry(idx).or_default();
+            entry.mass += weight * mass_i;
+            entry.momentum += momentum;
+        }
+    }
+}
+
+fn merge_cell_maps(a: &mut CellMap, b: CellMap) {
+    for (idx, cell) in b {
+        let entry = a.entry(idx).or_default();
+        entry.mass += cell.mass;
+        entry.momentum += cell.momentum;
+    }
+}
 
 /// P2G: scatter particle mass, momentum, and stress forces onto the grid (MLS-MPM, Hu 2018 §4).
 ///
 /// Stress is pre-integrated as a momentum impulse so the grid needs one accumulation pass.
 /// The APIC affine term conserves angular momentum without a correction step.
 ///
-/// NOT parallelized (unlike G2P below): multiple particles write to the same grid cell (3×3
-/// B-spline stencils overlap), so summing their contributions requires either a shared mutable
-/// map (unsound across threads — `HashMap::entry()` can trigger a resize) or a thread-local
-/// fold/reduce merge. The latter was attempted and reverted 2026-06-20: it's safe and compiles
-/// clean, but changes floating-point summation order across particles sharing a cell, and that
-/// shifted results enough to break `fluid_spreads_more_than_elastic_under_gravity` (a 600-step
-/// chaotic simulation) — confirmed by isolated A/B, not assumed. Reverted rather than accepted
-/// the correctness risk for an unmeasured gain.
+/// PARALLELIZED (2026-08-05) via a thread-local `CellMap` fold/reduce, then merged into the
+/// real grid in one serial pass (`Grid::merge_cells`) -- pure safe Rust, no unsafe pointers,
+/// no shared mutable state during the parallel phase (each rayon task owns its own private
+/// `CellMap`; `HashMap::entry()`'s possible resize is therefore never shared across threads).
+///
+/// Tried a dense `Vec<Cell>` (2026-08-07) instead of `CellMap` here, on the strength of an
+/// isolated SERIAL measurement showing a HashMap insert costs 6.5x a plain indexed write.
+/// Measured the REAL integrated version afterward (not just the isolated microbenchmark):
+/// catastrophically worse, 330-375ms vs ~20ms (15-20x), because rayon's fold/reduce creates
+/// far more, far smaller accumulator instances than assumed -- each one now paying a full
+/// `resolution^2` allocation+zero, vastly more total work than a lazily-growing HashMap that
+/// only ever allocates what a given chunk actually touches. Exact same failure mode as the
+/// earlier same-night capacity-reservation attempt (also reverted for measuring worse) --
+/// should have been the tell. Reverted; `CellMap::default` is the real, measured winner for
+/// THIS parallel-fold access pattern, even though a bare serial HashMap-vs-Vec test says the
+/// opposite. Lesson: a microbenchmark of the accumulator alone does not predict the cost of
+/// the real fold/reduce shape -- always measure the integrated change, not the isolated one.
+///
+/// A first attempt at this (2026-06-20) used the identical thread-local-map-then-merge shape
+/// and was reverted -- NOT for a soundness reason (that version was safe Rust too), but because
+/// it changed the floating-point SUMMATION ORDER for grid cells touched by multiple particles
+/// (float addition isn't associative), and that shifted `fluid_spreads_more_than_elastic_under_
+/// gravity`'s (a 600-step CHAOTIC simulation) qualitative outcome. Re-verified 2026-08-05: that
+/// test's own assertions are real qualitative inequalities (`ar_fluid_final > ar_elastic_final`),
+/// not exact-value matching -- a legitimate physical claim, not a fragile snapshot -- so the
+/// real risk is chaotic amplification of a thin margin, not a badly-designed test. This
+/// implementation is re-verified against that exact test (and the full regression suite) before
+/// being trusted, same "revert immediately if anything moves" discipline as every other change
+/// tonight.
+///
+/// Contact (`Particle::contact_group`) and mixture (`WithMixturePhase`) scatter are
+/// DELIBERATELY kept in a separate, still-serial second pass rather than folded into the
+/// parallel accumulator: both are opt-in, zero-cost-when-unused features that only a minority
+/// of scenes touch, and giving them their own parallel-safe accumulator design wasn't worth the
+/// added risk for this pass. The real, disclosed cost: particles that use either feature get
+/// `combined_kirchhoff_stress`/`stress_volume` recomputed a second time (same pure functions,
+/// same inputs, so results are identical -- just a small redundant-computation cost for the
+/// particles that opt into these features, not a correctness risk).
 pub fn scatter_particles_to_grid(
     particles: &Particles,
     grid: &mut Grid,
@@ -28,18 +121,59 @@ pub fn scatter_particles_to_grid(
     dt: f32,
     active_count: usize,
 ) {
+    let resolution = grid.resolution();
+
+    // Measured rayon's default chunking for this exact workload directly (a
+    // temp diagnostic, not guessed): 105 fold instances for 2925 particles
+    // on 8 cores -- ~13x more, much smaller chunks than the naive
+    // one-per-core assumption. `with_min_len` forces fewer, larger chunks;
+    // real, measured, KEPT win on its own: p2g_us 20ms -> 13ms, ~22fps ->
+    // ~28fps, `CellMap` unchanged. A dense `Vec<Cell>` accumulator was tried
+    // TWICE on top of this same-night investigation -- once against default
+    // chunking (catastrophic, 330-375ms: 105 instances x a full
+    // resolution^2 alloc+zero) and once again WITH this same `with_min_len`
+    // fix (still worse than `CellMap`, 16-17ms vs 13ms): each chunk only
+    // ever touches a small fraction of the `resolution^2` cells (heavy
+    // per-particle stencil overlap), so `CellMap`'s lazy growth -- which
+    // only ever allocates what a chunk actually touches -- beats a dense
+    // buffer's fixed full-grid allocation regardless of chunk count. Both
+    // dense attempts reverted; `with_min_len` + `CellMap` is the real,
+    // twice-verified winner for this access pattern.
+    let min_len = (active_count / (rayon::current_num_threads() * 2)).max(1);
+    let local_map: CellMap = (0..active_count)
+        .into_par_iter()
+        .with_min_len(min_len)
+        .fold(CellMap::default, |mut acc, i| {
+            scatter_one_into(&mut acc, particles, materials, dt, resolution, i);
+            acc
+        })
+        .reduce(CellMap::default, |mut a, b| {
+            merge_cell_maps(&mut a, b);
+            a
+        });
+    grid.merge_cells(local_map);
+
     for i in 0..active_count {
-        let material_id = particles.material_id[i];
-        let material = materials.get(material_id);
+        let contact_group = particles.contact_group[i];
+        let material = materials.get(particles.material_id[i]);
+        let mixture_phase = material.mixture_phase();
+        if contact_group == 0 && mixture_phase.is_none() {
+            continue;
+        }
+
         let x = particles.x[i];
         let mass_i = particles.mass[i];
         let v_i = particles.v[i];
         let c_i = particles.velocity_gradient[i];
-        let contact_group = particles.contact_group[i];
-        let mixture_phase = material.mixture_phase();
 
         let stress = combined_kirchhoff_stress(material, particles, i);
         let stress_coeff = -material.stress_volume(particles, i) * KERNEL_D_INVERSE * dt;
+        if material.owns_deformation_volume_state() {
+            assert!(
+                stress.x_axis.is_finite() && stress.y_axis.is_finite() && stress_coeff.is_finite(),
+                "strict WC-MPM particle {i} produced an unrepresentable stress impulse; reduce the timestep or use a pressure solver"
+            );
+        }
 
         let weights = quadratic_weights(x);
         for gx in 0..3 {
@@ -49,26 +183,150 @@ pub fn scatter_particles_to_grid(
                 let cell_dist = cell_pos.as_vec2() - x + Vec2::splat(0.5);
                 let momentum = weight
                     * (mass_i * (v_i + c_i * cell_dist) + stress_coeff * (stress * cell_dist));
-                grid.add_mass_momentum(cell_pos, weight * mass_i, momentum);
                 // Additive second scatter for multi-field contact (Bardenhagen 2001) —
-                // see `Particle::contact_group` doc. A no-op call for every particle
-                // with contact_group == 0 (the default, i.e. every scene that doesn't
-                // use this feature): `Grid::add_grip_mass_momentum` just never gets
-                // called, so there's no extra work, not even an empty branch, for the
-                // common case.
+                // see `Particle::contact_group` doc.
                 if contact_group != 0 {
                     grid.add_grip_mass_momentum(cell_pos, weight * mass_i, momentum);
                 }
                 // Additive second scatter for two-phase mixture coupling (Tampubolon
-                // et al. 2017) — see `WithMixturePhase`/`MixturePhase` doc. A no-op
-                // for every particle whose material never opts in (the default),
-                // same zero-cost-when-unused property as the contact scatter above.
+                // et al. 2017) — see `WithMixturePhase`/`MixturePhase` doc.
                 if let Some(phase) = mixture_phase {
                     grid.add_mixture_mass_momentum(cell_pos, phase, weight * mass_i, momentum);
                 }
             }
         }
     }
+}
+
+/// Real, opt-in spatial-sort variant of `scatter_particles_to_grid`'s dense
+/// (first) scatter pass -- `SimConfig::spatial_sort_enabled`, see that
+/// field's own doc for the full real motivation (Gao et al. 2018 SIGGRAPH
+/// Asia, "GPU Optimization of Material Point Methods": periodic particle
+/// reordering for cache locality; this engine's OWN GPU path already does
+/// this via an indirection array, `particle_sort.wgsl`'s `sorted_particle_
+/// ids`, never physically moving particle data -- this CPU version mirrors
+/// that exact precedent instead of physically reordering the `Particles`
+/// SoA, since nothing in this codebase's index-instability model needed
+/// changing to support it (confirmed: `tag_index`/sleep-wake already treat
+/// indices as unstable across frames, but a NEW un-synchronized reorder
+/// pass would still need its own bookkeeping -- the indirection approach
+/// sidesteps that entirely, real indices never move).
+///
+/// `order` must contain each of `0..active_count` exactly once (a real
+/// permutation, not filtered/subset) -- callers get this from
+/// `spatial_sort_order` below. Only the dense CellMap-accumulated pass is
+/// reordered; the second (contact/mixture) pass deliberately stays
+/// iterating `0..active_count` in the original order, unaffected -- it
+/// isn't parallel-fold-accumulated (no CellMap, no chunk-locality benefit
+/// to gain there) and keeping it untouched means this feature's blast
+/// radius is exactly the one pass it's meant to help, nothing more.
+///
+/// REAL, DISCLOSED RISK (not new -- see `scatter_particles_to_grid`'s own
+/// doc on the 2026-06-20 revert): changing which particles land in which
+/// rayon chunk changes the floating-point SUMMATION ORDER for grid cells
+/// touched by multiple particles (float addition isn't associative). That
+/// exact class of change previously shifted a chaotic test's (`fluid_
+/// spreads_more_than_elastic_under_gravity`) qualitative outcome. This
+/// function must be re-verified against that specific test (and the full
+/// regression suite) before being trusted, same discipline as last time --
+/// not assumed safe just because the underlying math per-particle is
+/// unchanged.
+pub fn scatter_particles_to_grid_sorted(
+    particles: &Particles,
+    grid: &mut Grid,
+    materials: &MaterialRegistry,
+    dt: f32,
+    active_count: usize,
+    order: &[usize],
+) {
+    debug_assert_eq!(
+        order.len(),
+        active_count,
+        "spatial sort order must cover exactly the active particle range"
+    );
+    let resolution = grid.resolution();
+    let min_len = (active_count / (rayon::current_num_threads() * 2)).max(1);
+    let local_map: CellMap = order
+        .into_par_iter()
+        .copied()
+        .with_min_len(min_len)
+        .fold(CellMap::default, |mut acc, i| {
+            scatter_one_into(&mut acc, particles, materials, dt, resolution, i);
+            acc
+        })
+        .reduce(CellMap::default, |mut a, b| {
+            merge_cell_maps(&mut a, b);
+            a
+        });
+    grid.merge_cells(local_map);
+
+    for i in 0..active_count {
+        let contact_group = particles.contact_group[i];
+        let material = materials.get(particles.material_id[i]);
+        let mixture_phase = material.mixture_phase();
+        if contact_group == 0 && mixture_phase.is_none() {
+            continue;
+        }
+
+        let x = particles.x[i];
+        let mass_i = particles.mass[i];
+        let v_i = particles.v[i];
+        let c_i = particles.velocity_gradient[i];
+
+        let stress = combined_kirchhoff_stress(material, particles, i);
+        let stress_coeff = -material.stress_volume(particles, i) * KERNEL_D_INVERSE * dt;
+        if material.owns_deformation_volume_state() {
+            assert!(
+                stress.x_axis.is_finite() && stress.y_axis.is_finite() && stress_coeff.is_finite(),
+                "strict WC-MPM particle {i} produced an unrepresentable stress impulse; reduce the timestep or use a pressure solver"
+            );
+        }
+
+        let weights = quadratic_weights(x);
+        for gx in 0..3 {
+            for gy in 0..3 {
+                let weight = weights.wx[gx] * weights.wy[gy];
+                let cell_pos = weights.base_cell + IVec2::new(gx as i32 - 1, gy as i32 - 1);
+                let cell_dist = cell_pos.as_vec2() - x + Vec2::splat(0.5);
+                let momentum = weight
+                    * (mass_i * (v_i + c_i * cell_dist) + stress_coeff * (stress * cell_dist));
+                if contact_group != 0 {
+                    grid.add_grip_mass_momentum(cell_pos, weight * mass_i, momentum);
+                }
+                if let Some(phase) = mixture_phase {
+                    grid.add_mixture_mass_momentum(cell_pos, phase, weight * mass_i, momentum);
+                }
+            }
+        }
+    }
+}
+
+/// Computes a real spatial sort permutation of `0..active_count`, ordered by
+/// each particle's own P2G stencil center (`quadratic_weights(x).base_cell`,
+/// the SAME cell the scatter loop itself keys into) flattened to a single
+/// grid-row-major index -- particles that land in the same or nearby grid
+/// cells end up adjacent in the returned order, so a rayon chunk (a
+/// contiguous slice of this order) touches far fewer DISTINCT `CellMap`
+/// entries than a chunk of spawn-order particles that have since drifted
+/// apart spatially. Real, not guessed: `CellMap` is a `HashMap`, and this
+/// engine's own `scatter_particles_to_grid` doc already establishes that
+/// its per-chunk hashmap-entry cost dominates over raw memory-access
+/// pattern for this workload.
+///
+/// Particles outside the grid (`flat_index` returns `None`) sort to the end
+/// via `u32::MAX` -- rare (only particles that have left the domain), and
+/// harmless: they still appear exactly once, just not usefully grouped.
+pub fn spatial_sort_order(
+    particles: &Particles,
+    active_count: usize,
+    resolution: usize,
+) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..active_count).collect();
+    order.sort_unstable_by_key(|&i| {
+        let base_cell = quadratic_weights(particles.x[i]).base_cell;
+        flat_index(base_cell, resolution).unwrap_or(u32::MAX)
+    });
+    order
 }
 
 /// Gathers the labeled particle point cloud (`+1.0` grip / `-1.0` rest) that

@@ -19,18 +19,15 @@ extern crate emerge_engine as emerge;
 ///
 ///   cargo run --example basic_plant --features render
 use emerge::fields::LinearDragField;
+use emerge::render::demo_harness::{DemoApp, run_demo};
 use emerge::render::{ColorMode, GridVolumeSource, Renderer};
 use emerge::{
     FrameLogger, SimConfig, Simulation, SlipBoundary, SpawnRegion, ViscoelasticMaterial,
     per_material_stats,
 };
 use glam::{IVec2, Vec2};
-use std::sync::Arc;
-use winit::application::ApplicationHandler;
-use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{Window, WindowId};
+use winit::event::MouseButton;
+use winit::keyboard::KeyCode;
 
 const GRID: usize = 64;
 // The renderer's camera frames the full simulation grid with no pan -- this
@@ -66,19 +63,10 @@ const WIND_GUST_PERIOD_SECONDS: f32 = 4.0;
 const STALK_WIDTH_BASE: i32 = 3;
 const STALK_WIDTH_TIP_UNITS: f32 = 1.5;
 
-struct App {
-    window: Option<Arc<Window>>,
-    state: Option<State>,
-}
-
 struct State {
-    surface: wgpu::Surface<'static>,
-    surface_config: wgpu::SurfaceConfiguration,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
     sim: Simulation,
     renderer: Renderer,
-    cursor_pos: [f32; 2],
+    cursor_frac: [f32; 2],
     lmb_just_pressed: bool,
     rmb_just_pressed: bool,
     frame: u64,
@@ -168,56 +156,61 @@ fn make_sim(wind_enabled: bool) -> Simulation {
 }
 
 impl State {
-    async fn new(window: Arc<Window>) -> Self {
-        let size = window.inner_size();
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-        let surface = instance.create_surface(window.clone()).unwrap();
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-            })
-            .await
-            .expect("no GPU adapter");
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                required_limits: adapter.limits(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        let caps = surface.get_capabilities(&adapter);
-        let fmt = caps
-            .formats
-            .iter()
-            .find(|f| f.is_srgb())
-            .copied()
-            .unwrap_or(caps.formats[0]);
-        let sc = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: fmt,
-            width: size.width,
-            height: size.height,
-            present_mode: wgpu::PresentMode::AutoVsync,
-            desired_maximum_frame_latency: 2,
-            alpha_mode: caps.alpha_modes[0],
-            view_formats: vec![],
-        };
-        surface.configure(&device, &sc);
+    /// Rebuilds `grid_bridge_buf`/`material_mass_bridge_buf` from the CPU
+    /// solver's current state -- see those fields' own doc for the real,
+    /// disclosed cost. Identical technique to `fire_spread.rs`'s own bridge.
+    fn upload_grid_volume_bridge(&self, queue: &wgpu::Queue) {
+        const SLOTS: usize = 16;
+        let grid = self.sim.grid();
+        let mut dense = vec![0f32; GRID * GRID * 4];
+        for y in 0..GRID {
+            for x in 0..GRID {
+                let idx = y * GRID + x;
+                dense[idx * 4 + 2] = grid.mass_at(IVec2::new(x as i32, y as i32));
+            }
+        }
+        queue.write_buffer(&self.grid_bridge_buf, 0, bytemuck::cast_slice(&dense));
+
+        let mut material_mass = vec![0f32; GRID * GRID * SLOTS];
+        let particles = self.sim.particles();
+        for i in 0..particles.x.len() {
+            let p = particles.x[i];
+            let cx = (p.x.round() as i32).clamp(0, GRID as i32 - 1) as usize;
+            let cy = (p.y.round() as i32).clamp(0, GRID as i32 - 1) as usize;
+            let slot = (particles.material_id[i] as usize) % SLOTS;
+            material_mass[(cy * GRID + cx) * SLOTS + slot] += particles.mass[i];
+        }
+        queue.write_buffer(
+            &self.material_mass_bridge_buf,
+            0,
+            bytemuck::cast_slice(&material_mass),
+        );
+    }
+
+    fn cursor_grid(&self) -> Vec2 {
+        Vec2::new(
+            self.cursor_frac[0] * DISPLAY_GRID as f32,
+            (1.0 - self.cursor_frac[1]) * DISPLAY_GRID as f32,
+        )
+    }
+}
+
+impl DemoApp for State {
+    const TITLE: &'static str = "emerge -- Basic Plant [Phase 1: interactive stalk]";
+
+    fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+        width: u32,
+        height: u32,
+    ) -> Self {
         let wind_enabled = true;
         let sim = make_sim(wind_enabled);
         let base_x = sim.particles().iter().map(|p| p.x.x).sum::<f32>()
             / sim.particles().len().max(1) as f32;
-        let mut renderer = Renderer::new(&device, sim.particles().len(), fmt);
-        renderer.set_camera(
-            &queue,
-            DISPLAY_GRID as u32,
-            size.width,
-            size.height,
-            0.6,
-            true,
-        );
+        let mut renderer = Renderer::new(device, sim.particles().len(), format);
+        renderer.set_camera(queue, DISPLAY_GRID as u32, width, height, 0.6, true);
         renderer.set_color_mode(ColorMode::ByPhysics);
         println!(
             "basic_plant: {} particles  |  LMB push  RMB pull  W toggle wind  G toggle grid-volume/splat  R reset  Q quit",
@@ -252,13 +245,9 @@ impl State {
         });
 
         Self {
-            surface,
-            surface_config: sc,
-            device,
-            queue,
             sim,
             renderer,
-            cursor_pos: [0.0; 2],
+            cursor_frac: [0.0; 2],
             lmb_just_pressed: false,
             rmb_just_pressed: false,
             frame: 0,
@@ -280,61 +269,20 @@ impl State {
         }
     }
 
-    /// Rebuilds `grid_bridge_buf`/`material_mass_bridge_buf` from the CPU
-    /// solver's current state -- see those fields' own doc for the real,
-    /// disclosed cost. Identical technique to `fire_spread.rs`'s own bridge.
-    fn upload_grid_volume_bridge(&self) {
-        const SLOTS: usize = 16;
-        let grid = self.sim.grid();
-        let mut dense = vec![0f32; GRID * GRID * 4];
-        for y in 0..GRID {
-            for x in 0..GRID {
-                let idx = y * GRID + x;
-                dense[idx * 4 + 2] = grid.mass_at(IVec2::new(x as i32, y as i32));
-            }
-        }
-        self.queue
-            .write_buffer(&self.grid_bridge_buf, 0, bytemuck::cast_slice(&dense));
-
-        let mut material_mass = vec![0f32; GRID * GRID * SLOTS];
-        let particles = self.sim.particles();
-        for i in 0..particles.x.len() {
-            let p = particles.x[i];
-            let cx = (p.x.round() as i32).clamp(0, GRID as i32 - 1) as usize;
-            let cy = (p.y.round() as i32).clamp(0, GRID as i32 - 1) as usize;
-            let slot = (particles.material_id[i] as usize) % SLOTS;
-            material_mass[(cy * GRID + cx) * SLOTS + slot] += particles.mass[i];
-        }
-        self.queue.write_buffer(
-            &self.material_mass_bridge_buf,
-            0,
-            bytemuck::cast_slice(&material_mass),
-        );
-    }
-
-    fn resize(&mut self, w: u32, h: u32) {
-        if w == 0 || h == 0 {
-            return;
-        }
-        self.surface_config.width = w;
-        self.surface_config.height = h;
-        self.surface.configure(&self.device, &self.surface_config);
+    fn resize(&mut self, queue: &wgpu::Queue, width: u32, height: u32) {
         self.renderer
-            .set_camera(&self.queue, DISPLAY_GRID as u32, w, h, 0.6, true);
+            .set_camera(queue, DISPLAY_GRID as u32, width, height, 0.6, true);
     }
 
-    fn cursor_grid(&self) -> Vec2 {
-        Vec2::new(
-            self.cursor_pos[0] / self.surface_config.width as f32 * DISPLAY_GRID as f32,
-            (1.0 - self.cursor_pos[1] / self.surface_config.height as f32) * DISPLAY_GRID as f32,
-        )
-    }
-
-    fn update_and_render(&mut self) {
-        // Fires once on the press (rising edge), not every held frame --
-        // repeatedly re-applying a clamped impulse stacks into unbounded
-        // cumulative energy injection (`apply_impulse`'s CFL clamp is
-        // min_dt-based, not the actual sub_dt).
+    fn update_and_render(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        view: &wgpu::TextureView,
+    ) {
+        // Fires once on the press (rising edge), not every held frame:
+        // repeatedly applying an impulse would deliberately stack unbounded
+        // cumulative energy injection.
         if self.lmb_just_pressed {
             self.sim.apply_radial_impulse(self.cursor_grid(), 5.0, 2.0);
             self.lmb_just_pressed = false;
@@ -430,111 +378,71 @@ impl State {
             self.fps_timer = std::time::Instant::now();
             self.fps_frames = 0;
         }
-        let output = match self.surface.get_current_texture() {
-            Ok(t) => t,
-            Err(_) => return,
-        };
-        let view = output
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
         if self.grid_volume_mode {
-            self.upload_grid_volume_bridge();
+            self.upload_grid_volume_bridge(queue);
             self.renderer.render_grid_volume(
-                &self.device,
-                &self.queue,
+                device,
+                queue,
                 GridVolumeSource {
                     grid: &self.grid_bridge_buf,
                     material_mass: &self.material_mass_bridge_buf,
                     material_mass_enabled: true,
                 },
-                &view,
+                view,
                 true,
             );
         } else {
             self.renderer
-                .render(&self.device, &self.queue, self.sim.particles(), &view, true);
+                .render(device, queue, self.sim.particles(), view, true);
         }
-        output.present();
-    }
-}
-
-impl ApplicationHandler for App {
-    fn resumed(&mut self, el: &ActiveEventLoop) {
-        let w = Arc::new(
-            el.create_window(
-                winit::window::WindowAttributes::default()
-                    .with_title("emerge -- Basic Plant [Phase 1: interactive stalk]")
-                    .with_inner_size(winit::dpi::LogicalSize::new(480u32, 480u32)),
-            )
-            .unwrap(),
-        );
-        self.state = Some(pollster::block_on(State::new(w.clone())));
-        self.window = Some(w);
     }
 
-    fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        let Some(s) = self.state.as_mut() else {
+    fn cursor_moved(&mut self, x_frac: f32, y_frac: f32) {
+        self.cursor_frac = [x_frac, y_frac];
+    }
+
+    fn mouse_button(&mut self, button: MouseButton, pressed: bool) {
+        if !pressed {
             return;
-        };
-        match event {
-            WindowEvent::CloseRequested => el.exit(),
-            WindowEvent::CursorMoved { position, .. } => {
-                s.cursor_pos = [position.x as f32, position.y as f32];
+        }
+        match button {
+            MouseButton::Left => self.lmb_just_pressed = true,
+            MouseButton::Right => self.rmb_just_pressed = true,
+            _ => {}
+        }
+    }
+
+    fn key_pressed(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::KeyR => {
+                self.sim = make_sim(self.wind_enabled);
+                self.frame = 0;
+                self.wind_time = 0.0;
+                println!(
+                    "reset (wind={})",
+                    if self.wind_enabled { "on" } else { "off" }
+                );
             }
-            WindowEvent::MouseInput { state, button, .. } => {
-                if state == ElementState::Pressed {
-                    match button {
-                        MouseButton::Left => s.lmb_just_pressed = true,
-                        MouseButton::Right => s.rmb_just_pressed = true,
-                        _ => {}
+            KeyCode::KeyW => {
+                self.wind_enabled = !self.wind_enabled;
+                self.sim = make_sim(self.wind_enabled);
+                self.frame = 0;
+                self.wind_time = 0.0;
+                println!(
+                    "wind: {} (reset to A/B cleanly)",
+                    if self.wind_enabled { "on" } else { "off" }
+                );
+            }
+            KeyCode::KeyG => {
+                self.grid_volume_mode = !self.grid_volume_mode;
+                println!(
+                    "render: {}",
+                    if self.grid_volume_mode {
+                        "grid-volume"
+                    } else {
+                        "splat"
                     }
-                }
-            }
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        physical_key: PhysicalKey::Code(key),
-                        state: ElementState::Pressed,
-                        ..
-                    },
-                ..
-            } => match key {
-                KeyCode::Escape | KeyCode::KeyQ => el.exit(),
-                KeyCode::KeyR => {
-                    s.sim = make_sim(s.wind_enabled);
-                    s.frame = 0;
-                    s.wind_time = 0.0;
-                    println!("reset (wind={})", if s.wind_enabled { "on" } else { "off" });
-                }
-                KeyCode::KeyW => {
-                    s.wind_enabled = !s.wind_enabled;
-                    s.sim = make_sim(s.wind_enabled);
-                    s.frame = 0;
-                    s.wind_time = 0.0;
-                    println!(
-                        "wind: {} (reset to A/B cleanly)",
-                        if s.wind_enabled { "on" } else { "off" }
-                    );
-                }
-                KeyCode::KeyG => {
-                    s.grid_volume_mode = !s.grid_volume_mode;
-                    println!(
-                        "render: {}",
-                        if s.grid_volume_mode {
-                            "grid-volume"
-                        } else {
-                            "splat"
-                        }
-                    );
-                }
-                _ => {}
-            },
-            WindowEvent::Resized(sz) => s.resize(sz.width, sz.height),
-            WindowEvent::RedrawRequested => {
-                s.update_and_render();
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
+                );
             }
             _ => {}
         }
@@ -542,11 +450,5 @@ impl ApplicationHandler for App {
 }
 
 fn main() {
-    let el = EventLoop::new().unwrap();
-    el.set_control_flow(ControlFlow::Poll);
-    let mut app = App {
-        window: None,
-        state: None,
-    };
-    el.run_app(&mut app).unwrap();
+    run_demo::<State>();
 }

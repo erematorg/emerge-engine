@@ -30,17 +30,24 @@ not an implementation layer:
 
 ```
 src/
-  matter/            particle.rs (repr(C), 112 B, GPU-uploadable) · Particles (SoA)
-    materials/        MaterialModel trait · 12 constitutive models · SVD · registry
+  matter/            particle/ (Particle, repr(C) 128 B GPU-uploadable · Grain ·
+                     RodPoints · Particles SoA)
+    materials/        MaterialModel trait · registry · 11 standalone models ·
+                      granular/ (sand, sand_mui, cosserat, grain_contact_law,
+                      scale_contract -- grouped by active research thread)
   spacetime/          the actual solver
-    solver/            Simulation · SimConfig · SpawnRegion · spatial hash · query
-    grid/               Grid · Cell · quadratic B-spline kernel
-    transfer.rs         P2G scatter + G2P gather (MLS-APIC)
+    solver/            Simulation · SimConfig · SpawnRegion · spatial hash ·
+                       body_state (BodyState aggregation)
+    grid/               Grid · Cell · ContactCell (multi-field contact) · kernel
+    transfer/           P2G scatter + G2P gather (MLS-APIC)
     diff.rs             differentiable/gradient-trainable stepping
-    rod/                Rod · RodPoints · RodMaterial · build_straight_rod ·
+    rod/                Rod · RodMaterial · build_straight_rod ·
                         coupling.rs (scatter/gather to the shared Grid)
-  forces/             boundary/ (Slip / Predictive / Friction / Heightmap) ·
-                      fields/ (NBody / GravityWell / Coulomb / Confinement) ·
+    grains/             DEM grain dynamics: population/coupling/oracle
+                        (state lives in matter::particle::Grain)
+  forces/             boundary/ (Slip / Predictive / Heightmap / friction/
+                      [Friction / GripFriction / RatchetFriction]) ·
+                      fields/ (NBody / GravityWell / Coulomb / Confinement / cutoff) ·
                       electromagnetics.rs
   energy/             thermodynamics/ (ThermalDiffusion · ScalarDiffusionField) ·
                       acoustics/, electromagnetics.rs [feature=experimental]
@@ -97,22 +104,22 @@ Add a variant to `ConstitutiveModel`. The discriminant must be the next consecut
 #[repr(u32)]
 pub enum ConstitutiveModel {
     // ... existing variants ...
-    MyMaterial = 12,  // next available discriminant
+    MyMaterial = 13,  // next available discriminant
 }
 
 // in the assert block:
-assert!(ConstitutiveModel::MyMaterial as u32 == 12);
+assert!(ConstitutiveModel::MyMaterial as u32 == 13);
 ```
 
 Re-export from `mod.rs` and add to `src/prelude.rs`.
 
 ### 3. `src/systems/gpu/shaders/p2g.wgsl`
 
-Add `case 12u` to the Kirchhoff stress `switch`. If the material is CPU-only, return zero stress and set `needs_cpu_update = true` in Rust.
+Add `case 13u` to the Kirchhoff stress `switch`. If the material is CPU-only, return zero stress and set `needs_cpu_update = true` in Rust.
 
 ### 4. `src/systems/gpu/shaders/particles_update.wgsl`
 
-Add `case 12u` to the plasticity update `switch`. CPU-only materials can leave this as a no-op.
+Add `case 13u` to the plasticity update `switch`. CPU-only materials can leave this as a no-op.
 
 ---
 
@@ -140,6 +147,8 @@ Before changing numerical constants or plasticity return-mapping, check the sour
 | Sand (DP) | Klar et al. 2016, *Drucker-Prager Elastoplasticity for Sand Animation* |
 | SandMuI (µ(I)) | Dunatunga & Kamrin 2015, *Continuum modelling and simulation of granular flow* |
 | GranularFluid | Dunatunga & Kamrin 2015 (Tait EOS + corotated deviatoric) |
+| Rankine | Rankine 1876 (original criterion); Wolper et al. 2019 (MPM brittle fracture) |
+| NACC | Klar et al. 2016; sparkl `plasticity_nacc.rs` |
 | Surface tension | Stomakhin et al. 2014, *Augmented MPM for cloth and soft bodies* (ψ=γ·J) |
 | N-body gravity | Barnes & Hut 1986, *A hierarchical O(N log N) force-calculation algorithm* |
 | Viscoelastic | Fung 1993, *Biomechanics: Mechanical Properties of Living Tissues* (Kelvin-Voigt) |

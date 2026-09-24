@@ -231,8 +231,13 @@ pub(super) fn build_g2p_and_update_pipelines(
 ) {
     // MAX_MATERIALS: array-size constant, same rationale as p2g_src above.
     let particles_update_src = patch_shader(shaders::PARTICLES_UPDATE);
+    // g2p.wgsl gained a `materials` binding (2026-08-15, GPU/CPU density/
+    // volume parity fix) -- needs the same MAX_MATERIALS patch p2g/
+    // particles_update already get, or naga fails at shader-module creation
+    // (array size must be CREATION_RESOLVED, see patch_shader's own doc).
+    let g2p_src = patch_shader(shaders::G2P);
 
-    let g2p = make_pipeline(device, layout, shaders::G2P, "g2p_main", "g2p", &[], false);
+    let g2p = make_pipeline(device, layout, &g2p_src, "g2p_main", "g2p", &[], false);
     let particles_update = make_pipeline(
         device,
         layout,

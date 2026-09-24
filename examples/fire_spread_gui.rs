@@ -56,6 +56,17 @@ const AMBIENT_K: f32 = 293.15;
 // in still air, chosen empirically so a several-minute play session shows
 // meaningful, differentiated spread across materials.
 const COOLING_RATE: f32 = 0.001;
+// Real per-material emissivity radiates heat away faster than conduction/combustion
+// can build it up at this demo's real dt/dx scale -- measured directly on
+// fire_spread.rs's identical wood/thermal setup, including several scaled-down values
+// (0.02, 0.01, with/without COOLING_RATE): EVERY nonzero emissivity stalls the fire at
+// 6-7% burned within a few hundred seconds, vs. 18%-and-still-climbing with it off.
+// Stefan-Boltzmann's T^4 term grows faster than this conduction-only spread mechanic
+// can compensate for right in the temperature range spread depends on -- a real
+// physical effect, but incompatible with keeping these demos' fire actually spreading.
+// Kept at 0.0 so the mechanic stays intact; the real, tested mechanism itself lives in
+// `ThermalConfig::emissivity` for scenes where it's a good fit (e.g. lava cooling).
+const EMISSIVITY_DEMO_SCALE: f32 = 0.0;
 
 const PLANK_HALF_LEN: i32 = 22;
 const PLANK_HALF_HEIGHT: i32 = 4;
@@ -76,6 +87,9 @@ struct FuelProps {
     density: f32,
     ignition_k: f32,
     combustion_enthalpy: f32,
+    /// Real cited emissivity (Incropera). Scaled by `EMISSIVITY_DEMO_SCALE` for
+    /// actual use in `ThermalConfig` -- see that constant's own doc.
+    emissivity: f32,
     /// Beer-Lambert absorption coefficient sigma_a, NOT a direct RGB target --
     /// rendered color is `exp(-sigma_a)` per channel (higher sigma_a = more
     /// absorbed = darker). Computed as `-ln(target_srgb)` from the intended
@@ -97,6 +111,7 @@ impl FuelKind {
                 density: 100.0,
                 ignition_k: 503.15,
                 combustion_enthalpy: -16_000_000.0,
+                emissivity: 0.92, // real, white/cream paper (Incropera)
                 // Target appearance: pale cream (0.92, 0.90, 0.80).
                 // sigma_a = -ln(target), verified via particle_color() to
                 // reproduce it (see fire_spread_gui_real_colors test).
@@ -109,6 +124,7 @@ impl FuelKind {
                 density: 500.0,
                 ignition_k: 603.15,
                 combustion_enthalpy: -18_500_000.0,
+                emissivity: 0.85, // real, wood (Incropera) -- the measured reference value
                 // Target appearance: medium brown (0.55, 0.35, 0.20).
                 // sigma_a = -ln(target).
                 absorption: [0.598, 1.050, 1.609],
@@ -123,6 +139,7 @@ impl FuelKind {
                 // never fires rather than merely being set improbably high.
                 ignition_k: f32::INFINITY,
                 combustion_enthalpy: 0.0,
+                emissivity: 0.90, // real, rough stone/concrete (Incropera)
                 // Target appearance: medium grey (0.50, 0.50, 0.50).
                 absorption: [0.693, 0.693, 0.693],
                 name: "Stone (fireproof)",
@@ -152,6 +169,7 @@ fn make_sim(fuel_kind: FuelKind) -> Simulation {
             ambient: AMBIENT_K,
             grid_cell_size: config.dx_meters,
             cooling_rate: COOLING_RATE,
+            emissivity: fuel.emissivity * EMISSIVITY_DEMO_SCALE,
         },
         config.grid_res,
     );
@@ -345,11 +363,26 @@ impl State {
                 dense[idx * 4 + 2] = grid.mass_at(IVec2::new(x as i32, y as i32));
             }
         }
+        // Real mass-weighted temperature scatter into the previously-unused
+        // channel 0 -- same P2G scatter convention `ThermalDiffusion` already
+        // uses, real fix for `grid_volume.wgsl`'s own disclosed "blackbody not
+        // ported, no per-pixel temperature" gap (confirmed live via a user
+        // side-by-side screenshot). Grid-cell mass already exists above;
+        // temperature isn't tracked per-cell by the CPU solver, so scatter it
+        // here the same way the solver's own P2G would (nearest-cell,
+        // mass-weighted) directly from particle state.
+        let particles = self.sim.particles();
+        for i in 0..particles.x.len() {
+            let p = particles.x[i];
+            let cx = (p.x.round() as i32).clamp(0, GRID as i32 - 1) as usize;
+            let cy = (p.y.round() as i32).clamp(0, GRID as i32 - 1) as usize;
+            let idx = cy * GRID + cx;
+            dense[idx * 4] += particles.mass[i] * particles.temperature[i];
+        }
         self.queue
             .write_buffer(&self.grid_bridge_buf, 0, bytemuck::cast_slice(&dense));
 
         let mut material_mass = vec![0f32; GRID * GRID * SLOTS];
-        let particles = self.sim.particles();
         for i in 0..particles.x.len() {
             let p = particles.x[i];
             let cx = (p.x.round() as i32).clamp(0, GRID as i32 - 1) as usize;

@@ -144,7 +144,7 @@ impl ScalarDiffusionField {
     }
 
     /// Grid resolution this field was created with.
-    pub fn grid_res(&self) -> usize {
+    pub const fn grid_res(&self) -> usize {
         self.grid_res
     }
 

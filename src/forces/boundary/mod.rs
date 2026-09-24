@@ -1,5 +1,7 @@
-//! Boundary conditions: the `BoundaryCondition` trait plus 6 real models,
-//! one per file (mirrors the `materials/` one-model-per-file pattern).
+//! Boundary conditions: the `BoundaryCondition` trait plus 6 real models.
+//! The 3 Coulomb-friction variants (plain/grip/ratchet) are a real, tightly
+//! related family -- grouped under `friction/` (see that module's own doc);
+//! `heightmap`/`predictive`/`slip` are each standalone, one file apiece.
 //!
 //! Shared helpers (`apply_coulomb_wall`, `apply_slip_wall_velocity`,
 //! `clamp_position_inside_grid`) and their direct unit tests live here,
@@ -7,29 +9,58 @@
 
 use glam::Vec2;
 
-use crate::particle::Particles;
+use crate::particle::ParticleUpdateCtx;
 
 mod friction;
-mod grip_friction;
 mod heightmap;
+mod kinematic_obstacle;
+mod no_slip;
 mod predictive;
-mod ratchet_friction;
 mod slip;
 
-pub use friction::FrictionBoundary;
-pub use grip_friction::GripFrictionBoundary;
+pub use friction::{FrictionBoundary, GripFrictionBoundary, RatchetFrictionBoundary};
 pub use heightmap::HeightmapBoundary;
+pub use kinematic_obstacle::KinematicCircleBoundary;
+pub use no_slip::NoSlipBoundary;
 pub use predictive::PredictiveBoundary;
-pub use ratchet_friction::RatchetFrictionBoundary;
 pub use slip::SlipBoundary;
 
 pub trait BoundaryCondition: Send + Sync + core::fmt::Debug {
     fn apply_to_grid_velocity(&self, cell_index: usize, grid_res: usize, velocity: &mut Vec2);
+    /// Optional reaction hook: called once per corrected grid cell with that
+    /// cell's own grid-index position and the MASS-WEIGHTED momentum the
+    /// correction just removed from it, sign-flipped (Newton's third law --
+    /// what the grid LOST, this boundary GAINED). Default no-op, zero cost
+    /// for every existing boundary (a static wall has nothing to react
+    /// with). `KinematicCircleBoundary` is the one real implementor -- see
+    /// its own doc for why this exists (real two-way momentum coupling
+    /// without a rigid-body solver, without touching `Particle::
+    /// contact_group`/`WithMixturePhase`, both of which are unsafe or
+    /// unsupported for strict WC-MPM fluid; see project_fluid_solid_
+    /// coupling_real_root_cause_and_path memory). `cell_pos` (added
+    /// 2026-08-16, alongside the impulse from day one -- this hook is new
+    /// enough this session that widening its signature directly, rather
+    /// than adding a second method, is the honest choice) lets a real
+    /// implementor also accumulate TORQUE (`cross(cell_pos - center,
+    /// impulse)`), needed for genuine rotational dynamics (a rolling ball's
+    /// own real angular momentum), not just linear reaction.
+    fn on_grid_correction(&self, _cell_pos: Vec2, _reaction_impulse: Vec2) {}
     /// Clamp particle position to the valid domain after G2P.
     /// Not a physical force — last-resort domain enforcement so particles never escape the grid.
     /// Proper no-penetration physics lives in `apply_to_grid_velocity`.
     fn clamp_particle_position(&self, position: Vec2, grid_res: usize) -> Vec2;
-    fn post_g2p_particle(&self, _particles: &mut Particles, _i: usize, _grid_res: usize, _dt: f32) {
+    /// Optional post-G2P per-particle hook (e.g. `GripFrictionBoundary`'s muscle
+    /// grip). Takes a `ParticleUpdateCtx`, not `&mut Particles, i` -- same reason
+    /// as `MaterialModel::update_particle`: only ever touches its own particle's
+    /// fields, so G2P can run every particle's boundary hook in parallel too.
+    fn post_g2p_particle(&self, _ctx: &mut ParticleUpdateCtx, _grid_res: usize, _dt: f32) {}
+
+    /// Whether this boundary has a declared compatible wall discretisation
+    /// for strict WC-MPM liquids. The conservative default is false: a
+    /// post-G2P particle mutation is not automatically a fluid traction or
+    /// no-penetration condition. Implementors must opt in explicitly.
+    fn is_strict_wc_mpm_fluid_compatible(&self) -> bool {
+        false
     }
 }
 
@@ -43,12 +74,20 @@ impl<T: BoundaryCondition + ?Sized> BoundaryCondition for std::sync::Arc<T> {
         (**self).apply_to_grid_velocity(cell_index, grid_res, velocity);
     }
 
+    fn on_grid_correction(&self, cell_pos: Vec2, reaction_impulse: Vec2) {
+        (**self).on_grid_correction(cell_pos, reaction_impulse);
+    }
+
     fn clamp_particle_position(&self, position: Vec2, grid_res: usize) -> Vec2 {
         (**self).clamp_particle_position(position, grid_res)
     }
 
-    fn post_g2p_particle(&self, particles: &mut Particles, i: usize, grid_res: usize, dt: f32) {
-        (**self).post_g2p_particle(particles, i, grid_res, dt);
+    fn post_g2p_particle(&self, ctx: &mut ParticleUpdateCtx, grid_res: usize, dt: f32) {
+        (**self).post_g2p_particle(ctx, grid_res, dt);
+    }
+
+    fn is_strict_wc_mpm_fluid_compatible(&self) -> bool {
+        (**self).is_strict_wc_mpm_fluid_compatible()
     }
 }
 
@@ -75,7 +114,7 @@ pub(crate) fn apply_coulomb_wall(velocity: &mut Vec2, outward_normal: Vec2, mu: 
     };
 }
 
-pub(crate) fn apply_slip_wall_velocity(
+pub(crate) const fn apply_slip_wall_velocity(
     thickness: usize,
     cell_index: usize,
     grid_res: usize,
@@ -97,6 +136,29 @@ pub(crate) fn apply_slip_wall_velocity(
     }
     if y > hi {
         velocity.y = velocity.y.min(0.0);
+    }
+}
+
+/// True no-slip wall: velocity forced to exactly zero (both normal AND
+/// tangential) inside the wall band, unconditionally -- not gated on
+/// approach direction the way `apply_slip_wall_velocity`'s per-axis clamp
+/// is, because the real Navier-Stokes no-slip condition is `v = 0` AT the
+/// wall, always, not just "don't penetrate." Real, cited source: `tmp/
+/// sparkl`'s (Dimforge, Apache-2.0, already used elsewhere in this engine
+/// for its Monaghan-SPH Tait EOS) own `grid_update.rs`,
+/// `BoundaryHandling::Stick` variant -- `if is_inside: cell.velocity = 0`,
+/// the exact same unconditional-zero rule, not a hand-derived approximation.
+pub(crate) const fn apply_no_slip_wall_velocity(
+    thickness: usize,
+    cell_index: usize,
+    grid_res: usize,
+    velocity: &mut Vec2,
+) {
+    let hi = grid_res - (thickness + 1);
+    let x = cell_index / grid_res;
+    let y = cell_index % grid_res;
+    if x < thickness || x > hi || y < thickness || y > hi {
+        *velocity = Vec2::ZERO;
     }
 }
 

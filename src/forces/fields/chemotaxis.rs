@@ -77,7 +77,7 @@ impl ChemotaxisField {
     }
 
     /// Restrict force to a single material.  `None` (default) = all particles.
-    pub fn with_material_filter(mut self, id: u32) -> Self {
+    pub const fn with_material_filter(mut self, id: u32) -> Self {
         self.material_filter = Some(id);
         self
     }
@@ -111,7 +111,7 @@ impl ChemotaxisField {
 }
 
 impl Field for ChemotaxisField {
-    fn prepare(&mut self, _particles: &Particles) {
+    fn prepare(&mut self, _particles: &Particles, _dt: f32) {
         // Gradient is computed on-demand from the snapshot; no pre-computation needed.
     }
 

@@ -86,6 +86,15 @@ struct MaterialParams {
     bulk_viscosity:          f32,
     surface_tension_coeff:   f32,
     cohesion_coeff:              f32,
+    // GPU/CPU parity fix (2026-08-15) -- see Rust MaterialParams's own doc.
+    // Not consumed here (ASFLIP is mutually exclusive with strict-fluid
+    // mode, see step.rs's assert_strict_fluid_mode_is_supported), kept only
+    // for byte-layout parity with the other MaterialParams mirrors sharing
+    // the same uniform buffer.
+    owns_deformation_volume_state: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 struct StepParams {
@@ -138,6 +147,27 @@ fn bspline_w(d: f32) -> f32 {
     if a < BSPLINE_INNER_LIMIT { return BSPLINE_CENTER_COEFF - a * a; }
     if a < BSPLINE_OUTER_LIMIT { let t = BSPLINE_OUTER_LIMIT - a; return BSPLINE_OUTER_SCALE * t * t; }
     return 0.0;
+}
+
+// Free-surface velocity extrapolation for an UNTOUCHED grid node -- see
+// `g2p.wgsl`'s own copy of this function for the full doc (same core-solver
+// fix, this file's own separate fused G2P+particles_update pass).
+fn extrapolated_boundary_velocity(
+    particle_v: vec2<f32>,
+    cx: i32,
+    cy: i32,
+    res: i32,
+    gravity: vec2<f32>,
+    dt: f32,
+    boundary_thickness: u32,
+) -> vec2<f32> {
+    var v = particle_v + gravity * dt;
+    let bt = i32(boundary_thickness);
+    if cx < bt          && v.x < 0.0 { v.x = 0.0; }
+    if cx >= res - bt   && v.x > 0.0 { v.x = 0.0; }
+    if cy < bt          && v.y < 0.0 { v.y = 0.0; }
+    if cy >= res - bt   && v.y > 0.0 { v.y = 0.0; }
+    return v;
 }
 
 // ── 2D SVD (verbatim copy of particles_update.wgsl's own -- see this file's top doc
@@ -406,11 +436,18 @@ fn g2p_asflip_fused_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
                 let node_idx = u32(cy) * res + u32(cx);
                 let cell   = grid[node_idx];
-                let cell_v = select(
+                let touched_v = select(
                     cell.momentum,
                     select(resolved_rest_v[node_idx], resolved_grip_v[node_idx], is_grip),
                     contact_active,
                 );
+                // Free-surface velocity extrapolation for untouched nodes --
+                // see `extrapolated_boundary_velocity`'s own doc.
+                let extrap_v = extrapolated_boundary_velocity(
+                    p.v, cx, cy, i32(res), step_params.gravity, step_params.dt,
+                    step_params.boundary_thickness,
+                );
+                let cell_v = select(extrap_v, touched_v, cell.mass > NUM_FLOOR);
 
                 new_v       += w * cell_v;
                 b_col0      += w * cell_v * cell_dist.x;
@@ -511,6 +548,14 @@ fn g2p_asflip_fused_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let svd    = svd2(new_F);
         let dp_res = dp_plasticity(svd.s, p.log_volume_strain, p.friction_hardening, mat);
         var dp_sigma = abs(dp_res.sigma);
+        // Floor each axis individually before the product-based rescale below --
+        // same real bug (and same fix) as CPU `DruckerPragerMaterial`'s own
+        // `MIN_AXIS` guard (see that code's own doc): under a hard enough
+        // impact one singular value can collapse to exactly (or within float
+        // noise of) zero on its own axis, and a rescale that multiplies BOTH
+        // axes by the same scalar can never recover an axis already at zero
+        // (0 * any finite scalar is still 0).
+        dp_sigma = max(dp_sigma, vec2<f32>(1e-3));
         let dp_j = dp_sigma.x * dp_sigma.y;
         if dp_j < mat.volume_ratio_min {
             dp_sigma *= sqrt(mat.volume_ratio_min / max(dp_j, NUM_FLOOR_TIGHT));

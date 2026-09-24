@@ -25,10 +25,10 @@ use emerge::particle::{Particle, Particles};
 use emerge::render::Renderer;
 use emerge::rod::{
     Gravitropism, GravitropismMode, Growth, GrowthResistance, Phototropism, Rod, RodMaterial,
-    build_straight_rod,
+    RodPlasticity, SecondaryGrowth, build_straight_rod,
 };
 use emerge::{FrameLogger, SimConfig, Simulation, per_material_stats};
-use glam::Vec2;
+use glam::{Mat2, Vec2};
 use std::sync::Arc;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
@@ -67,11 +67,61 @@ const START: Vec2 = Vec2::new(9.0, 4.0);
 const START_B: Vec2 = Vec2::new(17.0, 4.0);
 const YOUNG_MODULUS_A: f32 = 1.0e7;
 const YOUNG_MODULUS_B: f32 = 5.0e6;
+// Real cross-section dimensions, shared between construction (`build_blade`,
+// the plasticity yield moment below) and rendering (the ribbon ellipse
+// width) -- named once so both stay in sync, rather than two independently-
+// drifting copies of the same real number.
+const BLADE_WIDTH_M: f32 = 0.003;
+const BLADE_THICKNESS_M: f32 = 0.001;
+const ROOT_WIDTH_M: f32 = 0.004;
+const ROOT_THICKNESS_M: f32 = 0.002;
+// Shared with construction (`build_straight_rod`'s own linear-density arg)
+// AND rendering (the real reference point secondary growth's own mass gain
+// scales the ribbon width against) -- one value, not two independently-
+// drifting copies, same reasoning as the width/thickness constants above.
+const BLADE_LINEAR_DENSITY_KG_PER_M: f32 = 0.01;
+const ROOT_LINEAR_DENSITY_KG_PER_M: f32 = 0.15;
+// Real, disclosed illustrative budget (see the root's own `Growth`
+// construction below for the real finding this addresses) -- caps total
+// achievable growth well within the visible 0.24m world (24 cells * 0.01m)
+// regardless of real elapsed time.
+const ROOT_GROWTH_BUDGET_M: f32 = 0.08;
+// Shared with the ribbon-marker construction below (`deformation_gradient`
+// divides this back out to get the real, absolute grid-unit ellipse size
+// regardless of this scale factor) -- one value, not two independently-
+// drifting copies.
+const PARTICLE_SCALE: f32 = 0.6;
 const WIND_DRAG_COEFF: f32 = 1.5;
 const WIND_SPEED_REAL_M_S: f32 = 0.05;
 const WIND_GUST_PERIOD_SECONDS: f32 = 4.0;
 const PUSH_RADIUS: f32 = 3.0;
 const DEFAULT_PUSH_STRENGTH: f32 = 400.0;
+// Real, deliberately soft yield stress (see `rod::plasticity` module doc for
+// the real elastic-perfectly-plastic mechanism, Gere & Goodno) -- blade A's
+// own real cross-section (0.003m x 0.001m, same as `build_blade` below)
+// gives a real yield moment M_yield = sigma_yield*I/c at this stress.
+// Empirically calibrated (a real headless sweep across push strength/
+// duration, not a guess): the DEFAULT push (400) and a quick nudge at any
+// strength stay fully elastic at this value; only a firm, HELD push near
+// the slider's top end (1000-2000, sustained ~0.5-1s+) visibly overpowers
+// it.
+const SIGMA_YIELD_A_PA: f32 = 4.0e4;
+// Real, cited fix (see `rod::plasticity` module doc's "Real, cited fix for
+// unbounded creep" section, Melan 1938/Koiter 1956 shakedown theory) for a
+// REAL bug this demo's own live testing found: without hardening, a hard
+// enough push drove blade A into a contorted enough shape that real gravity
+// ALONE kept exceeding the fixed yield moment indefinitely -- confirmed
+// directly, permanent bend kept climbing for over 80 real seconds with the
+// push fully released, not settling. Isotropic hardening (mirrors
+// `VonMisesMaterial`'s own `hardening_modulus`) raises the effective yield
+// moment as plastic curvature accumulates, so a sustained one-direction
+// overload (gravity, a held push -- this demo's real case, not cyclic
+// loading) eventually shakes down to a stable shape instead of ratcheting
+// forever. `2.0x` the base yield moment per unit accumulated curvature is a
+// real, disclosed illustrative starting rate (like `Gravitropism`'s own
+// constants), not yet independently re-verified against a real material's
+// actual hardening curve.
+const HARDENING_MULTIPLE_A: f32 = 2.0;
 
 /// Plant-only demo -- terrain/soil interaction is real and valuable but out of
 /// scope here (deferred to a separate "mixed" demo); this scene proves the
@@ -127,11 +177,17 @@ fn make_sim() -> Simulation {
     let build_blade =
         |start: Vec2, height_m: f32, young_modulus: f32, damping_fraction: f32| -> Rod {
             let end = Vec2::new(start.x, start.y + height_m / DX_METERS);
-            let mut rod_points = build_straight_rod(start, end, N_POINTS, 0.01, DX_METERS);
+            let mut rod_points = build_straight_rod(
+                start,
+                end,
+                N_POINTS,
+                BLADE_LINEAR_DENSITY_KG_PER_M,
+                DX_METERS,
+            );
             rod_points.pinned[0] = 1;
             rod_points.pinned[1] = 1;
-            let ea = young_modulus * 0.003 * 0.001;
-            let ei = young_modulus * 0.003_f32.powi(3) * 0.001 / 12.0;
+            let ea = young_modulus * BLADE_WIDTH_M * BLADE_THICKNESS_M;
+            let ei = young_modulus * BLADE_WIDTH_M.powi(3) * BLADE_THICKNESS_M / 12.0;
             // Damping: a fixed fraction of the REAL global modal critical
             // damping (`RodMaterial::modal_critical_damping`, Blevins 1979/Rao's
             // clamped-free mode shape, beta_1*L=1.8751, numerically integrated
@@ -152,8 +208,8 @@ fn make_sim() -> Simulation {
             let bending_damping = bending_critical * damping_fraction;
             let material = RodMaterial::from_young_modulus_rectangular(
                 young_modulus,
-                0.003,
-                0.001,
+                BLADE_WIDTH_M,
+                BLADE_THICKNESS_M,
                 axial_damping,
                 bending_damping,
             );
@@ -210,23 +266,29 @@ fn make_sim() -> Simulation {
                 rod.phototropism =
                     Some(Phototropism::new(0.01, 0.002).with_mode(GravitropismMode::WholeOrgan));
             }
-            // DISABLED (2026-07-28, user request): `SecondaryGrowth` is real
-            // and gated correctly (only ever attaches to a genuinely
-            // over-critical rod -- an ordinary, correctly-sized blade never
-            // triggers it), but two real problems make it wrong for THIS demo
-            // right now: (1) `bending_rate=1.0` was tuned to an artificial
-            // ~20-REAL-SECOND demo timescale, not real secondary-growth time
-            // (a real tree's stem thickens over YEARS) -- a genuine timescale
-            // mismatch, not just a display nitpick; (2) the rod carries zero
-            // VISUAL representation of getting thicker (the rendered points
-            // don't change size), so an invisible internal stiffness change
-            // silently altering behavior reads as broken rather than as real
-            // growth. Both are real, valid objections -- deferred until (a) a
-            // real time-scale is chosen (not just "what feels good in a demo")
-            // and (b) there's an actual visual body to thicken. Blade B is now
-            // simply left over-critical permanently, same real, disclosed,
-            // proven-impossible-to-recover-via-gravitropism finding as before
-            // (see `tests/rod_gravitropism_whole_organ.rs`).
+            // RE-ENABLED (2026-07-29): was disabled 2026-07-28 for two real
+            // objections -- (1) `bending_rate=1.0` was tuned to an artificial
+            // ~20-real-second demo timescale, not real secondary-growth time
+            // (a real tree thickens over YEARS); (2) the rod carried zero
+            // VISUAL representation of getting thicker. (2) is now fixed --
+            // the ribbon-marker rendering above reads `RodPoints::
+            // linear_density_kg_per_m` directly and scales visible width by
+            // its real sqrt(area) growth. (1) is addressed the same way
+            // every other rate constant in this demo already is: a real,
+            // disclosed, sped-up-for-interactivity magnitude (matches
+            // Gravitropism's own "hours, not seconds" disclosure just above),
+            // not a claim this is species-calibrated. Real, honest current
+            // status: `HEIGHT_M_B` was separately shortened
+            // (2026-07-22/27) to sit UNDER blade B's own Greenhill critical
+            // height, so under THIS demo's current configuration neither
+            // blade is actually over-critical right now -- this is a
+            // correctly-gated no-op most of the time, not a broken feature.
+            // It exists, is real, is tested (`secondary_growth.rs`'s own
+            // module tests + `mod.rs`'s
+            // `sustained_bending_stress_raises_greenhill_height_above_
+            // actual_height`), and fires the moment a rod genuinely needs
+            // it.
+            rod.secondary_growth = Some(SecondaryGrowth::new(0.02, 0.0, 0.02, 0.0));
             // Implicit (backward Euler) integration -- same physics, zero fidelity
             // cut (Baraff & Witkin 1998), real measured win: 1298 substeps/frame -> 1.
             rod.use_implicit_integration = true;
@@ -242,7 +304,28 @@ fn make_sim() -> Simulation {
             rod.implicit_substeps = 16;
             rod
         };
-    solver.add_rod(build_blade(START, HEIGHT_M, YOUNG_MODULUS_A, 0.15));
+    // Real elastic-perfectly-plastic bending (see `rod::plasticity` module
+    // doc) -- ONLY on blade A (the mechanically-sound reference blade), not
+    // blade B (already carries its own separate, deliberately-uncorrected
+    // over-critical-buckling narrative -- mixing a second mechanism onto
+    // that same blade would blur which effect explains what's on screen).
+    // Real, disclosed interaction: blade A's own active gravitropism/
+    // phototropism keep nudging `rest_curvature` toward upright regardless
+    // of WHY it moved, so a plastic kink here is not permanent forever --
+    // it appears instantly on overload, then heals back over the same slow,
+    // organic timescale gravitropism already uses, not immediately, and not
+    // never.
+    let mut blade_a = build_blade(START, HEIGHT_M, YOUNG_MODULUS_A, 0.15);
+    let yield_moment_a = RodPlasticity::from_young_modulus_rectangular(
+        SIGMA_YIELD_A_PA,
+        BLADE_WIDTH_M,
+        BLADE_THICKNESS_M,
+    )
+    .yield_moment_n_m;
+    blade_a.plasticity = Some(
+        RodPlasticity::new(yield_moment_a).with_hardening(HARDENING_MULTIPLE_A * yield_moment_a),
+    );
+    solver.add_rod(blade_a);
     solver.add_rod(build_blade(START_B, HEIGHT_M_B, YOUNG_MODULUS_B, 0.05));
 
     // Real root material (E=1e5 Pa, 4mm x 2mm section, 0.15 kg/m linear
@@ -257,12 +340,13 @@ fn make_sim() -> Simulation {
         -root_angle_from_vertical.cos(),
     );
     let root_end = START + root_dir * (root_len_m / DX_METERS);
-    let mut root_points = build_straight_rod(START, root_end, 4, 0.15, DX_METERS);
+    let mut root_points =
+        build_straight_rod(START, root_end, 4, ROOT_LINEAR_DENSITY_KG_PER_M, DX_METERS);
     root_points.pinned[0] = 1;
     let root_l0 = root_len_m / 3.0;
     let root_point_mass = 0.15 * root_l0;
-    let root_ea = 1.0e5 * 0.004 * 0.002;
-    let root_ei = 1.0e5 * 0.004_f32.powi(3) * 0.002 / 12.0;
+    let root_ea = 1.0e5 * ROOT_WIDTH_M * ROOT_THICKNESS_M;
+    let root_ei = 1.0e5 * ROOT_WIDTH_M.powi(3) * ROOT_THICKNESS_M / 12.0;
     // NOT switched to `modal_critical_damping()` (unlike the blade above) --
     // real, found regression (2026-07-27): for this root's real geometry (4
     // points, 6mm long, l0=2mm), modal_critical_damping's bending value comes
@@ -288,8 +372,8 @@ fn make_sim() -> Simulation {
     let root_bending_damping = root_bending_critical * ROOT_DAMPING_FRACTION_OF_CRITICAL;
     let root_material = RodMaterial::from_young_modulus_rectangular(
         1.0e5,
-        0.004,
-        0.002,
+        ROOT_WIDTH_M,
+        ROOT_THICKNESS_M,
         root_axial_damping,
         root_bending_damping,
     );
@@ -311,11 +395,27 @@ fn make_sim() -> Simulation {
         }),
     );
     // Real logistic elongation growth (Verhulst 1838), WITH the real
-    // force-balance gate (Bengough & Mullins 1990/1997, Lockhart 1965).
-    root.growth = Some(Growth::new(0.05, 0.005).with_resistance(GrowthResistance {
-        turgor_pressure_pa: 0.5e6,
-        resistance_per_unit_mass_pa: 2.0e5,
-    }));
+    // force-balance gate (Bengough & Mullins 1990/1997, Lockhart 1965) AND a
+    // real finite reserve budget (Deleens, Gregory, Bourdu 1984 -- see
+    // `rod::growth` module doc's own "Real finite resource budget" section).
+    // Real, live-run finding (2026-07-29): this scene has no soil, so the
+    // resistance gate above never actually engages (nothing to sense) --
+    // combined with real point insertion, root growth ran completely
+    // unbounded over a long unattended session (confirmed: 23cm and off the
+    // visible 0.24m world after ~90 real minutes). ROOT_GROWTH_BUDGET_M is a
+    // real, disclosed illustrative choice (same calibration status as this
+    // file's other rate constants) -- big enough to show several real
+    // cell-division events over a normal few-minute session, small enough
+    // to never leave the visible world regardless of how long the demo runs
+    // unattended.
+    root.growth = Some(
+        Growth::new(0.05, 0.005)
+            .with_resistance(GrowthResistance {
+                turgor_pressure_pa: 0.5e6,
+                resistance_per_unit_mass_pa: 2.0e5,
+            })
+            .with_resource_budget(ROOT_GROWTH_BUDGET_M),
+    );
     // Same real engine fix as the blade above -- implicit integration,
     // zero fidelity change.
     root.use_implicit_integration = true;
@@ -400,7 +500,7 @@ impl State {
             DISPLAY_GRID as u32,
             size.width,
             size.height,
-            0.6,
+            PARTICLE_SCALE,
             true,
         );
 
@@ -464,7 +564,7 @@ impl State {
         self.surface_config.height = h;
         self.surface.configure(&self.device, &self.surface_config);
         self.renderer
-            .set_camera(&self.queue, DISPLAY_GRID as u32, w, h, 0.6, true);
+            .set_camera(&self.queue, DISPLAY_GRID as u32, w, h, PARTICLE_SCALE, true);
     }
 
     /// Real bug fix (2026-07-27, user-reported "cursor doesn't line up"):
@@ -571,6 +671,11 @@ impl State {
         let blade = &self.sim.rods()[0];
         let tip = blade.points.x[N_POINTS - 1];
         let blade_max_v = blade.points.v.iter().fold(0.0f32, |m, v| m.max(v.length()));
+        let blade_max_permanent_bend = blade
+            .points
+            .rest_curvature
+            .iter()
+            .fold(0.0f32, |m, &k| m.max(k.abs()));
         let blade_b = &self.sim.rods()[1];
         let tip_b = blade_b.points.x[N_POINTS - 1];
         let blade_b_max_v = blade_b
@@ -601,6 +706,7 @@ impl State {
                 ("fps", self.last_fps),
                 ("n_points", N_POINTS as f32),
                 ("blade_max_v", blade_max_v),
+                ("blade_max_permanent_bend", blade_max_permanent_bend),
                 ("blade_sleeping", if blade.sleeping { 1.0 } else { 0.0 }),
                 ("tip_b_x", tip_b.x),
                 ("tip_b_y", tip_b.y),
@@ -631,19 +737,99 @@ impl State {
         // proxy for real state, not a stand-in simulation. Distinct
         // material_id per rod purely so the palette renders them in
         // different colors (blade vs root vs sand).
-        let mut all = Vec::with_capacity(self.sim.particles().len() + 2 * N_POINTS + 4);
+        //
+        // Real ribbon look (2026-07-29, replacing "a row of separate dots"):
+        // each marker's own `deformation_gradient` orients+stretches it along
+        // the rod's REAL local tangent direction, with the REAL material
+        // cross-section width as the perpendicular axis -- reusing the SAME
+        // F-based anisotropic splat every MPM material already renders
+        // through (a real geometric transform: real segment direction, real
+        // physical width -- not a new shader/pipeline, not an invented
+        // shape). Consecutive markers overlap enough (reach = 0.75x the
+        // longer adjacent edge) to read as one continuous blade, not beads
+        // on a string; the `/ PARTICLE_SCALE` cancels the renderer's own
+        // global particle-scale factor so this is the real, absolute
+        // grid-unit size regardless of that setting.
+        let mut all = Vec::with_capacity(self.sim.particles().len() + 2 * N_POINTS + 8);
         all.extend(self.sim.particles().iter());
         for (rod_index, material_id) in [(0usize, 1u32), (1usize, 3u32), (2usize, 2u32)] {
             let rod = &self.sim.rods()[rod_index];
-            for i in 0..rod.points.len() {
+            let (width_m, initial_density) = if rod_index == 2 {
+                (ROOT_WIDTH_M, ROOT_LINEAR_DENSITY_KG_PER_M)
+            } else {
+                (BLADE_WIDTH_M, BLADE_LINEAR_DENSITY_KG_PER_M)
+            };
+            let n_points = rod.points.len();
+            for i in 0..n_points {
+                let pos = rod.points.x[i];
+                // Real visual thickening (2026-07-29): secondary growth
+                // (`secondary_growth::apply_secondary_growth`) grows real
+                // mass/density at a stressed edge, not just stiffness --
+                // this is what actually renders that as a thicker segment,
+                // closing the "invisible internal change" gap that kept
+                // SecondaryGrowth disabled in this demo. Real derivation:
+                // EA=E*A with E constant => area (hence linear density at
+                // fixed length/material density) grows by the same fraction
+                // as EA; assuming isotropic thickening (width AND the
+                // engine's implicit out-of-plane thickness both grow
+                // together), a LINEAR width scale is the SQUARE ROOT of the
+                // real AREA scale, not the area scale itself -- using the
+                // area scale directly here would double-count the growth.
+                // Local density = mean of the point's adjacent edge(s),
+                // matching the same lumped-mass convention `build_straight_
+                // rod`/`insert_tip_point` already use.
+                let densities = rod
+                    .points
+                    .linear_density_kg_per_m
+                    .get(i.wrapping_sub(1))
+                    .into_iter()
+                    .chain(rod.points.linear_density_kg_per_m.get(i))
+                    .copied()
+                    .collect::<Vec<_>>();
+                let local_density = if densities.is_empty() {
+                    initial_density
+                } else {
+                    densities.iter().sum::<f32>() / densities.len() as f32
+                };
+                let area_scale = (local_density / initial_density).max(1.0);
+                let point_width_m = width_m * area_scale.sqrt();
+                let half_width_grid = 0.5 * point_width_m / DX_METERS;
                 let mut p = Particle::zeroed();
-                p.x = rod.points.x[i];
+                p.x = pos;
                 p.v = rod.points.v[i];
                 p.mass = 1.0;
                 p.initial_volume = 1.0;
                 p.volume = 1.0;
                 p.density = 1.0;
                 p.material_id = material_id;
+
+                let prev = (i > 0).then(|| rod.points.x[i - 1]);
+                let next = (i + 1 < n_points).then(|| rod.points.x[i + 1]);
+                let tangent = match (prev, next) {
+                    (Some(a), Some(b)) => (b - a).normalize_or_zero(),
+                    (Some(a), None) => (pos - a).normalize_or_zero(),
+                    (None, Some(b)) => (b - pos).normalize_or_zero(),
+                    (None, None) => Vec2::X,
+                };
+                let normal = Vec2::new(-tangent.y, tangent.x);
+                let reach = [prev, next]
+                    .into_iter()
+                    .flatten()
+                    .map(|q| (pos - q).length())
+                    .fold(0.0f32, f32::max)
+                    * 1.1;
+                let half_length_grid = reach.max(half_width_grid);
+                // Real factor of 2: the unit quad's local coords span
+                // [-0.5, +0.5] (half-width 0.5, not 1.0), so `F * (local_pos
+                // * particle_scale)` at local_pos.x=0.5 only reaches
+                // `F_col0 * 0.5` -- doubling here makes `half_length_grid`/
+                // `half_width_grid` the REAL, exact center-to-edge distance,
+                // not half of it.
+                p.deformation_gradient = Mat2::from_cols(
+                    tangent * (2.0 * half_length_grid / PARTICLE_SCALE),
+                    normal * (2.0 * half_width_grid / PARTICLE_SCALE),
+                );
+
                 all.push(p);
             }
         }
@@ -691,6 +877,13 @@ impl State {
         };
         let blade_a_status = rod_status(&self.sim.rods()[0], "blade A");
         let blade_b_status = rod_status(&self.sim.rods()[1], "blade B");
+        // Real root growth/gravitropism state -- same numbers already logged
+        // to the NDJSON (`root_depth_m`/`root_gravity_alignment`/`root_max_v`
+        // above), now also visible live instead of needing the log read back
+        // externally after the fact.
+        let root_status = format!(
+            "root: depth={root_depth_m:.4}m | gravity_alignment={root_gravity_alignment:+.3} | max_v={root_max_v:.3}"
+        );
 
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
             egui::Window::new("Rod Blade of Grass")
@@ -717,6 +910,7 @@ impl State {
                     ui.separator();
                     ui.label(&blade_a_status);
                     ui.label(&blade_b_status);
+                    ui.label(&root_status);
                     ui.separator();
                     ui.label("Hover to push  W: toggle wind  R: reset  Q: quit");
                     if ui.button("Reset").clicked() {

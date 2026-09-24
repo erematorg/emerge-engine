@@ -12,8 +12,8 @@ use std::sync::Arc;
 use emerge::diagnostics::log_frame_gpu;
 use emerge::render::{ColorMode, Renderer};
 use emerge::{
-    DruckerPragerMaterial, GpuSimulation, MaterialRegistry, SimConfig, SpawnRegion,
-    StomakhinMaterial, build_particles,
+    DruckerPragerMaterial, FixedStepController, GpuSimulation, MaterialRegistry, SimConfig,
+    SpawnRegion, StomakhinMaterial, build_particles,
 };
 use glam::{IVec2, Vec2};
 use winit::application::ApplicationHandler;
@@ -52,6 +52,11 @@ struct State {
     frame: u64,
     fps_timer: std::time::Instant,
     fps_frames: u64,
+    /// Real-time-decoupled stepping -- see `basic_fluids_gpu.rs`'s own field
+    /// doc for the full real bug/fix writeup.
+    stepper: FixedStepController,
+    last_instant: std::time::Instant,
+    max_steps_seen: usize,
 }
 
 fn make_sim_data(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) -> GpuSimulation {
@@ -157,6 +162,9 @@ impl State {
             frame: 0,
             fps_timer: std::time::Instant::now(),
             fps_frames: 0,
+            stepper: FixedStepController::standard(DT, 60.0),
+            last_instant: std::time::Instant::now(),
+            max_steps_seen: 0,
         }
     }
 
@@ -183,6 +191,8 @@ impl State {
         let (device, queue) = (self.sim.device().clone(), self.sim.queue().clone());
         self.sim = make_sim_data(device, queue);
         self.frame = 0;
+        self.stepper.reset();
+        self.last_instant = std::time::Instant::now();
         println!("reset");
     }
 
@@ -194,30 +204,62 @@ impl State {
             Ok(t) => t,
             Err(_) => return,
         };
-        self.sim.step_frame();
-        self.sim.phase_transition(
-            |p| p.material_id == MAT_PACKED && p.v.length() > 5.0,
-            MAT_SHATTER,
-        );
-        self.frame += 1;
+        let now = std::time::Instant::now();
+        let frame_delta = (now - self.last_instant).as_secs_f32();
+        self.last_instant = now;
+        let steps = self.stepper.steps_for_frame(frame_delta);
+        self.max_steps_seen = self.max_steps_seen.max(steps);
+        for _ in 0..steps {
+            self.sim.step_frame();
+            self.frame += 1;
+            // Gated, not evaluated every step -- `phase_transition` does a real,
+            // BLOCKING GPU->CPU sync internally (`sync_particles_blocking`, see
+            // its own doc), so calling it once per real simulation step (rather
+            // than once per RENDER callback, the pre-2026-07-30 behavior) was a
+            // genuine, self-inflicted cost multiplication once multiple steps
+            // could happen per callback -- confirmed live: fps collapsed to
+            // 13-16 with a chronic 4-steps-per-render pattern. Isolated timing
+            // showed BOTH `step_frame()` (~6ms) and `phase_transition()` alone
+            // (~1ms) are individually cheap -- the real cost is the sync POINT
+            // itself breaking CPU/GPU pipelining in the live interleaved
+            // render+compute loop (a real, well-known GPU perf pattern:
+            // synchronization stalls cost far more in context than in
+            // isolation). `is_multiple_of(15)`, matching `material_sandbox_
+            // gpu`'s own already-proven gated-scan interval, not a fresh guess.
+            if self.frame.is_multiple_of(15) {
+                // Fracture trigger: real plastic compression (Jp), not raw
+                // speed -- the old `v.length() > 5.0` fired at launch,
+                // before any collision (already fixed in basic_snow.rs/
+                // basic_snow_gui.rs 2026-08-16; this GPU sibling was missed
+                // at the time and carried the same live regression until now).
+                self.sim.phase_transition(
+                    |p| p.material_id == MAT_PACKED && p.plastic_volume_ratio < 0.9,
+                    MAT_SHATTER,
+                );
+            }
+            if self.frame.is_multiple_of(60) {
+                log_frame_gpu(self.frame, DT, self.sim.particles(), LABELS, 1);
+                let snap = self.sim.diagnostics_snapshot();
+                println!(
+                    "  non_finite={}  out_of_bounds={}  max_speed={:.3}  sub={}  cfl={:.4}",
+                    snap.non_finite_particle_values,
+                    snap.out_of_bounds_particles,
+                    snap.max_particle_speed,
+                    snap.substeps_last_step,
+                    snap.cfl_number,
+                );
+            }
+        }
         self.fps_frames += 1;
         if self.fps_timer.elapsed().as_secs_f32() >= 2.0 {
             let fps = self.fps_frames as f32 / self.fps_timer.elapsed().as_secs_f32();
-            println!("frame={} fps={:.0}", self.frame, fps);
+            println!(
+                "frame={} fps={:.0} max_steps_per_render={}",
+                self.frame, fps, self.max_steps_seen
+            );
             self.fps_timer = std::time::Instant::now();
             self.fps_frames = 0;
-        }
-        if self.frame.is_multiple_of(60) {
-            log_frame_gpu(self.frame, DT, self.sim.particles(), LABELS, 1);
-            let snap = self.sim.diagnostics_snapshot();
-            println!(
-                "  non_finite={}  out_of_bounds={}  max_speed={:.3}  sub={}  cfl={:.4}",
-                snap.non_finite_particle_values,
-                snap.out_of_bounds_particles,
-                snap.max_particle_speed,
-                snap.substeps_last_step,
-                snap.cfl_number,
-            );
+            self.max_steps_seen = 0;
         }
         let view = output
             .texture

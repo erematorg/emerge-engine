@@ -1,10 +1,7 @@
-// RESOLVED (was a TODO to move this into LP's mpm crate): the decision went the
-// other way. LP's crates/mpm was retired back into a single crate (2026-07-01),
-// and ARCHITECTURE.md §7 documents `control::Lnn` as a deliberate exception that
-// lives in emerge: it does not participate in the substep loop at all — a
-// standalone ODE the caller integrates, writing its output into
-// `Particle::activation`/`activation_dir` between steps. emerge supplies the
-// controller math; it has no opinion on when or whether it runs.
+// Lives in emerge, not LP: a deliberate exception
+// that doesn't participate in the substep loop at all -- a standalone ODE
+// the caller integrates, writing its output into
+// `Particle::activation`/`activation_dir` between steps.
 
 /// Liquid Time-constant Network (LNN) — Hasani, Lechner, Amini, Rus, Grosu,
 /// "Liquid Time-constant Networks" (arXiv preprint 2020; published AAAI 2021,
@@ -58,7 +55,7 @@ impl Lnn {
         }
     }
 
-    pub fn n_neurons(&self) -> usize {
+    pub const fn n_neurons(&self) -> usize {
         self.state.len()
     }
 
@@ -97,7 +94,7 @@ impl Lnn {
     // ── Genome API ──────────────────────────────────────────────────────────────
 
     /// Expected flat genome length for n neurons: n·(n + 3).
-    pub fn genome_size(n: usize) -> usize {
+    pub const fn genome_size(n: usize) -> usize {
         n + n + n * n + n
     }
 
@@ -168,15 +165,19 @@ impl Lnn {
         );
 
         let n = n_rings * n_per_ring;
-        // tau=0.5 at period=1.0 -- NOT derived from the period via a formula
-        // (see 2026-07-05 rewrite below for why the old period/(2*pi) mapping
-        // is gone). Scaled proportionally with period as the least-surprising
-        // extrapolation, but ONLY period=1.0 is empirically deep-verified
-        // (every real call site in this codebase -- emerge's own demo and
-        // LP's creature -- uses period=1.0; no call site uses another value
-        // outside a single short unit test). Other periods are a reasonable
-        // guess, not independently proven.
-        let tau_val = (0.5 * period).max(1e-3);
+        // HONEST DISCLOSURE (audit 2026-08-15): `tau=0.5` at `period=1.0` is a
+        // free parameter tuned empirically against this engine's sustained-wave
+        // regression below, not a value derived from CPG literature. Ijspeert's
+        // 2008 review covers different oscillator equations, and the LTC model
+        // of Hasani et al. (AAAI 2021) defines tau as a model parameter; neither
+        // supplies a mapping from a requested period to tau for this equation.
+        // The proportional scaling is likewise an uncalibrated convenience.
+        // Only period=1.0 is deeply verified (and used by real call sites);
+        // other periods require independent calibration before being presented
+        // as physically meaningful -- the same honesty convention used for
+        // `FORAGING_RECOVERY_RATE` elsewhere in this codebase.
+        const EMPIRICAL_TAU_AT_UNIT_PERIOD: f32 = 0.5;
+        let tau_val = (EMPIRICAL_TAU_AT_UNIT_PERIOD * period).max(1e-3);
         let tau = vec![tau_val; n];
         // States oscillate in (-A, +A); sigmoid maps ±4 → (0.018, 0.982) --
         // see the amplitude rewrite note below for why this changed from 2.0.
@@ -187,8 +188,7 @@ impl Lnn {
         // reasonable and passed its own test at the time, but that test only
         // ran 50 steps at dt=0.01 (0.5 simulated seconds) and only checked
         // that SOMETHING moved -- it never checked SUSTAINED oscillation.
-        // Real finding (2026-07-04/05, see project memory
-        // [[emerge_locomotion_root_cause_and_fix]]): the old topology
+        // Real finding: the old topology
         // converges to a fully-synchronized fixed point (oscillation DIES,
         // every neuron settles to an identical constant) within ~20 steps at
         // dt=0.1, regardless of external bias -- driving zero real locomotion
@@ -224,17 +224,25 @@ impl Lnn {
         // Networks 21:642) is unchanged. What changed: self-inhibition
         // REMOVED (was -0.5, now 0.0 -- the sweep found self-inhibition
         // specifically was part of what collapsed the ring to synchrony), and
-        // inhibit now matches excite in magnitude (was 3.0/-2.0 asymmetric,
-        // now 6.0/-6.0 symmetric) -- an unverified-in-literature but now
-        // directly, numerically verified parameter choice, same honesty
-        // standard as the old comment already applied to the magnitudes.
+        // inhibit now matches excite in magnitude (was 3.0/-2.0 asymmetric).
+        // HONEST DISCLOSURE (audit 2026-08-15): the magnitudes below are free
+        // parameters tuned empirically against this engine's sustained-wave
+        // regression, not literature-calibrated synaptic strengths. Published
+        // CPG models use different state equations and normalizations, so their
+        // numerical weights do not define a transferable range for this LNN.
+        // Keep these values labelled as engine calibration unless this exact
+        // equation is independently calibrated -- the same honesty convention
+        // used for `FORAGING_RECOVERY_RATE` elsewhere in this codebase.
+        const EMPIRICAL_EXCITATORY_WEIGHT: f32 = 6.0;
+        const EMPIRICAL_INHIBITORY_WEIGHT: f32 = -6.0;
         let mut weights = vec![0.0f32; n * n];
         for r in 0..n_rings {
             let base = r * n_per_ring;
             for i in 0..n_per_ring {
                 let row = base + i;
-                weights[row * n + base + (i + 1) % n_per_ring] = 6.0; // excite next → wave propagation
-                weights[row * n + base + (i + n_per_ring / 2) % n_per_ring] = -6.0; // inhibit opposite → phase separation
+                weights[row * n + base + (i + 1) % n_per_ring] = EMPIRICAL_EXCITATORY_WEIGHT; // excite next → wave propagation
+                weights[row * n + base + (i + n_per_ring / 2) % n_per_ring] =
+                    EMPIRICAL_INHIBITORY_WEIGHT; // inhibit opposite → phase separation
                 // No self-inhibition term (was -0.5) -- verified this was
                 // part of what collapsed the ring to a synchronized fixed
                 // point; the outer leak term (-x/tau) already provides decay.
@@ -284,8 +292,7 @@ fn sigmoid(x: f32) -> f32 {
 mod tests {
     use super::*;
 
-    /// Real, permanent regression for the 2026-07-05 CPG rewrite (see
-    /// [[emerge_locomotion_root_cause_and_fix]] in project memory). The OLD
+    /// Real, permanent regression for the 2026-07-05 CPG rewrite. The OLD
     /// topology looked alive under a 50-step/dt=0.01 check but converged to a
     /// fully-synchronized fixed point (oscillation DIES) within ~20 steps at
     /// the dt=0.1 real gameplay actually runs at -- this exact kind of gap is

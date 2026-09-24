@@ -33,9 +33,10 @@ type ReadbackResult = std::sync::Arc<std::sync::Mutex<Option<Result<(), wgpu::Bu
 
 /// GPU-backed MLS-MPM solver.
 ///
-/// Pass sequence:
-///   Once per frame: particle_sort (identity permutation → sorted_particle_ids)
-///   Per substep:    grid_clear → p2g → grid_update → g2p → particles_update → force_fields
+/// Pass sequence (see `encode_substep.rs` for the authoritative dispatch list --
+/// several passes below are conditional, e.g. contact/mixture/thermal/resource):
+///   Once per frame: particle_sort_clear → count → scan → scatter
+///   Per substep:    active_block_refresh → grid_clear → p2g → grid_update → g2p → particles_update
 ///
 /// Particles live in VRAM between frames; the CPU only touches them at spawn and for
 /// plasticity readback (currently: none — all plasticity runs in particles_update.wgsl).
@@ -156,9 +157,9 @@ pub struct GpuSimulation {
     /// `RefCell` + `spatial_hash_dirty` defer the actual rebuild to the first query
     /// call after new data lands, instead of paying it unconditionally on every
     /// readback -- see `ensure_spatial_hash_fresh` in `queries.rs`. Matches the
-    /// discipline the CPU `Simulation` follows for the same queries (`ARCHITECTURE.md`
-    /// §4: hash rebuilt once per external `step()`, since LP queries happen between
-    /// frames, never mid-substep). Zero staleness change: a query after a dirty
+    /// discipline the CPU `Simulation` follows for the same queries: hash rebuilt
+    /// once per external `step()`, since LP queries happen between frames, never
+    /// mid-substep. Zero staleness change: a query after a dirty
     /// readback still sees the exact same freshly-landed positions, just computed on
     /// demand.
     spatial_hash: std::cell::RefCell<crate::solver::spatial_hash::SpatialHash>,
@@ -229,7 +230,7 @@ impl GpuSimulation {
         particles: Vec<Particle>,
         registry: MaterialRegistry,
     ) -> Self {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let instance = super::create_wgpu_instance();
 
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {

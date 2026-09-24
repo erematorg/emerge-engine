@@ -13,8 +13,12 @@ use glam::Vec2;
 
 use crate::grid::Grid;
 use crate::grid::kernel::quadratic_weights;
+use crate::solver::operator::{CoupledBody, OperatorCtx, Stage};
 
-use super::{RodMaterial, RodPoints, RodRestState, compute_internal_forces};
+use super::{
+    Rod, RodMaterial, RodPoints, RodRestState, apply_bending_plasticity, apply_gravitropism,
+    apply_growth, apply_phototropism, apply_secondary_growth, compute_internal_forces,
+};
 
 /// Kernel support radius for `quadratic_weights` is 1.5 grid cells — two
 /// scatter locations spaced up to this far apart still have overlapping
@@ -288,5 +292,98 @@ pub fn apply_rod_internal_and_wind_forces(
         let a_wind = wind_drag_coeff * (wind_velocity - rod.v[i]);
         let a_push = push_acceleration(rod.x[i], push_center, push_strength, push_radius);
         rod.v[i] += (a_internal + a_wind + a_push) * dt;
+    }
+}
+
+/// Second real `CoupledBody` implementor, after `GrainPopulation` -- proves
+/// the trait generalizes to a genuinely more complex body. See `solver::
+/// operator` module doc.
+///
+/// `stages()` is dynamic (not a fixed array) because whether a rod
+/// participates in the shared grid loop depends on real per-instance state
+/// -- sleeping, or the implicit-integration path, which has its own
+/// separate, once-per-`step()` lifecycle entirely outside this system (see
+/// `implicit.rs`) -- mirroring the `!rod.sleeping &&
+/// !rod.use_implicit_integration` guard the old hand-written loops used.
+impl CoupledBody for Rod {
+    fn stages(&self) -> &'static [Stage] {
+        if self.sleeping || self.use_implicit_integration {
+            &[]
+        } else {
+            &[Stage::Scatter, Stage::Gather, Stage::PostGather]
+        }
+    }
+
+    fn scatter(&mut self, ctx: &mut OperatorCtx, _dt: f32) {
+        scatter_rod_to_grid(&self.points, ctx.grid);
+    }
+
+    fn gather(&mut self, ctx: &mut OperatorCtx, dt: f32) {
+        gather_grid_to_rod(&mut self.points, ctx.grid, dt);
+    }
+
+    /// Real, unchanged 6-part sequence (internal+wind forces, gravitropism,
+    /// phototropism, growth, secondary growth, plasticity), same order,
+    /// same gating -- moved here from `step.rs`'s inline loop body, not
+    /// rewritten. See each real citation at its original definition
+    /// (unchanged) for why this exact order matters (plasticity applies
+    /// AFTER any biological reshaping, secondary growth is gated on still
+    /// being over-critical, etc).
+    fn post_gather(&mut self, ctx: &mut OperatorCtx, dt: f32) {
+        apply_rod_internal_and_wind_forces(
+            &mut self.points,
+            &self.material,
+            RodForceParams {
+                wind_velocity: self.wind_velocity,
+                wind_drag_coeff: self.wind_drag_coeff,
+                push_center: self.push_center,
+                push_strength: self.push_strength,
+                push_radius: self.push_radius,
+                dx_meters: ctx.config.dx_meters,
+                dt,
+            },
+        );
+        if let Some(gravitropism) = &self.gravitropism {
+            apply_gravitropism(
+                &mut self.points,
+                gravitropism,
+                ctx.config.gravity,
+                ctx.grid,
+                dt,
+            );
+        }
+        if let Some(phototropism) = &self.phototropism {
+            apply_phototropism(
+                &mut self.points,
+                phototropism,
+                ctx.config.light_dir,
+                ctx.grid,
+                dt,
+            );
+        }
+        if let Some(growth) = &mut self.growth {
+            apply_growth(
+                &mut self.points,
+                growth,
+                ctx.grid,
+                ctx.config.light_dir,
+                ctx.config.dx_meters,
+                dt,
+            );
+        }
+        if let Some(secondary_growth) = &self.secondary_growth {
+            let gravity_si = ctx.config.gravity.length() * ctx.config.dx_meters;
+            if self.buckling_warning(gravity_si).is_some() {
+                apply_secondary_growth(
+                    &mut self.points,
+                    secondary_growth,
+                    ctx.config.dx_meters,
+                    dt,
+                );
+            }
+        }
+        if let Some(plasticity) = &self.plasticity {
+            apply_bending_plasticity(&mut self.points, plasticity, ctx.config.dx_meters);
+        }
     }
 }

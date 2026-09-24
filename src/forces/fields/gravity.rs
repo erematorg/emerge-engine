@@ -13,9 +13,9 @@
 
 use glam::Vec2;
 
+use super::cutoff::smooth_cutoff;
 use crate::fields::{FADE_ONSET_RATIO, Field};
 use crate::particle::Particles;
-use crate::solver::cutoff::smooth_cutoff;
 
 /// Gravitational acceleration from one or more point-mass sources.
 ///
@@ -52,7 +52,11 @@ pub struct GravityWellField {
 
 impl GravityWellField {
     /// Full-range gravity — IRL default, no distance cutoff.
-    pub fn new(sources: Vec<(Vec2, f32)>, gravitational_constant: f32, softening: f32) -> Self {
+    pub const fn new(
+        sources: Vec<(Vec2, f32)>,
+        gravitational_constant: f32,
+        softening: f32,
+    ) -> Self {
         Self {
             sources,
             gravitational_constant,

@@ -15,7 +15,7 @@ pub struct PredictiveBoundary {
 }
 
 impl PredictiveBoundary {
-    pub fn new(thickness: usize, predictive_wall_min: f32) -> Self {
+    pub const fn new(thickness: usize, predictive_wall_min: f32) -> Self {
         Self {
             thickness,
             predictive_wall_min,

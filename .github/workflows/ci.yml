@@ -33,12 +33,19 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    # Several long-horizon stability tests in physics_correctness.rs run 60s+
-    # each in debug mode (real correctness checks, not perf benchmarks -- see
-    # their own doc comments); GitHub's default job timeout was cutting the
-    # combined no-features + all-features run short. 60 min gives real headroom
-    # without masking a genuine hang (a real hang would still exceed this).
-    timeout-minutes: 60
+    # Several long-horizon stability tests in tests/accuracy.rs run up to
+    # 100,000+ MPM steps each in debug mode (real correctness checks, not
+    # perf benchmarks -- see their own doc comments) -- confirmed directly
+    # (this branch's first real CI run) to cost single-digit minutes each,
+    # not the ~60s this timeout's original estimate assumed; combined with
+    # the no-features + all-features passes this exceeded a 60 min budget.
+    # 180 min gives real headroom without masking a genuine hang (a real
+    # hang would still exceed this). A real follow-up worth doing later:
+    # audit tests/accuracy.rs for further diag_* tests whose finding is
+    # already captured in-doc and mark them #[ignore], the same way two new
+    # ones were tonight -- not done wholesale here to avoid touching tests
+    # unrelated to this change under time pressure.
+    timeout-minutes: 180
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest]

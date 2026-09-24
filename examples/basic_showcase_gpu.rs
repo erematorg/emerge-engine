@@ -4,8 +4,8 @@ use emerge::diagnostics::log_frame_gpu;
 use emerge::gpu::GpuSimulation;
 use emerge::render::{ColorMode, Renderer};
 use emerge::{
-    DruckerPragerMaterial, MaterialRegistry, NeoHookeanMaterial, NewtonianFluidMaterial, SimConfig,
-    SpawnRegion, build_particles,
+    DruckerPragerMaterial, FixedStepController, MaterialRegistry, NeoHookeanMaterial,
+    NewtonianFluidMaterial, SimConfig, SpawnRegion, build_particles,
 };
 use glam::{IVec2, Vec2};
 /// GPU three-material showcase -- sand terrain, fluid pool, elastic blob.
@@ -58,6 +58,11 @@ struct State {
     frame: u64,
     fps_timer: std::time::Instant,
     fps_frames: u64,
+    /// Real-time-decoupled stepping -- see `basic_fluids_gpu.rs`'s own field
+    /// doc for the full real bug/fix writeup.
+    stepper: FixedStepController,
+    last_instant: std::time::Instant,
+    max_steps_seen: usize,
 }
 
 fn make_sim(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) -> GpuSimulation {
@@ -92,6 +97,12 @@ fn make_sim(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) -> GpuSimulation
             box_center: Vec2::new(45.0, 9.0),
             material_id: FLUID_ID,
             precompute_initial_volumes: true,
+            // Without this, mass falls back to `config.particle_mass` (1.0),
+            // completely decoupled from the material's own rest_density=0.1
+            // -- a real, separate gap found 2026-08-08 alongside the SI fix
+            // (see basic_fluids.rs's doc). m = rho0*spacing^2, same
+            // derivation used everywhere else.
+            mass_override: Some(0.1 * SPACING * SPACING),
             ..SpawnRegion::for_sim(&config)
         },
     ));
@@ -110,7 +121,15 @@ fn make_sim(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) -> GpuSimulation
     let sand = DruckerPragerMaterial::new(400.0, 200.0);
     // Real water: Cole 1948 Tait exponent (7.0) + real dynamic viscosity, not a
     // hand-picked 0.1/4.0 pair -- see NewtonianFluidMaterial::low_viscosity.
-    let fluid = NewtonianFluidMaterial::low_viscosity(4.0, 10.0);
+    // rest_density=0.1, NOT the old 4.0 -- real SI fix, 2026-08-08, see
+    // basic_fluids.rs's own doc for the full derivation.
+    // eos_stiffness=0.25, NOT 10 -- rest_density shrinking 40x makes
+    // `timestep_bound`'s c2 (sound-speed-squared) 40x larger at the old
+    // stiffness for the same compression; confirmed by a real crash in
+    // basic_fluids.rs's CPU twin. Rescaling stiffness by the same factor
+    // (10*0.1/4.0=0.25) restores the original, already-stable c2 -- see
+    // basic_fluids.rs's own doc for the full derivation.
+    let fluid = NewtonianFluidMaterial::low_viscosity(0.1, 0.25);
     let mut reg = MaterialRegistry::with_default(Box::new(elastic));
     reg.insert(SAND_ID, Box::new(sand));
     reg.insert(FLUID_ID, Box::new(fluid));
@@ -183,6 +202,9 @@ impl State {
             frame: 0,
             fps_timer: std::time::Instant::now(),
             fps_frames: 0,
+            stepper: FixedStepController::standard(DT, 60.0),
+            last_instant: std::time::Instant::now(),
+            max_steps_seen: 0,
         }
     }
 
@@ -242,26 +264,37 @@ impl State {
             Err(_) => return,
         };
 
-        self.sim.step_frame();
-        self.frame += 1;
+        let now = std::time::Instant::now();
+        let frame_delta = (now - self.last_instant).as_secs_f32();
+        self.last_instant = now;
+        let steps = self.stepper.steps_for_frame(frame_delta);
+        self.max_steps_seen = self.max_steps_seen.max(steps);
+        for _ in 0..steps {
+            self.sim.step_frame();
+            self.frame += 1;
+            if self.frame.is_multiple_of(60) {
+                log_frame_gpu(self.frame, DT, self.sim.particles(), LABELS, 1);
+                let snap = self.sim.diagnostics_snapshot();
+                println!(
+                    "  non_finite={}  out_of_bounds={}  max_speed={:.3}  sub={}  cfl={:.4}",
+                    snap.non_finite_particle_values,
+                    snap.out_of_bounds_particles,
+                    snap.max_particle_speed,
+                    snap.substeps_last_step,
+                    snap.cfl_number,
+                );
+            }
+        }
         self.fps_frames += 1;
         if self.fps_timer.elapsed().as_secs_f32() >= 2.0 {
             let fps = self.fps_frames as f32 / self.fps_timer.elapsed().as_secs_f32();
-            println!("frame={} fps={:.0}", self.frame, fps);
+            println!(
+                "frame={} fps={:.0} max_steps_per_render={}",
+                self.frame, fps, self.max_steps_seen
+            );
             self.fps_timer = std::time::Instant::now();
             self.fps_frames = 0;
-        }
-        if self.frame.is_multiple_of(60) {
-            log_frame_gpu(self.frame, DT, self.sim.particles(), LABELS, 1);
-            let snap = self.sim.diagnostics_snapshot();
-            println!(
-                "  non_finite={}  out_of_bounds={}  max_speed={:.3}  sub={}  cfl={:.4}",
-                snap.non_finite_particle_values,
-                snap.out_of_bounds_particles,
-                snap.max_particle_speed,
-                snap.substeps_last_step,
-                snap.cfl_number,
-            );
+            self.max_steps_seen = 0;
         }
         let view = output
             .texture
@@ -327,6 +360,8 @@ impl ApplicationHandler for App {
                     KeyCode::KeyR if pressed => {
                         s.sim = make_sim(s.device.clone(), s.queue.clone());
                         s.frame = 0;
+                        s.stepper.reset();
+                        s.last_instant = std::time::Instant::now();
                         println!("reset");
                     }
                     KeyCode::ArrowUp => s.arrow_up = pressed,

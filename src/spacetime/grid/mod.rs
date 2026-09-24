@@ -15,8 +15,10 @@ pub mod kernel;
 
 mod contact;
 mod contact_normal;
+mod dct;
 mod directional_grip;
 mod mixture;
+mod pressure;
 
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hasher};
@@ -83,7 +85,7 @@ pub type VelocitySnapshot = HashMap<u32, Vec2, FxU32BuildHasher>;
 /// Converts a cell position to the flat HashMap key, or `None` if out of domain bounds.
 /// Shared by `Grid::add_mass_momentum` and the parallel P2G scatter in `transfer.rs` — both
 /// must agree on bounds-checking and indexing, so this is the single source of truth.
-pub(crate) fn flat_index(cell_pos: IVec2, resolution: usize) -> Option<u32> {
+pub(crate) const fn flat_index(cell_pos: IVec2, resolution: usize) -> Option<u32> {
     if cell_pos.x < 0 || cell_pos.y < 0 {
         return None;
     }
@@ -149,14 +151,25 @@ impl Grid {
         }
     }
 
-    pub fn resolution(&self) -> usize {
+    pub const fn resolution(&self) -> usize {
         self.resolution
+    }
+
+    /// Flat index -> cell position. Inverse of `flat_index`. Shared by
+    /// `mixture::pressure` and `pressure` (single-phase fluid projection) --
+    /// both run the identical dirty-cell-iteration Jacobi-Poisson pattern.
+    pub(crate) const fn idx_to_pos(&self, idx: u32) -> IVec2 {
+        let idx = idx as usize;
+        IVec2::new(
+            (idx / self.resolution) as i32,
+            (idx % self.resolution) as i32,
+        )
     }
 
     /// True if any grip particle touched the grid this substep. Gates the extra
     /// contact-aware work in P2G/G2P/step — when false (every scene that never sets
     /// `Particle::contact_group`), those paths run their original, unmodified logic.
-    pub fn has_contact_activity(&self) -> bool {
+    pub const fn has_contact_activity(&self) -> bool {
         !self.contact_dirty.is_empty()
     }
 
@@ -190,7 +203,7 @@ impl Grid {
     /// True if any mixture-phase particle touched the grid this substep. Gates
     /// the extra mixture-aware work in P2G/G2P/step — same convention as
     /// `has_contact_activity`.
-    pub fn has_mixture_activity(&self) -> bool {
+    pub const fn has_mixture_activity(&self) -> bool {
         !self.mixture_dirty.is_empty()
     }
 
@@ -200,6 +213,29 @@ impl Grid {
             return;
         };
         self.accumulate(idx, mass, momentum);
+    }
+
+    /// Merges a thread-local `CellMap` (built by parallel P2G's rayon
+    /// fold/reduce, see `transfer::p2g::scatter_particles_to_grid`) into this
+    /// grid's own cell storage. Reuses `accumulate` so dirty-tracking stays
+    /// correct, exactly as if every entry had gone through `add_mass_momentum`
+    /// one at a time -- just batched into a single serial merge pass after the
+    /// parallel scatter completes. `pub(crate)` since only `transfer.rs` (same
+    /// crate) needs it.
+    ///
+    /// A dense `Vec<Cell>` replacement was tried here twice (2026-08-07, see
+    /// `transfer::p2g::scatter_particles_to_grid`'s own doc for the full
+    /// writeup) -- measured worse both times (once catastrophically, once
+    /// merely worse after fixing the first attempt's chunking problem).
+    /// `CellMap`'s lazy growth (only ever allocates what a given fold chunk
+    /// actually touches, a small fraction of `resolution^2` per chunk) beats
+    /// a dense buffer's fixed full-grid allocation regardless of chunk
+    /// count. Don't re-try a dense accumulator here without re-measuring the
+    /// INTEGRATED cost on the real scene, not an isolated microbenchmark.
+    pub(crate) fn merge_cells(&mut self, local: CellMap) {
+        for (idx, cell) in local {
+            self.accumulate(idx, cell.mass, cell.momentum);
+        }
     }
 
     /// Accumulate by pre-computed flat index (already bounds-checked by the caller).
@@ -232,6 +268,83 @@ impl Grid {
         self.cells
             .get(&((x * self.resolution + y) as u32))
             .map_or(Vec2::ZERO, |c| c.momentum)
+    }
+
+    /// Same as `velocity_at`, but an untouched (never-scattered-to) cell falls back to
+    /// `gravity * dt` (boundary-clamped) instead of a hard zero.
+    ///
+    /// Real, CPU/GPU parity fix (2026-08-08): a G2P kernel stencil can span BOTH touched
+    /// (real particle mass, real momentum, gravity already added by `apply_gravity`) and
+    /// untouched (`velocity_at`'s old hard-zero) cells -- e.g. a sparse free surface.
+    /// Gravity accelerates touched cells every substep but never untouched ones, so the
+    /// gathered field has a discontinuity of exactly `gravity * dt` at that boundary that
+    /// is a pure grid sampling artifact, not physics. The GPU solver already had this
+    /// right (`grid_update.wgsl`'s "empty cells: gravity for stray particles" block); this
+    /// brings CPU in line with it. Investigated as a candidate root cause for a separate,
+    /// still-open momentum-conservation bug (see `MEMORY.md`'s fluid-recovery notes) --
+    /// confirmed via an instrumented counter that this path is NEVER hit in that bug's own
+    /// repro (a dense, packed water column has no cell that's genuinely untouched within
+    /// any particle's stencil before impact), so it is NOT that bug's cause. Kept anyway:
+    /// real, correct, and will matter for any genuinely sparse fluid scene.
+    /// `extrapolated_v`: the velocity to use at an EMPTY node -- pass the
+    /// gathering particle's own current velocity. See the free-surface
+    /// extrapolation note below for why this, and not zero, is correct.
+    ///
+    /// Free-surface velocity extrapolation (2026-08-13). The `gravity * dt`
+    /// fallback this replaced supplied only ONE substep of gravity to an empty
+    /// node, ignoring the fluid's accumulated velocity entirely -- measured, it
+    /// was ~99.5% wrong (`gravity*dt = 0.0056` against a fluid genuinely moving
+    /// at 0.3-2.0). A particle at a free surface therefore gathered a huge
+    /// artificial jump across its own stencil, reading as stretching: positive
+    /// `div(v)`, so `J` grew every substep and never self-corrected.
+    ///
+    /// Decisive evidence this is a pure artifact, not physics: during FREE FALL
+    /// gravity accelerates every particle identically, so a falling column
+    /// cannot stretch and `div(v)` must be exactly 0. Live-measured on
+    /// `basic_fluids_gpu.rs`, `J` instead climbed monotonically 1.000 -> 1.005
+    /// -> 1.022 -> 1.052 -> 1.093 -> 1.140 -> 1.185 -> ... -> pinned at the 2.0
+    /// clamp, all BEFORE any impact.
+    ///
+    /// Constant (zeroth-order) extrapolation of the fluid velocity into empty
+    /// nodes is the standard treatment -- Bridson, "Fluid Simulation for
+    /// Computer Graphics", ch. 5 (extrapolate velocity from fluid into air
+    /// before advection/gather), universal in FLIP/PIC solvers. `+ gravity*dt`
+    /// keeps it consistent with touched cells, which `apply_gravity` has
+    /// already accelerated by exactly that. For a particle in free fall the
+    /// stencil is then uniform, `div(v) = 0` exactly, and `J` stays 1 -- which
+    /// is the correct answer.
+    ///
+    /// It also encodes the right free-surface boundary condition: zero traction
+    /// (no stress from the empty side), rather than the implicit "the air is a
+    /// wall at rest" that a zero/near-zero fallback asserts.
+    pub fn velocity_at_or_extrapolated(
+        &self,
+        cell_pos: IVec2,
+        extrapolated_v: Vec2,
+        gravity: Vec2,
+        dt: f32,
+        boundary_thickness: usize,
+    ) -> Vec2 {
+        if cell_pos.x < 0 || cell_pos.y < 0 {
+            return Vec2::ZERO;
+        }
+        let x = cell_pos.x as usize;
+        let y = cell_pos.y as usize;
+        if x >= self.resolution || y >= self.resolution {
+            return Vec2::ZERO;
+        }
+        let idx = (x * self.resolution + y) as u32;
+        if let Some(cell) = self.cells.get(&idx) {
+            return cell.momentum;
+        }
+        let mut v = extrapolated_v + gravity * dt;
+        crate::forces::boundary::apply_slip_wall_velocity(
+            boundary_thickness,
+            idx as usize,
+            self.resolution,
+            &mut v,
+        );
+        v
     }
 
     pub fn mass_at(&self, cell_pos: IVec2) -> f32 {
@@ -332,11 +445,20 @@ impl Grid {
                 let before = pre_force.get(&idx).copied().unwrap_or(Vec2::ZERO);
                 let after = cell.momentum;
                 let dv = after - before;
+                // Clamp the damping magnitude to at most `|after|` so the corrected
+                // component can reach zero but never cross it. Uncapped, `damp` can
+                // exceed `after`'s own magnitude whenever this substep's force
+                // transient (`dv`) is large relative to the resulting velocity --
+                // common for several substeps after a violent event even once the
+                // visible motion looks settled. Past that point the correction
+                // overshoots zero and flips sign, injecting energy instead of
+                // removing it. Standard fix for this class of non-viscous
+                // (Cundall 1982/1987) damping formulation.
                 let damp_component = |v: f32, d: f32| -> f32 {
                     if v == 0.0 {
                         0.0
                     } else {
-                        coefficient * d.abs() * v.signum()
+                        (coefficient * d.abs()).min(v.abs()) * v.signum()
                     }
                 };
                 let damp = Vec2::new(damp_component(after.x, dv.x), damp_component(after.y, dv.y));
@@ -379,7 +501,7 @@ impl Grid {
         self.dirty.iter().filter_map(move |idx| cells.get(idx))
     }
 
-    /// Iterate active cells (mutable). For CFL clamping.
+    /// Iterate active cells mutably.
     pub fn active_cells_mut(&mut self) -> impl Iterator<Item = &mut Cell> {
         let (dirty, cells) = (&self.dirty, &mut self.cells);
         // SAFETY: dirty contains unique indices (enforced at insertion), each yielding
@@ -404,7 +526,7 @@ impl Grid {
     }
 
     /// Number of cells that received mass this frame.
-    pub fn active_cell_count(&self) -> usize {
+    pub const fn active_cell_count(&self) -> usize {
         self.dirty.len()
     }
 }

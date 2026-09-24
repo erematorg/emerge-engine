@@ -57,7 +57,7 @@ impl LinearDragField {
     /// Sentinel mask affecting every material — matches `GpuFieldEntry::ALL_MATERIALS`.
     pub const ALL_MATERIALS: u32 = 0xFFFF_FFFF;
 
-    pub fn new(target_velocity: Vec2, drag_coefficient: f32, material_mask: u32) -> Self {
+    pub const fn new(target_velocity: Vec2, drag_coefficient: f32, material_mask: u32) -> Self {
         Self {
             target_velocity,
             drag_coefficient,

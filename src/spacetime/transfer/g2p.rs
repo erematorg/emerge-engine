@@ -5,11 +5,99 @@ use crate::boundary::BoundaryCondition;
 use crate::grid::Grid;
 use crate::grid::kernel::quadratic_weights;
 use crate::materials::registry::MaterialRegistry;
-use crate::particle::Particles;
+use crate::particle::{ParticleUpdateCtx, Particles};
 use crate::solver::config::KERNEL_D_INVERSE;
 
+/// Raw pointers to every mutable field `gather_grid_to_particles`' merged
+/// parallel pass needs, taken once before the loop -- see that function's own
+/// SAFETY comment for why indexing these concurrently is sound.
+struct MutFieldPtrs {
+    x: *mut Vec2,
+    v: *mut Vec2,
+    velocity_gradient: *mut Mat2,
+    deformation_gradient: *mut Mat2,
+    volume: *mut f32,
+    density: *mut f32,
+    hardening_scale: *mut f32,
+    plastic_volume_ratio: *mut f32,
+    log_volume_strain: *mut f32,
+    friction_hardening: *mut f32,
+    /// Kahan compensation residual for `x`'s position integration -- see
+    /// `Particles::position_compensation`'s own doc. Deliberately NOT part
+    /// of `ParticleUpdateCtx` (that struct is public API for external
+    /// `MaterialModel`/`BoundaryCondition` implementors; this is a pure
+    /// internal scratch value with no meaning outside this function), so
+    /// it gets its own accessor method below instead.
+    position_compensation: *mut Vec2,
+}
+// SAFETY: raw pointers aren't Send/Sync by default, but this type is only ever
+// used to derive disjoint per-index references (see the SAFETY comment where
+// it's constructed) -- sharing the pointers themselves across threads is safe,
+// only concurrent access to the SAME index would not be, and that never happens.
+unsafe impl Send for MutFieldPtrs {}
+unsafe impl Sync for MutFieldPtrs {}
+
+impl MutFieldPtrs {
+    /// Builds the real `ParticleUpdateCtx` directly, for one index -- a method
+    /// (not direct field access) on purpose: Rust 2021's disjoint closure
+    /// captures would otherwise capture individual `*mut T` fields directly
+    /// (never `Sync`, even though the `MutFieldPtrs` wrapper is), silently
+    /// bypassing the `unsafe impl Sync` above. Routing through a method call
+    /// forces the closure to capture `MutFieldPtrs` as a whole instead.
+    ///
+    /// SAFETY: caller must ensure `i` is unique across every concurrent call
+    /// (see the SAFETY comment where `MutFieldPtrs` is constructed).
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn ctx_at(
+        &self,
+        i: usize,
+        mass: f32,
+        temperature: f32,
+        initial_volume: f32,
+        activation: f32,
+        activation_dir: Vec2,
+        nonlocal_fluidity: f32,
+        cosserat_curvature: Vec2,
+    ) -> ParticleUpdateCtx<'_> {
+        unsafe {
+            ParticleUpdateCtx {
+                x: &mut *self.x.add(i),
+                v: &mut *self.v.add(i),
+                velocity_gradient: &mut *self.velocity_gradient.add(i),
+                deformation_gradient: &mut *self.deformation_gradient.add(i),
+                volume: &mut *self.volume.add(i),
+                density: &mut *self.density.add(i),
+                hardening_scale: &mut *self.hardening_scale.add(i),
+                plastic_volume_ratio: &mut *self.plastic_volume_ratio.add(i),
+                log_volume_strain: &mut *self.log_volume_strain.add(i),
+                friction_hardening: &mut *self.friction_hardening.add(i),
+                mass,
+                temperature,
+                initial_volume,
+                activation,
+                activation_dir,
+                nonlocal_fluidity,
+                cosserat_curvature,
+            }
+        }
+    }
+
+    /// SAFETY: same contract as `ctx_at` -- caller must ensure `i` is unique
+    /// across every concurrent call. A real, separate method (not direct
+    /// field access) for the same reason `ctx_at` is: routing through a
+    /// method call forces the closure to capture `MutFieldPtrs` as a whole,
+    /// not the individual (non-`Sync`) raw pointer field.
+    ///
+    /// Clippy's `mut_from_ref` heuristic can't see the disjoint-index proof
+    /// above (same as `ctx_at`'s identical pattern); the `&self` receiver is
+    /// required so callers keep capturing `MutFieldPtrs` as a whole.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn position_compensation_at(&self, i: usize) -> &mut Vec2 {
+        unsafe { &mut *self.position_compensation.add(i) }
+    }
+}
+
 pub struct G2PParams<'a> {
-    pub vel_limit: f32,
     pub apic_blend: f32,
     pub active_count: usize,
     /// ASFLIP blend factor (`SimConfig::asflip_blend`, Fei et al. 2021). 0.0 = disabled,
@@ -20,6 +108,22 @@ pub struct G2PParams<'a> {
     /// correction below only runs when `Some`, so a caller that never opts in (passes `None`)
     /// gets the byte-identical original code path regardless of what `asflip_blend` holds.
     pub pre_force_snapshot: Option<&'a crate::grid::VelocitySnapshot>,
+    /// Gathered granular fluidity `g`, one entry per active particle, from a
+    /// coupled `GranularFluidityField` computed at the END of the PREVIOUS
+    /// substep (see `Simulation::step`'s own ordering comment for why this
+    /// one-substep lag matches the already-established thermal/scalar-field
+    /// convention, not a shortcut specific to this feature). Empty (`&[]`)
+    /// when no such field is configured for this scene -- every read below
+    /// falls back to `0.0` in that case, matching `ParticleUpdateCtx::
+    /// nonlocal_fluidity`'s own real-rest-state default.
+    pub nonlocal_fluidity: &'a [f32],
+    /// Gathered Cosserat micro-curvature, one entry per active particle,
+    /// from a coupled `CosseratField` computed at the END of the PREVIOUS
+    /// substep -- same one-substep-lag convention as `nonlocal_fluidity`
+    /// above. Empty (`&[]`) when no such field is configured for this scene
+    /// -- every read below falls back to `Vec2::ZERO`, matching
+    /// `ParticleUpdateCtx::cosserat_curvature`'s own real-rest-state default.
+    pub cosserat_curvature: &'a [Vec2],
 }
 
 /// Analytic adjoint of G2P's velocity gather (`new_v = sum_c weight_c *
@@ -38,9 +142,9 @@ pub struct G2PParams<'a> {
 /// computes alongside it (`b = sum_c weight_c * outer(v_grid_c, dist_c)`) --
 /// a related, still-open piece: same per-cell structure, needs its own
 /// derivation and verification, not silently folded in here. Also doesn't
-/// cover the velocity clamp or position boundary-clamp applied after this in
-/// the real G2P (piecewise/conditional, same deferred-with-a-name status as
-/// grid update's boundary/clamp gap).
+/// cover the position boundary condition applied after this in the real
+/// G2P (piecewise/conditional, same deferred-with-a-name status as the
+/// grid-update boundary gap).
 ///
 /// Given the gradient flowing back from the particle's new velocity,
 /// `d_loss_d_new_v` (a Vec2), the adjoint of a weighted sum distributes it
@@ -147,35 +251,72 @@ pub fn f_update_vjp(c: Mat2, f_old: Mat2, dt: f32, d_loss_d_f_new: Mat2) -> (Mat
 }
 
 /// G2P: read grid velocities back into particles, advance state, apply boundaries.
-/// Returns the number of particles whose velocity was clamped to `vel_limit`.
+///
+/// The return value is retained for source compatibility with the old
+/// `last_vel_clamp_count` diagnostic. The solver no longer clips velocities,
+/// so it is always zero.
+#[allow(clippy::too_many_arguments)]
 pub fn gather_grid_to_particles(
     particles: &mut Particles,
     grid: &Grid,
     dt: f32,
+    gravity: Vec2,
+    boundary_thickness: usize,
     boundaries: &[Box<dyn BoundaryCondition>],
     materials: &MaterialRegistry,
     params: G2PParams,
 ) -> usize {
     let G2PParams {
-        vel_limit,
         apic_blend,
         active_count,
         asflip_blend,
         pre_force_snapshot,
+        nonlocal_fluidity,
+        cosserat_curvature,
     } = params;
     let grid_res = grid.resolution();
 
-    // Phase 1 (parallel): grid gather -> v, velocity_gradient, position advance + boundary
-    // position clamp. Pure math over read-only grid/boundary state, writing only the calling
-    // particle's own x/v/velocity_gradient — no cross-particle data dependency, so disjoint
-    // per-field slices can be processed concurrently (gather passes are race-free by
-    // construction; see Gao et al. 2018, "GPU Optimization of Material Point Methods").
-    let xs = &mut particles.x[..active_count];
-    let vs = &mut particles.v[..active_count];
-    let vgs = &mut particles.velocity_gradient[..active_count];
+    // Single parallel pass: grid gather -> v/velocity_gradient/position advance
+    // -> plasticity update -> boundary post-hooks, one particle at a time, in
+    // parallel across particles. Used to be two phases (a parallel gather, then
+    // a forced-sequential plasticity/boundary pass, because `MaterialModel::
+    // update_particle`/`BoundaryCondition::post_g2p_particle` used to need
+    // `&mut Particles` -- the WHOLE struct -- per call). Now both take a
+    // `ParticleUpdateCtx` (disjoint per-field borrows of just this particle's
+    // own state), so the whole thing runs as one parallel loop -- real, measured
+    // win: the plasticity/SVD update is the single most expensive per-particle
+    // math in the solver, and it was serial before this.
+    //
+    // Read-only fields: ordinary indexed slices, safe (shared refs, no unsafe).
     let contact_groups = &particles.contact_group[..active_count];
     let pinned_flags = &particles.pinned[..active_count];
     let material_ids = &particles.material_id[..active_count];
+    let masses = &particles.mass[..active_count];
+    let temperatures = &particles.temperature[..active_count];
+    let initial_volumes = &particles.initial_volume[..active_count];
+    let activations = &particles.activation[..active_count];
+    let activation_dirs = &particles.activation_dir[..active_count];
+    // Mutable fields: raw pointers taken once, before the parallel loop --
+    // avoids an 18-way nested `.zip()` (unreadable, error-prone to extend).
+    // SAFETY: `(0..active_count).into_par_iter()` is an IndexedParallelIterator
+    // -- every index in range is visited by exactly one task, so every pointer
+    // offset below is to a genuinely distinct particle's own memory. Same
+    // "unique indices never alias" argument `Grid::active_cells_mut` already
+    // uses for the identical problem (many disjoint mutable borrows driven by
+    // a known-unique index set).
+    let ptrs = MutFieldPtrs {
+        x: particles.x.as_mut_ptr(),
+        v: particles.v.as_mut_ptr(),
+        velocity_gradient: particles.velocity_gradient.as_mut_ptr(),
+        deformation_gradient: particles.deformation_gradient.as_mut_ptr(),
+        volume: particles.volume.as_mut_ptr(),
+        density: particles.density.as_mut_ptr(),
+        hardening_scale: particles.hardening_scale.as_mut_ptr(),
+        plastic_volume_ratio: particles.plastic_volume_ratio.as_mut_ptr(),
+        log_volume_strain: particles.log_volume_strain.as_mut_ptr(),
+        friction_hardening: particles.friction_hardening.as_mut_ptr(),
+        position_compensation: particles.position_compensation.as_mut_ptr(),
+    };
     // Gate once, not per particle: when no grip particle ever touched the grid this
     // substep (every scene that doesn't use `Particle::contact_group`), this is false
     // and the loop below takes the exact same path it always has — a plain
@@ -186,22 +327,63 @@ pub fn gather_grid_to_particles(
     // wraps a material this way, same zero-cost property as contact above.
     let mixture_active = grid.has_mixture_activity();
 
-    let clamp_count: usize = xs
-        .par_iter_mut()
-        .zip(vs.par_iter_mut())
-        .zip(vgs.par_iter_mut())
-        .zip(contact_groups.par_iter())
-        .zip(pinned_flags.par_iter())
-        .zip(material_ids.par_iter())
-        .map(
-            |(((((x, v), vg), &contact_group), &pinned), &material_id)| {
-                let mixture_phase = if mixture_active {
-                    materials.get(material_id).mixture_phase()
-                } else {
-                    None
-                };
-                let v_old = *v;
-                let weights = quadratic_weights(*x);
+    // Same real, measured lesson as P2G tonight (see
+    // `transfer::p2g::scatter_particles_to_grid`'s own doc): rayon's default
+    // chunking splits far more, far smaller tasks than a naive
+    // one-per-core assumption. This loop has no per-chunk accumulator to
+    // allocate (direct unique-pointer writes, not a fold/reduce), so the
+    // failure mode that broke P2G's dense-buffer attempt doesn't apply --
+    // but fewer/larger chunks still cuts rayon's own task-scheduling
+    // overhead. Measure before trusting, same discipline as every change
+    // tonight.
+    let min_len = (active_count / (rayon::current_num_threads() * 2)).max(1);
+    let clamp_count: usize = (0..active_count)
+        .into_par_iter()
+        .with_min_len(min_len)
+        .map(|i| {
+            let contact_group = contact_groups[i];
+            let pinned = pinned_flags[i];
+            let material_id = material_ids[i];
+            let material = materials.get(material_id);
+            // SAFETY: see the SAFETY comment on `ptrs` above -- index `i` is
+            // unique to this task for the whole closure body below.
+            let mut ctx = unsafe {
+                ptrs.ctx_at(
+                    i,
+                    masses[i],
+                    temperatures[i],
+                    initial_volumes[i],
+                    activations[i],
+                    activation_dirs[i],
+                    nonlocal_fluidity.get(i).copied().unwrap_or(0.0),
+                    cosserat_curvature.get(i).copied().unwrap_or(Vec2::ZERO),
+                )
+            };
+            // SAFETY: same contract as `ctx` above -- index `i` is unique to
+            // this task.
+            let pos_compensation = unsafe { ptrs.position_compensation_at(i) };
+            let mixture_phase = if mixture_active {
+                material.mixture_phase()
+            } else {
+                None
+            };
+
+            if pinned != 0 {
+                // Dirichlet/kinematic anchor (`Particle::pinned`): force v=0 and
+                // velocity_gradient=0 instead of gathering from the grid, so a
+                // pinned particle never moves and never accumulates local strain
+                // from being dragged — while its own mass/stress still scattered
+                // into P2G normally, so it acts as a real, immovable anchor other
+                // bodies push against (the standard technique for static/bedrock
+                // geometry in deformable-body sims). Position is deliberately left
+                // completely untouched, not just re-clamped to itself, avoiding any
+                // float drift from a v=0*dt add-then-reclamp round trip. Plastic/
+                // stress state (below) still updates normally either way.
+                *ctx.v = Vec2::ZERO;
+                *ctx.velocity_gradient = Mat2::ZERO;
+            } else {
+                let v_old = *ctx.v;
+                let weights = quadratic_weights(*ctx.x);
                 let mut new_v = Vec2::ZERO;
                 let mut b = Mat2::ZERO;
 
@@ -209,7 +391,7 @@ pub fn gather_grid_to_particles(
                     for gy in 0..3 {
                         let weight = weights.wx[gx] * weights.wy[gy];
                         let cell_pos = weights.base_cell + IVec2::new(gx as i32 - 1, gy as i32 - 1);
-                        let dist = cell_pos.as_vec2() - *x + Vec2::splat(0.5);
+                        let dist = cell_pos.as_vec2() - *ctx.x + Vec2::splat(0.5);
                         // Multi-field contact routing (Bardenhagen 2001): a grip particle
                         // reads the resolved grip field, a non-grip particle reads the
                         // resolved rest field, at nodes where contact was ever registered
@@ -223,18 +405,24 @@ pub fn gather_grid_to_particles(
                                 grid.rest_velocity_at(cell_pos)
                             }
                         } else if let Some(phase) = mixture_phase {
-                            // Two-phase mixture coupling routing (Tampubolon et al. 2017):
-                            // a solid-phase particle reads the resolved solid field, a
-                            // fluid-phase particle reads the resolved fluid field — both
-                            // fall back to the ordinary total velocity where no coupling
-                            // was registered at that node, same convention as contact.
-                            use crate::materials::MixturePhase;
-                            match phase {
-                                MixturePhase::Solid => grid.resolved_solid_velocity_at(cell_pos),
-                                MixturePhase::Fluid => grid.resolved_fluid_velocity_at(cell_pos),
-                            }
+                            // N-phase mixture coupling routing (generalizes Tampubolon et
+                            // al. 2017): a phase-`p` particle reads that phase's own
+                            // resolved velocity field, falling back to the ordinary total
+                            // velocity where no coupling was registered at that node, same
+                            // convention as contact.
+                            grid.resolved_velocity_at(cell_pos, phase)
                         } else {
-                            grid.velocity_at(cell_pos)
+                            // Free-surface velocity extrapolation: empty nodes
+                            // take THIS particle's own velocity, not ~zero --
+                            // see `velocity_at_or_extrapolated`'s own doc for
+                            // the measurement and the citation.
+                            grid.velocity_at_or_extrapolated(
+                                cell_pos,
+                                *ctx.v,
+                                gravity,
+                                dt,
+                                boundary_thickness,
+                            )
                         };
                         let weighted_velocity = node_v * weight;
                         let term =
@@ -242,22 +430,6 @@ pub fn gather_grid_to_particles(
                         b += term;
                         new_v += weighted_velocity;
                     }
-                }
-
-                // Dirichlet/kinematic anchor (`Particle::pinned`): force v=0 and
-                // velocity_gradient=0 instead of gathering from the grid, so a pinned
-                // particle never moves and never accumulates local strain from being
-                // dragged — while its own mass/stress still scattered into P2G normally,
-                // so it acts as a real, immovable anchor other bodies push against (the
-                // standard technique for static/bedrock geometry in deformable-body sims).
-                // Checked before the speed cap/position advance so a pinned particle takes
-                // neither — position is deliberately left completely untouched, not just
-                // re-clamped to itself, avoiding any float drift from a v=0*dt add-then-
-                // reclamp round trip.
-                if pinned != 0 {
-                    *v = Vec2::ZERO;
-                    *vg = Mat2::ZERO;
-                    return 0;
                 }
 
                 // ASFLIP (Fei, Guo, Wu, Huang, Gao 2021, "Revisiting Integration in the
@@ -295,49 +467,46 @@ pub fn gather_grid_to_particles(
                     v_position = new_v + gamma * asflip_blend * diff_vel;
                 }
 
-                // Hard speed cap — CFL in choose_substep_dt is the physics-grounded bound.
-                // This fires only when CFL is violated despite the timestep limiter (e.g. first
-                // substep of a high-energy spawn). Magnitude clamp preserves direction; no
-                // anisotropic bias unlike per-component clamping. Clamps both `v_store` and
-                // `v_position` by the SAME safety ratio (derived from the stored velocity's own
-                // magnitude) so they stay mutually consistent -- when ASFLIP is disabled the two
-                // are identical (`v_store == v_position == new_v`), so this is byte-identical to
-                // the original single-velocity clamp.
-                let spd = v_store.length();
-                let clamped = if spd > vel_limit {
-                    let scale = vel_limit / spd;
-                    v_store *= scale;
-                    v_position *= scale;
-                    1
-                } else {
-                    0
-                };
-
-                // Apply all boundaries' position clamp (pure function, no particle-struct access).
-                let mut new_pos = *x + v_position * dt;
+                // Kahan (compensated) summation (Kahan 1965) -- same real
+                // technique, same citation, `rod::coupling::gather_grid_to_rod`
+                // already uses for rods (see `Particles::position_compensation`'s
+                // own doc for the full derivation): a real, sustained velocity's
+                // own `v*dt` increment can fall below f32's representable
+                // precision at the particle's own grid-coordinate magnitude,
+                // silently rounding away to nothing every substep even though
+                // the underlying motion is real. Tracks the rounding error each
+                // addition drops and folds it back in next time. The boundary
+                // clamp below is a separate, unrelated, already-existing
+                // mechanism -- Kahan compensation only concerns the raw
+                // addition itself, not what a boundary does to the result
+                // afterward.
+                let y = v_position * dt - *pos_compensation;
+                let t = *ctx.x + y;
+                *pos_compensation = (t - *ctx.x) - y;
+                let mut new_pos = t;
                 for boundary in boundaries.iter() {
                     new_pos = boundary.clamp_particle_position(new_pos, grid_res);
                 }
 
-                *v = v_store;
-                *vg = b * KERNEL_D_INVERSE * apic_blend;
-                *x = new_pos;
-                clamped
-            },
-        )
-        .sum();
+                *ctx.v = v_store;
+                *ctx.velocity_gradient = b * KERNEL_D_INVERSE * apic_blend;
+                *ctx.x = new_pos;
+            }
 
-    // Phase 2 (sequential): plasticity update + boundary post-hooks need whole-`Particles`
-    // mutable access (deformation_gradient, hardening_scale, etc. per material) — not
-    // split-borrow-friendly without a larger `MaterialModel` trait redesign, so kept sequential.
-    for i in 0..active_count {
-        let material_id = particles.material_id[i];
-        let material = materials.get(material_id);
-        material.update_particle(particles, i, dt);
-        for boundary in boundaries.iter() {
-            boundary.post_g2p_particle(particles, i, grid_res, dt);
-        }
-    }
+            // Plasticity update + boundary post-hooks, now inline in the same
+            // parallel task (used to be a forced-sequential second pass -- see
+            // this function's own top doc). Runs unconditionally, even for a
+            // pinned particle above: its kinematic x/v/velocity_gradient are
+            // frozen, but its stress/plastic state must keep evolving normally
+            // (matches the pinned branch's own "acts as a real anchor" comment).
+            materials.update_particle(material_id, &mut ctx, dt);
+            for boundary in boundaries.iter() {
+                boundary.post_g2p_particle(&mut ctx, grid_res, dt);
+            }
+
+            0
+        })
+        .sum();
 
     clamp_count
 }

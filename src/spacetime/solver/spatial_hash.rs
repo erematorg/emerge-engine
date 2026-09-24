@@ -58,7 +58,7 @@ impl SpatialHash {
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn cell_of(&self, p: Vec2) -> (i32, i32) {
         (
             (p.x * self.inv_cell).floor() as i32,

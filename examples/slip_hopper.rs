@@ -119,7 +119,7 @@ impl SlipLeg {
 }
 
 impl Field for SlipLeg {
-    fn prepare(&mut self, particles: &Particles) {
+    fn prepare(&mut self, particles: &Particles, _dt: f32) {
         self.just_transitioned = false;
         let (pos, vel) = Self::body_centroid(particles);
         let angle = TOUCHDOWN_ANGLE_DEG.to_radians();
@@ -223,8 +223,8 @@ fn make_sim() -> (
     // Field itself must be Send+Sync to box into the solver.
     struct SharedSlipLeg(Arc<std::sync::Mutex<SlipLeg>>);
     impl Field for SharedSlipLeg {
-        fn prepare(&mut self, particles: &Particles) {
-            self.0.lock().unwrap().prepare(particles);
+        fn prepare(&mut self, particles: &Particles, dt: f32) {
+            self.0.lock().unwrap().prepare(particles, dt);
         }
         fn acceleration(&self, particles: &Particles, i: usize) -> Vec2 {
             self.0.lock().unwrap().acceleration(particles, i)

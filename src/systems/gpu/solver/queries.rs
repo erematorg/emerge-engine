@@ -131,12 +131,16 @@ impl GpuSimulation {
     }
 
     /// Aggregate state for all particles of the given material.
-    pub fn material_state(&self, material_id: u32) -> crate::solver::query::BodyState {
-        crate::solver::query::body_state_of_slice(&self.particles, material_id)
+    pub fn material_state(&self, material_id: u32) -> crate::solver::body_state::BodyState {
+        crate::solver::body_state::body_state_of_slice(&self.particles, material_id)
     }
 
     /// Aggregate state for all particles within `radius` grid-cells of `center`.
-    pub fn region_state(&self, center: glam::Vec2, radius: f32) -> crate::solver::query::BodyState {
-        crate::solver::query::region_body_state_of_slice(&self.particles, center, radius)
+    pub fn region_state(
+        &self,
+        center: glam::Vec2,
+        radius: f32,
+    ) -> crate::solver::body_state::BodyState {
+        crate::solver::body_state::region_body_state_of_slice(&self.particles, center, radius)
     }
 }

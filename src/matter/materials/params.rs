@@ -3,8 +3,11 @@
 /// Layout is a union — only the fields relevant to the constitutive model are filled;
 /// all others are zero. `model` is the `ConstitutiveModel` discriminant and is always set.
 ///
-/// 96 bytes, 16-byte aligned — directly uploadable to a GPU uniform buffer as
-/// `array<MaterialParams, N>` indexed by `particle.material_id`.
+/// 112 bytes, 16-byte aligned — directly uploadable to a GPU uniform buffer as
+/// `array<MaterialParams, N>` indexed by `particle.material_id`. Grew from 96
+/// (2026-08-15) to add `owns_deformation_volume_state` -- see that field's own
+/// doc. `_pad` is explicit, always-zeroed real reserved space (same Pod-safety
+/// convention `Particle::_pad` already uses), not implicit struct padding.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct MaterialParams {
@@ -80,22 +83,50 @@ pub struct MaterialParams {
     /// 0.0 = no temperature dependence (default).
     pub thermal_expansion: f32,
 
-    // --- Fluid extended (GPU-synced) ---
-    /// Fluid: EOS pressure lower bound. 0.0 = no tensile (stable free surface).
-    /// Negative = allow tensile — use only for explicit surface tension simulations.
-    /// Fluid: also used as J upper bound via `volume_ratio_max` for free-surface particles.
+    // --- Granular-fluid / fluid extended (GPU-synced) ---
+    /// GranularFluid-only EOS pressure lower bound.  Strict WC-MPM liquids use
+    /// the unmodified Tait law; a free-surface cavitation model is not encoded
+    /// in this union field.
     pub pressure_floor: f32,
-    /// Fluid: bulk (second) viscosity ζ — adds ζ·(∇·v)·I to Kirchhoff stress.
-    /// Damps compression waves and acoustic ringing. 0.0 = off (Stokes assumption).
+    /// Fluid: bulk (second) viscosity ζ — adds ζ·(∇·v)·I to Cauchy stress.
+    /// 0.0 = off (Stokes assumption).
     pub bulk_viscosity: f32,
-    /// Fluid/Bingham: surface tension γ — adds γ·J·I to Kirchhoff stress.
-    /// Continuum ψ = γ·J (Ziran 2020, SurfaceTension.h). 0.0 = disabled.
-    pub surface_tension_coeff: f32,
+    /// Bingham-only regularisation cutoff for the shear rate. This shares a
+    /// union slot because curvature-based surface tension is deliberately not
+    /// implemented without an interface reconstruction.
+    pub critical_shear_rate: f32,
     /// Snow: cohesion — τ += c·Jp·(J−1)·J·I when Jp<1 and J>1.
     /// Resists elastic expansion in plastically compacted snow. Stable (no feedback loop).
     /// 0.0 = disabled (Stomakhin default). ~200–800 for wet/packed snow.
     /// Repurposed from padding; zero for all other materials.
     pub cohesion_coeff: f32,
+
+    /// Mirrors `MaterialModel::owns_deformation_volume_state()` (1 = true,
+    /// 0 = false) -- GPU/CPU parity fix, 2026-08-15. CPU's
+    /// `estimate_particle_volumes` (`src/spacetime/solver/density.rs`)
+    /// SKIPS the raw kernel-mass density/volume gather for any material
+    /// returning true from that trait method (today: `NewtonianFluidMaterial`/
+    /// `BinghamFluidMaterial`), instead deriving density/volume ANALYTICALLY
+    /// from the material's own already-clamped deformation gradient. GPU had
+    /// no equivalent gate -- `g2p.wgsl` wrote every particle's density/volume
+    /// unconditionally from the same free-surface-biased kernel gather CPU
+    /// explicitly avoids for these materials. Measured, real consequence
+    /// (`basic_fluids_gpu.rs`, 2026-08-15): water density drifting to
+    /// [0.0116, 0.358] against a rest density of 0.1 -- both bounds outside
+    /// what the analytical, J-clamp-derived formula could ever produce
+    /// (theoretical range ~[0.05, 0.2] under CPU's own `.max(min_density)
+    /// .min(2*rest_density)` clamp) -- feeding a spurious excursion into the
+    /// CFL acoustic term (∝ density^(eos_power-1)) and pinning substep count
+    /// at its cap indefinitely instead of settling. Set via
+    /// `self.owns_deformation_volume_state() as u32` in each material's own
+    /// `params()` -- a GENERIC per-material flag, not a hardcoded material-ID
+    /// check, so any future material overriding that trait method gets
+    /// correct GPU behavior automatically.
+    pub owns_deformation_volume_state: u32,
+    /// Explicit, always-zeroed reserved space -- keeps the struct's real
+    /// size at the next 16-byte-aligned boundary (112, up from 96) with
+    /// genuine headroom for future flags, same convention as `Particle::_pad`.
+    pub _pad: [u32; 3],
 }
 
-const _: () = assert!(core::mem::size_of::<MaterialParams>() == 96);
+const _: () = assert!(core::mem::size_of::<MaterialParams>() == 112);

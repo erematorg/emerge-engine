@@ -202,17 +202,12 @@ impl GpuBuffers {
     }
 
     /// Release a FAILED readback's mapping without extracting data (there's nothing
-    /// valid to read on `Err`). Real bug this closes (found 2026-07-05, see project
-    /// memory): `map_async`'s callback firing at all -- Ok OR Err -- means wgpu
-    /// considers the buffer mapped; only `finish_readback`/this function's call to
-    /// `unmap()` releases that state. The old code only ever unmapped on the Ok path,
-    /// so a single `Err` (rare on fast hardware, far more likely on a slow/software
-    /// backend where async completion timing differs) left the staging buffer
-    /// permanently mapped -- silently disabling every future readback for the rest of
-    /// the run, then panicking ("Buffer is already mapped") the next time anything
-    /// tried to map it again (reproduced locally forcing a software WARP-style
-    /// adapter; plausibly the same root cause behind emerge issue #10's
-    /// STATUS_STACK_BUFFER_OVERRUN on CI, manifesting differently per-driver).
+    /// valid to read on `Err`). `map_async`'s callback firing at all -- Ok OR Err --
+    /// means wgpu considers the buffer mapped; only `finish_readback`/this
+    /// function's call to `unmap()` releases that state. Skipping unmap on `Err`
+    /// leaves the staging buffer permanently mapped, silently disabling every
+    /// future readback for the rest of the run, then panicking ("Buffer is
+    /// already mapped") the next time anything tries to map it again.
     pub fn abandon_readback(&self) {
         self.readback_staging.unmap();
     }

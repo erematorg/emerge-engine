@@ -292,7 +292,23 @@ impl State {
         // SpawnRegion dropped at the cursor each frame while held, capped by
         // POUR_BUDGET so the (fixed-size) render buffer never overflows.
         if self.pouring && self.poured_count < POUR_BUDGET {
-            let cursor = self.cursor_grid();
+            // Real, found-live bug (2026-08-04): pouring with the cursor near
+            // the window edge maps to a grid position close enough to the
+            // domain boundary that `POUR_BOX` no longer fits inside the
+            // spawnable region -- `add_body` then hits `validate_for_sim`'s
+            // own real assert and hard-panics the whole demo instead of just
+            // declining that frame's pour. Clamp the pour center to the same
+            // real bound `fits_in_sim` checks (`boundary_thickness` margin
+            // plus half the pour box on each axis) so pouring at the edge
+            // just pours as close to the wall as actually fits, not a crash.
+            let config = self.sim.config();
+            let half = POUR_BOX.as_vec2() * 0.5;
+            let domain_min = Vec2::splat(config.boundary_thickness as f32) + half;
+            let domain_max =
+                Vec2::splat((config.grid_res - config.boundary_thickness) as f32) - half;
+            let cursor = self
+                .cursor_grid()
+                .clamp(domain_min, domain_max.max(domain_min));
             self.pour_seed += 1;
             let mat = if self.pour_dense {
                 MAT_DENSE
@@ -311,6 +327,27 @@ impl State {
                 ..SpawnRegion::for_sim(self.sim.config())
             };
             let before = self.sim.particles().len();
+            // TEMP diagnostic (2026-08-05, user-flagged pour-vs-default gap
+            // investigation) -- ground-truth the real gap in grid units via
+            // stdout instead of trusting a screenshot alone (this project has
+            // a documented PrintWindow false-positive on a similar demo).
+            // Printed BEFORE add_body so `existing_max_y` excludes this
+            // frame's own new particles.
+            if self.frame.is_multiple_of(15) {
+                let existing_max_y = self
+                    .sim
+                    .particles()
+                    .iter()
+                    .map(|p| p.x.y)
+                    .fold(f32::MIN, f32::max);
+                println!(
+                    "POUR_DIAG frame={} cursor_y={:.2} existing_pile_max_y={:.2} gap={:.2}",
+                    self.frame,
+                    cursor.y,
+                    existing_max_y,
+                    cursor.y - existing_max_y
+                );
+            }
             let _ = self.sim.add_body(spawn);
             self.poured_count += self.sim.particles().len() - before;
         }
@@ -322,6 +359,12 @@ impl State {
             self.last_fps = self.fps_frames as f32 / self.fps_timer.elapsed().as_secs_f32();
             self.fps_timer = std::time::Instant::now();
             self.fps_frames = 0;
+            println!(
+                "frame={} fps={:.1} particles={}",
+                self.frame,
+                self.last_fps,
+                self.sim.particles().len()
+            );
         }
 
         let output = match self.surface.get_current_texture() {

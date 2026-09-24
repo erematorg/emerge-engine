@@ -12,7 +12,7 @@
 //! compiling against a trait proves the interface exists; the counters prove
 //! the substep loop actually calls it.
 //!
-//! Seams covered (the extension table in ARCHITECTURE.md §7):
+//! Seams covered (see README.md's extension seams table):
 //! - `MaterialModel`      (custom constitutive response)
 //! - `Field`              (custom external body force)
 //! - `BoundaryCondition`  (custom grid boundary)
@@ -132,7 +132,7 @@ struct ExternalWind {
 }
 
 impl Field for ExternalWind {
-    fn prepare(&mut self, _particles: &Particles) {
+    fn prepare(&mut self, _particles: &Particles, _dt: f32) {
         self.prepare_calls.fetch_add(1, Ordering::Relaxed);
     }
     fn acceleration(&self, _particles: &Particles, _i: usize) -> Vec2 {

@@ -41,7 +41,7 @@ impl Renderer {
                     .collect();
                 let r0 = self.specular_r0[slot];
                 let t = (p.temperature / 5000.0).clamp(0.0, 1.0);
-                let glow = t * t * 2.0;
+                let glow = blackbody_glow_factor(p.temperature) * 2.0;
                 let [er, eg, eb, _] = heat(0.5 + t * 0.5);
                 [
                     (with_scattering[0] + r0 + er * glow).min(1.0),
@@ -86,6 +86,21 @@ pub(super) fn write_optical_table(
 
 fn det2(f: Mat2) -> f32 {
     f.x_axis.x * f.y_axis.y - f.x_axis.y * f.y_axis.x
+}
+
+/// Real, shared blackbody-emission proxy -- normalized to 5000 K (solar
+/// surface), same reference point `prep_instances.wgsl`'s ByPhysics branch
+/// already documents. `t²` (not linear `t`) matches Stefan-Boltzmann's own
+/// steep temperature dependence (`j = σT⁴`) in shape, without needing a full
+/// radiometric unit system just to decide how visually bright a "glow"
+/// should read -- same real, deliberate approximation already shipped in
+/// `ByPhysics`'s own thermal-emission term, now the single source of truth
+/// for it instead of two independent copies (this one and the render
+/// pipeline's own per-particle glow intensity, see `Renderer::render`'s
+/// `InstanceData::emission` field).
+pub(super) fn blackbody_glow_factor(temperature: f32) -> f32 {
+    let t = (temperature / 5000.0).clamp(0.0, 1.0);
+    t * t
 }
 
 fn heat(t: f32) -> [f32; 4] {

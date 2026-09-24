@@ -16,7 +16,8 @@ use std::sync::Arc;
 use emerge::render::{ColorMode, Renderer};
 use emerge::thermodynamics::saturating_uptake;
 use emerge::{
-    GpuSimulation, MaterialRegistry, NeoHookeanMaterial, SimConfig, SpawnRegion, build_particles,
+    FixedStepController, GpuSimulation, MaterialRegistry, NeoHookeanMaterial, SimConfig,
+    SpawnRegion, build_particles,
 };
 use glam::{IVec2, Vec2};
 use winit::application::ApplicationHandler;
@@ -46,6 +47,10 @@ struct State {
     renderer: Renderer,
     consuming: bool,
     frame: u64,
+    /// Real-time-decoupled stepping -- see `basic_fluids_gpu.rs`'s own field
+    /// doc for the full real bug/fix writeup.
+    stepper: FixedStepController,
+    last_instant: std::time::Instant,
 }
 
 fn make_sim_data(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) -> GpuSimulation {
@@ -129,6 +134,8 @@ impl State {
             renderer,
             consuming: true,
             frame: 0,
+            stepper: FixedStepController::standard(DT, 60.0),
+            last_instant: std::time::Instant::now(),
         }
     }
 
@@ -149,65 +156,73 @@ impl State {
         self.sim = make_sim_data(device, queue);
         self.consuming = true;
         self.frame = 0;
+        self.stepper.reset();
+        self.last_instant = std::time::Instant::now();
         println!("reset");
     }
 
     fn update_and_render(&mut self) {
-        if self.consuming {
-            // Real consumption: Holling Type II / saturating_uptake applied per-particle
-            // on THAT particle's own phi (same structure as CPU's own verified
-            // `resource_field_depletes_near_consumer_then_regrows`, tests/solver.rs) --
-            // rate naturally -> 0 as phi -> 0, so depletion decelerates near zero instead
-            // of a flat/aggregate budget driving everything to a hard clamp.
-            //
-            // Skip the readback on frame 0: the CPU mirror already holds the correct
-            // freshly-set scalar_field=RESOURCE_K (no step_frame has uploaded/evolved
-            // anything yet) -- syncing here would instead download the GPU's stale
-            // pre-upload buffer (spawn-time scalar_field=0.0) and clobber it before the
-            // real upload (queued by `mark_particles_dirty` in `make_sim_data`) ever runs.
-            if self.frame > 0 {
-                self.sim.sync_particles_blocking();
-            }
-            let nearby: Vec<usize> = self
-                .sim
-                .particles_near(CONSUMER_POS, SENSE_RADIUS)
-                .map(|(i, _)| i)
-                .collect();
-            if !nearby.is_empty() {
-                let particles = self.sim.particles_mut();
-                for &i in &nearby {
-                    let phi = particles[i].scalar_field;
-                    let rate =
-                        saturating_uptake(phi, MAX_CONSUMPTION_RATE, HALF_SATURATION_DENSITY);
-                    particles[i].scalar_field = (phi - rate * DT).max(0.0);
-                }
-                self.sim.mark_particles_dirty();
-            }
-        }
-
         let output = match self.surface.get_current_texture() {
             Ok(t) => t,
             Err(_) => return,
         };
-        self.sim.step_frame();
-        self.frame += 1;
-        if self.frame.is_multiple_of(30) {
-            self.sim.sync_particles_blocking();
-            let particles = self.sim.particles();
-            let near: Vec<f32> = self
-                .sim
-                .particles_near(CONSUMER_POS, SENSE_RADIUS)
-                .map(|(i, _)| particles[i].scalar_field)
-                .collect();
-            let near_avg = if near.is_empty() {
-                0.0
-            } else {
-                near.iter().sum::<f32>() / near.len() as f32
-            };
-            println!(
-                "frame={} consuming={} near_consumer_avg={near_avg:.3}",
-                self.frame, self.consuming
-            );
+        let now = std::time::Instant::now();
+        let frame_delta = (now - self.last_instant).as_secs_f32();
+        self.last_instant = now;
+        let steps = self.stepper.steps_for_frame(frame_delta);
+        for _ in 0..steps {
+            if self.consuming {
+                // Real consumption: Holling Type II / saturating_uptake applied per-particle
+                // on THAT particle's own phi (same structure as CPU's own verified
+                // `resource_field_depletes_near_consumer_then_regrows`, tests/solver.rs) --
+                // rate naturally -> 0 as phi -> 0, so depletion decelerates near zero instead
+                // of a flat/aggregate budget driving everything to a hard clamp.
+                //
+                // Skip the readback on frame 0: the CPU mirror already holds the correct
+                // freshly-set scalar_field=RESOURCE_K (no step_frame has uploaded/evolved
+                // anything yet) -- syncing here would instead download the GPU's stale
+                // pre-upload buffer (spawn-time scalar_field=0.0) and clobber it before the
+                // real upload (queued by `mark_particles_dirty` in `make_sim_data`) ever runs.
+                if self.frame > 0 {
+                    self.sim.sync_particles_blocking();
+                }
+                let nearby: Vec<usize> = self
+                    .sim
+                    .particles_near(CONSUMER_POS, SENSE_RADIUS)
+                    .map(|(i, _)| i)
+                    .collect();
+                if !nearby.is_empty() {
+                    let particles = self.sim.particles_mut();
+                    for &i in &nearby {
+                        let phi = particles[i].scalar_field;
+                        let rate =
+                            saturating_uptake(phi, MAX_CONSUMPTION_RATE, HALF_SATURATION_DENSITY);
+                        particles[i].scalar_field = (phi - rate * DT).max(0.0);
+                    }
+                    self.sim.mark_particles_dirty();
+                }
+            }
+
+            self.sim.step_frame();
+            self.frame += 1;
+            if self.frame.is_multiple_of(30) {
+                self.sim.sync_particles_blocking();
+                let particles = self.sim.particles();
+                let near: Vec<f32> = self
+                    .sim
+                    .particles_near(CONSUMER_POS, SENSE_RADIUS)
+                    .map(|(i, _)| particles[i].scalar_field)
+                    .collect();
+                let near_avg = if near.is_empty() {
+                    0.0
+                } else {
+                    near.iter().sum::<f32>() / near.len() as f32
+                };
+                println!(
+                    "frame={} consuming={} near_consumer_avg={near_avg:.3}",
+                    self.frame, self.consuming
+                );
+            }
         }
 
         let view = output

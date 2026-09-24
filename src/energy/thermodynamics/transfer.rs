@@ -57,6 +57,34 @@ pub fn heat_radiation(
         * (hot_temp_k.powi(4) - cold_temp_k.powi(4))
 }
 
+/// Total radiant power of a spherical blackbody -- Stefan-Boltzmann law
+/// applied to a sphere's surface area: L = 4·π·R²·σ·T⁴. Real, standard
+/// formula connecting a star's surface temperature+radius to its total
+/// luminosity (e.g. the Sun: R=6.957e8 m, T=5772 K -- real IAU 2015
+/// nominal values -- gives L≈3.83e26 W, matching the real IAU nominal
+/// solar luminosity 3.828e26 W to within 0.1%, see this module's own test).
+#[inline]
+pub fn stellar_luminosity_w(radius_m: f32, surface_temp_k: f32) -> f32 {
+    4.0 * std::f32::consts::PI * radius_m * radius_m * STEFAN_BOLTZMANN * surface_temp_k.powi(4)
+}
+
+/// Real inverse-square irradiance law: flux = L / (4·π·r²) -- far-field
+/// radiative flux from a point-like luminous source, the same real law
+/// that gives the solar constant (real ≈1361 W/m² at 1 AU from the Sun's
+/// own real luminosity). Distinct from `heat_radiation` above (a near-
+/// field surface-to-surface exchange with a defined view factor between
+/// two close bodies) -- this is the far-field point-source regime, valid
+/// when the source's own radius is negligible next to the query distance
+/// (true for a star at planetary distances, the same real simplification
+/// `GravityWellField`'s point-mass model already makes for gravity).
+#[inline]
+pub fn irradiance_at_distance(luminosity_w: f32, distance_m: f32) -> f32 {
+    if distance_m <= 0.0 {
+        return f32::INFINITY;
+    }
+    luminosity_w / (4.0 * std::f32::consts::PI * distance_m * distance_m)
+}
+
 /// Reversible entropy change ΔS = Q/T — J/K.
 ///
 /// Entropy transferred when heat `Q` (J) crosses a boundary at temperature `T` (K).
@@ -142,6 +170,46 @@ mod tests {
         let q1 = heat_radiation(500.0, 0.0, 1.0, 1.0, 1.0);
         let q2 = heat_radiation(1000.0, 0.0, 1.0, 1.0, 1.0);
         assert!((q2 / q1 - 16.0).abs() < 1e-3, "ratio {}", q2 / q1);
+    }
+
+    /// Real IAU 2015 nominal solar values (R=6.957e8 m, T=5772 K) must
+    /// reproduce the real, independently-measured solar luminosity
+    /// (3.828e26 W) -- confirms the sphere-Stefan-Boltzmann formula is
+    /// correctly derived, not just internally self-consistent.
+    #[test]
+    fn sun_luminosity_from_real_temperature_and_radius_matches_iau_value() {
+        let l = stellar_luminosity_w(6.957e8, 5772.0);
+        let l_iau = 3.828e26_f32;
+        assert!(
+            (l - l_iau).abs() / l_iau < 0.01,
+            "expected ~{l_iau:e} W, got {l:e} W"
+        );
+    }
+
+    /// Real, independent second check: the Sun's own real luminosity,
+    /// carried through the inverse-square law out to 1 real AU, must
+    /// reproduce the real, independently-measured solar constant
+    /// (≈1361 W/m²) -- two different real measured quantities agreeing
+    /// through two chained real laws, not one law calibrated to match
+    /// itself.
+    #[test]
+    fn sun_irradiance_at_one_au_matches_real_solar_constant() {
+        let l = stellar_luminosity_w(6.957e8, 5772.0);
+        let au_m = 1.496e11_f32;
+        let flux = irradiance_at_distance(l, au_m);
+        let real_solar_constant = 1361.0_f32;
+        assert!(
+            (flux - real_solar_constant).abs() / real_solar_constant < 0.02,
+            "expected ~{real_solar_constant} W/m^2, got {flux} W/m^2"
+        );
+    }
+
+    #[test]
+    fn irradiance_falls_off_as_exact_inverse_square() {
+        let f1 = irradiance_at_distance(1.0e20, 10.0);
+        let f2 = irradiance_at_distance(1.0e20, 20.0);
+        // Doubling distance must quarter the flux exactly, not approximately.
+        assert!((f1 / f2 - 4.0).abs() < 1e-3, "ratio={}", f1 / f2);
     }
 
     #[test]

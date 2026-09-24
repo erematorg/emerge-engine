@@ -52,14 +52,14 @@ impl FixedStepController {
         self.config.simulation_speed = speed;
     }
 
-    pub fn dt(&self) -> f32 {
+    pub const fn dt(&self) -> f32 {
         self.config.dt
     }
-    pub fn simulation_speed(&self) -> f32 {
+    pub const fn simulation_speed(&self) -> f32 {
         self.config.simulation_speed
     }
     /// Reset the time accumulator — call on save-load or pause-resume to prevent stutter.
-    pub fn reset(&mut self) {
+    pub const fn reset(&mut self) {
         self.accumulator = 0.0;
     }
 

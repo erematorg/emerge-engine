@@ -1,3 +1,12 @@
+//! Blocking `impl GpuSimulation` readback wrappers -- distinct from
+//! `systems::gpu::buffers::readback`, which owns the low-level `GpuBuffers`
+//! download primitives these methods call into. Mostly test/diagnostic
+//! accessors (each documents itself as such); `download_particles_blocking`
+//! and `material_mass_blocking` are real production accessors, not
+//! test-only scaffolding -- kept in this file rather than split further
+//! because every method here shares the same "blocking, off the per-frame
+//! path" shape regardless of caller.
+
 use super::GpuSimulation;
 use crate::systems::gpu::step_params::{
     ContactDebugParams, MAX_CONTACT_POINTS_PER_BLOCK, MAX_RENDER_MATERIAL_SLOTS, NUM_BLOCKS,

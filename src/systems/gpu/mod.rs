@@ -47,8 +47,8 @@ pub use solver::GpuSimulation;
 pub use step_params::{
     GpuFieldEntry, GpuFieldsParams, GpuImpulseEntry, GpuImpulseParams, GpuSleepWakeParams,
     GpuStepParams, MAX_CONTACT_POINTS_PER_BLOCK, MAX_FORCE_FIELDS, MAX_GPU_IMPULSES,
-    MAX_SLEEP_WAKE_TAGS, NUM_BLOCKS, NUM_BLOCKS_PER_DIM, NUM_CONTACT_BLOCKS,
-    NUM_CONTACT_BLOCKS_PER_DIM, field_type,
+    MAX_RENDER_MATERIAL_SLOTS, MAX_SLEEP_WAKE_TAGS, NUM_BLOCKS, NUM_BLOCKS_PER_DIM,
+    NUM_CONTACT_BLOCKS, NUM_CONTACT_BLOCKS_PER_DIM, field_type,
 };
 
 #[cfg(feature = "gpu")]
@@ -56,3 +56,30 @@ mod step_params;
 
 #[cfg(feature = "gpu")]
 mod solver;
+
+/// Every real `wgpu::Instance` construction in this crate (production and
+/// tests) must go through here — NOT `InstanceDescriptor::default()`
+/// directly. Default selects the Fxc DX12 shader compiler, which fails to
+/// compile `resolve_contact.wgsl` on the D3D12 WARP software adapter CI
+/// runs on (`windows-latest` has no real GPU): FXC cannot unroll one of its
+/// loops ("array reference cannot be used as an l-value... forcing loop to
+/// unroll... unable to unroll... 6 iterations"), a known real FXC weakness
+/// with dynamically-indexed local arrays that Dxc doesn't share. `StaticDxc`
+/// (the `static-dxc` Cargo feature, which statically links Microsoft's own
+/// DirectXShaderCompiler via `mach-dxcompiler-rs`) fixes it without needing
+/// to ship a separate `dxcompiler.dll`. That dependency is Windows-only by
+/// its own `Cargo.toml` target cfg, so this has zero effect on Linux/macOS
+/// builds or the `ubuntu-latest` CI job.
+#[cfg(feature = "gpu")]
+pub(crate) fn create_wgpu_instance() -> wgpu::Instance {
+    wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        backend_options: wgpu::BackendOptions {
+            dx12: wgpu::Dx12BackendOptions {
+                shader_compiler: wgpu::Dx12Compiler::StaticDxc,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+}

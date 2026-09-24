@@ -53,6 +53,43 @@ struct StepParams {
     contact_active:     u32,
 }
 
+// GPU/CPU parity fix (2026-08-15) -- see Rust `MaterialParams`'s own doc.
+// Byte-exact mirror of the same struct in p2g.wgsl/particles_update.wgsl
+// (must all agree, they share one uniform buffer). Only
+// `owns_deformation_volume_state` is actually read here -- every other
+// field exists purely for layout parity.
+struct MaterialParams {
+    model:                   u32,
+    lambda:                  f32,
+    mu:                      f32,
+    hardening_exponent:      f32,
+    compression_limit:       f32,
+    stretch_limit:           f32,
+    rest_density:            f32,
+    eos_stiffness:           f32,
+    eos_power:               f32,
+    dynamic_viscosity:       f32,
+    volume_ratio_min:        f32,
+    volume_ratio_max:        f32,
+    dp_h0:                   f32,
+    dp_h1:                   f32,
+    dp_h2:                   f32,
+    dp_h3:                   f32,
+    active_stress_coeff:     f32,
+    hardening_modulus:       f32,
+    thermal_viscosity_coeff: f32,
+    thermal_expansion:       f32,
+    pressure_floor:          f32,
+    bulk_viscosity:          f32,
+    surface_tension_coeff:   f32,
+    cohesion_coeff:          f32,
+    owns_deformation_volume_state: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+const MAX_MATERIALS:        u32 = {{MAX_MATERIALS}}u;
 const BSPLINE_INNER_LIMIT:  f32 = 0.5;
 const BSPLINE_OUTER_LIMIT:  f32 = 1.5;
 const BSPLINE_CENTER_COEFF: f32 = 0.75;
@@ -62,6 +99,7 @@ const NUM_FLOOR:            f32 = 1e-6;
 
 @group(0) @binding(0) var<storage, read_write> particles:   array<Particle>;
 @group(0) @binding(1) var<storage, read_write> grid:        array<Cell>;
+@group(0) @binding(2) var<uniform>             materials:   array<MaterialParams, MAX_MATERIALS>;
 @group(0) @binding(3) var<uniform>             step_params: StepParams;
 // Multi-field contact (GPU port) — resolved velocities from resolve_contact_main, one
 // per grid node, ALREADY defaulted to the ordinary total velocity everywhere a real
@@ -76,6 +114,34 @@ fn bspline_w(d: f32) -> f32 {
     if a < BSPLINE_INNER_LIMIT { return BSPLINE_CENTER_COEFF - a * a; }
     if a < BSPLINE_OUTER_LIMIT { let t = BSPLINE_OUTER_LIMIT - a; return BSPLINE_OUTER_SCALE * t * t; }
     return 0.0;
+}
+
+// Free-surface velocity extrapolation for an UNTOUCHED grid node -- mirrors
+// CPU's `Grid::velocity_at_or_extrapolated` (`a236fef`, 2026-08-13). An
+// untouched node's raw `cell.momentum` is a stale zero, not a real velocity
+// -- gathering it reads as an artificial jump across a free-surface
+// particle's own stencil, which LOOKS like stretching even in true free
+// fall (where div(v) must be exactly 0). Verified live: free fall's own J
+// went to exactly `[1.000,1.000]`, bit-for-bit matching this fix's own
+// CPU-side measured result. Slip wall on the extrapolated value (matching
+// CPU's `apply_slip_wall_velocity`) so a near-boundary cell doesn't feed
+// back a velocity that ignores the wall.
+fn extrapolated_boundary_velocity(
+    particle_v: vec2<f32>,
+    cx: i32,
+    cy: i32,
+    res: i32,
+    gravity: vec2<f32>,
+    dt: f32,
+    boundary_thickness: u32,
+) -> vec2<f32> {
+    var v = particle_v + gravity * dt;
+    let bt = i32(boundary_thickness);
+    if cx < bt          && v.x < 0.0 { v.x = 0.0; }
+    if cx >= res - bt   && v.x > 0.0 { v.x = 0.0; }
+    if cy < bt          && v.y < 0.0 { v.y = 0.0; }
+    if cy >= res - bt   && v.y > 0.0 { v.y = 0.0; }
+    return v;
 }
 
 @compute @workgroup_size(64, 1, 1)
@@ -143,7 +209,7 @@ fn g2p_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // still comes from the ordinary total mass field (unaffected by which velocity
     // field a particle reads — mirrors CPU exactly, mass is never per-field).
     let is_grip = p.contact_group != 0u;
-    // Global gate (fixed 2026-07-15, mirrors CPU's Grid::has_contact_activity() check at
+    // Global gate (mirrors CPU's Grid::has_contact_activity() check at
     // transfer.rs's gather_grid_to_particles call site exactly): when NO particle anywhere
     // uses contact_group this frame, resolve_contact/gather_contact_points were skipped
     // entirely (see contact_active's doc, step.rs), so resolved_grip_v/resolved_rest_v were
@@ -162,11 +228,18 @@ fn g2p_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
             let node_idx = u32(cy) * res + u32(cx);
             let cell   = grid[node_idx];
-            let cell_v = select(
+            let touched_v = select(
                 cell.momentum,
                 select(resolved_rest_v[node_idx], resolved_grip_v[node_idx], is_grip),
                 contact_active,
             );
+            // Free-surface velocity extrapolation for untouched nodes -- see
+            // `extrapolated_boundary_velocity`'s own doc for the full account.
+            let extrap_v = extrapolated_boundary_velocity(
+                p.v, cx, cy, i32(res), step_params.gravity, step_params.dt,
+                step_params.boundary_thickness,
+            );
+            let cell_v = select(extrap_v, touched_v, cell.mass > NUM_FLOOR);
 
             new_v       += w * cell_v;
             B_col0      += w * cell_v * cell_dist.x;
@@ -189,11 +262,22 @@ fn g2p_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // The velocity clamp above already bounds the energy; CFL bounds the timestep.
     let C = mat2x2<f32>(B_col0, B_col1) * step_params.kernel_d_inverse;
 
-    let density = max(new_density, NUM_FLOOR);
-    let volume  = p.mass / density;
-
     particles[p_idx].v                 = new_v;
     particles[p_idx].velocity_gradient = C;
-    particles[p_idx].density           = density;
-    particles[p_idx].volume            = volume;
+
+    // GPU/CPU parity fix (2026-08-15): materials that own their own
+    // deformation-derived volume state (today: strict fluids) skip this
+    // raw kernel-mass gather entirely -- it's free-surface-biased and
+    // unbounded (real, measured: water density drifting to [0.0116,0.358]
+    // against a rest density of 0.1, well outside what the analytical,
+    // J-clamp-derived formula in particles_update.wgsl could ever produce).
+    // Mirrors CPU's `estimate_particle_volumes` (density.rs), which
+    // `continue`s past exactly these particles for the identical reason.
+    // Density/volume are left untouched here for them -- particles_update.wgsl
+    // overwrites both, every substep, from the material's own clamped F.
+    if materials[p.material_id].owns_deformation_volume_state == 0u {
+        let density = max(new_density, NUM_FLOOR);
+        particles[p_idx].density = density;
+        particles[p_idx].volume  = p.mass / density;
+    }
 }

@@ -19,24 +19,42 @@ exclude = ["LP_MPM_SPEC.md"]
 glam = { version = "0.30", features = ["bytemuck"] }
 bytemuck = { version = "1", features = ["derive"] }
 rayon = "1"
-wgpu = { version = "27", optional = true }
+# Arbitrary-length real FFT for `grid::dct`'s DCT-II/III -- the fluid
+# pressure-projection solve's Poisson operator diagonalizes exactly in this
+# basis, and the active-region bounding box (its own transform size) is not
+# a power of two, so a general-N FFT is required. A well-established, widely
+# used pure-Rust crate (Bluestein/mixed-radix internally), not a hand-rolled
+# arbitrary-N FFT written under time pressure -- see `grid::dct`'s own doc.
+rustfft = "6"
+wgpu = { version = "27", optional = true, features = ["static-dxc"] }
+# Real, optional dependencies of the LIBRARY (not dev-only) so `render::
+# demo_harness` can be a real, general, published capability -- any
+# consumer with `features=["render"]` gets a ready window+event-loop runner,
+# not just this repo's own examples. Deliberately NOT the only way to use
+# `Renderer`: LP (or anyone with their own event loop, e.g. Bevy) uses
+# `Renderer` directly and never touches this harness -- purely additive,
+# opt-in convenience, not a forced dependency of the core physics API
+# (neither is pulled in without `render`).
+winit = { version = "0.30", optional = true }
+pollster = { version = "0.3", optional = true }
 
 [features]
 default = []
-# GPU compute: 11-pass wgpu pipeline (5 sort/active-block passes once per frame,
-# 6 per substep -- see ARCHITECTURE.md §5). Plasticity runs on GPU for every
-# material except NACC, which is CPU-only (issue #5).
+# GPU compute: wgpu pipeline, sparse active-block dispatch on grid_clear/
+# grid_update, run every substep.
+# Plasticity runs on GPU for every material except NACC, which is CPU-only
+# (issue #5).
 gpu = ["dep:wgpu"]
-# Standalone debug renderer: instanced particle draw via wgpu. Requires gpu.
-render = ["gpu"]
+# Standalone debug renderer: instanced particle draw via wgpu, plus a real,
+# optional window+event-loop runner (`render::demo_harness::run_demo`).
+# Requires gpu.
+render = ["gpu", "dep:winit", "dep:pollster"]
 # Experimental physics modules: acoustics, EM, information theory.
 # Not part of the guaranteed public API — no concrete LP use yet.
 experimental = []
 
 [dev-dependencies]
-pollster = "0.3"
 criterion = "0.5"
-winit = "0.30"
 egui = "0.33.3"
 egui-winit = "0.33.3"
 egui-wgpu = "0.33.3"
@@ -95,6 +113,18 @@ required-features = ["render"]
 
 [[example]]
 name = "basic_fluids"
+required-features = ["render"]
+
+[[example]]
+name = "basic_orbital"
+required-features = ["render"]
+
+[[example]]
+name = "basic_orbital_gui"
+required-features = ["render"]
+
+[[example]]
+name = "basic_solar_system_gui"
 required-features = ["render"]
 
 [[example]]
@@ -178,11 +208,19 @@ name = "basic_fluids_gui"
 required-features = ["render"]
 
 [[example]]
+name = "fluid_pressure_projection_gui"
+required-features = ["render"]
+
+[[example]]
 name = "basic_sand_grid_gpu"
 required-features = ["render"]
 
 [[example]]
 name = "basic_sand_gui"
+required-features = ["render"]
+
+[[example]]
+name = "basic_granular_fluid_gui"
 required-features = ["render"]
 
 [[example]]
@@ -194,5 +232,49 @@ name = "sand_compaction_gui"
 required-features = ["render"]
 
 [[example]]
+name = "sand_ngf_collapse_gui"
+required-features = ["render"]
+
+[[example]]
+name = "sand_repose_angle_gui"
+required-features = ["render"]
+
+[[example]]
+name = "sand_collapse_settle_demo"
+required-features = ["render"]
+
+[[example]]
 name = "fire_spread_gui"
+required-features = ["render"]
+
+[[example]]
+name = "permafrost"
+required-features = ["render"]
+
+[[example]]
+name = "soil_horizons"
+required-features = ["render"]
+
+[[example]]
+name = "rock_fracture"
+required-features = ["render"]
+
+[[example]]
+name = "reactive_obstacle_water_demo"
+required-features = ["render"]
+
+[[example]]
+name = "basic_gas"
+required-features = ["render"]
+
+[[example]]
+name = "basic_steam"
+required-features = ["render"]
+
+[[example]]
+name = "kinematic_obstacle_water_demo"
+required-features = ["render"]
+
+[[example]]
+name = "rolling_snowball_demo"
 required-features = ["render"]

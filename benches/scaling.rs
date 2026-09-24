@@ -157,7 +157,6 @@ fn bench_g2p(c: &mut Criterion) {
         fx.fill_grid();
         let n = fx.n;
         let dt = fx.config.dt;
-        let vel_limit = fx.config.grid_cell_size / dt;
         let boundaries: Vec<Box<dyn BoundaryCondition>> =
             vec![Box::new(SlipBoundary::new(fx.config.boundary_thickness))];
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
@@ -166,14 +165,17 @@ fn bench_g2p(c: &mut Criterion) {
                     &mut fx.particles,
                     &fx.grid,
                     dt,
+                    fx.config.gravity,
+                    fx.config.boundary_thickness,
                     &boundaries,
                     &fx.registry,
                     emerge::transfer::G2PParams {
-                        vel_limit,
                         apic_blend: 1.0,
                         active_count: fx.n,
                         pre_force_snapshot: None,
                         asflip_blend: 0.0,
+                        nonlocal_fluidity: &[],
+                        cosserat_curvature: &[],
                     },
                 );
             });
@@ -250,7 +252,7 @@ fn bench_update_particle(c: &mut Criterion) {
             group.bench_function($name, |b| {
                 b.iter(|| {
                     for i in 0..n {
-                        $mat.update_particle(&mut ps, i, dt);
+                        $mat.update_particle(&mut ps.update_ctx(i), dt);
                     }
                 })
             });

@@ -367,3 +367,155 @@ mod p2g_position_vjp_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod spatial_sort_tests {
+    use super::*;
+    use crate::materials::NeoHookeanMaterial;
+    use crate::materials::registry::MaterialRegistry;
+    use crate::particle::{Particle, Particles};
+
+    fn scattered_particles(n: usize, resolution: usize) -> Particles {
+        // Real deterministic LCG, same real convention as `sand_repose_
+        // angle_gui.rs`/`tests/grains_repose_angle.rs::SmallRng` -- a
+        // reproducible, real "spawn-order no longer matches spatial order"
+        // layout (the exact real-world condition `spatial_sort_order`
+        // exists to fix), not a contrived best case.
+        struct Rng(u64);
+        impl Rng {
+            fn next_f32(&mut self) -> f32 {
+                self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((self.0 >> 33) as f32) / (u32::MAX as f32)
+            }
+        }
+        let mut rng = Rng(0xC0FF_EE11_u64);
+        let mut particles = Particles::default();
+        for _ in 0..n {
+            let x = Vec2::new(
+                rng.next_f32() * (resolution as f32 - 2.0) + 1.0,
+                rng.next_f32() * (resolution as f32 - 2.0) + 1.0,
+            );
+            particles.push(Particle {
+                x,
+                v: Vec2::new(rng.next_f32() - 0.5, rng.next_f32() - 0.5),
+                velocity_gradient: Mat2::ZERO,
+                deformation_gradient: Mat2::IDENTITY,
+                mass: 1.0,
+                initial_volume: 1.0,
+                volume: 1.0,
+                density: 1.0,
+                material_id: 0,
+                plastic_volume_ratio: 1.0,
+                hardening_scale: 1.0,
+                friction_hardening: 0.0,
+                log_volume_strain: 0.0,
+                temperature: 0.0,
+                scalar_field: 0.0,
+                user_tag: 0,
+                activation: 0.0,
+                activation_dir: Vec2::ZERO,
+                muscle_group_id: 0,
+                contact_group: 0,
+                sleeping: 0,
+                pinned: 0,
+                internal_pressure: 0.0,
+            });
+        }
+        particles
+    }
+
+    #[test]
+    fn spatial_sort_order_is_valid_permutation() {
+        let resolution = 32;
+        let particles = scattered_particles(200, resolution);
+        let order = spatial_sort_order(&particles, particles.len(), resolution);
+        assert_eq!(order.len(), particles.len());
+        let mut seen = vec![false; particles.len()];
+        for &i in &order {
+            assert!(!seen[i], "index {i} appeared more than once in sort order");
+            seen[i] = true;
+        }
+        assert!(
+            seen.iter().all(|&s| s),
+            "sort order did not cover every index 0..{}",
+            particles.len()
+        );
+    }
+
+    #[test]
+    fn spatial_sort_order_groups_nearby_particles() {
+        // Real check that the sort actually improves locality, not just
+        // that it's a valid permutation: consecutive entries in the sorted
+        // order should land in the same or a neighboring grid cell far more
+        // often than the ORIGINAL (random spawn) order does.
+        let resolution = 32;
+        let particles = scattered_particles(300, resolution);
+        let cell_of = |i: usize| -> IVec2 { particles.x[i].floor().as_ivec2() };
+        let neighbor_frac = |order: &[usize]| -> f32 {
+            let mut adjacent = 0usize;
+            for w in order.windows(2) {
+                let d = (cell_of(w[0]) - cell_of(w[1])).abs();
+                if d.x <= 1 && d.y <= 1 {
+                    adjacent += 1;
+                }
+            }
+            adjacent as f32 / (order.len() - 1) as f32
+        };
+        let identity: Vec<usize> = (0..particles.len()).collect();
+        let sorted = spatial_sort_order(&particles, particles.len(), resolution);
+        let frac_identity = neighbor_frac(&identity);
+        let frac_sorted = neighbor_frac(&sorted);
+        assert!(
+            frac_sorted > frac_identity,
+            "sort did not improve spatial locality: identity={frac_identity:.3} sorted={frac_sorted:.3}"
+        );
+    }
+
+    #[test]
+    fn scatter_sorted_matches_unsorted_mass_and_momentum() {
+        // Real, disclosed tolerance, not exact equality: `scatter_particles_
+        // to_grid_sorted`'s own doc explains WHY exact match isn't
+        // expected (float summation order changes with iteration order).
+        // What must hold is real conservation -- total mass and momentum
+        // scattered onto the grid should agree closely regardless of which
+        // order particles were processed in.
+        let resolution = 24;
+        let particles = scattered_particles(150, resolution);
+        let materials =
+            MaterialRegistry::with_default(Box::new(NeoHookeanMaterial::new(900.0, 700.0)));
+        let active_count = particles.len();
+        let dt = 0.01;
+
+        let mut grid_unsorted = crate::grid::Grid::new(resolution);
+        scatter_particles_to_grid(&particles, &mut grid_unsorted, &materials, dt, active_count);
+
+        let order = spatial_sort_order(&particles, active_count, resolution);
+        let mut grid_sorted = crate::grid::Grid::new(resolution);
+        scatter_particles_to_grid_sorted(
+            &particles,
+            &mut grid_sorted,
+            &materials,
+            dt,
+            active_count,
+            &order,
+        );
+
+        let sum_mass = |g: &crate::grid::Grid| -> f32 { g.active_cells().map(|c| c.mass).sum() };
+        let sum_momentum =
+            |g: &crate::grid::Grid| -> Vec2 { g.active_cells().map(|c| c.momentum).sum() };
+
+        let m_unsorted = sum_mass(&grid_unsorted);
+        let m_sorted = sum_mass(&grid_sorted);
+        assert!(
+            (m_unsorted - m_sorted).abs() < 1.0e-3 * m_unsorted.max(1.0),
+            "total mass diverged: unsorted={m_unsorted} sorted={m_sorted}"
+        );
+
+        let p_unsorted = sum_momentum(&grid_unsorted);
+        let p_sorted = sum_momentum(&grid_sorted);
+        assert!(
+            (p_unsorted - p_sorted).length() < 1.0e-3 * p_unsorted.length().max(1.0),
+            "total momentum diverged: unsorted={p_unsorted:?} sorted={p_sorted:?}"
+        );
+    }
+}

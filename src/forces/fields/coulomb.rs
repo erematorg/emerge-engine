@@ -21,9 +21,9 @@ use std::collections::HashMap;
 
 use glam::Vec2;
 
+use super::cutoff::smooth_cutoff;
 use crate::fields::{FADE_ONSET_RATIO, Field};
 use crate::particle::Particles;
-use crate::solver::cutoff::smooth_cutoff;
 
 /// Electrostatic acceleration from external point charges, affecting particles by material.
 pub struct CoulombField {
@@ -64,7 +64,7 @@ pub struct CoulombField {
 
 impl CoulombField {
     /// Full-range Coulomb field — IRL default, no distance cutoff.
-    pub fn new(
+    pub const fn new(
         sources: Vec<(Vec2, f32)>,
         material_charges: HashMap<u32, f32>,
         coulomb_constant: f32,

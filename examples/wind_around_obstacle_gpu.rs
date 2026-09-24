@@ -13,7 +13,8 @@ use std::sync::Arc;
 use emerge::gpu::GpuFieldEntry;
 use emerge::render::{ColorMode, Renderer};
 use emerge::{
-    GpuSimulation, MaterialRegistry, NeoHookeanMaterial, SimConfig, SpawnRegion, build_particles,
+    FixedStepController, GpuSimulation, MaterialRegistry, NeoHookeanMaterial, SimConfig,
+    SpawnRegion, build_particles,
 };
 use glam::{IVec2, Vec2};
 use winit::application::ApplicationHandler;
@@ -40,6 +41,13 @@ struct State {
     sim: GpuSimulation,
     renderer: Renderer,
     frame: u64,
+    /// Real-time-decoupled stepping -- see `basic_fluids_gpu.rs`'s own field
+    /// doc for the full real bug/fix writeup. Uses this demo's OWN existing
+    /// `DT` (0.05, not 0.1) -- `standard(DT, 60.0)` preserves whatever
+    /// effective speed this demo already had, same convention every other
+    /// demo in this pass follows.
+    stepper: FixedStepController,
+    last_instant: std::time::Instant,
 }
 
 fn make_sim_data(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) -> GpuSimulation {
@@ -123,6 +131,8 @@ impl State {
             sim,
             renderer,
             frame: 0,
+            stepper: FixedStepController::standard(DT, 60.0),
+            last_instant: std::time::Instant::now(),
         }
     }
 
@@ -142,6 +152,8 @@ impl State {
         let (device, queue) = (self.sim.device().clone(), self.sim.queue().clone());
         self.sim = make_sim_data(device, queue);
         self.frame = 0;
+        self.stepper.reset();
+        self.last_instant = std::time::Instant::now();
         println!("reset");
     }
 
@@ -150,21 +162,27 @@ impl State {
             Ok(t) => t,
             Err(_) => return,
         };
-        self.sim.step_frame();
-        self.frame += 1;
-        if self.frame.is_multiple_of(60) {
-            self.sim.sync_particles_blocking();
-            let particles = self.sim.particles();
-            let centroid_x: f32 =
-                particles.iter().map(|p| p.x.x).sum::<f32>() / particles.len() as f32;
-            let past_cylinder = particles
-                .iter()
-                .filter(|p| p.x.x > CYLINDER_CENTER.x + CYLINDER_RADIUS)
-                .count();
-            println!(
-                "frame={} centroid_x={:.2} particles_past_cylinder={past_cylinder}",
-                self.frame, centroid_x
-            );
+        let now = std::time::Instant::now();
+        let frame_delta = (now - self.last_instant).as_secs_f32();
+        self.last_instant = now;
+        let steps = self.stepper.steps_for_frame(frame_delta);
+        for _ in 0..steps {
+            self.sim.step_frame();
+            self.frame += 1;
+            if self.frame.is_multiple_of(60) {
+                self.sim.sync_particles_blocking();
+                let particles = self.sim.particles();
+                let centroid_x: f32 =
+                    particles.iter().map(|p| p.x.x).sum::<f32>() / particles.len() as f32;
+                let past_cylinder = particles
+                    .iter()
+                    .filter(|p| p.x.x > CYLINDER_CENTER.x + CYLINDER_RADIUS)
+                    .count();
+                println!(
+                    "frame={} centroid_x={:.2} particles_past_cylinder={past_cylinder}",
+                    self.frame, centroid_x
+                );
+            }
         }
         let view = output
             .texture

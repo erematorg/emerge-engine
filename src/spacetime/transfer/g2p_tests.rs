@@ -1038,3 +1038,104 @@ mod multistep_backprop_tests {
         });
     }
 }
+
+/// Real, direct proof of the Kahan-summation fix for ordinary particle
+/// position integration (`Particles::position_compensation`, wired into
+/// `gather_grid_to_particles`'s position update) -- found chasing the
+/// disclosed "Sun's own tiny wobble is below f32 precision" limit in
+/// `basic_solar_system_gui.rs`. A lone particle at a large grid coordinate
+/// (x=1024.0, ULP(1024)≈1.221e-4) given a real, sustained velocity whose
+/// PER-SUBSTEP increment (1e-5) is ~12x SMALLER than that ULP -- naive
+/// `x += v*dt` would round every single addition away to exactly zero,
+/// freezing the particle forever even though the velocity is real and
+/// constant. The ACCUMULATED displacement over 1000 such substeps
+/// (v*total_time = 1.0*0.01 = 0.01) is ~82x LARGER than the ULP, so Kahan
+/// summation (which tracks each dropped rounding remainder and folds it
+/// back in) must recover it.
+#[cfg(test)]
+mod position_compensation_tests {
+    use crate::boundary::SlipBoundary;
+    use crate::materials::NeoHookeanMaterial;
+    use crate::solver::{SimConfig, Simulation, SpawnRegion};
+    use glam::{IVec2, Vec2};
+
+    const GRID_RES: usize = 1200;
+    const X0: f32 = 1024.0;
+    const Y0: f32 = 600.0;
+    const V: f32 = 1.0;
+    const DT: f32 = 1.0e-5;
+    const STEPS: usize = 1000;
+
+    fn make_sim() -> Simulation {
+        let config = SimConfig {
+            adaptive_timestep: false,
+            dt: DT,
+            min_dt: DT * 0.1,
+            gravity: Vec2::ZERO,
+            ..SimConfig::standard(GRID_RES, DT, Vec2::ZERO)
+        };
+        let spawn = SpawnRegion {
+            spacing: 1.0,
+            box_size: IVec2::new(1, 1),
+            box_center: Vec2::new(X0, Y0),
+            position_jitter: 0.0,
+            ..SpawnRegion::for_sim(&config)
+        };
+        let mut sim = Simulation::new(config, spawn)
+            .with_default_material(Box::new(NeoHookeanMaterial::new(1.0, 1.0)))
+            .with_boundary(Box::new(SlipBoundary::new(config.boundary_thickness)));
+        sim.particles_mut().v[0] = Vec2::new(V, 0.0);
+        sim
+    }
+
+    /// Real, hand-computable proof: accumulated displacement over 1000
+    /// sub-ULP substeps must be close to the real expected `v*total_time`
+    /// (0.01), not silently zero.
+    #[test]
+    fn sustained_sub_ulp_velocity_accumulates_a_real_measurable_displacement() {
+        let mut sim = make_sim();
+        let x_start = sim.particles().x[0].x;
+
+        for _ in 0..STEPS {
+            sim.step();
+        }
+
+        let x_end = sim.particles().x[0].x;
+        let moved = x_end - x_start;
+        let expected = V * (STEPS as f32 * DT);
+        let ulp_at_x0 = X0 * f32::EPSILON;
+
+        assert!(
+            moved > ulp_at_x0 * 10.0,
+            "real, sustained sub-ULP velocity should have produced a measurable \
+             displacement well above the local ULP ({ulp_at_x0:e}); got moved={moved:e} \
+             (particle would be frozen at x_start if compensation weren't working)"
+        );
+        assert!(
+            (moved - expected).abs() / expected < 0.1,
+            "displacement should be close to the real hand-computed v*total_time={expected:e}: \
+             got moved={moved:e}"
+        );
+    }
+
+    /// Real control: WITHOUT a sustained velocity (v=0), position must not
+    /// drift at all -- Kahan compensation must not introduce spurious
+    /// motion of its own, only recover real motion that would otherwise
+    /// round away.
+    #[test]
+    fn zero_velocity_produces_zero_drift() {
+        let mut sim = make_sim();
+        sim.particles_mut().v[0] = Vec2::ZERO;
+        let x_start = sim.particles().x[0].x;
+
+        for _ in 0..STEPS {
+            sim.step();
+        }
+
+        let moved = (sim.particles().x[0].x - x_start).abs();
+        assert!(
+            moved < 1.0e-6,
+            "a real particle with zero sustained velocity must not drift: moved={moved:e}"
+        );
+    }
+}

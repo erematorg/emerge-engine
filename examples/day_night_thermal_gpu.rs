@@ -13,7 +13,8 @@ use std::sync::Arc;
 
 use emerge::render::{ColorMode, Renderer};
 use emerge::{
-    GpuSimulation, MaterialRegistry, NeoHookeanMaterial, SimConfig, SpawnRegion, build_particles,
+    FixedStepController, GpuSimulation, MaterialRegistry, NeoHookeanMaterial, SimConfig,
+    SpawnRegion, build_particles,
 };
 use glam::{IVec2, Vec2};
 use winit::application::ApplicationHandler;
@@ -53,6 +54,14 @@ struct State {
     renderer: Renderer,
     elapsed: f32,
     frame: u64,
+    /// Real-time-decoupled stepping -- see `basic_fluids_gpu.rs`'s own field
+    /// doc for the full real bug/fix writeup. Matters here specifically
+    /// because `elapsed` drives the real sinusoidal day-night cycle --
+    /// letting it advance once per RENDER frame (assuming render fps ==
+    /// 1/DT) would desync "real sim seconds" from the cycle's own stated
+    /// `CYCLE_SECONDS` whenever fps drifts from that assumption.
+    stepper: FixedStepController,
+    last_instant: std::time::Instant,
 }
 
 fn make_sim_data(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) -> GpuSimulation {
@@ -146,6 +155,8 @@ impl State {
             renderer,
             elapsed: 0.0,
             frame: 0,
+            stepper: FixedStepController::standard(DT, 60.0),
+            last_instant: std::time::Instant::now(),
         }
     }
 
@@ -166,6 +177,8 @@ impl State {
         self.sim = make_sim_data(device, queue);
         self.elapsed = 0.0;
         self.frame = 0;
+        self.stepper.reset();
+        self.last_instant = std::time::Instant::now();
         println!("reset");
     }
 
@@ -175,31 +188,40 @@ impl State {
             Err(_) => return,
         };
 
-        // Real sinusoidal day-night cycle -- midpoint + amplitude*sin, phase chosen so
-        // t=0 starts at night_ambient (matches the slab's own initial temperature).
-        self.elapsed += DT;
-        let mid = (DAY_AMBIENT + NIGHT_AMBIENT) * 0.5;
-        let amp = (DAY_AMBIENT - NIGHT_AMBIENT) * 0.5;
-        let phase =
-            2.0 * std::f32::consts::PI * self.elapsed / CYCLE_SECONDS - std::f32::consts::FRAC_PI_2;
-        let ambient = mid + amp * phase.sin();
-        self.sim.set_thermal_ambient(ambient);
+        let now = std::time::Instant::now();
+        let frame_delta = (now - self.last_instant).as_secs_f32();
+        self.last_instant = now;
+        let steps = self.stepper.steps_for_frame(frame_delta);
+        for _ in 0..steps {
+            // Real sinusoidal day-night cycle -- midpoint + amplitude*sin, phase chosen
+            // so t=0 starts at night_ambient (matches the slab's own initial
+            // temperature). Advanced once per real SIMULATION step (not render
+            // frame) so `elapsed` genuinely tracks simulated seconds against
+            // `CYCLE_SECONDS`, regardless of render fps.
+            self.elapsed += DT;
+            let mid = (DAY_AMBIENT + NIGHT_AMBIENT) * 0.5;
+            let amp = (DAY_AMBIENT - NIGHT_AMBIENT) * 0.5;
+            let phase = 2.0 * std::f32::consts::PI * self.elapsed / CYCLE_SECONDS
+                - std::f32::consts::FRAC_PI_2;
+            let ambient = mid + amp * phase.sin();
+            self.sim.set_thermal_ambient(ambient);
 
-        self.sim.step_frame();
-        self.frame += 1;
-        if self.frame.is_multiple_of(30) {
-            self.sim.sync_particles_blocking();
-            let avg_t: f32 = self
-                .sim
-                .particles()
-                .iter()
-                .map(|p| p.temperature)
-                .sum::<f32>()
-                / self.sim.particle_count() as f32;
-            println!(
-                "t={:.1}s ambient={:.1} avg_particle_temp={:.2}",
-                self.elapsed, ambient, avg_t
-            );
+            self.sim.step_frame();
+            self.frame += 1;
+            if self.frame.is_multiple_of(30) {
+                self.sim.sync_particles_blocking();
+                let avg_t: f32 = self
+                    .sim
+                    .particles()
+                    .iter()
+                    .map(|p| p.temperature)
+                    .sum::<f32>()
+                    / self.sim.particle_count() as f32;
+                println!(
+                    "t={:.1}s ambient={:.1} avg_particle_temp={:.2}",
+                    self.elapsed, ambient, avg_t
+                );
+            }
         }
 
         let view = output

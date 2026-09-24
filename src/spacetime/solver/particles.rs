@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use glam::Vec2;
+use glam::{Mat2, Vec2};
 
 use super::{LcgRng, Simulation, SpawnRegion, density, initialize_particles};
 use crate::particle::Particle;
@@ -16,24 +16,129 @@ use crate::solver::density::estimate_particle_volumes;
 use crate::thermodynamics::ScalarDiffusionField;
 
 impl Simulation {
+    /// Real, shared phase-transition logic -- the single place both
+    /// `phase_transition` (this file) and the per-substep `add_phase_rule`
+    /// evaluation (`solver::step`) apply a material change, so the two
+    /// can never drift apart on what a transition actually does.
+    ///
+    /// Real fix (2026-08-14) for a genuine "spring" artifact live-reported
+    /// on a fluid->solid transition (e.g. the water->ice freeze rule): a
+    /// particle arriving from a material with no real rest-shape memory (a
+    /// fluid's `F` only ever encodes volume ratio, `sqrt(J)*I` -- see
+    /// `NewtonianFluidMaterial`'s own doc) into a material that interprets
+    /// `F` as elastic strain away from a rest configuration (any solid) had
+    /// its leftover, almost-never-exactly-1.0 `J` misread as real elastic
+    /// strain -- generating a spurious restoring stress that visibly
+    /// oscillates instead of the particle freezing smoothly into its
+    /// current shape. `MaterialModel::init_particle`'s default is a no-op
+    /// and no existing solid material touches `deformation_gradient` there
+    /// (confirmed by reading `CorotatedMaterial::init_particle` and the
+    /// trait default), so nothing rebaselined it before this fix.
+    ///
+    /// Real physical justification, not a workaround: a genuine phase
+    /// transition (water becoming ice, rock becoming lava) changes the
+    /// material's actual physical structure, so whatever elastic strain
+    /// existed relative to the OLD phase's reference configuration has no
+    /// meaning in the NEW phase -- the new phase's zero-strain reference is
+    /// wherever the particle physically IS at the instant of transition.
+    /// Standard treatment for phase-transforming materials in computational
+    /// solid mechanics, applied generically here rather than as a per-solid-
+    /// material patch (this project's own standing preference for a single
+    /// reusable mechanism over duplicated per-material boilerplate).
+    ///
+    /// Deliberately volume/density-CONTINUOUS, not a reset to some default:
+    /// `initial_volume` is rebaselined to the particle's CURRENT volume (not
+    /// its original spawn volume), so there is no discontinuous size jump
+    /// at the instant of transition -- only the ELASTIC STRAIN memory is
+    /// cleared, not the particle's real physical size. A material whose own
+    /// `init_particle` subsequently redefines volume/density from ITS OWN
+    /// rest_density (e.g. `NewtonianFluidMaterial`, for a melting
+    /// transition) is free to do so -- that is a real, physically expected
+    /// density change on phase transition (most real materials change
+    /// density when they melt/freeze too), not a bug this rebaseline
+    /// introduces.
+    ///
+    /// ## Real, disclosed roadmap toward a genuine Stefan-condition treatment
+    ///
+    /// This function (and every `add_phase_rule` predicate, e.g. "water
+    /// freezes below 273K") implements phase change as an instantaneous,
+    /// per-particle THRESHOLD -- a particle flips the instant its own local
+    /// temperature crosses a fixed point, with no notion of how fast that
+    /// transformation should actually happen. The real, governing PDE this
+    /// approximates is the Stefan condition for a moving phase boundary:
+    /// `L * rho * v_interface = -[k * grad(T)]` -- the interface velocity is
+    /// set by the JUMP in heat flux across it, i.e. by how much MORE energy
+    /// is leaving one side than entering the other. A threshold switch is
+    /// exactly that condition's zeroth-order limit (`v_interface ->
+    /// infinity`, the phase change treated as instantaneous once enough
+    /// energy has crossed the threshold at all, regardless of RATE) -- a
+    /// real, named simplification, not an unexamined one.
+    ///
+    /// What is ALREADY real and load-bearing in that equation, today: `L`
+    /// (latent heat, debited below from `MaterialModel::latent_heat()`) and
+    /// `k`/`grad(T)` (real thermal conductivity and gradient, already
+    /// computed every substep by `ThermalDiffusion`, see
+    /// `energy::thermodynamics::diffusion`). The missing piece is using
+    /// `grad(T)` at the moment of transition to RATE-LIMIT the transition
+    /// itself, instead of switching materials outright once `L` has been
+    /// debited -- the real next increment, not attempted here. This is
+    /// disclosed so it can be picked up as a genuine PDE-consistency
+    /// upgrade to this exact function later, without re-deriving where the
+    /// gap is.
+    pub(super) fn apply_phase_transition(&mut self, i: usize, new_material_id: u32) {
+        self.particles.material_id[i] = new_material_id;
+
+        let current_volume = self.particles.volume[i];
+        if current_volume.is_finite() && current_volume > 0.0 {
+            self.particles.deformation_gradient[i] = Mat2::IDENTITY;
+            self.particles.initial_volume[i] = current_volume;
+            self.particles.density[i] = self.particles.mass[i] / current_volume;
+        }
+
+        let latent_heat = self.materials.get(new_material_id).latent_heat();
+        if latent_heat != 0.0
+            && let Some(thermal) = &self.thermal
+        {
+            self.particles.temperature[i] -= latent_heat / thermal.config.heat_capacity;
+        }
+
+        // Real, general engine hook (added 2026-08-18, see `MaterialModel::
+        // init_particle_from_transition`'s own doc for the full story):
+        // defaults to `init_particle` unchanged for every material that
+        // doesn't override it -- zero behavior change for water->ice and
+        // every other existing phase-transition demo. A material whose own
+        // rest state differs dramatically from what it might be
+        // transitioning FROM (water->steam, `GasMaterial`) overrides this
+        // instead, to honor the real, continuous rebaseline just above
+        // rather than blindly recomputing from `mass/rest_density`.
+        let mut p = self.particles.get(i);
+        self.materials
+            .get(new_material_id)
+            .init_particle_from_transition(&mut p);
+        self.particles.set(i, p);
+    }
+
     /// Switch material for every particle where `predicate` returns true.
     ///
-    /// After a transition involving fluid materials, call `recompute_initial_volumes()`
-    /// if density has shifted significantly.
+    /// Rebaselines each transitioned particle's elastic reference state to
+    /// its current physical configuration and calls the new material's own
+    /// `init_particle` -- see `apply_phase_transition`'s own doc for the
+    /// real reasoning (this is not a cosmetic reset: without it, a solid
+    /// material arriving from a fluid's leftover volumetric state visibly
+    /// springs/oscillates instead of freezing smoothly). Otherwise a
+    /// transitioned particle would also inherit stale material-specific
+    /// plastic fields (`hardening_scale`, `friction_hardening`,
+    /// `plastic_volume_ratio`, etc.) from its OLD material, reinterpreted
+    /// under the new material's semantics (e.g. Rankine's damage
+    /// accumulator read as Drucker-Prager's friction accumulator) --
+    /// `init_particle` resets those to the new material's own defaults,
+    /// exactly like `reinit_all_particle_state`/`add_body` do for every
+    /// other material-assignment path.
     ///
     /// If `new_material_id`'s `MaterialModel::latent_heat()` is non-zero and a thermal
     /// model is configured (`with_thermal`/`set_thermal`), debits `temperature` by
     /// `latent_heat / heat_capacity` for every transitioned particle — see
     /// `MaterialModel::latent_heat` for the sign convention.
-    ///
-    /// Real bug fixed 2026-07-19: this used to leave every material-specific plastic
-    /// field (`hardening_scale`, `friction_hardening`, `plastic_volume_ratio`, etc.)
-    /// untouched across the swap, so a transitioned particle silently inherited stale
-    /// state from its OLD material, reinterpreted under the new material's own
-    /// semantics for that same field (e.g. Rankine's damage accumulator read as
-    /// Drucker-Prager's friction accumulator). Now calls the new material's own
-    /// `init_particle` right after the swap, exactly like `reinit_all_particle_state`
-    /// and `add_body` already do for every other material-assignment path.
     pub fn phase_transition<F>(&mut self, predicate: F, new_material_id: u32)
     where
         F: Fn(&Particle) -> bool,
@@ -43,18 +148,10 @@ impl Simulation {
             "phase_transition: material_id {new_material_id} is not registered — \
              call solver.with_material({new_material_id}, ...) first"
         );
-        let latent_heat = self.materials.get(new_material_id).latent_heat();
-        let heat_capacity = self.thermal.as_ref().map(|t| t.config.heat_capacity);
         for i in 0..self.particles.len() {
             let p = self.particles.get(i);
             if predicate(&p) {
-                self.particles.material_id[i] = new_material_id;
-                if let (true, Some(cp)) = (latent_heat != 0.0, heat_capacity) {
-                    self.particles.temperature[i] -= latent_heat / cp;
-                }
-                let mut p = self.particles.get(i);
-                self.materials.get(new_material_id).init_particle(&mut p);
-                self.particles.set(i, p);
+                self.apply_phase_transition(i, new_material_id);
             }
         }
     }
@@ -100,20 +197,11 @@ impl Simulation {
 
     /// Apply a velocity delta to all particles within `radius` of `center`, with linear falloff.
     /// `force` units: grid-cell/s (instantaneous velocity change).
-    /// Result is clamped to the solver's CFL velocity limit so LP impulses can't break stability.
-    ///
-    /// **This is the safe API for external impulses.** Always prefer this over `particles_mut()`
-    /// for any gameplay-driven velocity change — direct mutation bypasses the CFL clamp and can
-    /// collapse deformation gradients (J→0) under large forces.
-    ///
-    /// KNOWN OPEN ISSUE: the CFL clamp here uses `min_dt`, which is a conservative bound.
-    /// Under adaptive substeps the actual sub_dt may be larger, making the clamp overly
-    /// permissive. True safety requires clamping to `current_sub_dt` at the moment of application,
-    /// but `apply_impulse` is called between solver steps where `current_sub_dt` is unknown.
-    /// Options under research: (a) grid-velocity projection post-P2G, (b) semi-implicit
-    /// integration, (c) energy-bounded impulse splitting across substeps. See fields/mod.rs.
+    /// This applies the requested impulse exactly; it is not velocity-clamped.
+    /// The next substep is selected from the resulting actual CFL state. Supply
+    /// a physically meaningful impulse (or a resolved force history) rather
+    /// than using this as a hidden settling/stability control.
     pub fn apply_impulse(&mut self, center: Vec2, radius: f32, force: Vec2) {
-        let vel_limit = self.config.grid_cell_size / self.config.min_dt;
         let r2 = radius * radius;
         let mut to_wake = Vec::new();
         for i in 0..self.particles.len() {
@@ -125,10 +213,6 @@ impl Simulation {
                 }
                 let falloff = 1.0 - (dist2 / r2).sqrt();
                 self.particles.v[i] += force * falloff;
-                let spd = self.particles.v[i].length();
-                if spd > vel_limit {
-                    self.particles.v[i] *= vel_limit / spd;
-                }
             }
         }
         for i in to_wake {
@@ -137,9 +221,9 @@ impl Simulation {
     }
 
     /// Apply an outward radial velocity delta to particles within `radius`, with linear falloff.
-    /// Result is clamped to the solver's CFL velocity limit.
+    /// This applies the requested radial impulse exactly; the next substep
+    /// uses the resulting actual CFL state.
     pub fn apply_radial_impulse(&mut self, center: Vec2, radius: f32, strength: f32) {
-        let vel_limit = self.config.grid_cell_size / self.config.min_dt;
         let r2 = radius * radius;
         let mut to_wake = Vec::new();
         for i in 0..self.particles.len() {
@@ -152,10 +236,6 @@ impl Simulation {
                 let dist = dist2.sqrt();
                 let falloff = 1.0 - dist / radius;
                 self.particles.v[i] += (d / dist) * strength * falloff;
-                let spd = self.particles.v[i].length();
-                if spd > vel_limit {
-                    self.particles.v[i] *= vel_limit / spd;
-                }
             }
         }
         for i in to_wake {
@@ -209,6 +289,80 @@ impl Simulation {
             }
         }
         removed
+    }
+
+    /// Grows `grain_populations[population_idx].grains[grain_idx]` by
+    /// absorbing every active particle within `radius` of the grain's
+    /// current position matching `predicate` -- real conserved-momentum
+    /// merge, not an ad-hoc velocity kick: a perfectly inelastic collision
+    /// (`new_v = (m_grain*v_grain + sum(m_i*v_i)) / new_mass`), and real 2D
+    /// area-based radius growth (`new_area = old_area + sum(particle.
+    /// volume)`, `new_radius = sqrt(new_area/pi)` -- `Particle::volume` is
+    /// this engine's own real 2D "footprint" field, the same one
+    /// `estimate_particle_volumes` maintains for every ordinary particle,
+    /// not a separately-assumed constant). Absorbed particles are REMOVED
+    /// via `remove_particles` (the tag-then-remove pattern that method's
+    /// own doc already documents), not hacked into near-zero mass -- real
+    /// removal, not a workaround. Returns the number of particles absorbed.
+    ///
+    /// Real gap this closes, found 2026-08-16: no particle-merge-into-a-
+    /// rigid-body mechanism existed anywhere in this engine. A demo needing
+    /// a growing rolling body (a snowball, a boulder picking up debris, a
+    /// coalescing ice chunk) had to hand-roll this at the app level, which
+    /// is what produced three real, distinct bugs in one evening (see
+    /// `examples/rolling_snowball_demo.rs`'s own history) -- fighting the
+    /// real solver after the fact instead of using it. This composes three
+    /// already-real, already-tested primitives (`particles_near`,
+    /// `Particles::get`, `remove_particles`), it does not invent new
+    /// machinery.
+    pub fn grain_absorb_particles<F: Fn(&Particle) -> bool>(
+        &mut self,
+        population_idx: usize,
+        grain_idx: usize,
+        radius: f32,
+        predicate: F,
+    ) -> usize {
+        let center = self.grain_populations[population_idx].grains[grain_idx].x;
+        let nearby = self.particles_near(center, radius);
+
+        // Reserved sentinel, not `Particle::user_tag` -- that field is
+        // caller-defined (LP uses it for creature ownership, per its own
+        // doc), and stomping it here even briefly would be a real
+        // correctness risk if any other code observed it before removal.
+        // `material_id` is safe to borrow transiently: it's set and the
+        // particle is removed within this single synchronous call, with no
+        // `step()` (the only place `material_id` is actually dispatched on)
+        // running in between.
+        const ABSORBED_SENTINEL: u32 = u32::MAX;
+        let mut sum_mass = 0.0f32;
+        let mut sum_momentum = Vec2::ZERO;
+        let mut sum_area = 0.0f32;
+        let mut absorbed = 0usize;
+        for i in nearby {
+            let p = self.particles.get(i);
+            if !predicate(&p) {
+                continue;
+            }
+            sum_mass += p.mass;
+            sum_momentum += p.mass * p.v;
+            sum_area += p.volume;
+            self.particles.material_id[i] = ABSORBED_SENTINEL;
+            absorbed += 1;
+        }
+        if absorbed == 0 {
+            return 0;
+        }
+
+        let grain = &mut self.grain_populations[population_idx].grains[grain_idx];
+        let new_mass = grain.mass + sum_mass;
+        grain.v = (grain.mass * grain.v + sum_momentum) / new_mass;
+        grain.mass = new_mass;
+        let old_area = std::f32::consts::PI * grain.radius * grain.radius;
+        let new_area = old_area + sum_area;
+        grain.radius = (new_area / std::f32::consts::PI).sqrt();
+
+        self.remove_particles(|p| p.material_id == ABSORBED_SENTINEL);
+        absorbed
     }
 
     /// Iterate physical indices of all particles with `tag`. O(group_size) via tag_index.
@@ -317,7 +471,7 @@ impl Simulation {
     }
 
     /// Number of currently active (non-sleeping) particles.
-    pub fn active_count(&self) -> usize {
+    pub const fn active_count(&self) -> usize {
         self.active_count
     }
 
@@ -426,7 +580,9 @@ impl Simulation {
             true,
         );
         self.spatial_hash
+            .borrow_mut()
             .rebuild(&self.particles.x, self.active_count);
+        self.spatial_hash_dirty.set(false);
         tag
     }
 
@@ -458,5 +614,154 @@ impl Simulation {
     pub fn with_scalar_field(mut self, field: ScalarDiffusionField) -> Self {
         self.attach_scalar_field(field);
         self
+    }
+}
+
+#[cfg(test)]
+mod grain_absorb_particles_tests {
+    use super::*;
+    use crate::grains::population::GrainPopulation;
+    use crate::materials::solid::granular::grain_contact_law::ContactLawConfig;
+    use crate::particle::Grain;
+    use crate::solver::SimConfig;
+
+    fn contact_config() -> ContactLawConfig {
+        ContactLawConfig {
+            normal_stiffness: 1.0e5,
+            tangential_stiffness: 0.8e5,
+            rolling_stiffness: 5.0e3,
+            normal_damping: 50.0,
+            tangential_damping: 50.0,
+            rolling_damping: 50.0,
+            friction: 0.5,
+            rolling_friction: 0.1,
+        }
+    }
+
+    /// Real, minimal, fully-known particle -- `Particle::zeroed()` is this
+    /// codebase's own established test convention (dozens of real
+    /// precedents, e.g. `spacetime/transfer/g2p_tests.rs`), safe here since
+    /// this test never calls `step()` -- only `grain_absorb_particles`
+    /// itself, which only reads `x`/`v`/`mass`/`volume`.
+    fn make_particle(x: Vec2, v: Vec2, mass: f32, volume: f32) -> Particle {
+        let mut p = Particle::zeroed();
+        p.x = x;
+        p.v = v;
+        p.mass = mass;
+        p.volume = volume;
+        p.material_id = 0;
+        p
+    }
+
+    #[test]
+    fn grain_absorbs_nearby_particles_with_real_conserved_momentum_and_area() {
+        // Real, precise, hand-computable check -- not "doesn't crash".
+        let mut sim = Simulation::empty(SimConfig::standard(32, 0.05, Vec2::ZERO));
+        sim.particles.push(make_particle(
+            Vec2::new(10.5, 10.0),
+            Vec2::new(1.0, 0.0),
+            2.0,
+            0.36,
+        ));
+        sim.particles.push(make_particle(
+            Vec2::new(10.0, 10.5),
+            Vec2::new(0.0, 2.0),
+            3.0,
+            0.36,
+        ));
+        // A third particle, deliberately OUTSIDE the absorb radius -- proves
+        // the radius/predicate actually filters, not "absorbs everything".
+        sim.particles.push(make_particle(
+            Vec2::new(25.0, 25.0),
+            Vec2::new(5.0, 5.0),
+            100.0,
+            0.36,
+        ));
+        sim.active_count = sim.particles.len();
+        // Manual `particles.push` (not `add_body`) doesn't mark the spatial
+        // hash dirty the way the normal spawn path does -- without this,
+        // `particles_near` (which `grain_absorb_particles` depends on) sees
+        // a stale, empty hash and finds nothing. Real, found live via this
+        // test's own first failed run (0 absorbed instead of 2), not
+        // guessed.
+        sim.spatial_hash_dirty.set(true);
+
+        let grain = Grain::new(Vec2::new(10.0, 10.0), 1.0, 1.0);
+        let grain_mass_before = grain.mass;
+        let grain_radius_before = grain.radius;
+        let grain_v_before = grain.v;
+        sim.add_grain_population(GrainPopulation::new(vec![grain], contact_config()));
+
+        let absorbed = sim.grain_absorb_particles(0, 0, 2.0, |p| p.material_id == 0);
+
+        assert_eq!(
+            absorbed, 2,
+            "expected exactly the two nearby particles absorbed"
+        );
+        assert_eq!(
+            sim.particles().len(),
+            1,
+            "the two absorbed particles must be REMOVED from the simulation, not just relabeled"
+        );
+        // The one remaining particle must be the far one (real identity check,
+        // not just a count check).
+        assert!((sim.particles().x[0] - Vec2::new(25.0, 25.0)).length() < 1e-5);
+
+        let g = &sim.grain_populations()[0].grains[0];
+        let expected_mass = grain_mass_before + 2.0 + 3.0;
+        assert!(
+            (g.mass - expected_mass).abs() < 1e-4,
+            "mass not conserved: got {}, expected {expected_mass}",
+            g.mass
+        );
+        let expected_momentum = grain_mass_before * grain_v_before
+            + 2.0 * Vec2::new(1.0, 0.0)
+            + 3.0 * Vec2::new(0.0, 2.0);
+        let expected_v = expected_momentum / expected_mass;
+        assert!(
+            (g.v - expected_v).length() < 1e-4,
+            "momentum not conserved: v={:?}, expected={:?}",
+            g.v,
+            expected_v
+        );
+        let expected_area =
+            std::f32::consts::PI * grain_radius_before * grain_radius_before + 0.36 + 0.36;
+        let expected_radius = (expected_area / std::f32::consts::PI).sqrt();
+        assert!(
+            (g.radius - expected_radius).abs() < 1e-4,
+            "radius not from real area accounting: got {}, expected {expected_radius}",
+            g.radius
+        );
+    }
+
+    #[test]
+    fn grain_absorb_particles_respects_the_predicate() {
+        // A particle within radius but failing the predicate must be left
+        // alone entirely -- real filtering, not "radius is the only gate".
+        let mut sim = Simulation::empty(SimConfig::standard(32, 0.05, Vec2::ZERO));
+        let mut other_material = make_particle(Vec2::new(10.5, 10.0), Vec2::ZERO, 2.0, 0.36);
+        other_material.material_id = 99;
+        sim.particles.push(other_material);
+        sim.active_count = sim.particles.len();
+        // Manual `particles.push` (not `add_body`) doesn't mark the spatial
+        // hash dirty the way the normal spawn path does -- without this,
+        // `particles_near` (which `grain_absorb_particles` depends on) sees
+        // a stale, empty hash and finds nothing. Real, found live via this
+        // test's own first failed run (0 absorbed instead of 2), not
+        // guessed.
+        sim.spatial_hash_dirty.set(true);
+        sim.add_grain_population(GrainPopulation::new(
+            vec![Grain::new(Vec2::new(10.0, 10.0), 1.0, 1.0)],
+            contact_config(),
+        ));
+
+        let absorbed = sim.grain_absorb_particles(0, 0, 2.0, |p| p.material_id == 0);
+
+        assert_eq!(absorbed, 0);
+        assert_eq!(
+            sim.particles().len(),
+            1,
+            "non-matching particle must not be removed"
+        );
     }
 }

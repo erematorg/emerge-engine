@@ -179,31 +179,36 @@ pub struct FluidGranular {
 }
 
 impl FluidGranular {
-    // REAL API FIX (2026-07-19): these three presets used to share their exact
-    // names (`saturated_loam`/`consolidated_clay`/`cytoplasmic`) with
-    // `GranularFluidMaterial`'s own, DIFFERENT presets in `granular_fluid.rs`
-    // (zero-arg fixed-SI-literature-value here vs. parameterized
-    // `(young_modulus, poisson_ratio)` there) -- a real ambiguity risk, not
-    // just a style nit. Suffixed `_preset` to mark these as the fixed-value
-    // convenience layer; `GranularFluidMaterial`'s parameterized versions
-    // (same names, no suffix) are the unambiguous, SI-consistent primary entry
-    // point -- use those directly unless you specifically want this property
-    // family's fixed literature-style defaults.
+    // Suffixed `_preset` to disambiguate from `GranularFluidMaterial`'s own,
+    // differently-parameterized presets of the same name
+    // (`saturated_loam`/`consolidated_clay`/`cytoplasmic`) in
+    // `granular_fluid.rs` (zero-arg fixed-SI-literature-value here vs.
+    // parameterized `(young_modulus, poisson_ratio)` there). Prefer the
+    // unsuffixed, parameterized versions unless you specifically want this
+    // property family's fixed literature-style defaults.
 
     /// Saturated loam — yields easily, flows slowly under sustained load.
     ///
-    /// HONEST DISCLOSURE (audit 2026-07-17, same finding as `GranularFluidMaterial`'s
-    /// own presets in `granular_fluid.rs`): `scale_lame`/`scale_stress` below DO
-    /// perform a real, dimensionally-consistent SI-to-grid-unit conversion (same
-    /// pattern already verified for `NewtonianFluidMaterial`), so the MECHANISM here is
-    /// sound. But these specific SI values (`rho_kg_m3`, `bulk_modulus_pa`, `e_pa`,
-    /// `compression_limit` etc.) are not tied to any specific real measurement/paper —
-    /// `rho_kg_m3=1800`/`e_pa=5e3` are plausible ballpark figures for real wet loam, not
-    /// verified against one. Presenting them in real SI units carries a stronger
-    /// implicit "this is measured" claim than a dimensionless test parameter would, so
-    /// this needs the same honest flag: real conversion math, unverified specific
-    /// numbers, not yet a literature-sourced material.
-    pub fn saturated_loam_preset() -> Self {
+    /// UPDATED (2026-08-15): the conversion mechanism (`scale_lame`/
+    /// `scale_stress`) was already real and verified (2026-07-17 audit).
+    /// `rho_kg_m3=1800` is not tied to one specific paper -- real soil bulk
+    /// density is inherently composition/moisture-dependent, not a
+    /// universal constant like Kleiber's law -- but it IS now verified to
+    /// sit inside the real, published range for compacted/saturated loam-
+    /// family soils: dry bulk density 1150-1820 kg/m3 across tested
+    /// densities (Xu et al., triaxial compression on sandy loam), saturated
+    /// remolded loess tested at 1500-1700 kg/m3 dry-basis (PMC9282495).
+    /// 1800 sits at the dense end of that real range, appropriate for
+    /// "saturated" (pore-filled, denser than dry) rather than an arbitrary
+    /// guess. `e_pa`/`bulk_modulus_pa`/`nu` remain honestly undocumented
+    /// against one specific measurement (the same literature shows Young's
+    /// modulus varying strongly with moisture/density, no single citable
+    /// number) -- left as disclosed, mechanism-sound, range-plausible
+    /// engineering defaults, same convention as `FORAGING_RECOVERY_RATE`'s
+    /// own documented precedent elsewhere in this engine.
+    /// Sources: [Effects of Bulk Density and Moisture Content on Selected Mechanical Properties of Sandy Loam Soil](https://www.sciencedirect.com/science/article/abs/pii/S1537511002901030),
+    /// [Experimental study on shear strength of saturated remolded loess](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC9282495/).
+    pub const fn saturated_loam_preset() -> Self {
         Self {
             rho_kg_m3: 1800.0,
             bulk_modulus_pa: 2.0e5,
@@ -217,9 +222,22 @@ impl FluidGranular {
 
     /// Consolidated clay — stiffer shear, slow plastic creep.
     ///
-    /// Same honest disclosure as `saturated_loam` above: real conversion mechanism,
-    /// unverified specific SI values.
-    pub fn consolidated_clay_preset() -> Self {
+    /// CONFIRMED (2026-08-15): `rho_kg_m3=2000` is above the general loose
+    /// clay/fine-silt range, but is realistic for the stiff overconsolidated
+    /// clay implied by this preset's name. Rouainia et al. describe London
+    /// Clay explicitly as "very stiff and heavily overconsolidated" and use
+    /// a measured/calculated bulk unit weight of 20 kN/m3 at Denmark Place;
+    /// dividing by standard gravity gives ~2040 kg/m3. The British Geological
+    /// Survey independently compiles London Clay bulk densities of
+    /// 1.83-2.35 Mg/m3. Thus 2000 kg/m3 is directly inside a published range
+    /// for the intended dense-clay regime, not an extrapolation from ordinary
+    /// loose clay. `e_pa`/`bulk_modulus_pa`/`nu` remain undocumented against a
+    /// specific measurement, same as `saturated_loam`.
+    /// Sources: Rouainia et al., "A pressuremeter-based evaluation of structure
+    /// in London Clay using a kinematic hardening constitutive model", Acta
+    /// Geotechnica 15 (2020), doi:10.1007/s11440-020-00940-w; British Geological
+    /// Survey, "Geology of London", Table 23d.
+    pub const fn consolidated_clay_preset() -> Self {
         Self {
             rho_kg_m3: 2000.0,
             bulk_modulus_pa: 8.0e5,
@@ -233,11 +251,20 @@ impl FluidGranular {
 
     /// Cytoplasmic matrix — very soft elastic, near-fluid, large yield surface.
     ///
-    /// Same honest disclosure as `saturated_loam` above: real conversion mechanism,
-    /// unverified specific SI values (though `e_pa=500` is at least in the right real
-    /// ballpark per AFM cytoplasm-stiffness literature -- not yet tied to a specific
-    /// paper).
-    pub fn cytoplasmic_preset() -> Self {
+    /// CONFIRMED (2026-08-15): real AFM (atomic force microscopy) cell-
+    /// mechanics literature reports cell elastic modulus spanning ~100 Pa
+    /// to 100 kPa, with the ~100 Pa end specifically attributed to the
+    /// actin cortex at small deformations (PMC5377332, "On the
+    /// determination of elastic moduli of cells by AFM based indentation").
+    /// `e_pa=500` sits inside this real measured range, toward the soft
+    /// end -- appropriate for this preset's own "near-fluid, large yield
+    /// surface" framing (cytoplasm proper, not the stiffer cortex/membrane).
+    /// `rho_kg_m3=1050` also matches real cytoplasm density (close to
+    /// water's 1000 kg/m3, real cell biology convention).
+    /// `bulk_modulus_pa`/`nu`/plasticity params remain undocumented against
+    /// a specific measurement.
+    /// Source: [On the determination of elastic moduli of cells by AFM based indentation](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC5377332/).
+    pub const fn cytoplasmic_preset() -> Self {
         Self {
             rho_kg_m3: 1050.0,
             bulk_modulus_pa: 2.0e4,
@@ -344,12 +371,6 @@ pub(super) struct BinghamProps {
 #[inline]
 pub(super) fn scale_stress(pa: f32, rho: f32, config: &SimConfig) -> f32 {
     config.stress_from_si(pa, rho)
-}
-
-/// Scale SI viscosity (Pa·s) to grid units: `η_grid = η_SI · ρ · dx² / dt³`.
-#[inline]
-pub(super) fn scale_visc(eta: f32, rho: f32, config: &SimConfig) -> f32 {
-    config.visc_from_si(eta, rho)
 }
 
 /// Scale SI Young's modulus to grid Lamé parameters.

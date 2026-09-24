@@ -1,47 +1,41 @@
-pub mod bingham;
-pub mod corotated;
-pub mod elastic;
-pub mod fluid;
-pub mod granular_fluid;
-pub mod nacc;
-pub mod no_compression;
+pub mod gas;
+pub mod liquid;
+pub mod mixture;
 pub mod params;
 pub mod physical_props;
 mod property_dispatch;
-pub mod rankine;
 pub mod registry;
-pub mod sand;
-pub mod sand_mui;
-pub mod snow;
+pub mod rod_material;
+pub mod solid;
 pub(crate) mod svd;
 pub mod utils;
-pub mod viscoelastic;
-pub mod von_mises;
 
 pub use physical_props::{
     BrittleProps, Elastic, Elastoplastic, Fluid, FluidGranular, FromSI, NoCompression,
     ParticleMass, PlasticityModel, Pressurized, Viscoelastic,
 };
 
-pub use bingham::BinghamFluidMaterial;
-pub use corotated::CorotatedMaterial;
-pub use elastic::NeoHookeanMaterial;
-pub use fluid::NewtonianFluidMaterial;
-pub use granular_fluid::GranularFluidMaterial;
-pub use nacc::NaccMaterial;
-pub use no_compression::NoCompressionMaterial;
+pub use gas::ideal_gas::GasMaterial;
+pub use liquid::bingham::BinghamFluidMaterial;
+pub use liquid::fluid::NewtonianFluidMaterial;
+pub use mixture::granular_fluid::GranularFluidMaterial;
 pub use params::MaterialParams;
-pub use rankine::RankineMaterial;
 pub use registry::{MAX_MATERIAL_SLOTS, MaterialRegistry};
-pub use sand::DruckerPragerMaterial;
-pub use sand_mui::MuIRheologyMaterial;
-pub use snow::StomakhinMaterial;
+pub use rod_material::RodMaterial;
+pub use solid::corotated::CorotatedMaterial;
+pub use solid::elastic::NeoHookeanMaterial;
+pub use solid::granular::sand::DruckerPragerMaterial;
+pub use solid::granular::sand_mui::MuIRheologyMaterial;
+pub use solid::nacc::NaccMaterial;
+pub use solid::no_compression::NoCompressionMaterial;
+pub use solid::rankine::RankineMaterial;
+pub use solid::snow::StomakhinMaterial;
+pub use solid::viscoelastic::ViscoelasticMaterial;
+pub use solid::von_mises::VonMisesMaterial;
 pub use utils::{
     elastic_wave_dt, gravity_to_grid, lame_from_si, lame_from_young, polar_decomposition_2d,
     rankine_damage_estimate,
 };
-pub use viscoelastic::ViscoelasticMaterial;
-pub use von_mises::VonMisesMaterial;
 
 use glam::Mat2;
 
@@ -67,6 +61,13 @@ pub enum ConstitutiveModel {
     Nacc = 10,            // Non-Associated Cam-Clay — wet soil, clay, bio tissue under compression
     GranularFluid = 11, // Granular-fluid mixture — Tait EOS + corotated deviatoric + SVD plasticity
     NoCompression = 12, // Tension-only (no-compression) reversible elastic — silk, tendons, membranes
+    /// Ideal gas EOS (p=ρRT) — CPU only. GPU shaders (`p2g.wgsl`,
+    /// `particles_update.wgsl`) have no case-13 branch yet; an unrecognised
+    /// `mat.model` falls through their `default: { return mat2x2<f32>(); }`
+    /// arm, i.e. zero stress on GPU today. Real, disclosed limitation, not
+    /// silent — see `GasMaterial`'s own doc. CPU correctness first, GPU
+    /// port second (per this engine's own standing development rule).
+    Gas = 13,
 }
 
 // WGSL shaders (p2g.wgsl, particles_update.wgsl) index material branches by the
@@ -87,27 +88,75 @@ const _: () = {
     assert!(C::Nacc as u32 == 10);
     assert!(C::GranularFluid as u32 == 11);
     assert!(C::NoCompression as u32 == 12);
+    assert!(C::Gas as u32 == 13);
 };
 
-/// Which role a material plays in two-phase mixture coupling (Tampubolon et al.
-/// 2017, "Multi-species simulation of porous sand and water mixtures" --
-/// interpenetrating granular-fluid Darcy drag, e.g. water soaking into sand).
-/// This is a MATERIAL-level classification (via `MaterialModel::mixture_phase`),
+/// Cap on simultaneous mixture phases -- see `MixturePhase`'s own doc.
+/// Deliberately small (YAGNI): covers solid + fluid + a real 3rd/4th phase
+/// (air, a second fluid) without pre-building for a need that doesn't
+/// exist yet. Raising it later is a one-line change (`MixtureCell`'s
+/// arrays and `resolve_mixture_coupling`'s solve both size off this
+/// constant, nothing else needs touching).
+pub const MAX_MIXTURE_PHASES: usize = 4;
+
+/// Which of up to `MAX_MIXTURE_PHASES` roles a material plays in N-phase
+/// mixture coupling (generalizes Tampubolon et al. 2017, "Multi-species
+/// simulation of porous sand and water mixtures" -- interpenetrating
+/// granular-fluid Darcy drag, e.g. water soaking into sand, to N
+/// simultaneously-tracked phases exchanging real pairwise momentum). This
+/// is a MATERIAL-level classification (via `MaterialModel::mixture_phase`),
 /// not a per-particle field -- every particle of a given material shares the
 /// same phase, matching how `constitutive_model` already works. `None` (the
 /// default for every existing material) opts a scene entirely out of mixture
 /// coupling at zero cost -- see `Grid::has_mixture_activity`.
+///
+/// A plain slot index (0..MAX_MIXTURE_PHASES), not a fixed enum -- unlike
+/// the render side's `material_id % 16` convention, this does NOT wrap: an
+/// out-of-range index is a real configuration error (asserted where used),
+/// since silently colliding two unrelated phases into the same slot would
+/// corrupt real physics, not just misdraw a pixel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MixturePhase {
+pub struct MixturePhase(pub u8);
+
+impl MixturePhase {
     /// The porous solid (e.g. sand/soil) -- keeps its own full elastic/plastic
     /// deformation, unaffected by mixture coupling beyond the drag force itself.
-    Solid,
+    pub const SOLID: MixturePhase = MixturePhase(0);
     /// The interpenetrating fluid (e.g. water) -- exchanges momentum with the
     /// solid phase via Darcy-style drag at every node both phases touch.
-    Fluid,
+    pub const FLUID: MixturePhase = MixturePhase(1);
 }
 
-pub trait MaterialModel: Send + Sync + core::fmt::Debug {
+/// Blanket downcast hook for `MaterialRegistry`'s enum-dispatch fast path
+/// (see `registry::MaterialDispatch`). P2G/G2P/CFL call `kirchhoff_stress`/
+/// `stress_volume`/`timestep_bound`/`owns_deformation_volume_state` once per
+/// particle per substep; going through `dyn MaterialModel`'s vtable every
+/// time is real, measured cost at scale. The registry downcasts each
+/// registered material to one of the engine's known concrete types ONCE (at
+/// `insert`/`set_default` time) and caches a match-dispatched copy;
+/// unrecognised types (a wrapper like `WithMixturePhase`, or an LP-side
+/// custom material) simply fail every downcast and keep using the trait
+/// object as before — zero behavior change, only unlocks a fast path for
+/// materials the engine already knows about.
+///
+/// Split into its own blanket-impl'd trait (rather than a default method
+/// directly on `MaterialModel`) because `fn as_any(&self) -> &dyn Any { self }`
+/// as a *default* method on a `Self: ?Sized`-context trait doesn't typecheck
+/// (the unsized coercion needs a concrete, Sized `Self`) — the standard fix
+/// (used by e.g. the `downcast-rs` crate) is a supertrait with a blanket
+/// `impl<T: Any> AsAny for T`, which every `Sized` material — including any
+/// external/LP-defined one — gets automatically, no per-material code needed.
+pub trait AsAny: core::any::Any {
+    fn as_any(&self) -> &dyn core::any::Any;
+}
+
+impl<T: core::any::Any> AsAny for T {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+pub trait MaterialModel: Send + Sync + core::fmt::Debug + AsAny {
     /// Which constitutive law this material implements.
     /// Used by the GPU shader to select the correct stress branch per particle.
     fn constitutive_model(&self) -> ConstitutiveModel {
@@ -140,7 +189,37 @@ pub trait MaterialModel: Send + Sync + core::fmt::Debug {
         f32::INFINITY
     }
 
-    fn update_particle(&self, _particles: &mut Particles, _i: usize, _dt: f32) {}
+    /// Speed-of-sound-squared (c²) this material's own acoustic CFL term
+    /// evaluates to AT REST (density == rest_density, the Tait-EOS density
+    /// ratio's baseline of 1). `None` (the default) for materials with no
+    /// meaningful acoustic term, or a strict fluid whose `eos_stiffness` is
+    /// deliberately `0.0` (e.g. pressure-projection incompressible fluids --
+    /// see `fluid_pressure_projection_gui.rs`). A real Tait-EOS fluid
+    /// overrides this with `eos_stiffness * eos_power / rest_density` -- the
+    /// SAME formula its own `timestep_bound` already evaluates at
+    /// density_ratio=1, not a new derivation.
+    ///
+    /// Used by `choose_substep_dt`'s near-wall gate to scale its
+    /// compression-anomaly threshold to THIS material's own acoustic
+    /// stiffness instead of a fixed absolute percentage tuned for a
+    /// different EOS: the standard WCSPH relation Ma² ≈ Δρ (density
+    /// variation ≈ squared Mach number; Monaghan 1994, Morris et al. 1997)
+    /// means the compression a real flow induces scales with
+    /// `(v_max / c_s_rest)²`, not a scene-independent constant -- see
+    /// `SimConfig::fluid_near_wall_compression_mach_margin`'s own doc, and
+    /// Zhang et al., "A variable speed of sound formulation for weakly
+    /// compressible SPH" (arXiv:2310.04139), whose own variable-c_s update
+    /// rule is built on the identical Ma²≈Δρ relation.
+    fn rest_acoustic_c2(&self) -> Option<f32> {
+        None
+    }
+
+    /// Advances plastic/deformation state for one particle after G2P's velocity
+    /// gather. Takes a `ParticleUpdateCtx` (disjoint per-field borrows), not
+    /// `&mut Particles, i` -- every real implementation only ever touches its
+    /// own particle's fields, so this shape lets G2P run every particle's
+    /// update in parallel (see `ParticleUpdateCtx`'s own doc).
+    fn update_particle(&self, _ctx: &mut crate::particle::ParticleUpdateCtx, _dt: f32) {}
 
     /// Seed per-particle plastic state at spawn time.
     ///
@@ -148,6 +227,42 @@ pub trait MaterialModel: Send + Sync + core::fmt::Debug {
     /// Default: no-op (elastic materials need no initial plastic state).
     /// Override for materials that have a non-zero neutral accumulator (e.g. sand).
     fn init_particle(&self, _particle: &mut Particle) {}
+
+    /// Seed per-particle state when TRANSITIONING into this material from
+    /// another (via `Simulation::phase_transition`/`add_phase_rule`), as
+    /// opposed to a fresh spawn. Default: delegates to `init_particle`
+    /// unchanged -- exactly today's existing behavior for every material
+    /// that doesn't override this, zero behavior change.
+    ///
+    /// Real, found live 2026-08-18 (`examples/basic_steam.rs`, water
+    /// boiling into `GasMaterial` steam): `Simulation::
+    /// apply_phase_transition` (`spacetime::solver::particles`) already
+    /// rebaselines a transitioning particle to its real, continuous prior
+    /// state (F=IDENTITY, `initial_volume`=its actual current volume)
+    /// before calling this. For a material whose own fresh-spawn
+    /// analytical state (`init_particle`'s own `mass/rest_density`
+    /// formula) is close to what it's transitioning FROM, blindly
+    /// overwriting that rebaseline is harmless (e.g. water->ice, similar
+    /// real densities) -- but for a material transitioning from something
+    /// with a dramatically different rest density (water->steam, a real
+    /// ~1700x ratio), it makes the particle's claimed VOLUME jump that
+    /// same ~1700x in a single instant, injecting a real but wildly
+    /// under-resolved force spike (P2G's `stress*volume*kernel_gradient`
+    /// scatters that huge volume at the particle's own, unmoved grid
+    /// location) -- confirmed live as the direct cause of a real crash.
+    ///
+    /// Override this (leaving `init_particle` itself untouched for the
+    /// fresh-spawn case) when a material's rest state can differ enough
+    /// from whatever it might be transitioning from that continuity, not
+    /// a fresh analytical reset, is the physically honest choice -- see
+    /// `GasMaterial`'s own override for the real, worked pattern (keep the
+    /// reference volume TRUE, matching what per-substep dynamics already
+    /// assume, and instead set the STARTING deformation gradient to
+    /// reflect real compression relative to that true reference, clamped
+    /// to the material's own valid range).
+    fn init_particle_from_transition(&self, particle: &mut Particle) {
+        self.init_particle(particle)
+    }
 
     /// Whether `update_particle` does real work on the CPU.
     ///
@@ -158,13 +273,21 @@ pub trait MaterialModel: Send + Sync + core::fmt::Debug {
         false
     }
 
-    /// Whether particles of this material require a per-substep density recompute.
+    /// Whether this material consumes an optional kernel-density measurement.
     ///
-    /// Fluid EOS materials (Newtonian, Bingham) need up-to-date density each substep
-    /// because their pressure is a function of current ρ. Elastic/plastic materials
-    /// do not — density is derived from J at the end of update_particle.
-    /// Default: false. Override in fluid models.
+    /// This is for models whose constitutive law explicitly uses that sampled
+    /// field. Strict WC-MPM liquids do *not*: their EOS state is
+    /// `rho = rho0 / J`, owned together with `V = V0 J`; see
+    /// `owns_deformation_volume_state` below. Default: false.
     fn needs_density_recompute(&self) -> bool {
+        false
+    }
+
+    /// Whether this material owns density and current volume through its
+    /// deformation state.  Such materials must not have those values replaced
+    /// by a kernel-density gather, whose free-surface bias is a measurement
+    /// artifact rather than a constitutive update.
+    fn owns_deformation_volume_state(&self) -> bool {
         false
     }
 
@@ -266,14 +389,17 @@ macro_rules! forward_material_model_common {
                 viscous_cfl,
             )
         }
-        fn update_particle(&self, particles: &mut Particles, i: usize, dt: f32) {
-            self.inner.update_particle(particles, i, dt)
+        fn update_particle(&self, ctx: &mut crate::particle::ParticleUpdateCtx, dt: f32) {
+            self.inner.update_particle(ctx, dt)
         }
         fn needs_cpu_update(&self) -> bool {
             self.inner.needs_cpu_update()
         }
         fn needs_density_recompute(&self) -> bool {
             self.inner.needs_density_recompute()
+        }
+        fn owns_deformation_volume_state(&self) -> bool {
+            self.inner.owns_deformation_volume_state()
         }
         fn activation_scale(&self) -> f32 {
             self.inner.activation_scale()
@@ -288,7 +414,7 @@ macro_rules! forward_material_model_common {
 }
 
 /// Wraps any `MaterialModel` to give it a non-zero `latent_heat()` without writing a full
-/// delegating impl by hand — none of the 12 built-in materials expose a settable
+/// delegating impl by hand — none of the built-in materials expose a settable
 /// `latent_heat` field directly, since most users never need one.
 ///
 /// ```rust,no_run
@@ -304,7 +430,7 @@ pub struct WithLatentHeat<M> {
 }
 
 impl<M> WithLatentHeat<M> {
-    pub fn new(inner: M, latent_heat: f32) -> Self {
+    pub const fn new(inner: M, latent_heat: f32) -> Self {
         Self { inner, latent_heat }
     }
 }
@@ -313,6 +439,15 @@ impl<M: MaterialModel> MaterialModel for WithLatentHeat<M> {
     forward_material_model_common!();
     fn init_particle(&self, particle: &mut Particle) {
         self.inner.init_particle(particle)
+    }
+    // Real, explicit forward (not the trait default): the trait's own
+    // default would call THIS wrapper's `init_particle` (i.e. `inner.
+    // init_particle`), silently skipping `inner`'s own overridden
+    // transition-continuity logic if it has one (e.g. `GasMaterial`) --
+    // found live 2026-08-18 while adding this method, same real class of
+    // gap the method itself exists to close.
+    fn init_particle_from_transition(&self, particle: &mut Particle) {
+        self.inner.init_particle_from_transition(particle)
     }
     fn mixture_phase(&self) -> Option<MixturePhase> {
         self.inner.mixture_phase()
@@ -334,7 +469,7 @@ impl<M: MaterialModel> MaterialModel for WithLatentHeat<M> {
 /// ```rust,no_run
 /// # extern crate emerge_engine as emerge;
 /// # use emerge::{DruckerPragerMaterial, MixturePhase, WithMixturePhase};
-/// let sand = WithMixturePhase::new(DruckerPragerMaterial::cohesionless(1.0e5, 0.2), MixturePhase::Solid);
+/// let sand = WithMixturePhase::new(DruckerPragerMaterial::cohesionless(1.0e5, 0.2), MixturePhase::SOLID);
 /// ```
 #[derive(Debug, Clone, Copy)]
 pub struct WithMixturePhase<M> {
@@ -343,7 +478,7 @@ pub struct WithMixturePhase<M> {
 }
 
 impl<M> WithMixturePhase<M> {
-    pub fn new(inner: M, phase: MixturePhase) -> Self {
+    pub const fn new(inner: M, phase: MixturePhase) -> Self {
         Self { inner, phase }
     }
 }
@@ -352,6 +487,9 @@ impl<M: MaterialModel> MaterialModel for WithMixturePhase<M> {
     forward_material_model_common!();
     fn init_particle(&self, particle: &mut Particle) {
         self.inner.init_particle(particle)
+    }
+    fn init_particle_from_transition(&self, particle: &mut Particle) {
+        self.inner.init_particle_from_transition(particle)
     }
     fn latent_heat(&self) -> f32 {
         self.inner.latent_heat()
@@ -384,7 +522,7 @@ pub struct WithPreStress<M> {
 }
 
 impl<M> WithPreStress<M> {
-    pub fn new(inner: M, pressure: f32) -> Self {
+    pub const fn new(inner: M, pressure: f32) -> Self {
         Self { inner, pressure }
     }
 }
@@ -393,6 +531,10 @@ impl<M: MaterialModel> MaterialModel for WithPreStress<M> {
     forward_material_model_common!();
     fn init_particle(&self, particle: &mut Particle) {
         self.inner.init_particle(particle);
+        particle.internal_pressure = self.pressure;
+    }
+    fn init_particle_from_transition(&self, particle: &mut Particle) {
+        self.inner.init_particle_from_transition(particle);
         particle.internal_pressure = self.pressure;
     }
     fn mixture_phase(&self) -> Option<MixturePhase> {

@@ -16,6 +16,7 @@ use super::Particle;
 ///
 /// # Invariant
 /// All vecs have the same length at all times. Methods panic on out-of-bounds.
+#[derive(Clone)]
 pub struct Particles {
     // ── Kinematics — hot (read every substep) ────────────────────────────────
     pub x: Vec<Vec2>,
@@ -55,11 +56,98 @@ pub struct Particles {
     /// True when sleeping (skipped by P2G/G2P). `pub(crate)`: write only via
     /// `Simulation::wake`/`sleep`, which keep the tail-partition invariant intact.
     pub(crate) sleeping: Vec<bool>,
+
+    /// Kahan (compensated) summation residual for `x`'s position integration
+    /// in `transfer::g2p::gather_grid_to_particles` -- same real technique,
+    /// same citation (Kahan 1965), as `RodPoints::position_compensation`
+    /// already uses for rods: an ordinary velocity*dt increment can fall
+    /// below f32's representable precision at the particle's own grid-
+    /// coordinate magnitude (e.g. a barely-moving body far from the domain
+    /// origin) even though the underlying velocity is real and sustained --
+    /// this tracks the rounding error each addition drops and folds it back
+    /// in next time. NOT part of the `Particle` AoS view (no spare byte on
+    /// that 128-byte GPU-shared struct -- see its own doc; this is a pure
+    /// CPU-integration scratch value, reset to zero on push, same
+    /// convention `sleeping` above already established for a field with no
+    /// `Particle` counterpart).
+    pub(crate) position_compensation: Vec<Vec2>,
+}
+
+/// Per-particle mutable view into one particle's warm state, used by
+/// `MaterialModel::update_particle` and `BoundaryCondition::post_g2p_particle`.
+/// Exists so G2P's per-particle plasticity/boundary pass can run in parallel
+/// across particles (rayon) instead of needing `&mut Particles` (the whole
+/// SoA struct) one particle at a time -- every field here is disjoint-borrowed
+/// straight out of `Particles`' own separate `Vec<T>` fields (real struct-of-
+/// arrays, not just in name), so the borrow checker can prove two different
+/// particles' contexts never alias, even built concurrently on different
+/// threads. Covers exactly the fields every material's `update_particle` (and
+/// `GripFrictionBoundary`'s `post_g2p_particle`) actually touches -- verified
+/// by grepping every real implementation, not guessed.
+pub struct ParticleUpdateCtx<'a> {
+    pub x: &'a mut Vec2,
+    pub v: &'a mut Vec2,
+    pub velocity_gradient: &'a mut Mat2,
+    pub deformation_gradient: &'a mut Mat2,
+    pub volume: &'a mut f32,
+    pub density: &'a mut f32,
+    pub hardening_scale: &'a mut f32,
+    pub plastic_volume_ratio: &'a mut f32,
+    pub log_volume_strain: &'a mut f32,
+    pub friction_hardening: &'a mut f32,
+    pub mass: f32,
+    pub temperature: f32,
+    pub initial_volume: f32,
+    pub activation: f32,
+    pub activation_dir: Vec2,
+    /// Gathered granular fluidity `g` from a coupled
+    /// `GranularFluidityField` (see `energy::thermodynamics::granular_fluidity`),
+    /// for this substep only -- transient, never stored on `Particle` itself
+    /// (there is no spare byte for it). 0.0 (the field's own real rest
+    /// state) when no such field is wired up for this scene, or when the
+    /// reading material doesn't opt in -- provably inert in that case, not
+    /// a tuning default.
+    pub nonlocal_fluidity: f32,
+    /// Gathered micro-curvature (kappa = grad(omega_c)) from a coupled
+    /// `CosseratField` (see `energy::thermodynamics::cosserat_field`), for
+    /// this substep only -- transient, never stored on `Particle` itself,
+    /// same convention `nonlocal_fluidity` already uses. `Vec2::ZERO` (the
+    /// field's own real rest state) when no such field is wired up for this
+    /// scene, or when the reading material doesn't opt in -- provably inert
+    /// in that case, not a tuning default.
+    pub cosserat_curvature: Vec2,
 }
 
 impl Particles {
+    /// Builds a `ParticleUpdateCtx` for one particle by index. For single-
+    /// particle/test call sites (needs exclusive `&mut Particles`, so NOT
+    /// usable from inside a parallel loop over sliced fields -- the real G2P
+    /// hot path builds these directly from its own already-disjoint parallel
+    /// slices instead of calling this).
+    pub fn update_ctx(&mut self, i: usize) -> ParticleUpdateCtx<'_> {
+        ParticleUpdateCtx {
+            x: &mut self.x[i],
+            v: &mut self.v[i],
+            velocity_gradient: &mut self.velocity_gradient[i],
+            deformation_gradient: &mut self.deformation_gradient[i],
+            volume: &mut self.volume[i],
+            density: &mut self.density[i],
+            hardening_scale: &mut self.hardening_scale[i],
+            plastic_volume_ratio: &mut self.plastic_volume_ratio[i],
+            log_volume_strain: &mut self.log_volume_strain[i],
+            friction_hardening: &mut self.friction_hardening[i],
+            mass: self.mass[i],
+            temperature: self.temperature[i],
+            initial_volume: self.initial_volume[i],
+            activation: self.activation[i],
+            activation_dir: self.activation_dir[i],
+            nonlocal_fluidity: 0.0,
+            cosserat_curvature: Vec2::ZERO,
+        }
+    }
+
     /// Create an empty `Particles` store.
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             x: Vec::new(),
             v: Vec::new(),
@@ -84,6 +172,7 @@ impl Particles {
             scalar_field: Vec::new(),
             internal_pressure: Vec::new(),
             sleeping: Vec::new(),
+            position_compensation: Vec::new(),
         }
     }
 
@@ -113,18 +202,19 @@ impl Particles {
             scalar_field: Vec::with_capacity(cap),
             internal_pressure: Vec::with_capacity(cap),
             sleeping: Vec::with_capacity(cap),
+            position_compensation: Vec::with_capacity(cap),
         }
     }
 
     /// Number of particles.
     #[inline]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.x.len()
     }
 
     /// True if there are no particles.
     #[inline]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.x.is_empty()
     }
 
@@ -215,6 +305,9 @@ impl Particles {
         // live GPU particles (sleeping state included) into this SoA. Freshly-spawned
         // particles always have sleeping=0 already, so this is a no-op for that path.
         self.sleeping.push(p.sleeping != 0);
+        // A new particle starts with zero accumulated rounding error, same
+        // convention `sleeping` above uses for a field with no `Particle` counterpart.
+        self.position_compensation.push(Vec2::ZERO);
     }
 
     /// Swap all SoA fields for indices `a` and `b`. Used by sleep/wake partition logic.
@@ -246,6 +339,7 @@ impl Particles {
         self.scalar_field.swap(a, b);
         self.internal_pressure.swap(a, b);
         self.sleeping.swap(a, b);
+        self.position_compensation.swap(a, b);
     }
 
     /// Rotate `[start..end]` so that `[mid..end]` precedes `[start..mid]`.
@@ -290,8 +384,10 @@ impl Particles {
             if pred(&p) {
                 if write != read {
                     self.set(write, p);
-                    // sleeping is not part of the AoS Particle view — copy explicitly.
+                    // sleeping/position_compensation are not part of the AoS
+                    // Particle view — copy explicitly.
                     self.sleeping[write] = self.sleeping[read];
+                    self.position_compensation[write] = self.position_compensation[read];
                 }
                 write += 1;
             }
@@ -319,6 +415,7 @@ impl Particles {
         self.scalar_field.truncate(write);
         self.internal_pressure.truncate(write);
         self.sleeping.truncate(write);
+        self.position_compensation.truncate(write);
     }
 
     /// Apply `f` to every particle, writing all changes back.
@@ -369,7 +466,7 @@ impl<'a> Iterator for ParticlesIter<'a> {
 impl ExactSizeIterator for ParticlesIter<'_> {}
 
 impl Particles {
-    pub fn iter(&self) -> ParticlesIter<'_> {
+    pub const fn iter(&self) -> ParticlesIter<'_> {
         ParticlesIter {
             particles: self,
             index: 0,

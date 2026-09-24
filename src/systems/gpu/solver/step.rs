@@ -436,8 +436,8 @@ impl GpuSimulation {
                 // IMPORTANT: GPU g2p already integrated F via `F_new = (I + dt·C)·F_old`.
                 // Zero affine before update_particle so only the plasticity projection runs.
                 // Restore GPU affine afterwards so next P2G APIC term is correct.
-                // The new MaterialModel API takes (&mut Particles, usize) — convert AoS to SoA,
-                // run the CPU pass, then scatter results back.
+                // Convert AoS to SoA, run the CPU pass via a per-particle
+                // `ParticleUpdateCtx`, then scatter results back.
                 if any_cpu {
                     // Stash GPU affine matrices — we zero affine for the plasticity call then restore.
                     let gpu_affines: Vec<_> =
@@ -456,11 +456,10 @@ impl GpuSimulation {
                         if soa.sleeping[i] {
                             continue;
                         }
-                        self.registry.get(soa.material_id[i]).update_particle(
-                            &mut soa,
-                            i,
-                            self.last_sub_dt,
-                        );
+                        let material_id = soa.material_id[i];
+                        self.registry
+                            .get(material_id)
+                            .update_particle(&mut soa.update_ctx(i), self.last_sub_dt);
                     }
                     self.particles = soa.to_vec();
                     // Restore GPU affine.

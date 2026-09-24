@@ -1,21 +1,13 @@
 /// Compute pipeline setup for MLS-MPM GPU passes.
 ///
-/// Eleven passes per frame:
-///   Once per frame, in order (block-level counting sort, see particle_sort.wgsl):
-///     0a. particle_sort_clear    — zero the 256-entry block histogram + active_block_count
-///     0b. particle_sort_count    — one thread per particle, build histogram
-///     0c. particle_sort_compact  — GPU sparse grid Phase 1: record which blocks are occupied
-///                                  (reads the RAW histogram, must run before scan overwrites it)
-///     0d. particle_sort_scan     — one workgroup, exclusive prefix sum -> scatter cursor
-///     0e. particle_sort_scatter  — one thread per particle, write sorted_particle_ids
-///   Per substep:
-///     1. grid_clear       — zero only cells in active blocks (see grid_clear.wgsl, Phase 1)
-///     2. p2g              — scatter particles → grid (sorted access, 64-wide workgroups)
-///     3. grid_update      — normalize momentum→velocity, apply gravity, enforce boundary —
-///                            active-block dispatch too (see grid_update.wgsl, Phase 2)
-///     4. g2p              — gather grid → particles, write v + velocity_gradient only
-///     5. particles_update — F update, plasticity, volume/density, position, boundary (sorted)
-///     6. force_fields     — apply non-uniform body forces after particles_update
+/// See `solver/encode_substep.rs` for the authoritative per-substep dispatch
+/// order (this module builds the pipeline objects; it doesn't own the order
+/// they're dispatched in). Once per frame: a 4-pass block-level counting
+/// sort (`particle_sort_clear → count → scan → scatter`, see
+/// `particle_sort.wgsl`). Active-block detection (`particle_sort_compact`,
+/// GPU sparse grid Phase 1) runs every substep, not once per frame --
+/// particles move every substep, so a once-per-frame version goes stale by
+/// substep 2 of a multi-substep step.
 ///
 /// TWO bind group layouts shared by all passes (split 2026-07-16 — a single 20-binding
 /// layout hit a real, present limit: `create_bind_group_layout` failed on any adapter

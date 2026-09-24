@@ -67,6 +67,19 @@ const WOOD_DENSITY: f32 = 500.0;
 // in still air, and chosen empirically so a several-minute play session shows
 // meaningful spread -- real physics alone reads as too slow for that timescale.
 const COOLING_RATE: f32 = 0.001;
+// Real wood emissivity is ~0.85 (Incropera). Measured directly (headless comparisons,
+// same constants as this file, 2000s sim-time each): at the real value the plank NEVER
+// ignites (radiative loss equilibrates around 340K). Tried scaling it down (0.02, 0.01,
+// combined with/without COOLING_RATE) -- EVERY nonzero value stalls the fire at 6-7%
+// burned within a few hundred seconds, vs. 18%-and-still-climbing with emissivity=0.0.
+// Root cause: Stefan-Boltzmann's T^4 term grows much faster than this plank's
+// conduction can compensate for right in the 500-600K range spread depends on -- a
+// real physical effect (radiative-loss-driven flame extinction), but this demo's
+// conduction-only spread mechanic is too delicately balanced to carry ANY of it.
+// Kept off (0.0) so the actual "fire spreads" mechanic stays intact; the real,
+// tested Stefan-Boltzmann mechanism itself lives in `ThermalConfig::emissivity` for
+// scenes where it's a good fit (e.g. lava cooling), just not this one.
+const WOOD_EMISSIVITY: f32 = 0.0;
 
 const PLANK_HALF_LEN: i32 = 22;
 const PLANK_HALF_HEIGHT: i32 = 4;
@@ -135,6 +148,7 @@ fn make_sim() -> Simulation {
             // requires this, else diffusion rate is silently wrong.
             grid_cell_size: config.dx_meters,
             cooling_rate: COOLING_RATE,
+            emissivity: WOOD_EMISSIVITY,
         },
         config.grid_res,
     );
@@ -288,6 +302,17 @@ impl State {
                 dense[idx * 4 + 2] = grid.mass_at(IVec2::new(x as i32, y as i32));
             }
         }
+        // Real mass-weighted temperature scatter into the previously-unused
+        // channel 0 -- same fix as `fire_spread_gui.rs`'s own bridge, see
+        // `grid_volume.wgsl`'s own doc for the real formula this feeds.
+        let particles = self.sim.particles();
+        for i in 0..particles.x.len() {
+            let p = particles.x[i];
+            let cx = (p.x.round() as i32).clamp(0, GRID as i32 - 1) as usize;
+            let cy = (p.y.round() as i32).clamp(0, GRID as i32 - 1) as usize;
+            let idx = cy * GRID + cx;
+            dense[idx * 4] += particles.mass[i] * particles.temperature[i];
+        }
         self.queue
             .write_buffer(&self.grid_bridge_buf, 0, bytemuck::cast_slice(&dense));
 
@@ -295,7 +320,6 @@ impl State {
         // material_mass_bridge_buf's own doc): good enough for a 2-material dominant-
         // color decision, not claiming P2G-kernel accuracy.
         let mut material_mass = vec![0f32; GRID * GRID * SLOTS];
-        let particles = self.sim.particles();
         for i in 0..particles.x.len() {
             let p = particles.x[i];
             let cx = (p.x.round() as i32).clamp(0, GRID as i32 - 1) as usize;

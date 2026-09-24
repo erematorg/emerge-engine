@@ -210,7 +210,7 @@ pub struct FeedbackController {
 }
 
 impl FeedbackController {
-    pub fn feature_len(n_groups: usize) -> usize {
+    pub const fn feature_len(n_groups: usize) -> usize {
         n_groups * 4
     }
 

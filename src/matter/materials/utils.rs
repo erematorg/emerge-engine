@@ -1,24 +1,38 @@
 use crate::materials::svd::svd2;
 use glam::{Mat2, Vec2};
 
+/// `x.powf(exp)` using exact integer exponentiation-by-squaring (`powi`)
+/// when `exp` is a representable integer -- identical result, no
+/// transcendental call. Every Tait-EOS exponent this engine ships (7.0,
+/// Cole 1948) is a clean integer; this is a pure implementation-cost win in
+/// a hot per-particle, per-substep path (kirchhoff_stress + timestep_bound
+/// for every fluid material), not a physics change. Falls back to `powf`
+/// exactly for any exponent that isn't a clean integer, so behavior for a
+/// non-standard EOS power is unchanged.
+#[inline]
+pub(crate) fn fast_pow(x: f32, exp: f32) -> f32 {
+    if exp.fract() == 0.0 && exp.abs() < 32.0 {
+        x.powi(exp as i32)
+    } else {
+        x.powf(exp)
+    }
+}
+
 /// Floor applied to singular values before taking log — prevents ln(0).
 /// All material `update_particle` implementations clamp σᵢ above this value.
 pub(crate) const LOG_CLAMP: f32 = 1e-10;
 
-/// Floor applied to det(F) = J before using it for volume/density.
-/// Prevents divide-by-zero in stress and density computations.
-/// All materials clamp J ≥ MIN_J after projection.
+/// Floor applied by legacy solid/plastic constitutive laws before using
+/// `det(F)=J` in a singular expression. Strict WC-MPM liquid state does not
+/// use this floor: it keeps positive `J` through its exponential continuity
+/// update and reports an inadmissible state instead of clamping it.
 pub(crate) const MIN_J: f32 = 1e-6;
 
 /// Floor on Rankine's exponentially-softened effective tensile strength, as a
 /// fraction of the virgin `tensile_strength`. Without this floor, `t_eff` decays
 /// toward zero as damage grows, so ANY sustained cyclic stress eventually exceeds
 /// it every step by a growing margin -- an unbounded damage ratchet with no
-/// resting state (found 2026-07-06: LP's real 2D bulk-modulus fix raised
-/// settling strain just enough to cross this for the first time; traced to
-/// unbounded growth over 1200 steps, no plateau, no numerical blowup in
-/// velocity -- the damage accumulator itself was the runaway, not the physics).
-/// Real quasi-brittle/ductile damage models retain nonzero residual capacity
+/// resting state. Real quasi-brittle/ductile damage models retain nonzero residual capacity
 /// after yield rather than decaying to zero (Lemaitre & Chaboche, "Mechanics of
 /// Solid Materials," 1990 -- continuum damage mechanics caps effective
 /// stiffness/strength at a small nonzero residual specifically to keep the
@@ -54,7 +68,7 @@ pub(crate) fn rankine_damage_saturation_point(softening_rate: f32) -> f32 {
 /// The absolute value preserves Hencky strain magnitudes when `svd2()` encodes
 /// an inversion via a signed second singular value.
 /// Used identically by VonMisesMaterial, DruckerPragerMaterial, RankineMaterial.
-#[inline(always)]
+#[inline]
 pub(crate) fn hencky_strains(sigma: Vec2) -> Vec2 {
     let sigma = sigma.abs().max(Vec2::splat(LOG_CLAMP));
     Vec2::new(sigma.x.ln(), sigma.y.ln())
@@ -63,7 +77,7 @@ pub(crate) fn hencky_strains(sigma: Vec2) -> Vec2 {
 /// Reconstruct a 2×2 deformation gradient from SVD factors and (possibly updated) singular values.
 ///
 /// F = U · diag(sigma) · Vᵀ
-#[inline(always)]
+#[inline]
 pub(crate) fn reconstruct_f(u: Mat2, sigma: Vec2, vt: Mat2) -> Mat2 {
     u * Mat2::from_cols(Vec2::new(sigma.x, 0.0), Vec2::new(0.0, sigma.y)) * vt
 }
@@ -80,7 +94,7 @@ pub(crate) fn reconstruct_f(u: Mat2, sigma: Vec2, vt: Mat2) -> Mat2 {
 /// is for REVERSIBLE materials whose principal stress response is asymmetric (e.g. a
 /// no-compression/tension-only law) but that never modify F, only its own stress
 /// output for the CURRENT F.
-#[inline(always)]
+#[inline]
 pub(crate) fn reconstruct_stress_from_principal(u: Mat2, tau_principal: Vec2) -> Mat2 {
     u * Mat2::from_diagonal(tau_principal) * u.transpose()
 }
@@ -89,7 +103,7 @@ pub(crate) fn reconstruct_stress_from_principal(u: Mat2, tau_principal: Vec2) ->
 ///
 /// For corotated/Hencky elastic: τᵢ = (2µ+λ)·εᵢ + λ·ε_j  →  system inversion.
 /// Inverse: ε = A⁻¹·τ where det(A) = 4µ(µ+λ).
-#[inline(always)]
+#[inline]
 pub(crate) fn stress_to_hencky(tau: Vec2, lambda: f32, mu: f32) -> Vec2 {
     let det = 4.0 * mu * (mu + lambda);
     let a = 2.0 * mu + lambda;
@@ -196,6 +210,35 @@ pub fn self_consistent_plastic_multiplier(
     gamma
 }
 
+/// Real, generic 1D elastic-perfectly-plastic return mapping -- the shared
+/// ALGORITHMIC core of "clamp a trial value to an interval around a
+/// permanent/plastic offset, permanently absorbing any excess," for any
+/// quantity whose yield surface is a plain interval rather than a
+/// norm-ball. This is the scalar-state sibling of the tensor-space radial
+/// return every material above uses (e.g. `VonMisesMaterial::update_particle`'s
+/// own `dev * (effective_yield/elastic_dev)` projection) -- genuinely
+/// different math from that (an interval clamp, not a norm rescale) because
+/// the underlying state is 1D, not a tensor; the SHARED concept (elastic
+/// trial -> yield check -> permanent return-map) is the same, only the
+/// shape of the projection differs with dimensionality. Real first adopter:
+/// `rod::plasticity`'s bending curvature; any other future scalar-state
+/// plasticity (a scalar damage variable, an axial-force yield) can reuse
+/// this directly instead of re-deriving the same three-line clamp.
+///
+/// `trial`: the fully-elastic candidate value (e.g. current curvature).
+/// `permanent`: the current permanent/plastic offset (e.g. rest curvature).
+/// `limit`: the real, positive elastic-limit half-width of the interval.
+pub fn scalar_return_map(trial: f32, permanent: f32, limit: f32) -> f32 {
+    let elastic = trial - permanent;
+    if elastic > limit {
+        permanent + (elastic - limit)
+    } else if elastic < -limit {
+        permanent + (elastic + limit)
+    } else {
+        permanent
+    }
+}
+
 /// CFL timestep bound from elastic longitudinal wave speed c_P = √((λ+2µ)·h / ρ).
 ///
 /// `hardening` = 1.0 for materials without hardening (elastic, sand, von Mises).
@@ -278,6 +321,41 @@ pub fn lame_from_si(
     let (lambda_si, mu_si) = lame_from_young(young_modulus_pa, poisson_ratio);
     let scale = dt_seconds * dt_seconds / (rest_density_kg_m3 * dx_meters * dx_meters);
     (lambda_si * scale, mu_si * scale)
+}
+
+/// Von Neumann & Richtmyer 1950 (LA-671) artificial bulk viscosity, EOS-
+/// agnostic core: `q = rho*(c0*h^2*(div v)^2 - c1*h*c_sound*div v)`, gated
+/// to compression (`div v < 0`) -- real shocks only form under
+/// compression. `c0 = (gamma+1)/4` is the Kurapatenko 1967 weak-shock
+/// coefficient; `c1 = 1.0` (Landshoff) is the standard linear term. Every
+/// EOS supplies its OWN `c_sound` (its own `dp/drho` at the current state)
+/// and its own real `gamma` (an ideal gas's actual adiabatic index, or a
+/// Tait-EOS liquid's `eos_power` used as Kurapatenko's stand-in -- see
+/// `liquid::fluid::artificial_bulk_viscosity`'s doc) -- this function owns
+/// only the shared shock-viscosity FORM, not any one EOS's derivative.
+/// Extracted 2026-08-18 so a genuinely different EOS (ideal gas) can reuse
+/// the real, cited shock-capturing term without faking Tait parameters to
+/// back into it.
+#[inline]
+pub(crate) fn von_neumann_richtmyer_q(
+    rest_density: f32,
+    j: f32,
+    div_v: f32,
+    grid_cell_size: f32,
+    c_sound: f32,
+    weak_shock_gamma: f32,
+) -> f32 {
+    if div_v.is_nan() || div_v >= 0.0 {
+        return 0.0;
+    }
+    let c0_quadratic = (weak_shock_gamma + 1.0) * 0.25;
+    const C1_LINEAR: f32 = 1.0;
+    let rho = rest_density / j;
+    let h = grid_cell_size;
+    let quadratic = c0_quadratic * h * h * div_v * div_v;
+    let linear = C1_LINEAR * h * c_sound * div_v;
+    let q = rho * (quadratic - linear);
+    if q.is_finite() { q } else { 0.0 }
 }
 
 /// Convert SI gravity (m/s²) to solver units (grid cells / s²).

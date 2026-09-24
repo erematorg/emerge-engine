@@ -11,11 +11,12 @@ use emerge::thermodynamics::{
     ScalarDiffusionConfig, ScalarDiffusionField, ThermalConfig, ThermalDiffusion, saturating_uptake,
 };
 use emerge::{
-    DruckerPragerMaterial, Elastic, Field, MixturePhase, MuIRheologyMaterial, NaccMaterial,
-    NeoHookeanMaterial, NewtonianFluidMaterial, RankineMaterial, SimConfig, Simulation,
-    SlipBoundary, SpawnRegion, StomakhinMaterial, VonMisesMaterial, WithMixturePhase,
+    DruckerPragerMaterial, Elastic, Field, GripFrictionBoundary, MixturePhase, MuIRheologyMaterial,
+    NaccMaterial, NeoHookeanMaterial, NewtonianFluidMaterial, RankineMaterial, SimConfig,
+    Simulation, SlipBoundary, SpawnRegion, StomakhinMaterial, VonMisesMaterial, WithLatentHeat,
+    WithMixturePhase,
 };
-use glam::{IVec2, Vec2};
+use glam::{IVec2, Mat2, Vec2};
 
 // --- helpers ---
 
@@ -95,11 +96,7 @@ fn jelly_stable_after_many_steps() {
 
 #[test]
 fn fluid_stable_after_many_steps() {
-    let solver_config = SimConfig {
-        recompute_density_each_step: true,
-        ..small_solver_config()
-    };
-    let mut solver = Simulation::new(solver_config, small_spawn_config(16.0))
+    let mut solver = Simulation::new(small_solver_config(), small_spawn_config(16.0))
         .with_default_material(Box::new(NewtonianFluidMaterial::new(4.0, 0.1, 10.0, 4.0)));
 
     solver.step_n(200);
@@ -114,10 +111,121 @@ fn fluid_stable_after_many_steps() {
             "particle {i}: velocity non-finite after fluid sim"
         );
         assert!(
-            p.density > 0.0,
-            "particle {i}: density collapsed after fluid sim"
+            p.density.is_finite() && p.density > 0.0 && p.volume.is_finite() && p.volume > 0.0,
+            "particle {i}: fluid volume/density became inadmissible after fluid sim"
+        );
+        let j = p.deformation_gradient.determinant();
+        assert!(
+            j.is_finite() && j > 0.0 && ((p.volume / p.initial_volume - j) / j).abs() < 2.0e-4,
+            "particle {i}: strict fluid J state disagrees with V/V0"
+        );
+        assert!(
+            ((p.density * p.volume - p.mass) / p.mass).abs() < 2.0e-4,
+            "particle {i}: strict fluid state violates rho*V=m"
         );
     }
+}
+
+#[test]
+fn compressed_strict_fluid_generates_barotropic_momentum() {
+    let config = SimConfig {
+        dt: 0.02,
+        gravity: Vec2::ZERO,
+        ..small_solver_config()
+    };
+    let spawn = SpawnRegion {
+        spacing: 0.5,
+        box_size: IVec2::new(4, 4),
+        box_center: Vec2::splat(16.0),
+        mass_override: Some(4.0 * 0.5 * 0.5),
+        initial_deformation_gradient: Mat2::from_diagonal(Vec2::splat(0.95_f32.sqrt())),
+        ..SpawnRegion::for_sim(&config)
+    };
+    let mut pressurised = Simulation::new(config, spawn)
+        .with_default_material(Box::new(NewtonianFluidMaterial::new(4.0, 0.0, 10.0, 4.0)));
+    let mut pressure_free = Simulation::new(config, spawn)
+        .with_default_material(Box::new(NewtonianFluidMaterial::new(4.0, 0.0, 0.0, 4.0)));
+
+    pressurised.step();
+    pressure_free.step();
+    let maximum_velocity_difference = pressurised
+        .particles()
+        .iter()
+        .zip(pressure_free.particles())
+        .map(|(with_pressure, without_pressure)| (with_pressure.v - without_pressure.v).length())
+        .fold(0.0_f32, f32::max);
+    assert!(
+        maximum_velocity_difference > 1.0e-5,
+        "a compressed free-surface WC-MPM state must receive a nonzero Tait pressure impulse"
+    );
+}
+
+/// Real, deliberate contract as of 2026-08-10 (was: silently loop past
+/// `max_substeps_per_step` to always finish, guaranteeing zero dropped
+/// time -- that's what this test used to assert). `max_substeps_per_step`
+/// is now a hard, honest per-frame work budget for EVERY material (a
+/// runaway CFL collapse must not be free to make a single `step()` call
+/// take seconds, see that field's own doc) -- ordinary materials tolerate
+/// an honestly-tracked drop, but a strict WC-MPM fluid's own "no hidden
+/// corner-cuts" philosophy means it must fail LOUD instead of silently
+/// advancing less than the requested dt. Same real tradeoff every other
+/// strict-fluid safety check in this codebase already makes (see
+/// `check_j_range`/`assert_owned_deformation_state`).
+#[test]
+#[should_panic(expected = "could not advance the full requested dt")]
+fn strict_fluid_panics_rather_than_silently_drop_time_past_substep_budget() {
+    let config = SimConfig {
+        max_substeps_per_step: 1,
+        gravity: Vec2::ZERO,
+        ..small_solver_config()
+    };
+    let spawn = SpawnRegion {
+        spacing: 0.5,
+        box_size: IVec2::new(4, 4),
+        box_center: Vec2::splat(16.0),
+        mass_override: Some(4.0 * 0.5 * 0.5),
+        ..SpawnRegion::for_sim(&config)
+    };
+    let mut solver = Simulation::new(config, spawn)
+        .with_default_material(Box::new(NewtonianFluidMaterial::new(4.0, 0.0, 1000.0, 4.0)));
+    for velocity in &mut solver.particles_mut().v {
+        *velocity = Vec2::new(1.0, 0.0);
+    }
+
+    solver.step();
+}
+
+#[test]
+#[should_panic(expected = "cannot use ASFLIP")]
+fn strict_fluid_rejects_asflip_transfer_heuristic() {
+    let config = SimConfig {
+        asflip_blend: 0.5,
+        ..small_solver_config()
+    };
+    let mut solver = Simulation::new(config, small_spawn_config(16.0))
+        .with_default_material(Box::new(NewtonianFluidMaterial::new(4.0, 0.0, 10.0, 4.0)));
+    solver.step();
+}
+
+#[test]
+#[should_panic(expected = "requires apic_blend = 1")]
+fn strict_fluid_rejects_attenuated_velocity_gradient() {
+    let config = SimConfig {
+        apic_blend: 0.5,
+        ..small_solver_config()
+    };
+    let mut solver = Simulation::new(config, small_spawn_config(16.0))
+        .with_default_material(Box::new(NewtonianFluidMaterial::new(4.0, 0.0, 10.0, 4.0)));
+    solver.step();
+}
+
+#[test]
+#[should_panic(expected = "undeclared post-G2P particle mutation")]
+fn strict_fluid_rejects_grip_velocity_hook() {
+    let mut solver = Simulation::new(small_solver_config(), small_spawn_config(16.0))
+        .with_default_material(Box::new(NewtonianFluidMaterial::new(4.0, 0.0, 10.0, 4.0)));
+    solver.add_boundary_condition(Box::new(GripFrictionBoundary::new(3, 0.5, 0.5)));
+    solver.step();
 }
 
 #[test]
@@ -249,7 +357,7 @@ fn rankine_softening_reduces_tensile_strength() {
     p.velocity_gradient = glam::Mat2::ZERO;
 
     let mut soa = Particles::from(vec![p]);
-    mat.update_particle(&mut soa, 0, 0.01);
+    mat.update_particle(&mut soa.update_ctx(0), 0.01);
     p = soa.get(0);
 
     // Damage should be positive (tensile yield occurred) or zero (elastic)
@@ -366,6 +474,136 @@ fn phase_transition_switches_material_ids() {
         "all particles transitioned â€” expected partial"
     );
     assert_eq!(fluid_count + jelly_count, solver.particles().len());
+}
+
+/// Real permafrost thaw -- reuses the SAME machinery already proven for
+/// combustion tonight (`add_phase_rule` + real `WithLatentHeat`), not new
+/// physics, just composing already-tested pieces for a new real phenomenon.
+/// Real freezing point 273.15K. Real water/ice latent heat of fusion, 334 (same value already used
+/// elsewhere in this file for water) -- honestly NOT scaled down by real
+/// permafrost's actual ice-content fraction (soil is an ice-BONDED mixture, not
+/// pure ice); a disclosed simplification, same spirit as `MixturePhase`'s own
+/// single-scalar-not-full-porosity-field disclosure.
+#[test]
+fn permafrost_thaws_at_freezing_point_with_real_latent_heat_debit() {
+    const FROZEN_ID: u32 = 0;
+    const THAWED_ID: u32 = 1;
+    const FREEZING_POINT_K: f32 = 273.15;
+    const LATENT_HEAT_FUSION: f32 = 334.0;
+    const HEAT_CAPACITY: f32 = 2000.0; // real order-of-magnitude soil specific heat, J/(kg*K)
+
+    let config = small_solver_config();
+    let thermal = ThermalDiffusion::new(
+        ThermalConfig {
+            heat_capacity: HEAT_CAPACITY,
+            density: 1800.0, // kg/m^3, real order-of-magnitude soil density
+            grid_cell_size: 0.1,
+            ..Default::default()
+        },
+        config.grid_res,
+    );
+
+    let frozen = NaccMaterial::wet_soil(900.0 * 8.0, 0.3);
+    let thawed = WithLatentHeat::new(NaccMaterial::wet_soil(900.0, 0.3), LATENT_HEAT_FUSION);
+
+    let mut solver = Simulation::new(config, small_spawn_config(16.0))
+        .with_default_material(Box::new(frozen))
+        .with_material(THAWED_ID, Box::new(thawed))
+        .with_thermal(thermal)
+        .with_phase_rule(move |p| {
+            if p.material_id == FROZEN_ID && p.temperature > FREEZING_POINT_K {
+                Some(THAWED_ID)
+            } else {
+                None
+            }
+        });
+
+    // Start well below freezing (real permafrost winter temperature), then warm
+    // past the real freezing point -- like `ThermalConfig::ambient` driving a
+    // real seasonal thaw, simplified to a direct temperature set for a
+    // deterministic test (same style as the existing latent-heat test above).
+    for t in solver.particles_mut().temperature.iter_mut() {
+        *t = 260.0;
+    }
+    assert!(
+        solver
+            .particles()
+            .iter()
+            .all(|p| p.material_id == FROZEN_ID),
+        "must start fully frozen"
+    );
+
+    for t in solver.particles_mut().temperature.iter_mut() {
+        *t = 280.0; // above freezing
+    }
+    solver.step();
+
+    let expected_temp = 280.0 - LATENT_HEAT_FUSION / HEAT_CAPACITY;
+    for p in solver.particles().iter() {
+        assert_eq!(
+            p.material_id, THAWED_ID,
+            "particle above freezing point must thaw"
+        );
+        assert!(
+            (p.temperature - expected_temp).abs() < 1.0,
+            "expected real latent-heat debit toward {expected_temp:.3}, got {:.3}",
+            p.temperature
+        );
+    }
+}
+
+/// Real mechanical difference, not just a renamed material: a frozen (ice-
+/// bonded, stiffer) block must resist the SAME downward strike more than the
+/// SAME soil once thawed -- verifies the freeze/thaw pair actually changes
+/// physical behavior, matching the real qualitative literature consensus
+/// (Andersland & Ladanyi, "Frozen Ground Engineering": frozen ground
+/// substantially stiffer than thawed, exact ratio soil/ice-content-dependent --
+/// composing two independently real citations, ~100 MPa unfrozen soil vs
+/// ~23-30 GPa frozen fine sand, gives an order-of-magnitude-plus real ratio; an
+/// 8x stiffness increase is used here instead, real direction preserved,
+/// magnitude reduced for explicit-MPM CFL practicality at this grid scale --
+/// same disclosed tradeoff as tonight's rock presets).
+#[test]
+fn frozen_ground_resists_a_strike_more_than_thawed_ground() {
+    let config = small_solver_config(); // real default gravity -- see below for why
+    let frozen_mat = NaccMaterial::wet_soil(900.0 * 8.0, 0.3);
+    let thawed_mat = NaccMaterial::wet_soil(900.0, 0.3);
+
+    // NACC's elastic predictor bug fix (2026-07-31, `nacc.rs::update_particle`)
+    // exposed that this test's ORIGINAL zero-gravity setup was measuring a
+    // physically degenerate regime: real critical-state soil mechanics says a
+    // cohesionless/low-cohesion Cam-Clay material has ~zero shear capacity at
+    // zero confining pressure REGARDLESS of stiffness (same real fact already
+    // documented on `small_elastic_strain_is_not_projected` above) -- so
+    // "frozen vs thawed" barely differed once the material's stress genuinely
+    // engaged. Real fix: let the block settle under gravity first (builds real
+    // confining pressure / p0 pre-consolidation, the actual real-world
+    // precondition for "frozen ground" to mean anything mechanically), THEN
+    // measure displacement from that settled state -- matching how
+    // `permafrost.rs`'s live demo actually works (gravity always on).
+    let displacement_after_strike = |mat: NaccMaterial| -> f32 {
+        let mut solver =
+            Simulation::new(config, small_spawn_config(16.0)).with_default_material(Box::new(mat));
+        solver.step_n(200); // settle under self-weight, build real confining pressure
+        let before: Vec<Vec2> = solver.particles().x.clone();
+        solver.apply_impulse(Vec2::splat(16.0), 6.0, Vec2::new(0.0, -20.0));
+        solver.step_n(30);
+        let after = &solver.particles().x;
+        before
+            .iter()
+            .zip(after.iter())
+            .map(|(&b, &a)| (a - b).length())
+            .fold(0.0f32, f32::max)
+    };
+
+    let frozen_displacement = displacement_after_strike(frozen_mat);
+    let thawed_displacement = displacement_after_strike(thawed_mat);
+
+    assert!(
+        frozen_displacement < thawed_displacement,
+        "frozen ground should displace LESS than thawed ground under the same \
+         strike: frozen={frozen_displacement:.4} thawed={thawed_displacement:.4}"
+    );
 }
 
 /// Sets a distinctive, material-specific value in `init_particle` so a real test
@@ -642,7 +880,7 @@ fn resource_field_depletes_near_consumer_then_regrows() {
 
     // Phase 1: consumer present, depletes nearby resource every step.
     for _ in 0..30 {
-        let nearby: Vec<usize> = solver.particles_near(consumer_pos, EAT_RADIUS).collect();
+        let nearby: Vec<usize> = solver.particles_near(consumer_pos, EAT_RADIUS);
         let particles = solver.particles_mut();
         for i in nearby {
             let phi = particles.temperature[i];
@@ -654,15 +892,17 @@ fn resource_field_depletes_near_consumer_then_regrows() {
 
     let near_after_eating: f32 = solver
         .particles_near(consumer_pos, EAT_RADIUS)
+        .into_iter()
         .map(|i| solver.particles().get(i).temperature)
         .sum::<f32>()
-        / solver.particles_near(consumer_pos, EAT_RADIUS).count() as f32;
+        / solver.particles_near(consumer_pos, EAT_RADIUS).len() as f32;
     let far_pos = Vec2::new(26.0, 16.0);
     let far_after_eating: f32 = solver
         .particles_near(far_pos, EAT_RADIUS)
+        .into_iter()
         .map(|i| solver.particles().get(i).temperature)
         .sum::<f32>()
-        / solver.particles_near(far_pos, EAT_RADIUS).count() as f32;
+        / solver.particles_near(far_pos, EAT_RADIUS).len() as f32;
 
     println!(
         "resource_field_depletes_near_consumer_then_regrows: after eating -- \
@@ -683,9 +923,10 @@ fn resource_field_depletes_near_consumer_then_regrows() {
     }
     let near_after_regrowth: f32 = solver
         .particles_near(consumer_pos, EAT_RADIUS)
+        .into_iter()
         .map(|i| solver.particles().get(i).temperature)
         .sum::<f32>()
-        / solver.particles_near(consumer_pos, EAT_RADIUS).count() as f32;
+        / solver.particles_near(consumer_pos, EAT_RADIUS).len() as f32;
 
     println!(
         "resource_field_depletes_near_consumer_then_regrows: after regrowth -- near={near_after_regrowth:.3}"
@@ -1143,6 +1384,75 @@ fn thermal_diffusion_spreads_heat() {
 }
 
 #[test]
+fn thermal_stability_dt_matches_the_cited_formula() {
+    let cfg = ThermalConfig {
+        conductivity: 0.6,
+        heat_capacity: 4182.0,
+        density: 1000.0,
+        ambient: 0.0,
+        grid_cell_size: 0.1,
+        ..Default::default()
+    };
+    let expected = 1.0 / (4.0 * cfg.alpha_grid());
+    assert!((cfg.stability_dt() - expected).abs() < 1.0e-9);
+    assert!(cfg.stability_dt() > 0.0);
+}
+
+/// Real regression guard: a `ThermalConfig` whose `grid_cell_size` is too
+/// small relative to its own conductivity/density/heat_capacity gives a
+/// stability bound smaller than the scene's own `dt` -- exactly the
+/// disclosed footgun `ThermalConfig::grid_cell_size`'s own doc describes
+/// (passing the wrong cell-size convention inflates `alpha_grid()` and used
+/// to blow explicit Euler into runaway temperatures). Now that
+/// `ThermalConfig::stability_dt()` is folded into the adaptive substep
+/// chooser, the same misconfiguration must stay finite and bounded instead.
+#[test]
+fn thermal_misconfigured_grid_cell_size_stays_finite_under_adaptive_substep() {
+    let config = SimConfig {
+        gravity: Vec2::ZERO,
+        ..small_solver_config()
+    };
+    let thermal = ThermalDiffusion::new(
+        ThermalConfig {
+            conductivity: 0.6,
+            heat_capacity: 4182.0,
+            density: 1000.0,
+            ambient: 0.0,
+            grid_cell_size: 0.0001, // deliberately too small -- stability_dt << config.dt
+            ..Default::default()
+        },
+        config.grid_res,
+    );
+    assert!(
+        thermal.config.stability_dt() < config.dt,
+        "test setup must actually exercise the clamp: stability_dt={} should be < dt={}",
+        thermal.config.stability_dt(),
+        config.dt
+    );
+
+    let mut solver = Simulation::new(config, small_spawn_config(16.0))
+        .with_default_material(Box::new(NeoHookeanMaterial::new(10.0, 20.0)))
+        .with_thermal(thermal);
+
+    {
+        let particles = solver.particles_mut();
+        for i in 0..particles.len() {
+            particles.temperature[i] = if particles.x[i].x < 16.0 { 100.0 } else { 0.0 };
+        }
+    }
+
+    solver.step_n(300);
+
+    for (i, p) in solver.particles().iter().enumerate() {
+        assert!(
+            p.temperature.is_finite() && p.temperature.abs() < 1.0e6,
+            "thermal: particle {i} temperature runaway under misconfigured grid_cell_size: {}",
+            p.temperature
+        );
+    }
+}
+
+#[test]
 fn thermal_uniform_temperature_stays_stable() {
     // All particles at the same temperature as ambient â€” diffusion should produce no drift.
     let config = SimConfig {
@@ -1297,6 +1607,7 @@ fn thermal_config_mut_drives_day_night_ambient_cycle() {
             ambient: initial_temp,
             cooling_rate: 0.5,
             grid_cell_size: 0.1,
+            emissivity: 0.0,
         },
         config.grid_res,
     );
@@ -1343,6 +1654,70 @@ fn thermal_config_mut_drives_day_night_ambient_cycle() {
     println!(
         "thermal_config_mut_drives_day_night_ambient_cycle: initial={initial_temp} \
          day_mean={mean_temp_day:.2} night_mean={mean_temp_night:.2}"
+    );
+}
+
+/// Real Stefan-Boltzmann radiative loss (`ThermalConfig::emissivity`), isolated from
+/// spatial diffusion (`conductivity: 0.0`) and Newton cooling (`cooling_rate: 0.0`) so
+/// only the T^4 term acts. `heat_radiation`'s own T^4 scaling law is already unit-tested
+/// in `transfer.rs`; this proves the SOLVER WIRING: disabled by default (emissivity=0.0,
+/// matching `cooling_rate`'s existing 0.0-disables convention), and a hotter slab cools
+/// strictly faster with higher emissivity when enabled -- the real ordering a T^4 law
+/// must produce, not just "temperature goes down eventually".
+#[test]
+fn radiative_cooling_scales_with_emissivity() {
+    let hot_temp = 1000.0_f32; // K, real fire-range temperature -- where T^4 actually matters
+    let ambient = 293.15_f32; // K, real room temperature
+
+    let run = |emissivity: f32| -> f32 {
+        let config = SimConfig {
+            gravity: Vec2::ZERO,
+            ..small_solver_config()
+        };
+        let thermal = ThermalDiffusion::new(
+            ThermalConfig {
+                conductivity: 0.0, // isolate radiation from spatial diffusion
+                heat_capacity: 1000.0,
+                density: 1000.0,
+                ambient,
+                grid_cell_size: 0.1,
+                cooling_rate: 0.0, // isolate radiation from Newton cooling
+                emissivity,
+            },
+            config.grid_res,
+        );
+        let mut solver = Simulation::new(config, small_spawn_config(16.0))
+            .with_default_material(Box::new(NeoHookeanMaterial::new(10.0, 20.0)))
+            .with_thermal(thermal);
+        for t in solver.particles_mut().temperature.iter_mut() {
+            *t = hot_temp;
+        }
+        solver.step_n(20);
+        solver
+            .particles()
+            .iter()
+            .map(|p| p.temperature)
+            .sum::<f32>()
+            / solver.particles().len() as f32
+    };
+
+    let mean_disabled = run(0.0);
+    let mean_low_emissivity = run(0.3);
+    let mean_high_emissivity = run(0.9);
+
+    assert!(
+        (mean_disabled - hot_temp).abs() < 1e-3,
+        "emissivity=0.0 must be a true no-op (default, backward-compatible): mean={mean_disabled:.4}"
+    );
+    assert!(
+        mean_low_emissivity < hot_temp,
+        "radiative loss must actually cool the slab: mean={mean_low_emissivity:.2}"
+    );
+    assert!(
+        mean_high_emissivity < mean_low_emissivity,
+        "higher emissivity must radiate away MORE heat per step (T^4 law is monotone in \
+         emissivity, not just present): low_eps_mean={mean_low_emissivity:.2} \
+         high_eps_mean={mean_high_emissivity:.2}"
     );
 }
 
@@ -1918,23 +2293,9 @@ fn spawn_region_mass_from_matches_manual_particle_mass() {
 
 // --- two-phase mixture coupling (Tampubolon et al. 2017) ---
 
-/// Real end-to-end check through the FULL pipeline (P2G scatter -> grid-level
-/// closed-form drag solve -> G2P routing), not just the unit-level grid solve
-/// already verified in `spacetime::grid::mixture_coupling_tests`.
-///
-/// REAL FINDING while building this test, worth recording: comparing against
-/// `mixture_drag_coefficient=0.0` ("disabled") is NOT a valid "no coupling"
-/// baseline for an A/B here. Ordinary single-field MPM already fully merges
-/// momentum for ANY two materials sharing a grid node (one shared `Cell`,
-/// unconditionally) -- that's a stronger, effectively-infinite-stiffness
-/// coupling, not "no coupling at all". A genuinely LOWER, physically-correct
-/// finite-drag exchange therefore looks *weaker* than the disabled/merged
-/// baseline for two fully-co-located bodies, which is real and expected, not a
-/// bug (confirmed via direct instrumentation of the resolved per-node
-/// velocities during investigation, not assumed). The valid, confound-free A/B
-/// is HIGH drag vs LOW drag -- both paths engage the exact same resolved-
-/// velocity routing, differing only in how strongly it relaxes the two phases
-/// toward each other, which is exactly what the closed-form solve predicts.
+/// Construct a deliberately unsupported strict-liquid/porous-mixture scene.
+/// It is used only to verify that the solver fails explicitly instead of
+/// blending two unrelated momentum equations into a plausible-looking result.
 fn build_mixture_scene(drag_coefficient: f32) -> Simulation {
     let config = SimConfig {
         mixture_drag_coefficient: drag_coefficient,
@@ -1961,11 +2322,11 @@ fn build_mixture_scene(drag_coefficient: f32) -> Simulation {
     };
     let solid = WithMixturePhase::new(
         DruckerPragerMaterial::from_young_modulus(1.0e6, 0.2),
-        MixturePhase::Solid,
+        MixturePhase::SOLID,
     );
     let fluid = WithMixturePhase::new(
         NewtonianFluidMaterial::low_viscosity(4.0, 10.0),
-        MixturePhase::Fluid,
+        MixturePhase::FLUID,
     );
     let mut solver = Simulation::new(config, solid_spawn)
         .with_default_material(Box::new(solid))
@@ -1983,43 +2344,250 @@ fn build_mixture_scene(drag_coefficient: f32) -> Simulation {
     solver
 }
 
-fn relative_solid_fluid_speed(sim: &Simulation) -> f32 {
-    let particles = sim.particles();
-    let avg = |id: u32| -> Vec2 {
-        let group: Vec<Vec2> = particles
-            .iter()
-            .filter(|p| p.material_id == id)
-            .map(|p| p.v)
-            .collect();
-        group.iter().sum::<Vec2>() / group.len() as f32
+/// **Archived diagnostic:** the historical notes below predate strict
+/// WC-MPM state ownership and full-time adaptive stepping. They are retained
+/// for investigation provenance, not as a description of current behavior.
+///
+/// Real, permanent, OBSERVATIONAL diagnostic (not a pass/fail regression --
+/// see result below) for the `mixture_sand_water.rs` example's own
+/// `dropped`/min_dt-clamp finding (2026-08-04, see
+/// `mixture_sand_water_explosion_investigation` memory): mirrors that
+/// example's exact scene (same grid, spacing, box sizes, material params,
+/// `SlipBoundary`, gravity) headless, long horizon, tracking whether
+/// `sim_time_dropped` stays bounded as sustained settling compacts material
+/// against the floor.
+///
+/// Real bug found and fixed same session, kept regardless of the result
+/// below: `NewtonianFluidMaterial` never wrote `particles.density`/`volume`
+/// from its own bounded EOS formula each substep (see its `update_particle`)
+/// -- left entirely to `estimate_particle_volumes`'s grid-mass estimate,
+/// which has no ceiling on compaction (only `clamp_rarefied_volume`'s
+/// rarefaction ceiling). Unlike every plastic solid material (DP included),
+/// nothing corrected a drifting estimate back down. This is real, disclosed,
+/// physically-motivated (every other material already self-corrects this
+/// way) -- kept as a genuine improvement independent of whether it closes
+/// the issue below.
+///
+/// REAL, MEASURED RESULT with the fix applied (2026-08-04): does NOT close
+/// the issue. `dropped` still climbs past frame ~2100, reaching 59.8% of
+/// frame dt by frame 2189 -- worse than the pre-fix baseline's own 6.8%
+/// plateau at the OLD (tighter) substep budget, though a different config
+/// (96 substeps vs 32) makes the two not directly comparable. Honest
+/// conclusion: the missing fluid self-correction was a REAL bug (now fixed)
+/// but not the (or not the only) root cause of the dropped-time runaway --
+/// something else keeps demanding more substeps than any tested budget
+/// covers. Kept as `#[ignore]`d (not a CI-blocking regression for an
+/// unsolved, disclosed, open problem) -- re-enable the assert once the real
+/// root cause is found and fixed.
+/// Real isolation test, requested directly (2026-08-04): the geyser found
+/// live in `mixture_sand_water.rs` (sand erupting to 3-7x its settled pile
+/// height) was being chased inside the mixture pressure solve -- but that
+/// assumes the mixture coupling IS the cause. Before chasing that further:
+/// same sand block, same spawn geometry, same real long horizon, but ZERO
+/// water and ZERO mixture coupling. If this ALSO erupts, the bug is in
+/// `sand.rs`'s own single-material physics (most likely the volumetric-floor
+/// stress mechanism analyzed earlier tonight: `kirchhoff_stress`'s plain
+/// linear `lambda*(J-1)*J` term, evaluated at the real packing-limit floor
+/// J=0.6, was flagged as a plausible real-but-too-violent response) -- NOT
+/// the mixture pressure solve, which would mean tonight's new pressure-solve
+/// instrumentation is chasing the wrong file entirely.
+#[test]
+#[ignore = "diagnostic -- run manually, real long horizon"]
+fn diag_sand_only_no_mixture_long_horizon_erupts_or_not() {
+    const GRID: usize = 96;
+    const DT: f32 = 0.1;
+    const MAT_SAND: u32 = 0;
+
+    let config = SimConfig {
+        min_dt: 3.0e-4,
+        max_substeps_per_step: 96,
+        gravity: Vec2::new(0.0, -0.3),
+        // Zero mixture coupling entirely -- real isolation, not just an
+        // unused water body sitting inert.
+        mixture_drag_coefficient: 0.0,
+        mixture_pressure_iterations: 0,
+        ..SimConfig::earth(GRID, 0.01, DT)
     };
-    (avg(0) - avg(1)).length()
+    let spawn_sand = SpawnRegion {
+        spacing: 0.5,
+        box_size: IVec2::new(56, 10),
+        box_center: Vec2::new(48.0, 8.0),
+        material_id: MAT_SAND,
+        precompute_initial_volumes: true,
+        mass_override: Some(1.8),
+        ..SpawnRegion::for_sim(&config)
+    };
+    let sand = DruckerPragerMaterial::new(10_000.0, 15_000.0);
+    let solver_boundary = SlipBoundary::new(config.boundary_thickness);
+    let mut solver = Simulation::new(config, spawn_sand)
+        .with_default_material(Box::new(sand))
+        .with_boundary(Box::new(solver_boundary));
+
+    const FRAMES: u32 = 3000;
+    let mut max_y_ever = 0.0f32;
+    let mut max_y_frame = 0u32;
+    let mut baseline_max_y = 0.0f32;
+    for frame in 0..FRAMES {
+        solver.step();
+        let particles = solver.particles();
+        let max_y = particles
+            .iter()
+            .filter(|p| p.material_id == MAT_SAND)
+            .map(|p| p.x.y)
+            .fold(0.0f32, f32::max);
+        if frame == 200 {
+            baseline_max_y = max_y;
+        }
+        if max_y > max_y_ever {
+            max_y_ever = max_y;
+            max_y_frame = frame;
+        }
+        if frame % 200 == 0 {
+            let snap = solver.diagnostics_snapshot();
+            println!(
+                "  [frame {frame}] max_y={max_y:.2} cfl={:.5} substeps={} dropped={:.5}",
+                snap.cfl_number, snap.substeps_last_step, snap.sim_time_dropped
+            );
+        }
+    }
+    println!(
+        "diag_sand_only_no_mixture: baseline_max_y(frame200)={baseline_max_y:.2} \
+         max_y_ever={max_y_ever:.2} at frame={max_y_frame} over {FRAMES} frames"
+    );
 }
 
 #[test]
-fn higher_drag_relaxes_solid_fluid_relative_velocity_faster() {
-    let mut low = build_mixture_scene(1.0);
-    let mut high = build_mixture_scene(50.0);
-    let initial_relative_speed = relative_solid_fluid_speed(&low);
+#[ignore = "archived: strict WC-MPM rejects this porous-mixture hybrid and solvers no longer drop time"]
+fn diag_mixture_sand_water_dropped_time_long_horizon() {
+    const GRID: usize = 96;
+    const DT: f32 = 0.1;
+    const MAT_SAND: u32 = 0;
+    const MAT_WATER: u32 = 1;
 
-    low.step_n(1);
-    high.step_n(1);
-    let low_relative = relative_solid_fluid_speed(&low);
-    let high_relative = relative_solid_fluid_speed(&high);
+    let config = SimConfig {
+        min_dt: 3.0e-4,
+        max_substeps_per_step: 96,
+        recompute_density_each_step: true,
+        gravity: Vec2::new(0.0, -0.3),
+        mixture_drag_coefficient: 30.0,
+        mixture_pressure_iterations: 8,
+        ..SimConfig::earth(GRID, 0.01, DT)
+    };
+    let spawn_sand = SpawnRegion {
+        spacing: 0.5,
+        box_size: IVec2::new(56, 10),
+        box_center: Vec2::new(48.0, 8.0),
+        material_id: MAT_SAND,
+        precompute_initial_volumes: true,
+        mass_override: Some(1.8),
+        ..SpawnRegion::for_sim(&config)
+    };
+    let spawn_water = SpawnRegion {
+        spacing: 0.5,
+        box_size: IVec2::new(16, 16),
+        box_center: Vec2::new(48.0, 42.0),
+        material_id: MAT_WATER,
+        precompute_initial_volumes: true,
+        ..SpawnRegion::for_sim(&config)
+    };
+    let sand = WithMixturePhase::new(
+        DruckerPragerMaterial::new(10_000.0, 15_000.0),
+        MixturePhase::SOLID,
+    );
+    let water = WithMixturePhase::new(
+        NewtonianFluidMaterial::low_viscosity(4.0, 10.0),
+        MixturePhase::FLUID,
+    );
+    let mut solver = Simulation::new(config, spawn_sand)
+        .with_default_material(Box::new(sand))
+        .with_material(MAT_WATER, Box::new(water))
+        .with_boundary(Box::new(SlipBoundary::new(config.boundary_thickness)));
+    let _ = solver.add_body(spawn_water);
 
+    // Original bug report: `dropped` stayed exactly 0.0 through frame ~1650,
+    // then climbed again once CFL wanted more than the (already-tripled)
+    // 96-substep cap. 2400 frames covers well past that real onset point.
+    // Observational only (see doc comment) -- no assert, this is tracking an
+    // open bug, not guarding a fixed one.
+    const FRAMES: u32 = 2400;
+    // "Near floor" = within a few cells of the SlipBoundary's own thickness --
+    // real, disclosed candidate mechanisms (boundary kernel truncation, DP's
+    // own volumetric floor) are both specifically boundary-adjacent, so a
+    // near-floor/bulk split is the direct way to discriminate them from a
+    // scene-wide effect.
+    let near_floor_y = config.boundary_thickness as f32 + 4.0;
+    let mut max_dropped_fraction = 0.0f32;
+    let mut first_frame_past_10_percent: Option<u32> = None;
+    for frame in 0..FRAMES {
+        solver.step();
+        let snap = solver.diagnostics_snapshot();
+        // `dropped` as a fraction of the configured frame dt -- same
+        // normalization the example's own printed diagnostic used.
+        let dropped_fraction = snap.sim_time_dropped / DT;
+        max_dropped_fraction = max_dropped_fraction.max(dropped_fraction);
+        if first_frame_past_10_percent.is_none() && dropped_fraction > 0.1 {
+            first_frame_past_10_percent = Some(frame);
+        }
+        // Dense sampling bracketing the real onset window found 2026-08-04
+        // (a genuine ~20x velocity spike hitting BOTH materials around frame
+        // 2200, `dropped` first crosses 10% at frame 1863) -- sparse 200-
+        // frame sampling missed the actual event entirely. Every frame in
+        // [1700,2300), every 200 elsewhere.
+        let dense_window = (1700..2300).contains(&frame);
+        if frame % 200 == 0 || frame == FRAMES - 1 || dense_window {
+            let particles = solver.particles();
+            let mut sand_min_j = f32::INFINITY;
+            let mut sand_min_j_near_floor = f32::INFINITY;
+            let mut sand_max_speed = 0.0f32;
+            let mut sand_max_speed_pos = Vec2::ZERO;
+            let mut water_max_speed = 0.0f32;
+            let mut water_max_speed_pos = Vec2::ZERO;
+            let mut water_min_j = f32::INFINITY;
+            for p in particles.iter() {
+                let j = p.deformation_gradient.determinant();
+                let speed = p.v.length();
+                if p.material_id == MAT_SAND {
+                    sand_min_j = sand_min_j.min(j);
+                    if speed > sand_max_speed {
+                        sand_max_speed = speed;
+                        sand_max_speed_pos = p.x;
+                    }
+                    if p.x.y < near_floor_y {
+                        sand_min_j_near_floor = sand_min_j_near_floor.min(j);
+                    }
+                } else {
+                    water_min_j = water_min_j.min(j);
+                    if speed > water_max_speed {
+                        water_max_speed = speed;
+                        water_max_speed_pos = p.x;
+                    }
+                }
+            }
+            let tag = if dense_window { "DENSE" } else { "sparse" };
+            println!(
+                "  [{tag} frame {frame}] dropped={dropped_fraction:.4} cfl={:.5} substeps={} \
+                 sand_min_j={sand_min_j:.4} sand_min_j_near_floor={sand_min_j_near_floor:.4} \
+                 sand_max_speed={sand_max_speed:.4}@{sand_max_speed_pos:?} \
+                 water_min_j={water_min_j:.4} water_max_speed={water_max_speed:.4}@{water_max_speed_pos:?}",
+                snap.cfl_number, snap.substeps_last_step
+            );
+        }
+    }
     println!(
-        "mixture coupling: initial_relative={initial_relative_speed:.4} \
-         low_drag_relative={low_relative:.4} high_drag_relative={high_relative:.4}"
+        "diag_mixture_sand_water_dropped_time_long_horizon: max_dropped_fraction={:.5} \
+         first_frame_past_10pct={:?} over {FRAMES} frames",
+        max_dropped_fraction, first_frame_past_10_percent
     );
-    assert!(low_relative.is_finite() && high_relative.is_finite());
-    assert!(
-        low_relative < initial_relative_speed,
-        "even low drag should reduce relative velocity somewhat: \
-         initial={initial_relative_speed:.4} low={low_relative:.4}"
-    );
-    assert!(
-        high_relative < low_relative,
-        "higher drag should relax the solid/fluid relative velocity MORE than \
-         lower drag over the same real time: low={low_relative:.4} high={high_relative:.4}"
-    );
+}
+
+/// The old drag A/B combined strict WC-MPM liquid with a porous-mixture
+/// routing scheme. That is not a one-fluid PDE: it changes momentum through a
+/// separate phase solve and has no compatible free-surface/volume formulation.
+/// The solver must reject it rather than letting a visually plausible but
+/// undefined hybrid act as a fluid regression.
+#[test]
+#[should_panic(expected = "cannot use porous-mixture coupling")]
+fn strict_fluid_rejects_porous_mixture_coupling() {
+    let mut solver = build_mixture_scene(50.0);
+    solver.step();
 }

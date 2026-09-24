@@ -19,6 +19,7 @@
 //! changes where the files physically live, not any public API.
 
 pub mod diff;
+pub mod grains;
 pub mod grid;
 pub mod rod;
 pub mod solver;

@@ -1,6 +1,7 @@
 extern crate emerge_engine as emerge;
 
 use emerge::fields::LinearDragField;
+use emerge::render::demo_harness::{DemoApp, run_demo};
 use emerge::render::{ColorMode, Renderer};
 use emerge::{NewtonianFluidMaterial, SimConfig, Simulation, SlipBoundary, SpawnRegion};
 use glam::{IVec2, Vec2};
@@ -16,12 +17,7 @@ use glam::{IVec2, Vec2};
 /// here, this scene exists to prove the ONE new mechanism, not every dressing of it.
 ///
 ///   cargo run --example channel_flow --features "render"
-use std::sync::Arc;
-use winit::application::ApplicationHandler;
-use winit::event::{ElementState, KeyEvent, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{Window, WindowId};
+use winit::keyboard::KeyCode;
 
 const GRID: usize = 96;
 const DT: f32 = 0.1;
@@ -29,16 +25,7 @@ const MAT_WATER: u32 = 0;
 const CURRENT_SPEED: f32 = 4.0;
 const DRAG_COEFFICIENT: f32 = 1.5;
 
-struct App {
-    window: Option<Arc<Window>>,
-    state: Option<State>,
-}
-
 struct State {
-    surface: wgpu::Surface<'static>,
-    surface_config: wgpu::SurfaceConfiguration,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
     sim: Simulation,
     renderer: Renderer,
     frame: u64,
@@ -62,13 +49,27 @@ fn make_sim() -> Simulation {
     };
     // Real water: Cole 1948 Tait exponent (7.0) + real dynamic viscosity, not a
     // hand-picked 0.1/3.0 pair -- see NewtonianFluidMaterial::low_viscosity.
-    let water = NewtonianFluidMaterial::low_viscosity(4.0, 10.0);
+    // rest_density=0.1, NOT the old 4.0 -- real SI fix, 2026-08-08, see
+    // basic_fluids.rs's own doc for the full derivation.
+    // eos_stiffness=0.25, NOT 10 -- rest_density shrinking 40x makes
+    // `timestep_bound`'s c2 (sound-speed-squared) 40x larger at the old
+    // stiffness for the same compression; confirmed by a real crash in
+    // basic_fluids.rs's CPU twin. Rescaling stiffness by the same factor
+    // (10*0.1/4.0=0.25) restores the original, already-stable c2 -- see
+    // basic_fluids.rs's own doc for the full derivation.
+    let water = NewtonianFluidMaterial::low_viscosity(0.1, 0.25);
     let spawn_water = SpawnRegion {
         spacing: 0.6,
         box_size: IVec2::new(20, 16),
         box_center: Vec2::new(14.0, 12.0),
         material_id: MAT_WATER,
         initial_velocity_scale: 0.0,
+        // Without this, mass falls back to `config.particle_mass` (1.0),
+        // completely decoupled from the material's own rest_density=0.1
+        // -- a real, separate gap found 2026-08-08 alongside the SI fix
+        // (see basic_fluids.rs's doc). m = rho0*spacing^2, same
+        // derivation used everywhere else.
+        mass_override: Some(0.1 * 0.6 * 0.6),
         ..SpawnRegion::for_sim(&config)
     };
     let current = LinearDragField::new(
@@ -82,57 +83,26 @@ fn make_sim() -> Simulation {
         .with_force_field(Box::new(current))
 }
 
-impl State {
-    async fn new(window: Arc<Window>) -> Self {
-        let size = window.inner_size();
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-        let surface = instance.create_surface(window.clone()).unwrap();
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-            })
-            .await
-            .expect("no GPU adapter");
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                required_limits: adapter.limits(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        let caps = surface.get_capabilities(&adapter);
-        let fmt = caps
-            .formats
-            .iter()
-            .find(|f| f.is_srgb())
-            .copied()
-            .unwrap_or(caps.formats[0]);
-        let sc = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: fmt,
-            width: size.width,
-            height: size.height,
-            present_mode: wgpu::PresentMode::AutoVsync,
-            desired_maximum_frame_latency: 2,
-            alpha_mode: caps.alpha_modes[0],
-            view_formats: vec![],
-        };
-        surface.configure(&device, &sc);
+impl DemoApp for State {
+    const TITLE: &'static str = "emerge -- Channel Flow [LinearDragField]";
+    const SIZE: (u32, u32) = (640, 480);
+
+    fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+        width: u32,
+        height: u32,
+    ) -> Self {
         let sim = make_sim();
-        let mut renderer = Renderer::new(&device, sim.particles().len(), fmt);
-        renderer.set_camera(&queue, GRID as u32, size.width, size.height, 0.6, true);
+        let mut renderer = Renderer::new(device, sim.particles().len(), format);
+        renderer.set_camera(queue, GRID as u32, width, height, 0.6, true);
         renderer.set_color_mode(ColorMode::ByMaterial);
         println!(
             "channel_flow: {} water particles  |  LinearDragField pushes downstream at target_v=({CURRENT_SPEED},0)  |  R reset  Q quit",
             sim.particles().len()
         );
         Self {
-            surface,
-            surface_config: sc,
-            device,
-            queue,
             sim,
             renderer,
             frame: 0,
@@ -141,18 +111,17 @@ impl State {
         }
     }
 
-    fn resize(&mut self, w: u32, h: u32) {
-        if w == 0 || h == 0 {
-            return;
-        }
-        self.surface_config.width = w;
-        self.surface_config.height = h;
-        self.surface.configure(&self.device, &self.surface_config);
+    fn resize(&mut self, queue: &wgpu::Queue, width: u32, height: u32) {
         self.renderer
-            .set_camera(&self.queue, GRID as u32, w, h, 0.6, true);
+            .set_camera(queue, GRID as u32, width, height, 0.6, true);
     }
 
-    fn update_and_render(&mut self) {
+    fn update_and_render(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        view: &wgpu::TextureView,
+    ) {
         self.sim.step();
         self.frame += 1;
         self.fps_frames += 1;
@@ -167,74 +136,19 @@ impl State {
             self.fps_timer = std::time::Instant::now();
             self.fps_frames = 0;
         }
-        let output = match self.surface.get_current_texture() {
-            Ok(t) => t,
-            Err(_) => return,
-        };
-        let view = output
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
         self.renderer
-            .render(&self.device, &self.queue, self.sim.particles(), &view, true);
-        output.present();
-    }
-}
-
-impl ApplicationHandler for App {
-    fn resumed(&mut self, el: &ActiveEventLoop) {
-        let w = Arc::new(
-            el.create_window(
-                winit::window::WindowAttributes::default()
-                    .with_title("emerge -- Channel Flow [LinearDragField]")
-                    .with_inner_size(winit::dpi::LogicalSize::new(640u32, 480u32)),
-            )
-            .unwrap(),
-        );
-        self.state = Some(pollster::block_on(State::new(w.clone())));
-        self.window = Some(w);
+            .render(device, queue, self.sim.particles(), view, true);
     }
 
-    fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        let Some(s) = self.state.as_mut() else {
-            return;
-        };
-        match event {
-            WindowEvent::CloseRequested => el.exit(),
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        physical_key: PhysicalKey::Code(key),
-                        state: ElementState::Pressed,
-                        ..
-                    },
-                ..
-            } => match key {
-                KeyCode::Escape | KeyCode::KeyQ => el.exit(),
-                KeyCode::KeyR => {
-                    s.sim = make_sim();
-                    s.frame = 0;
-                    println!("reset");
-                }
-                _ => {}
-            },
-            WindowEvent::Resized(sz) => s.resize(sz.width, sz.height),
-            WindowEvent::RedrawRequested => {
-                s.update_and_render();
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
-            }
-            _ => {}
+    fn key_pressed(&mut self, key: KeyCode) {
+        if key == KeyCode::KeyR {
+            self.sim = make_sim();
+            self.frame = 0;
+            println!("reset");
         }
     }
 }
 
 fn main() {
-    let el = EventLoop::new().unwrap();
-    el.set_control_flow(ControlFlow::Poll);
-    let mut app = App {
-        window: None,
-        state: None,
-    };
-    el.run_app(&mut app).unwrap();
+    run_demo::<State>();
 }

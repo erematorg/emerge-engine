@@ -13,6 +13,7 @@ pub mod buoyancy;
 pub mod chemotaxis;
 pub mod confinement;
 pub mod coulomb;
+pub mod cutoff;
 pub mod drag;
 pub mod em;
 mod force_field;

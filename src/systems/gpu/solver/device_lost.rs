@@ -30,30 +30,23 @@ impl GpuSimulation {
     /// registration wins and the first is silently lost (this is wgpu's own
     /// behavior, not something this method can prevent).
     ///
-    /// ALSO installs an uncaptured-error handler (2026-07-08). wgpu's default
-    /// behavior for ANY uncaptured error is an unconditional panic
-    /// (`panic!("wgpu error: {err}")`, confirmed by reading wgpu-27.0.1's
-    /// `default_error_handler`) — this handler replaces that default and
-    /// **never panics**, regardless of what the error says. That "never" is
-    /// load-bearing, not a simplification: an earlier version of this handler
-    /// tried to be more precise — classify errors naming a destroyed/lost
-    /// resource as an inferred device loss (no panic), but still panic for
-    /// anything else so a genuine, unrelated validation bug wouldn't be
-    /// silently swallowed. That version was reproduced crashing LOCALLY
-    /// (forcing the D3D12 WARP adapter — the same backend windows-latest CI
-    /// uses — instead of waiting on another CI round-trip) with the full
-    /// backtrace showing the panic originated from THIS handler's own `panic!`
-    /// call, invoked synchronously from inside `wgpu_core::Queue::submit`'s
-    /// internal error path — and unwinding a panic from there is what produced
-    /// `STATUS_STACK_BUFFER_OVERRUN`, not the error itself. In other words:
-    /// panicking from ANY code reachable from this callback is unsafe on this
-    /// backend, independent of whether the message looks like a device-loss
-    /// artifact or a real bug — so the "still panic for real bugs" branch was
-    /// itself the crash, not a safety net. The fix: never panic here, full
-    /// stop. Every uncaptured error sets `device_lost` (so `is_device_lost()`'s
-    /// existing no-op guards take over) and is `eprintln!`'d in full so it's
-    /// still visible for debugging — just never re-thrown as a Rust panic from
-    /// inside this specific callback context.
+    /// ALSO installs an uncaptured-error handler. wgpu's default behavior for
+    /// ANY uncaptured error is an unconditional panic (`panic!("wgpu error:
+    /// {err}")`, confirmed by reading wgpu-27.0.1's `default_error_handler`)
+    /// — this handler replaces that default and **never panics**, regardless
+    /// of what the error says.
+    ///
+    /// That "never" is load-bearing, not a simplification: a more "precise"
+    /// version that classified errors naming a destroyed/lost resource as an
+    /// inferred device loss (no panic), but still panicked for anything else,
+    /// crashed with `STATUS_STACK_BUFFER_OVERRUN` on the D3D12 WARP backend
+    /// (the same one windows-latest CI uses) — unwinding a panic from inside
+    /// `wgpu_core::Queue::submit`'s internal error path is unsafe on that
+    /// backend, independent of whether the error looks like device loss or a
+    /// real bug. Do not reintroduce a "still panic for real bugs" branch
+    /// here. Every uncaptured error instead sets `device_lost` (so
+    /// `is_device_lost()`'s existing no-op guards take over) and is
+    /// `eprintln!`'d in full so it's still visible for debugging.
     pub fn enable_device_lost_detection(&self) {
         let flag = self.device_lost.clone();
         self.device

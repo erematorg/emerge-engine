@@ -1,13 +1,17 @@
 use glam::Vec2;
 
-use super::BoundaryCondition;
+use super::{BoundaryCondition, apply_coulomb_wall};
 
 /// Heightmap terrain boundary — arbitrary ground profile + outer box walls.
 ///
 /// The terrain is described by `heights[x]` in grid units for each x-column.
 /// All grid cells at (x, y) with `y ≤ heights[x]` are treated as solid terrain.
-/// The terrain surface normal is +Y (pointing up). Coulomb friction is applied on the
-/// tangential (horizontal) velocity component at the surface.
+/// The real local surface normal (`normalize(-dh/dx, 1)`, a central
+/// difference of `heights` -- reduces to exactly +Y wherever the terrain is
+/// flat) is used for contact, not a fixed +Y -- real per-column slope
+/// support, not a staircase of flat micro-floors. Coulomb friction is
+/// applied on the real tangential component at the surface (`apply_coulomb_
+/// wall`, the same primitive `KinematicCircleBoundary` uses).
 ///
 /// Outer axis-aligned walls are always enforced (same as `SlipBoundary`), so the
 /// heightmap sits inside the standard simulation domain.
@@ -36,7 +40,7 @@ pub struct HeightmapBoundary {
 }
 
 impl HeightmapBoundary {
-    pub fn new(heights: Vec<f32>, friction: f32, wall_thickness: usize) -> Self {
+    pub const fn new(heights: Vec<f32>, friction: f32, wall_thickness: usize) -> Self {
         Self {
             heights,
             friction,
@@ -80,21 +84,35 @@ impl BoundaryCondition for HeightmapBoundary {
         // Heightmap terrain: cells at or below terrain surface.
         let terrain_h = self.height_at(x);
         if (y as f32) <= terrain_h {
-            // Block downward (into terrain) velocity component.
-            if velocity.y < 0.0 {
-                let v_n = velocity.y.abs();
-                velocity.y = 0.0;
-                // Coulomb friction on tangential (horizontal) component.
-                if self.friction > 0.0 {
-                    let friction_impulse = self.friction * v_n;
-                    let v_t = velocity.x.abs();
-                    velocity.x = if v_t > friction_impulse {
-                        velocity.x * (1.0 - friction_impulse / v_t)
-                    } else {
-                        0.0
-                    };
-                }
-            }
+            // Real local terrain-slope normal (central difference), not a
+            // fixed +Y. Found live 2026-08-16: the old fixed-+Y version
+            // (kept in this struct's own doc history) blocks ALL downward
+            // velocity every substep regardless of slope, deleting it
+            // outright instead of redirecting the part of it that's real
+            // tangential (downhill) motion -- fine for material with its
+            // own internal pressure/stress pushing it downhill (ordinary
+            // granular MPM particles, which is why existing snow/sand
+            // scenes never surfaced this), but a rigid DEM grain has no
+            // such internal stress of its own and simply never accelerates
+            // at all on a real slope under the old model (confirmed via a
+            // real isolated A/B: an app-level probe using this exact
+            // `normalize(-dh/dx, 1)` formula reached speed=15.4 down this
+            // same terrain; the grain under the old Y-only boundary decayed
+            // to a dead stop instead). `HeightmapBoundary` has exactly one
+            // real consumer today (`examples/rolling_snowball_demo.rs` and
+            // its headless probe sibling) and both use a real, non-flat
+            // slope, so this is a real fix, not a hypothetical one -- and
+            // for a genuinely flat floor (`dh_dx=0`) this normal reduces to
+            // exactly `(0,1)`, reproducing the old behavior bit-for-bit, so
+            // any future flat-floor use is unaffected. Reuses
+            // `apply_coulomb_wall`, the same real Coulomb-wall primitive
+            // `KinematicCircleBoundary` already relies on -- not a new
+            // friction formula.
+            let h_minus = self.height_at(x.saturating_sub(1));
+            let h_plus = self.height_at((x + 1).min(grid_res.saturating_sub(1)));
+            let dh_dx = (h_plus - h_minus) * 0.5;
+            let normal = Vec2::new(-dh_dx, 1.0).normalize();
+            apply_coulomb_wall(velocity, normal, self.friction);
         }
     }
 

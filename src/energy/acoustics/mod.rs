@@ -8,7 +8,9 @@
 //! physics half of zero-asset procedural sound. No audio synthesis/buffer
 //! generation here — that's real, separate, not-yet-started work.
 
+pub mod bubble;
 pub mod modal;
 pub mod wave_equation;
+pub use bubble::minnaert_bubble_mode;
 pub use modal::{AcousticMode, cantilever_rod_modes};
 pub use wave_equation::WaveEquation2D;

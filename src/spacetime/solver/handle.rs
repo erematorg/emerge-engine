@@ -1,6 +1,6 @@
 //! Typed handles for materials and particle groups.
 
-use crate::solver::query::BodyState;
+use crate::solver::body_state::BodyState;
 
 /// Typed handle for a registered material.
 ///
@@ -11,7 +11,7 @@ pub struct MaterialHandle(pub u32);
 
 impl MaterialHandle {
     #[inline]
-    pub fn id(self) -> u32 {
+    pub const fn id(self) -> u32 {
         self.0
     }
 }
@@ -62,18 +62,18 @@ pub struct ParticleGroup {
 }
 
 impl ParticleGroup {
-    pub fn new(tag: u32) -> Self {
+    pub const fn new(tag: u32) -> Self {
         Self { tag, label: None }
     }
 
-    pub fn named(tag: u32, label: &'static str) -> Self {
+    pub const fn named(tag: u32, label: &'static str) -> Self {
         Self {
             tag,
             label: Some(label),
         }
     }
 
-    pub fn tag(self) -> u32 {
+    pub const fn tag(self) -> u32 {
         self.tag
     }
 }
@@ -95,6 +95,6 @@ impl std::fmt::Display for ParticleGroup {
 
 /// Aggregate BodyState for a tag — delegates to Simulation::group_state.
 /// Kept here for callers that hold a ParticleGroup and want a one-liner.
-pub fn group_state_of(_group: ParticleGroup, state: BodyState) -> BodyState {
+pub const fn group_state_of(_group: ParticleGroup, state: BodyState) -> BodyState {
     state
 }

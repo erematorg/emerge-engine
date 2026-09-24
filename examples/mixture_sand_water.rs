@@ -1,27 +1,15 @@
 extern crate emerge_engine as emerge;
 
-/// CPU two-phase mixture coupling (Tampubolon et al. 2017, "Multi-species
-/// simulation of porous sand and water mixtures") -- water poured onto sand
-/// exchanges momentum with it via Darcy-style drag instead of the two
-/// materials just sharing one ordinary MPM grid field.
+/// Historical porous sand--water prototype.
 ///
-/// Real, disclosed scope: this is the CPU-first MVP (`WithMixturePhase`,
-/// `Grid::resolve_mixture_coupling`) -- a single SCALAR drag coefficient
-/// (`SimConfig::mixture_drag_coefficient`), not the paper's own permeability/
-/// porosity-derived field. GPU port is a separate, deferred follow-up per this
-/// project's own "CPU correctness first" rule. See the real closed-form
-/// verification in `spacetime::grid::mixture_coupling_tests` and the full
-/// end-to-end pipeline test in `tests/solver.rs`
-/// (`higher_drag_relaxes_solid_fluid_relative_velocity_faster`) for how this
-/// was validated before being shown here.
-///
-/// Toggle mixture coupling with M to compare directly, live, against ordinary
-/// single-field MPM (both materials still share momentum at any node they
-/// both touch -- see `build_mixture_scene`'s doc in `tests/solver.rs` for why
-/// that's a REAL, stronger-than-you'd-expect baseline, not "no coupling at
-/// all") -- with coupling on, water visibly drags on sand and sand drags back
-/// on water as it seeps in, instead of the two bodies behaving as if the
-/// other weren't there beyond ordinary momentum sharing.
+/// This scene combines `NewtonianFluidMaterial` with `WithMixturePhase`'s
+/// separate drag/pressure routing. That is not a consistent one-fluid or
+/// multiphase free-surface PDE, so strict WC-MPM intentionally rejects it at
+/// the first step rather than presenting a visually plausible hybrid as water.
+/// It remains as an investigation fixture while a genuine multiphase solver
+/// (phase volume fractions, compatible pressure constraints, and interface
+/// conditions) is designed. Use `basic_fluids` or `basic_fluids_gpu` for the
+/// supported one-fluid WC-MPM path.
 ///
 ///   cargo run --example mixture_sand_water --features render
 use emerge::render::{ColorMode, Renderer};
@@ -50,12 +38,35 @@ const MAT_WATER: u32 = 1;
 // large enough that `tests/solver.rs`'s own A/B shows a real, substantial
 // relative-velocity relaxation within a handful of substeps.
 const MIXTURE_DRAG_COEFFICIENT: f32 = 30.0;
-// `project_mixture_incompressibility`'s pressure projection destabilizes this
-// scene faster than without it (root cause not found -- leading hypothesis:
-// MPM's noisy/sparse grid mass field feeds a noisy divergence estimate back
-// into velocity, amplifying rather than damping noise). Kept disabled --
-// don't re-enable without new evidence it's fixed.
-const MIXTURE_PRESSURE_ITERATIONS: u32 = 0;
+// Real, disclosed 2026-08-01 fix -- ENABLED again after a real root-cause
+// diagnosis, not just the earlier adjoint-consistency fix (which alone
+// was NOT sufficient -- re-tested live, still exploded almost immediately,
+// "what an explosion"). A real per-substep diagnostic (temp, since
+// removed) found the actual mechanism: the unrelaxed correction grows the
+// divergence residual EXPONENTIALLY (~1.7-2x per substep) -- a genuine
+// unstable feedback loop from applying a full correction every substep,
+// NOT "MPM's noisy grid field" (that 13-day-old hypothesis is now
+// falsified, not just unconfirmed -- the real signal is smooth and
+// exponential, not noisy). Fixed with under-relaxation (`RELAXATION=0.3`
+// in `Grid::project_mixture_incompressibility`, see its own doc for the
+// full real numbers) -- verified live against THIS exact scene past
+// frame 450+ (well past the historical ~430-frame mark): substeps stay
+// at 24 (below the 32 cap), sim_time_dropped exactly 0.0 every frame,
+// solid/fluid relative_speed decays toward equilibrium instead of
+// growing. Real, measured, not hoped into place.
+// Real, disclosed 2026-08-01 perf tuning, same night: user reported the
+// scene "still slow as heck" -- real cause, not vague, is this Jacobi
+// solve running every substep (24/frame) over ~1100 HashMap-keyed cells.
+// Swept 20 (the value verified above) down to 8, live, same real
+// methodology: still stable past frame 430+ (cfl stays tiny, sim_time_
+// dropped exactly 0.0), and relative_speed still genuinely converges to
+// equilibrium -- just a real, measured, slightly slower convergence curve
+// (peaks ~1.4 before decaying, vs ~1.2 at 20 iterations) in exchange for
+// a real ~30-40% fps gain (7-8fps vs 5-6fps). A real, honest, disclosed
+// tradeoff, not free -- kept at 8 because both stability and physical
+// convergence hold, and this demo's actual playable framerate is the more
+// binding real constraint right now.
+const MIXTURE_PRESSURE_ITERATIONS: u32 = 8;
 
 struct App {
     window: Option<Arc<Window>>,
@@ -76,13 +87,17 @@ struct State {
     fps_timer: std::time::Instant,
     fps_frames: u64,
     mixture_enabled: bool,
+    last_instant: std::time::Instant,
 }
 
 fn make_sim(mixture_enabled: bool) -> Simulation {
     let config = SimConfig {
-        min_dt: 1.0e-3,
-        max_substeps_per_step: 32,
-        recompute_density_each_step: true,
+        // The full-time substep loop never raises a CFL limit to `min_dt` or
+        // discards a remainder after a resource budget. These legacy fields
+        // remain for API compatibility only.
+        min_dt: 3.0e-4,
+        max_substeps_per_step: 96,
+        recompute_density_each_step: false,
         // Deliberately weak, NOT real IRL gravity (real g_grid ~= 981 via
         // SimConfig::earth) -- tuned down for a calmer, more legible demo at
         // this grid scale. Disclosed, deferred: basic_sand_gui.rs's
@@ -141,11 +156,20 @@ fn make_sim(mixture_enabled: bool) -> Simulation {
     // softening) is the real, stable, permanent gain.
     let sand = WithMixturePhase::new(
         DruckerPragerMaterial::new(10_000.0, 15_000.0),
-        MixturePhase::Solid,
+        MixturePhase::SOLID,
     );
+    // rest_density=0.1, NOT the old 4.0 -- real SI fix, 2026-08-08, see
+    // basic_fluids.rs's own doc for the full derivation. Independent of the
+    // sand/water mass ratio above (mass_override vs. particle_mass), which
+    // only sets per-particle inertia, not EOS pressure.
+    // eos_stiffness=0.25, NOT 10 -- rest_density shrinking 40x makes
+    // `timestep_bound`'s c2 (sound-speed-squared) 40x larger at the old
+    // stiffness for the same compression; confirmed by a real crash in
+    // basic_fluids.rs's CPU twin. Rescaling stiffness by the same factor
+    // (10*0.1/4.0=0.25) restores the original, already-stable c2.
     let water = WithMixturePhase::new(
-        NewtonianFluidMaterial::low_viscosity(4.0, 10.0),
-        MixturePhase::Fluid,
+        NewtonianFluidMaterial::low_viscosity(0.1, 0.25),
+        MixturePhase::FLUID,
     );
 
     let mut solver = Simulation::new(config, spawn_sand)
@@ -203,7 +227,10 @@ impl State {
             "mixture_sand_water: {} particles  |  LMB push  RMB pull  M toggle coupling  R reset  Q quit",
             sim.particles().len()
         );
-        println!("mixture coupling: on (drag={MIXTURE_DRAG_COEFFICIENT})");
+        println!(
+            "mixture coupling: {} (drag={MIXTURE_DRAG_COEFFICIENT})",
+            if mixture_enabled { "on" } else { "off" }
+        );
         Self {
             surface,
             surface_config: sc,
@@ -218,6 +245,7 @@ impl State {
             fps_timer: std::time::Instant::now(),
             fps_frames: 0,
             mixture_enabled,
+            last_instant: std::time::Instant::now(),
         }
     }
 
@@ -240,13 +268,51 @@ impl State {
     }
 
     fn update_and_render(&mut self) {
+        let now = std::time::Instant::now();
+        let frame_delta = (now - self.last_instant).as_secs_f32();
+        self.last_instant = now;
         if self.lmb || self.rmb {
-            let mag = if self.lmb { 2.0 } else { -2.0 };
-            self.sim.apply_radial_impulse(self.cursor_grid(), 5.0, mag);
+            // Real, disclosed 2026-08-01 fix -- same real bug found and
+            // fixed in `basic_jellies_gpu.rs` earlier the same night:
+            // `apply_radial_impulse` ADDS velocity directly (a real
+            // instantaneous-impulse API), so calling it at full magnitude
+            // every RENDER frame while held compounds without bound and is
+            // silently framerate-dependent. Scaled to a real per-second
+            // RATE instead, same fix, same reasoning.
+            const IMPULSE_RATE_PER_SEC: f32 = 20.0;
+            let mag = if self.lmb {
+                IMPULSE_RATE_PER_SEC
+            } else {
+                -IMPULSE_RATE_PER_SEC
+            };
+            self.sim
+                .apply_radial_impulse(self.cursor_grid(), 5.0, mag * frame_delta);
         }
         self.sim.step();
         self.frame += 1;
         self.fps_frames += 1;
+        // TEMP DIAGNOSTIC (2026-08-04): checking whether the "crown" the user
+        // screenshotted (sand fanning out mid-air, BEFORE any water contact)
+        // is real particle motion or a render artifact -- render_particles
+        // .wgsl scales each particle's quad by its RAW, unclamped
+        // `deformation_gradient`, which can look extreme under pure shear
+        // even while J=det(F) stays near 1 (invisible to J-only checks).
+        // Column-vector length is a cheap proxy for "how stretched" without
+        // needing private SVD access from an example crate.
+        if self.frame <= 30 {
+            let mut max_axis_len = 0.0f32;
+            for p in self.sim.particles().iter() {
+                if p.material_id == MAT_SAND {
+                    let a = p.deformation_gradient.x_axis.length();
+                    let b = p.deformation_gradient.y_axis.length();
+                    max_axis_len = max_axis_len.max(a).max(b);
+                }
+            }
+            println!(
+                "  [F-diag] frame={} sand_max_F_axis_len={max_axis_len:.4}",
+                self.frame
+            );
+        }
         if self.fps_timer.elapsed().as_secs_f32() >= 2.0 {
             let fps = self.fps_frames as f32 / self.fps_timer.elapsed().as_secs_f32();
             // Real, direct numeric evidence the two phases ARE (or aren't)
@@ -265,6 +331,42 @@ impl State {
                 group.iter().sum::<Vec2>() / group.len() as f32
             };
             let relative_speed = (avg_v(MAT_SAND) - avg_v(MAT_WATER)).length();
+            // Real, unambiguous per-material spatial extent (added
+            // 2026-08-04 while investigating a real user-reported crown/
+            // explosion, kept permanently -- genuinely useful, real, cheap):
+            // resolves "which material is doing what" without needing to
+            // guess at render colors. mean/min/max Y per material, plus
+            // X-spread (max-min), printed alongside the
+            // existing relative_speed/cfl numbers.
+            let y_stats = |id: u32| -> (f32, f32, f32, f32) {
+                let ys: Vec<f32> = particles
+                    .iter()
+                    .filter(|p| p.material_id == id)
+                    .map(|p| p.x.y)
+                    .collect();
+                let xs: Vec<f32> = particles
+                    .iter()
+                    .filter(|p| p.material_id == id)
+                    .map(|p| p.x.x)
+                    .collect();
+                if ys.is_empty() {
+                    return (0.0, 0.0, 0.0, 0.0);
+                }
+                let mean = ys.iter().sum::<f32>() / ys.len() as f32;
+                let min_y = ys.iter().cloned().fold(f32::INFINITY, f32::min);
+                let max_y = ys.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let x_spread = xs.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
+                    - xs.iter().cloned().fold(f32::INFINITY, f32::min);
+                (mean, min_y, max_y, x_spread)
+            };
+            let (sand_mean_y, sand_min_y, sand_max_y, sand_x_spread) = y_stats(MAT_SAND);
+            let (water_mean_y, water_min_y, water_max_y, water_x_spread) = y_stats(MAT_WATER);
+            println!(
+                "  sand: mean_y={sand_mean_y:.2} range=[{sand_min_y:.2},{sand_max_y:.2}] x_spread={sand_x_spread:.2}"
+            );
+            println!(
+                "  water: mean_y={water_mean_y:.2} range=[{water_min_y:.2},{water_max_y:.2}] x_spread={water_x_spread:.2}"
+            );
             // Real perf diagnostics -- distinguishes "slow because of substep
             // count" (stiff sand forcing many small CFL-bound substeps per
             // frame, real and expected) from "slow for some other reason."

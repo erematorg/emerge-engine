@@ -35,14 +35,14 @@ impl GpuSimulation {
     /// `mu_easy != mu_resist` -- symmetric friction (the default) makes direction
     /// irrelevant, same "no bias without input" principle as `RatchetFrictionBoundary`.
     ///
-    /// HONEST STATUS (2026-07-16): this API is real and correctly wired -- verified
-    /// reaching `resolve_contact.wgsl`'s `grip_params` uniform. The RESULTING
-    /// directional effect is correctly signed (the "easy" direction genuinely retains
-    /// more speed) but its MAGNITUDE is measurably unstable run to run, unlike CPU's
-    /// `DirectionalContactGrip` which is consistent -- see
-    /// `gpu_directional_grip_is_direction_aware`'s `#[ignore]` reason in `tests/gpu.rs`
-    /// for the real measured numbers and the likely (not confirmed) root cause. Usable
-    /// for real, but don't present it as equivalent to CPU's steering yet.
+    /// KNOWN OPEN ISSUE: this API is correctly wired -- reaches
+    /// `resolve_contact.wgsl`'s `grip_params` uniform, and the resulting
+    /// directional effect is correctly signed (the "easy" direction genuinely
+    /// retains more speed). But its magnitude is measurably unstable run to
+    /// run, unlike CPU's `DirectionalContactGrip` which is consistent -- see
+    /// `gpu_directional_grip_is_direction_aware`'s `#[ignore]` reason in
+    /// `tests/gpu.rs` for measured numbers and the likely (not confirmed)
+    /// root cause. Usable, but not yet equivalent to CPU's steering.
     pub fn set_grip_direction(&mut self, direction: glam::Vec2) {
         self.grip_params.easy_direction = direction.normalize_or_zero();
     }

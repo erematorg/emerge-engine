@@ -159,8 +159,8 @@ fn force_fields_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // particles' velocity every substep — p2g.wgsl then scatters that as real
     // momentum next substep (p2g doesn't special-case pinned particles either,
     // since a pinned particle's mass/stress should still be felt by neighbors,
-    // just not its velocity). Mirrors the real CPU bug fixed the same way in
-    // step.rs's force-fields loop.
+    // just not its velocity). Mirrors the same fix in step.rs's force-fields
+    // loop (CPU).
     if p.pinned != 0u { return; }
 
     let dt = step_params.dt;

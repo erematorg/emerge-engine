@@ -32,7 +32,7 @@ pub struct BuoyancyField {
 }
 
 impl BuoyancyField {
-    pub fn new(fluid_density: f32, gravity: Vec2) -> Self {
+    pub const fn new(fluid_density: f32, gravity: Vec2) -> Self {
         Self {
             fluid_density,
             gravity,

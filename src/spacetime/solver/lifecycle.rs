@@ -6,6 +6,7 @@
 //! the simulation, as opposed to advancing it (`solver::step`) or reading
 //! aggregate state from it (`solver::queries`).
 
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use glam::Vec2;
@@ -41,17 +42,32 @@ impl Simulation {
             force_fields: Vec::new(),
             thermal: None,
             scalar_fields: Vec::new(),
+            pending_diffusion_dt: 0.0,
+            substep_index_in_frame: 0,
+            granular_fluidity: None,
+            granular_fluidity_g: Vec::new(),
+            cosserat: None,
+            cosserat_omega: Vec::new(),
+            cosserat_curvature: Vec::new(),
             frame_index: 0,
+            fluid_sticky_fine_dt: None,
+            last_max_particle_speed: 0.0,
             last_step_dt: config.dt,
             last_substeps: 0,
             last_vel_clamp_count: 0,
             last_j_projection_count: 0,
             last_sim_time_dropped: 0.0,
             last_timing: crate::diagnostics::StepTiming::default(),
+            cached_spatial_sort_order: Vec::new(),
             phase_rules: Vec::new(),
-            spatial_hash: SpatialHash::new(config.grid_cell_size),
+            spatial_hash: RefCell::new(SpatialHash::new(config.grid_cell_size)),
+            spatial_hash_dirty: Cell::new(false),
             scratch_indices: Vec::new(),
             rods: Vec::new(),
+            grain_populations: Vec::new(),
+            rod_networks: Vec::new(),
+            stage_ops: Vec::new(),
+            coupled_bodies: Vec::new(),
         }
     }
 
@@ -78,7 +94,7 @@ impl Simulation {
             // Initial particles carry user_tag=0; register them so group ops work.
             tag_index.insert(0, (0..active_count).collect());
         }
-        let mut solver = Self {
+        let solver = Self {
             config,
             particles,
             active_count,
@@ -91,20 +107,36 @@ impl Simulation {
             force_fields: Vec::new(),
             thermal: None,
             scalar_fields: Vec::new(),
+            pending_diffusion_dt: 0.0,
+            substep_index_in_frame: 0,
+            granular_fluidity: None,
+            granular_fluidity_g: Vec::new(),
+            cosserat: None,
+            cosserat_omega: Vec::new(),
+            cosserat_curvature: Vec::new(),
             frame_index: 0,
+            fluid_sticky_fine_dt: None,
+            last_max_particle_speed: 0.0,
             last_step_dt: config.dt,
             last_substeps: 0,
             last_vel_clamp_count: 0,
             last_j_projection_count: 0,
             last_sim_time_dropped: 0.0,
             last_timing: crate::diagnostics::StepTiming::default(),
+            cached_spatial_sort_order: Vec::new(),
             phase_rules: Vec::new(),
-            spatial_hash: SpatialHash::new(config.grid_cell_size),
+            spatial_hash: RefCell::new(SpatialHash::new(config.grid_cell_size)),
+            spatial_hash_dirty: Cell::new(false),
             scratch_indices: Vec::new(),
             rods: Vec::new(),
+            grain_populations: Vec::new(),
+            rod_networks: Vec::new(),
+            stage_ops: Vec::new(),
+            coupled_bodies: Vec::new(),
         };
         solver
             .spatial_hash
+            .borrow_mut()
             .rebuild(&solver.particles.x, solver.active_count);
         solver
     }
@@ -160,6 +192,32 @@ impl Simulation {
         self.thermal = Some(thermal);
     }
 
+    /// Attach a Nonlocal Granular Fluidity field (see `energy::
+    /// thermodynamics::granular_fluidity` module doc). `None` (never
+    /// calling this) is the default, zero-cost, byte-identical to every
+    /// existing scene -- same convention `with_thermal` already has.
+    ///
+    /// Its explicit von Neumann stability bound is folded directly into each
+    /// adaptive substep by `choose_substep_dt`. `SimConfig::min_dt` is never
+    /// allowed to raise that upper bound, so attaching this field does not
+    /// retune unrelated solver settings or trade stability for throughput.
+    pub fn with_granular_fluidity(
+        mut self,
+        field: crate::thermodynamics::GranularFluidityField,
+    ) -> Self {
+        self.granular_fluidity = Some(field);
+        self
+    }
+
+    /// Attach a Cosserat micro-rotation field (see `energy::thermodynamics::
+    /// cosserat_field` module doc). `None` (never calling this) is the
+    /// default, zero-cost, byte-identical to every existing scene -- same
+    /// convention `with_granular_fluidity` already has.
+    pub fn with_cosserat_field(mut self, field: crate::thermodynamics::CosseratField) -> Self {
+        self.cosserat = Some(field);
+        self
+    }
+
     /// Mutable access to the attached thermal model's config, if any (`None` when no
     /// `with_thermal`/`set_thermal` was ever called). The real, minimal hook for a
     /// scene/LP-driven day-night or seasonal cycle: mutate `.ambient` each frame from a
@@ -169,6 +227,12 @@ impl Simulation {
     /// new physics is needed, just this accessor to reach the config from outside.
     pub fn thermal_config_mut(&mut self) -> Option<&mut ThermalConfig> {
         self.thermal.as_mut().map(|t| &mut t.config)
+    }
+
+    /// Read-only access to the attached `GranularFluidityField`, if any --
+    /// same "`None` unless opted in" convention as `thermal_config_mut`.
+    pub const fn granular_fluidity(&self) -> Option<&crate::thermodynamics::GranularFluidityField> {
+        self.granular_fluidity.as_ref()
     }
 
     /// Register a material and return its typed `MaterialHandle`.
@@ -212,30 +276,37 @@ impl Simulation {
         self
     }
 
-    pub fn config(&self) -> &SimConfig {
+    pub const fn config(&self) -> &SimConfig {
         &self.config
     }
 
-    pub fn particles(&self) -> &Particles {
+    pub const fn particles(&self) -> &Particles {
         &self.particles
+    }
+
+    /// Diagnostic-only read access to the gathered Cosserat micro-curvature
+    /// buffer -- lets tests measure whether the coupling is actually
+    /// producing nonzero curvature, instead of only inferring it indirectly.
+    /// Empty when no `CosseratField` is configured for this scene.
+    pub fn cosserat_curvature(&self) -> &[glam::Vec2] {
+        &self.cosserat_curvature
     }
 
     /// Direct read-only access to the background grid -- lets a CPU-simulated scene's
     /// renderer sample the solver's own mass field (e.g. for grid-volume rendering,
     /// mirroring what GPU scenes get via `GpuSimulation::grid_buffer()`) without
     /// duplicating the solver's own P2G-computed density.
-    pub fn grid(&self) -> &Grid {
+    pub const fn grid(&self) -> &Grid {
         &self.grid
     }
 
     /// Direct mutable access to all particles.
     ///
-    /// **CFL WARNING:** velocity changes made here bypass the solver's CFL clamp.
-    /// Any velocity written must satisfy `|v| ≤ grid_cell_size / current_sub_dt` or the
-    /// next P2G scatter will inject extreme momentum → J→0 → deformation collapse.
-    /// For gameplay impulses use `apply_impulse` / `apply_radial_impulse` instead.
+    /// **State warning:** velocity changes made here are used exactly. The
+    /// next substep recomputes its CFL bound from the altered state; callers
+    /// must keep values finite and use physically meaningful forcing.
     /// Safe uses: writing non-velocity fields (temperature, activation, user_tag, material_id).
-    pub fn particles_mut(&mut self) -> &mut Particles {
+    pub const fn particles_mut(&mut self) -> &mut Particles {
         &mut self.particles
     }
 
@@ -254,7 +325,9 @@ impl Simulation {
                 .insert(i);
         }
         self.spatial_hash
+            .borrow_mut()
             .rebuild(&self.particles.x, self.active_count);
+        self.spatial_hash_dirty.set(false);
     }
 
     /// Splits active particles matching `should_split` into two half-mass/half-volume
@@ -311,7 +384,9 @@ impl Simulation {
                 .insert(i);
         }
         self.spatial_hash
+            .borrow_mut()
             .rebuild(&self.particles.x, self.active_count);
+        self.spatial_hash_dirty.set(false);
     }
 
     pub fn assign_particle_materials_by_position<F>(&mut self, mut material_for: F)
@@ -401,12 +476,31 @@ impl Simulation {
         self.force_fields.iter().map(|(n, _)| n.as_str()).collect()
     }
 
-    pub fn gravity(&self) -> Vec2 {
+    pub const fn gravity(&self) -> Vec2 {
         self.config.gravity
     }
 
-    pub fn set_gravity(&mut self, gravity: Vec2) {
+    pub const fn set_gravity(&mut self, gravity: Vec2) {
         self.config.gravity = gravity;
+    }
+
+    /// Live-tunable Cundall (1982) non-viscous damping coefficient, same
+    /// precedent as `set_gravity` -- lets a caller phase-gate it (e.g. off
+    /// while material is actively falling/impacting, on once it should
+    /// relax toward equilibrium) instead of one constant value for a
+    /// scene's entire run.
+    pub const fn set_cundall_damping(&mut self, damping: f32) {
+        self.config.cundall_damping = damping;
+    }
+
+    /// Live-tunable APIC/FLIP blend, same phase-gating precedent as
+    /// `set_cundall_damping` -- lets a caller run the violent/dynamic part
+    /// of a collapse at the scene's own default blend (real toppling
+    /// energy preserved), then switch to the proven quasi-static holding
+    /// value (0.05) once the material has actually settled, instead of one
+    /// constant blend fighting both phases at once.
+    pub const fn set_apic_blend(&mut self, blend: f32) {
+        self.config.apic_blend = blend;
     }
 
     /// Append a rod, returning its index into `rods()`/`rods_mut()`. A rod's
@@ -448,6 +542,56 @@ impl Simulation {
     pub fn rods_mut(&mut self) -> &mut [crate::rod::Rod] {
         &mut self.rods
     }
+
+    /// Adds a discrete-element grain population (`spacetime::grains`),
+    /// returning its index. Mirrors `add_rod` exactly. See `grain_populations`'s
+    /// own doc on `Simulation` for real scope (no automatic oracle yet --
+    /// this is an explicit, caller-decided population, same as a rod).
+    pub fn add_grain_population(
+        &mut self,
+        population: crate::grains::population::GrainPopulation,
+    ) -> usize {
+        self.grain_populations.push(population);
+        self.grain_populations.len() - 1
+    }
+
+    /// Builder variant of `add_grain_population`.
+    pub fn with_grain_population(
+        mut self,
+        population: crate::grains::population::GrainPopulation,
+    ) -> Self {
+        self.add_grain_population(population);
+        self
+    }
+
+    pub fn grain_populations(&self) -> &[crate::grains::population::GrainPopulation] {
+        &self.grain_populations
+    }
+
+    pub fn grain_populations_mut(&mut self) -> &mut [crate::grains::population::GrainPopulation] {
+        &mut self.grain_populations
+    }
+
+    /// Adds a branching rod/root network (`spacetime::rod::network`),
+    /// returning its index. Mirrors `add_rod`/`add_grain_population` exactly.
+    pub fn add_rod_network(&mut self, network: crate::rod::RodNetwork) -> usize {
+        self.rod_networks.push(network);
+        self.rod_networks.len() - 1
+    }
+
+    /// Builder variant of `add_rod_network`.
+    pub fn with_rod_network(mut self, network: crate::rod::RodNetwork) -> Self {
+        self.add_rod_network(network);
+        self
+    }
+
+    pub fn rod_networks(&self) -> &[crate::rod::RodNetwork] {
+        &self.rod_networks
+    }
+
+    pub fn rod_networks_mut(&mut self) -> &mut [crate::rod::RodNetwork] {
+        &mut self.rod_networks
+    }
 }
 
 #[cfg(test)]
@@ -465,7 +609,7 @@ mod add_rod_buckling_check_tests {
     /// right index, `rods()` reflects it) whether or not the rod happens to
     /// be over its own critical height -- the warning CONTENT itself is
     /// already covered by `rod::root_cause_fixes_tests::
-    /// buckling_warning_matches_tonights_real_finding`.
+    /// buckling_warning_matches_expected_critical_height`.
     fn make_rod(young_modulus: f32, height_m: f32, dx_meters: f32) -> Rod {
         let start = Vec2::new(9.0, 4.0);
         let end = Vec2::new(start.x, start.y + height_m / dx_meters);

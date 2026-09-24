@@ -5,13 +5,16 @@
 //
 //   Core physics (always compiled, stable API)
 //   ├── spacetime/       Spacetime domain: solver (Simulation, SimConfig,
-//   │                    SpawnRegion, query, density, cutoff), grid (Grid, Cell,
+//   │                    SpawnRegion, body_state, density), grid (Grid, Cell,
 //   │                    kernel), transfer (P2G/G2P transfer kernels), rod
-//   │                    (1D discrete elastic rod sub-solver, grid-coupled)
-//   ├── matter/          Matter domain: particle (Particle struct), materials/
-//   │                    (MaterialModel trait, constitutive models, MaterialRegistry)
-//   ├── forces/          Forces domain: boundary (BoundaryCondition + impls),
-//   │                    fields (Field trait + impls: gravity, Coulomb, EM, confinement)
+//   │                    (1D discrete elastic rod sub-solver, grid-coupled),
+//   │                    grains (DEM grain dynamics: population/coupling/oracle)
+//   ├── matter/          Matter domain: particle (Particle, Grain, RodPoints),
+//   │                    materials/ (MaterialModel trait, 13 constitutive models,
+//   │                    MaterialRegistry; granular/ groups the sand research thread)
+//   ├── forces/          Forces domain: boundary (BoundaryCondition + impls,
+//   │                    friction/ groups the Coulomb-friction family), fields
+//   │                    (Field trait + impls: gravity, Coulomb, EM, confinement, cutoff)
 //   ├── information/     Information domain: control (Lnn), measures (entropy/MI) [experimental]
 //   ├── energy/          Energy domain: thermodynamics (ThermalDiffusion,
 //   │                    ScalarDiffusionField), acoustics (WaveEquation2D) [experimental]
@@ -41,6 +44,8 @@ pub mod systems;
 // keeps resolving unchanged. See each domain's `mod.rs` doc for why.
 #[cfg(feature = "experimental")]
 pub use energy::acoustics;
+#[cfg(feature = "experimental")]
+pub use energy::orbital;
 pub use energy::thermodynamics;
 pub use forces::boundary;
 pub use forces::fields;
@@ -50,6 +55,7 @@ pub use information::measures;
 pub use matter::materials;
 pub use matter::particle;
 pub use spacetime::diff;
+pub use spacetime::grains;
 pub use spacetime::grid;
 pub use spacetime::rod;
 pub use spacetime::solver;
@@ -76,7 +82,7 @@ pub use solver::handle::{MaterialHandle, ParticleGroup};
 // Materials
 pub use materials::{
     BinghamFluidMaterial, BrittleProps, ConstitutiveModel, CorotatedMaterial,
-    DruckerPragerMaterial, Elastic, Elastoplastic, Fluid, FluidGranular, FromSI,
+    DruckerPragerMaterial, Elastic, Elastoplastic, Fluid, FluidGranular, FromSI, GasMaterial,
     GranularFluidMaterial, MAX_MATERIAL_SLOTS, MaterialModel, MaterialParams, MaterialRegistry,
     MixturePhase, MuIRheologyMaterial, NaccMaterial, NeoHookeanMaterial, NewtonianFluidMaterial,
     NoCompression, NoCompressionMaterial, ParticleMass, PlasticityModel, Pressurized,
@@ -88,7 +94,8 @@ pub use materials::{
 // Boundary conditions
 pub use boundary::{
     BoundaryCondition, FrictionBoundary, GripFrictionBoundary, HeightmapBoundary,
-    PredictiveBoundary, RatchetFrictionBoundary, SlipBoundary,
+    KinematicCircleBoundary, NoSlipBoundary, PredictiveBoundary, RatchetFrictionBoundary,
+    SlipBoundary,
 };
 
 // Force fields
@@ -101,15 +108,18 @@ pub use fields::{
 
 // State queries + density export for rendering
 pub use control::Lnn;
+pub use solver::body_state::BodyState;
 pub use solver::density::compute_density_grid;
-pub use solver::query::BodyState;
 
 /// Build a `Vec<Particle>` from a `SpawnRegion` — the primary way to construct
 /// initial particle regions for `GpuSimulation::new` or to merge multiple regions.
 ///
 /// Respects `SpawnRegion::shape` (box or disk), jitter, and material assignment.
-/// For physically accurate initial volumes call with `spawn.precompute_volumes()`
-/// or follow up with `estimate_particle_volumes`.
+/// For solid/plastic materials, call with `spawn.precompute_volumes()` or
+/// follow up with `estimate_particle_volumes` when a kernel-measured initial
+/// volume is required. `GpuSimulation::new` subsequently runs each registered
+/// material's initializer; strict WC-MPM liquids establish `V0=m/rho0` there
+/// and must not use a kernel-density estimate as EOS state.
 ///
 /// LP pattern:
 /// ```rust,no_run
@@ -132,12 +142,12 @@ pub fn build_particles(config: &SimConfig, spawn: SpawnRegion) -> Vec<Particle> 
     particles
 }
 
-/// Estimate initial particle volumes from P2G density.
+/// Estimate initial particle volumes from a P2G density measurement.
 ///
-/// Use when building particles manually for `GpuSimulation::new` and you need the same
-/// physically accurate density that `SpawnRegion::precompute_volumes()` gives you
-/// inside `Simulation::spawn_region`. Without it, initial particle density is geometric
-/// (`mass / spacing²`) which can cause a pressure spike on the first substep.
+/// Use for solid/plastic particle sets whose material model consumes that
+/// measurement. This low-level helper has no material registry and therefore
+/// must not be applied to strict WC-MPM liquid particles: their EOS state is
+/// initialized from conserved mass and rest density by `GpuSimulation::new`.
 pub fn estimate_particle_volumes(particles: &mut Vec<Particle>, grid_res: usize) {
     use crate::solver::density::estimate_particle_volumes as density_estimate;
     let mut soa = Particles::from(std::mem::take(particles));
@@ -149,7 +159,9 @@ pub fn estimate_particle_volumes(particles: &mut Vec<Particle>, grid_res: usize)
 
 // Thermodynamics
 pub use thermodynamics::{
-    ScalarDiffusionConfig, ScalarDiffusionField, ThermalConfig, ThermalDiffusion, saturating_uptake,
+    GranularFluidityConfig, GranularFluidityField, RadianceField, ScalarDiffusionConfig,
+    ScalarDiffusionField, ThermalConfig, ThermalDiffusion, irradiance_at_distance,
+    saturating_uptake, stellar_luminosity_w,
 };
 
 // Diagnostics + plugin system

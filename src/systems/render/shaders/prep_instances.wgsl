@@ -41,13 +41,15 @@ struct Particle {
 //   deform_col0: vec2<f32> @ offset  0
 //   deform_col1: vec2<f32> @ offset  8
 //   position:    vec2<f32> @ offset 16
-//   _pad:        vec2<f32> @ offset 24
+//   emission:    f32       @ offset 24
+//   _pad:        f32       @ offset 28
 //   color:       vec4<f32> @ offset 32
 struct InstanceData {
     deform_col0: vec2<f32>,
     deform_col1: vec2<f32>,
     position:    vec2<f32>,
-    _pad:        vec2<f32>,
+    emission:    f32,
+    _pad:        f32,
     color:       vec4<f32>,
 }
 
@@ -103,6 +105,18 @@ fn material_color(id: u32) -> vec4<f32> {
         case 14u: { return vec4(0.60, 0.60, 0.60, 1.0); } // grey
         default:  { return vec4(1.00, 1.00, 1.00, 1.0); } // white
     }
+}
+
+// Real, shared blackbody-emission proxy -- normalized to 5000 K (solar
+// surface), same reference point the ByPhysics thermal-glow term below
+// already used before this was extracted. Mirrors Rust's
+// `color::blackbody_glow_factor` exactly -- single source of truth for
+// "how much does this particle's own temperature make it glow," shared
+// between ByPhysics's baked-in color term and InstanceData::emission
+// (render_particles.wgsl's per-particle soft-glow gate).
+fn blackbody_glow_factor(temperature: f32) -> f32 {
+    let t = clamp(temperature / 5000.0, 0.0, 1.0);
+    return t * t;
 }
 
 // Smooth heat map: t ∈ [0, 1] → blue → cyan → green → yellow → red.
@@ -173,9 +187,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let with_specular = with_scattering + vec3(r0);
         //
         // Thermal emission: blackbody additive glow above ~300 K.
-        //   Normalized to 5000 K (solar surface) — biological temps near zero.
         let t_norm = clamp(p.temperature / 5000.0, 0.0, 1.0);
-        let emission = heat(0.5 + t_norm * 0.5).rgb * (t_norm * t_norm) * 2.0;
+        let emission = heat(0.5 + t_norm * 0.5).rgb * blackbody_glow_factor(p.temperature) * 2.0;
         //
         color = vec4(clamp(with_specular + emission, vec3(0.0), vec3(1.0)), 1.0);
     } else if config.mode == 4u {
@@ -196,10 +209,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     instances[id] = InstanceData(
-        f[0],        // deform_col0 — F's x-axis
-        f[1],        // deform_col1 — F's y-axis
-        p.x,         // position in grid coords
-        vec2(0.0),   // _pad
+        f[0],                             // deform_col0 — F's x-axis
+        f[1],                             // deform_col1 — F's y-axis
+        p.x,                              // position in grid coords
+        blackbody_glow_factor(p.temperature), // emission — real per-particle glow gate
+        0.0,                               // _pad
         color,
     );
 }

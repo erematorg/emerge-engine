@@ -162,11 +162,6 @@ impl Grid {
     /// criterion used here is exact "in the special case where contacting bodies are
     /// stress free."
     ///
-    /// `vel_limit`: the SAME CFL speed cap the caller already applies to the total
-    /// field right before this call, applied here too to every velocity this function
-    /// produces or reads raw — without it, a tiny-mass grip node could carry a huge raw
-    /// velocity even when the total field is safe.
-    ///
     /// `multi_field_contact_produces_real_coulomb_slip_and_stick`
     /// (`tests/physics_correctness.rs`) verifies both the frictionless-slip and
     /// high-friction-stick cases.
@@ -175,7 +170,6 @@ impl Grid {
         dt: f32,
         gravity: Vec2,
         friction: f32,
-        vel_limit: f32,
         grid_cell_size: f32,
         directional_grip: Option<&DirectionalContactGrip>,
     ) {
@@ -189,14 +183,6 @@ impl Grid {
         // the "no confident normal" branch below instead, which does correct,
         // uncontaminated per-field separation without a Coulomb correction.
         const MIN_MASS_FRACTION: f32 = 1.0e-6;
-        let clamp_speed = |v: Vec2| -> Vec2 {
-            let spd = v.length();
-            if spd > vel_limit {
-                v * (vel_limit / spd)
-            } else {
-                v
-            }
-        };
         for &idx in &self.contact_dirty {
             let node_pos = Vec2::new(
                 (idx as usize / self.resolution) as f32,
@@ -222,8 +208,8 @@ impl Grid {
                 continue;
             }
 
-            let v_cm = total.momentum; // already normalized + gravity-applied + clamped
-            let v_grip = clamp_speed(grip_momentum / grip_mass + gravity * dt);
+            let v_cm = total.momentum; // already normalized + gravity-applied
+            let v_grip = grip_momentum / grip_mass + gravity * dt;
 
             // Contact normal fitted through the actual particle point cloud (Nairn's LR
             // method) rather than a grid mass gradient. `-` because the raw fit points
@@ -255,8 +241,7 @@ impl Grid {
                 // interface still carry the real contact for the body as a whole).
                 let cell = self.contact_cells.get_mut(&idx).unwrap();
                 cell.resolved_grip_v = v_grip;
-                cell.resolved_rest_v =
-                    clamp_speed((v_cm * total.mass - v_grip * grip_mass) / rest_mass);
+                cell.resolved_rest_v = (v_cm * total.mass - v_grip * grip_mass) / rest_mass;
                 continue;
             };
 
@@ -280,15 +265,11 @@ impl Grid {
             // oscillation.
             //
             // Correction rate/speed must be a dt-INDEPENDENT absolute value, not the
-            // textbook `beta * gap / dt` (which assumes a roughly fixed timestep) — this
-            // engine's adaptive substep dt can shrink to ~1e-6 for a stiff material's CFL
-            // bound, and the raw formula blows up as dt->0. Clamping to `vel_limit` does
-            // NOT fix this: `vel_limit` is itself a CFL bound that scales as 1/dt by design
-            // (`grid_cell_size / sub_dt`), so it grows in lockstep with the blowup it would
-            // need to cap. A small ABSOLUTE correction rate and speed cap keeps the position
-            // fix bounded and gentle at any substep size, correcting large overlaps over
-            // several substeps instead of injecting one huge velocity kick that distorts F
-            // as if it were real physical momentum.
+            // textbook `beta * gap / dt` (which assumes a roughly fixed timestep): the
+            // engine's adaptive substep dt can shrink for stiff solids, and the raw formula
+            // then blows up as dt->0. This is a contact-constraint stabilization for solid
+            // scenes, not a fluid constitutive term; strict WC-MPM liquids reject multi-field
+            // contact before reaching this solver.
             let mut max_grip_proj = f32::NEG_INFINITY;
             let mut min_rest_proj = f32::INFINITY;
             for &(pos, label) in &contact.points {
@@ -302,7 +283,7 @@ impl Grid {
             if max_grip_proj.is_finite() && min_rest_proj.is_finite() {
                 let gap = min_rest_proj - max_grip_proj; // >0 separated, <0 overlapping
                 if gap < 0.0 {
-                    // Neither derived from dt nor from vel_limit -- a fixed, small correction
+                    // Neither derived from dt nor a generic velocity limiter -- a fixed, small correction
                     // rate (fraction of the overlap corrected per unit REAL time) and an
                     // absolute speed ceiling (a small fraction of one grid cell per unit real
                     // time), both independent of how finely the adaptive substep loop divides
@@ -326,7 +307,7 @@ impl Grid {
                 }
             }
 
-            let v_grip_new = clamp_speed(v_cm + v_rel);
+            let v_grip_new = v_cm + v_rel;
 
             // Exact momentum conservation: whatever the grip field's momentum changed
             // by, the rest field absorbs the opposite delta (eq. 14's identity holds by
@@ -334,7 +315,7 @@ impl Grid {
             // clamped v_grip_new so the conservation identity still holds against what
             // G2P will actually read.
             let total_momentum = v_cm * total.mass;
-            let v_rest_new = clamp_speed((total_momentum - v_grip_new * grip_mass) / rest_mass);
+            let v_rest_new = (total_momentum - v_grip_new * grip_mass) / rest_mass;
 
             let cell = self.contact_cells.get_mut(&idx).unwrap();
             cell.resolved_grip_v = v_grip_new;

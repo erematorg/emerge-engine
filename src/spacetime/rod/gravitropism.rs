@@ -126,19 +126,19 @@ impl Gravitropism {
         }
     }
 
-    pub fn with_resistance(mut self, resistance: GrowthResistance) -> Self {
+    pub const fn with_resistance(mut self, resistance: GrowthResistance) -> Self {
         self.resistance = Some(resistance);
         self
     }
 
     /// Set this organ's `target_angle_rad` -- see that field's own doc.
-    pub fn with_gsa(mut self, target_angle_rad: f32) -> Self {
+    pub const fn with_gsa(mut self, target_angle_rad: f32) -> Self {
         self.target_angle_rad = target_angle_rad;
         self
     }
 
     /// Choose which vertices evolve -- see `GravitropismMode`'s own doc.
-    pub fn with_mode(mut self, mode: GravitropismMode) -> Self {
+    pub const fn with_mode(mut self, mode: GravitropismMode) -> Self {
         self.mode = mode;
         self
     }
@@ -183,20 +183,20 @@ impl Phototropism {
         }
     }
 
-    pub fn with_resistance(mut self, resistance: GrowthResistance) -> Self {
+    pub const fn with_resistance(mut self, resistance: GrowthResistance) -> Self {
         self.resistance = Some(resistance);
         self
     }
 
     /// Set this organ's own target angle from the sensed light direction --
     /// see `target_angle_rad`'s own doc.
-    pub fn with_target_angle(mut self, target_angle_rad: f32) -> Self {
+    pub const fn with_target_angle(mut self, target_angle_rad: f32) -> Self {
         self.target_angle_rad = target_angle_rad;
         self
     }
 
     /// Choose which vertices evolve -- see `GravitropismMode`'s own doc.
-    pub fn with_mode(mut self, mode: GravitropismMode) -> Self {
+    pub const fn with_mode(mut self, mode: GravitropismMode) -> Self {
         self.mode = mode;
         self
     }
@@ -232,7 +232,7 @@ fn target_direction(gravity_dir: Vec2, target_angle_rad: f32) -> Vec2 {
 /// Which `rest_curvature` indices `mode` governs, for a rod of `n` points
 /// (`rest_curvature` has `n-2` entries). Matches `forces.rs`'s own vertex
 /// convention: vertex `j` sits between points `j`, `j+1`, `j+2`.
-fn vertex_range(mode: GravitropismMode, n: usize) -> std::ops::Range<usize> {
+const fn vertex_range(mode: GravitropismMode, n: usize) -> std::ops::Range<usize> {
     match mode {
         GravitropismMode::TipOnly => (n - 3)..(n - 2),
         GravitropismMode::WholeOrgan => 0..(n - 2),
