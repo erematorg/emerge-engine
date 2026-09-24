@@ -340,7 +340,7 @@ not a one-line fix: a law that heats itself needs somewhere for that
 heat to go, which is the thermal coupling this engine has for fluids and
 not for solids.
 
-### Most fluid families still cannot be pulled on
+### A fluid's cavitation pressure is only half derived
 
 The Tait law these fluids use is a gauge law, zero at rest density, so a
 particle above rest volume asks for a negative pressure. That request is
@@ -354,36 +354,53 @@ Measured, fixed and closed for the yield-stress family. Before
 every slab was clamped, 105 of 105 at two cells and 657 of 657 at sixteen, and
 the slabs climbed past J = 1.002 while their own weight said they should sit
 below 0.999. With the cavitation pressure its constants derive, about -280 Pa
-from the nucleus term `2*gamma/R`, the same slabs hold flat to the fourth
-decimal over twenty seconds at 2 ms a frame (0.99986, 0.99981, 0.99988,
-0.99957, 0.99875 at one, two, four, eight and sixteen cells) and sit on the
-correct side of one. The thickest is heading for the 0.998 that `rho g h / 2K`
-predicts for 32 mm of it, which is load, not drift. Worst `|J - 1|` on that
-slab: 0.79 to 0.86 at every window measured with no floor, 0.038 with one.
+from the nucleus term `2*gamma/R`, the same slabs end twenty seconds at 2 ms a
+frame within 1.3e-3 of one and all of them BELOW one (0.99986, 0.99981,
+0.99988, 0.99957, 0.99875 at one, two, four, eight and sixteen cells). That is
+not flat to the fourth decimal, which was the letter of the original criterion:
+the four-cell slab moves from 0.99924 to 0.99988 over that window. What is gone
+is the upward ratchet. On the same sweep window the drift reads +0.0012 against
++0.0444 percent a second at two cells and -0.0157 against +0.0737 at sixteen,
+where the sign has inverted to compaction, and the thickest slab is heading for
+the 0.998 that `rho g h / 2K` predicts for 32 mm of it, which is load. Worst
+`|J - 1|` on that slab: 0.79 to 0.86 at every window measured with no floor,
+0.038 with one.
 
 What is still open:
 
-- `BoilingMixtureMaterial`, `CavitatingFluidMaterial`,
-  `IsothermalCavitatingFluidMaterial` and `GranularFluidMaterial` have not been
-  measured for this. Each has its own EOS and its own right answer, so none
-  inherits Bingham's number.
+- Checked, and the other fluid families do NOT have this bug, which is worth
+  recording because an earlier draft of this entry claimed they did.
+  `BoilingMixtureMaterial`, `CavitatingFluidMaterial` and
+  `IsothermalCavitatingFluidMaterial` bound their pressure at `p_sat(T)` by
+  construction through `cavitating_eos`, which IS their tension limit and is
+  sourced. `GranularFluidMaterial` states `pressure_floor: 0.0` deliberately,
+  with its own comment saying so: a cohesionless granular contact carries no
+  tension, and zero is the right answer there.
+- `NewtonianFluidMaterial::from_physical` does still state -100,000 Pa as a
+  bare constant. `2*gamma/R` returns it at a 1.4 micrometre nucleus, so it
+  could come out of the same relation the yield-stress family now uses, at
+  each fluid's own surface tension instead of water's. It does not.
 - The needle-induced-cavitation relation is `P_c = 5E/6 + 2*gamma/R` and only
   the nucleus term is used. The elastic term would deepen the floor and make it
   depend on the fluid's own stiffness. Leaving it out is the conservative
   direction and is stated at the call site, but it has not been measured.
-- `NewtonianFluidMaterial::from_physical` still states -100,000 Pa as a bare
-  constant. The same `2*gamma/R` returns it at a 1.4 micrometre nucleus, so the
-  two are one relation at two nucleus sizes, but the liquid path does not yet
-  go through it.
+
 - Useful floors run from about -140 Pa, where clamping stops being the
   dominant effect, to about -2800 Pa. At -10,000 Pa the sixteen-cell slab
   panics on a timestep it cannot represent, so the floor is bounded from below
   by stability and not only by physics. That bound is measured on one scene.
-- Within that band, deeper is better: -560 Pa leaves 1 percent of expanded
-  particles clamped against 9 percent at -280, and half the worst `|J - 1|`.
-  The shipped value is the one the cited bound gives, not the one that
-  measures best, and the gap between them is the size of the modelling
-  question about which nucleus population is present.
+- Within that band, deeper measures better. At twenty seconds, -560 Pa leaves
+  3 of 567 expanded particles clamped on the sixteen-cell slab against 60 of
+  663 at -280, so 0.5 percent against 9 percent, and worst `|J - 1|` of 0.028
+  against 0.038. At -280 the fluid is asking for up to 830 Pa of tension and
+  getting 280 back, which is what those 9 percent are. The shipped value is
+  the one the cited bound gives, not the one that measures best.
+- That bound is itself the weakest link. The 1 mm is where a petrographic
+  manual for HARDENED concrete draws the line between entrained and entrapped
+  voids, not the largest bubble measured in a fresh paste, and entrapped voids
+  above 1 mm exist too and would give a shallower threshold still. The radius
+  is a declared modelling choice standing on a published class boundary. Only
+  the surface tension in `2*gamma/R` is measured on the fluid family itself.
 
 Ruled out by counting, and worth recording because this entry used to name it:
 the free-surface node exclusion in `gather_grid_to_particles`. Instrumented

@@ -10063,10 +10063,12 @@ fn a_rigid_translation_reads_no_velocity_gradient() {
 /// they should sit below 0.999.
 ///
 /// With the cavitation pressure the constants derive, about -280 Pa, the same
-/// slabs hold flat to the fourth decimal over twenty seconds at 2 ms a frame
-/// (0.99986, 0.99981, 0.99988, 0.99957, 0.99875 at one, two, four, eight and
-/// sixteen cells) and sit on the correct side of one. The thickest is on its
-/// way to the 0.998 its own weight asks for, which is load and not drift.
+/// slabs end twenty seconds at 2 ms a frame within 1.3e-3 of one and all of
+/// them BELOW one (0.99986, 0.99981, 0.99988, 0.99957, 0.99875 at one, two,
+/// four, eight and sixteen cells). Not flat to the fourth decimal: the
+/// four-cell slab moves from 0.99924 to 0.99988 over that window. What is
+/// gone is the upward ratchet, and the thickest is on its way to the 0.998
+/// its own weight asks for, which is load and not drift.
 ///
 /// This runs the cheapest of those slabs and asserts the two things that
 /// cannot be true at once with a ratchet present.

@@ -79,21 +79,32 @@
 //! ```
 //!
 //! The derived floor is where the ratchet stops being the dominant
-//! effect, a factor of ten short of where stability goes, and inside the
-//! 510 to 830 Pa band the fluid was asking for. None of that was tuned:
-//! it comes out of `2*gamma/R` at a measured surface tension and a
-//! measured bubble size. Note that -560 Pa behaves BETTER on every column
-//! of this table. It is not what the cited bound gives, so it is not what
-//! ships; this table is here so that choice stays visible.
+//! effect, and a factor of ten short of where stability goes. It comes out
+//! of `2*gamma/R` at a measured surface tension and a class boundary taken
+//! from a petrographic manual, which is a declared modelling choice and not
+//! a measured bubble.
 //!
-//! At twenty seconds and 2 ms a frame the slabs then read 0.99986,
-//! 0.99981, 0.99988, 0.99957 and 0.99875 at one, two, four, eight and
-//! sixteen cells, all flat to the fourth decimal and all below one, where
-//! before they climbed above it. Worst `|J - 1|` on the thickest: 0.79 to
-//! 0.86 at every window measured with no floor, 0.038 with one. The
-//! skin/interior split inverts too: 0.99955 against 0.99867 at sixteen
-//! cells, the interior now the more compacted, which is what bearing more
-//! load looks like.
+//! It is NOT inside the 510 to 830 Pa the fluid was asking for. Only -560
+//! is. At -280 the fluid asks for up to 830 Pa of tension and gets 280 back,
+//! and that is exactly why 60 of 663 expanded particles are still clamped at
+//! sixteen cells, 9 percent, against 0.5 percent at -560. -560 measures
+//! better on every column of the table above. It is not what the cited bound
+//! gives, so it is not what ships, and this is written down so the choice
+//! stays visible.
+//!
+//! At twenty seconds and 2 ms a frame the slabs then read 0.99986, 0.99981,
+//! 0.99988, 0.99957 and 0.99875 at one, two, four, eight and sixteen cells.
+//! Not flat to the fourth decimal, which is the letter of the original
+//! criterion and is not met: the four-cell slab moves from 0.99924 to
+//! 0.99988 over that window. What IS true is that every slab ends within
+//! 1.3e-3 of one and all of them BELOW one, and that the same sweep window
+//! puts the drift at +0.0012 against +0.0444 percent a second at two cells
+//! and -0.0157 against +0.0737 at sixteen: the upward ratchet is gone and
+//! the sign at sixteen cells has inverted to compaction. Worst `|J - 1|` on
+//! the thickest: 0.79 to 0.86 at every window measured with no floor, 0.038
+//! with one. The skin/interior split inverts too, 0.99955 against 0.99867 at
+//! sixteen cells, the interior now the more compacted, which is what bearing
+//! more load looks like.
 //!
 //!   cargo test --profile quick --all-features --test scratch_thin_layer_volume_drift -- --ignored --nocapture
 extern crate emerge_engine as emerge;

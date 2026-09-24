@@ -449,9 +449,11 @@ pub struct BinghamProps {
     /// asks for a negative pressure; this is how far down that request is
     /// honoured before the fluid is taken to have opened a cavity instead.
     ///
-    /// It is a measured coefficient of THIS fluid, not a number borrowed
-    /// from a pure liquid: `BinghamProps::cavitation_pressure_from_nucleus`
-    /// builds it from two independent measurements rather than stating it.
+    /// It is a coefficient of THIS fluid, not a number borrowed from a pure
+    /// liquid: `BinghamProps::cavitation_pressure_from_nucleus` builds it
+    /// from two independent published figures rather than stating it. One of
+    /// those, the nucleus radius, is a class boundary rather than a
+    /// measurement, and that is said where it is defined.
     ///
     /// Leaving it at 0.0 is a real physical statement and not a neutral
     /// default. It says the fluid carries no tension at all, so expansion
@@ -478,18 +480,23 @@ impl BinghamProps {
     /// Radius `[m]` of the largest gas nucleus an ordinarily mixed paste
     /// carries. The Federal Highway Administration's petrographic manual
     /// (FHWA-HRT-04-150, "Petrographic Methods of Examining Hardened
-    /// Concrete", July 2006, chapter 6) bounds entrained air voids at
-    /// "larger than the capillaries (at least 5 micrometres in diameter),
-    /// but ... less than 1 mm", anything above 1 mm being classed as
-    /// entrapped instead. The largest ENTRAINED void is therefore about a
-    /// millimetre across, and its radius half that.
+    /// Concrete", July 2006, chapter 6) describes entrained voids as
+    /// "spherical voids larger than the capillaries, but less than 1 mm on
+    /// the lapped surface", anything above 1 mm being classed as entrapped
+    /// instead.
     ///
-    /// The largest nucleus sets the threshold, because it is the first to
-    /// run away. WHICH population counts as present is a modelling choice
-    /// and not a measurement, so it is worth knowing that it barely
-    /// matters here: `tests/scratch_thin_layer_volume_drift.rs` sweeps this
-    /// floor and finds the slab behaves the same anywhere from -280 to
-    /// -2800 Pa, a factor of ten.
+    /// Read that for what it is: 1 mm is the boundary of a CLASS in a
+    /// petrographic manual for HARDENED concrete, not the largest bubble
+    /// anyone measured in a fresh paste. Entrapped voids above 1 mm exist
+    /// too and would set a shallower threshold still. So the radius here is
+    /// a declared modelling choice standing on a published class boundary,
+    /// not a measurement, and it is the least defensible number in this
+    /// file.
+    ///
+    /// What makes it usable anyway is that it barely matters:
+    /// `tests/scratch_thin_layer_volume_drift.rs` sweeps this floor and
+    /// finds the slab behaves much the same anywhere from -280 to -2800 Pa,
+    /// a factor of ten.
     pub const ENTRAINED_AIR_NUCLEUS_RADIUS_M: f32 = 500.0e-6;
 
     /// Cavitation pressure `[Pa gauge, negative]` from the nucleus term of
@@ -529,7 +536,10 @@ impl BinghamProps {
     }
 
     /// The cavitation pressure of an ordinarily mixed, air-entrained paste,
-    /// built from this type's own two measured constants. About -280 Pa.
+    /// from this type's own two constants. About -280 Pa. Half derived and
+    /// half declared: the surface tension is measured on this fluid family,
+    /// the nucleus radius is a class boundary read off a petrographic
+    /// manual. See `ENTRAINED_AIR_NUCLEUS_RADIUS_M`.
     pub fn air_entrained_cavitation_pressure() -> f32 {
         Self::cavitation_pressure_from_nucleus(
             Self::YIELD_STRESS_FLUID_SURFACE_TENSION_N_M,
