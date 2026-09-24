@@ -232,6 +232,10 @@ path = "examples/cpu/basic_membrane.rs"
 required-features = ["render"]
 
 [[example]]
+name = "cfl_margin_probe"
+path = "examples/cpu/cfl_margin_probe.rs"
+
+[[example]]
 name = "bingham_slump_probe"
 path = "examples/cpu/bingham_slump_probe.rs"
 
