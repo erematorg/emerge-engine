@@ -769,3 +769,157 @@ fn what_makes_the_first_body_skip_its_measurement() {
         }
     }
 }
+
+// --- 10. does the lattice volume close the hydrostatic gap? ----------------
+
+/// `tests/spawn_contract.rs` measures a settled elastic column carrying 13.7
+/// percent less than its own weight at 1 cm cells, and its doc shows that
+/// halving the cells halves the error, first order, which it reads as
+/// discretisation. It may be. But an EDGE artefact converges first order
+/// too, because the fraction of particles on the free surface halves each
+/// time the cells do, so that table cannot tell the two apart.
+///
+/// And there is a candidate edge artefact: the same volume estimate that
+/// inflated the Bingham columns inflates THIS column's free-surface
+/// particles up to 2.56 times, and here nothing overwrites it afterwards,
+/// because an elastic material does not set its own volume. Initial volume
+/// enters the grid force a particle exerts, so inflated edges push harder.
+///
+/// This is the gate's own scene, constant for constant, run twice: once as
+/// it spawns, and once with every particle's initial volume set to its
+/// lattice cell, `spacing^2`, which is exact for a lattice by construction.
+///
+/// # What it found
+///
+/// The lattice volume does NOT close the gap. It overshoots it the other
+/// way. At 1 cm cells, lower half of the column, time-averaged:
+///
+/// ```text
+///   initial volume        measured     rho g h     error
+///   as spawned (0.3009)    -755.6 Pa   -881.4 Pa   +14.3 %  carries less
+///   lattice    (0.2500)   -1116.2 Pa   -881.3 Pa   -26.7 %  carries more
+/// ```
+///
+/// Changing ONLY the free-surface particles' volume swings the answer by
+/// forty points, so the gap is dominated by the edges, but neither value is
+/// right. Refined with `HYDRO_REFINE`, and read only where `rho g h` still
+/// comes out near 881 Pa, which is the check that the column is actually at
+/// rest:
+///
+/// ```text
+///   initial volume     1 cm      0.5 cm     0.25 cm
+///   as spawned        +14.3 %    +5.9 %     not at rest
+///   lattice           -26.7 %    not at rest  -6.7 %
+/// ```
+///
+/// Both converge at first order, from opposite sides: -26.7 over a fourfold
+/// refinement is -6.7 exactly. That is what two discretisation errors of
+/// opposite sign look like, not a defect. The two rows marked "not at rest"
+/// read `rho g h` of 666 and 615 Pa for a column whose weight is 881: the
+/// column lost its static equilibrium. Which variant loses it flips between
+/// resolutions, so it is a stability property of this scene and not an
+/// effect of the volume. It is also NOT the substep cap: scaling that cap
+/// with the refinement left every number identical to the digit.
+///
+/// So at a practical resolution the lattice contract roughly DOUBLES the
+/// error for an elastic body. Only two valid points per variant, though.
+#[test]
+#[ignore = "diagnostic probe kept for reruns, not part of the CI suite"]
+fn lattice_volume_against_the_hydrostatic_gap() {
+    use emerge::{MaterialModel, NeoHookeanMaterial};
+    let spacing: f32 = 0.5;
+    let young: f32 = 2.0e5;
+    let poisson: f32 = 0.3;
+    // Refinement keeps the PHYSICAL column (6 x 12 cm) and halves the cell,
+    // exactly as the gate's own convergence table does.
+    let refine = env("HYDRO_REFINE", 1.0) as i32;
+    let grid: usize = 48 * refine as usize;
+    let dx: f32 = 0.01 / refine as f32;
+    let column: IVec2 = IVec2::new(6 * refine, 12 * refine);
+
+    println!(
+        "the phase 4 hydrostatic gate scene at {} cm cells, lower half of the column, time-averaged",
+        dx * 100.0
+    );
+    println!("  initial volume         measured      rho g h      error");
+    for lattice in [false, true] {
+        let config = SimConfig {
+            min_dt: 1.0e-7,
+            // The wave speed in CELLS per second doubles each time the cell
+            // halves, and so does the substep count a frame needs. A fixed
+            // cap of 128 made the refined runs hit it, drop simulated time,
+            // and never settle: their own rho*g*h read 666 and 615 Pa for a
+            // column whose weight is 881, which is what gave it away.
+            max_substeps_per_step: 128 * (refine * refine) as usize * 4,
+            ..SimConfig::earth(grid, dx, 0.0005)
+        };
+        let material = NeoHookeanMaterial::from_young_modulus(young, poisson);
+        let mass = RHO_KG_M3 * (spacing * dx).powi(2);
+        let spawn = SpawnRegion {
+            spacing,
+            box_size: column,
+            box_center: Vec2::new(
+                14.0 * refine as f32,
+                3.0 * refine as f32 + column.y as f32 * 0.5,
+            ),
+            material_id: 0,
+            mass_override: Some(mass),
+            initial_velocity_scale: 0.0,
+            ..SpawnRegion::for_sim(&config)
+        };
+        let mut sim = Simulation::new(config, spawn)
+            .with_default_material(Box::new(material))
+            .with_boundary(Box::new(SlipBoundary::new(config.boundary_thickness)));
+        let n = sim.particles().len();
+        if lattice {
+            let cell = spacing * spacing;
+            let p = sim.particles_mut();
+            for i in 0..n {
+                let j = p.deformation_gradient[i].determinant();
+                p.initial_volume[i] = cell;
+                p.volume[i] = cell * j;
+                p.density[i] = p.mass[i] / (cell * j);
+            }
+        }
+        let v0 = {
+            let p = sim.particles();
+            (0..n).map(|i| f64::from(p.initial_volume[i])).sum::<f64>() / n as f64
+        };
+        let g = sim.config().gravity.length();
+        for _ in 0..2000 {
+            sim.step();
+        }
+        let (mut measured, mut expected, mut samples) = (0.0f64, 0.0f64, 0u32);
+        for _ in 0..2000 {
+            sim.step();
+            let p = sim.particles();
+            let top = (0..n).map(|i| p.x[i].y).fold(f32::MIN, f32::max);
+            let (mut m, mut e, mut k) = (0.0f64, 0.0f64, 0u32);
+            for i in 0..n {
+                let depth = top - p.x[i].y;
+                if depth < column.y as f32 * 0.5 {
+                    continue;
+                }
+                let j = p.deformation_gradient[i].determinant().max(1.0e-6);
+                m += f64::from(material.kirchhoff_stress(p, i).y_axis.y / j);
+                e += f64::from(-RHO_KG_M3 * g * dx * depth * dx);
+                k += 1;
+            }
+            if k > 0 {
+                measured += m / f64::from(k);
+                expected += e / f64::from(k);
+                samples += 1;
+            }
+        }
+        let (measured, expected) = (measured / f64::from(samples), expected / f64::from(samples));
+        println!(
+            "  {:<18} mean {v0:.4}   {measured:>8.1} Pa  {expected:>8.1} Pa   {:>+6.1} %",
+            if lattice {
+                "lattice spacing^2"
+            } else {
+                "as spawned"
+            },
+            100.0 * (measured - expected) / expected.abs()
+        );
+    }
+}
