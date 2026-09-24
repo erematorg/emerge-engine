@@ -9972,3 +9972,75 @@ fn yield_stress_columns_slump_in_order_of_their_yield_stress() {
         heights[0]
     );
 }
+
+// --- TRANSFER: THE AFFINE GATHER MUST NOT INVENT A DIVERGENCE ---------------
+
+/// A body moving as one rigid piece deforms in no way at all, so every
+/// particle in it must read a velocity gradient of exactly zero, whether it
+/// sits in the middle or on the outer skin.
+///
+/// This is not a style point, it is what keeps a body from inventing volume.
+/// APIC gathers `b = sum(w * v (x) dist)` and reads the gradient off it.
+/// What makes that blind to translation is the quadratic B-spline's first
+/// moment: `sum(w * dist)` is exactly zero over the whole stencil, so adding
+/// the same velocity `u` to every node adds `u (x) 0`. Break the sum -- drop
+/// a node, weight a subset differently -- and the identity goes with it: `b`
+/// keeps a term proportional to the body's own velocity, and its trace is a
+/// divergence that a rigid translation alone produced. A material's volume
+/// book would then integrate that faithfully, forever.
+///
+/// The gather has a path that drops nodes: `Grid::is_extrapolated` excludes
+/// a node that received no scatter. Measured, that path does not fire -- 0
+/// nodes of 418,714,560 gathered over a settling-slab run -- because P2G
+/// inserts every in-bounds node of a particle's own stencil, so a particle
+/// always gathers from a complete one. This test is the numerical statement
+/// of the identity that makes the whole scheme translation-blind, and the
+/// guard that would catch a future change to either half of it.
+#[test]
+fn a_rigid_translation_reads_no_velocity_gradient() {
+    const GRID: usize = 32;
+    // Chosen off-axis and off-lattice so no accidental symmetry can cancel
+    // the term this test is looking for.
+    const DRIFT: Vec2 = Vec2::new(0.73, -0.41);
+
+    let config = zero_gravity_config(GRID);
+    let mut sim = Simulation::new(config, center_spawn(GRID, 6))
+        .with_default_material(Box::new(NeoHookeanMaterial::from_young_modulus(1.0e5, 0.3)));
+    // Undeformed and unsheared: at F = I this law's stress is exactly zero,
+    // so nothing but the transfer itself can write into the gradient.
+    {
+        let particles = sim.particles_mut();
+        for i in 0..particles.len() {
+            particles.v[i] = DRIFT;
+            particles.velocity_gradient[i] = Mat2::ZERO;
+            particles.deformation_gradient[i] = Mat2::IDENTITY;
+        }
+    }
+    sim.step();
+
+    let (mut worst_trace, mut worst_term) = (0.0f32, 0.0f32);
+    for i in 0..sim.particles().len() {
+        let c = sim.particles().velocity_gradient[i];
+        worst_trace = worst_trace.max((c.x_axis.x + c.y_axis.y).abs());
+        worst_term = worst_term
+            .max(c.x_axis.x.abs())
+            .max(c.x_axis.y.abs())
+            .max(c.y_axis.x.abs())
+            .max(c.y_axis.y.abs());
+    }
+    println!(
+        "rigid drift {DRIFT}: worst |trace C| {worst_trace:.3e} per second, worst |C| entry {worst_term:.3e}"
+    );
+    // The bound is the drift's own size times f32's resolution times room
+    // for the accumulation, not a number tuned to the measurement: anything
+    // this gather invents is proportional to the velocity it was handed.
+    let bound = DRIFT.length() * 1.0e-4;
+    assert!(
+        worst_trace < bound,
+        "a rigidly translating body must read no divergence, worst |trace C| = {worst_trace:.3e} against {bound:.3e}"
+    );
+    assert!(
+        worst_term < bound,
+        "a rigidly translating body must read no velocity gradient at all, worst entry = {worst_term:.3e} against {bound:.3e}"
+    );
+}
