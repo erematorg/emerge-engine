@@ -624,7 +624,7 @@ fn update_particle(p_idx: u32, pp: ptr<function, Particle>) {
     var f_increment = I + dt * p.velocity_gradient;
     if has_model(mat.model, 2u) || has_model(mat.model, 3u) || has_model(mat.model, 4u)
         || has_model(mat.model, 5u) || has_model(mat.model, 6u) || has_model(mat.model, 7u)
-        || has_model(mat.model, 9u) || has_model(mat.model, 11u) {
+        || has_model(mat.model, 8u) || has_model(mat.model, 9u) || has_model(mat.model, 11u) {
         f_increment = deformation_increment_exp(dt * p.velocity_gradient);
     }
     var new_F = f_increment * p.deformation_gradient;

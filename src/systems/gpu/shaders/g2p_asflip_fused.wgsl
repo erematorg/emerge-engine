@@ -631,7 +631,7 @@ fn g2p_asflip_fused_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Remaining tensor-F model SandMuI (8) stays on the original path until
     // their own plastic projections receive the same audit.
     var f_increment = identity + dt * p.velocity_gradient;
-    if mat.model == 2u || mat.model == 3u || mat.model == 4u || mat.model == 5u || mat.model == 6u || mat.model == 7u || mat.model == 9u || mat.model == 11u {
+    if mat.model == 2u || mat.model == 3u || mat.model == 4u || mat.model == 5u || mat.model == 6u || mat.model == 7u || mat.model == 8u || mat.model == 9u || mat.model == 11u {
         f_increment = deformation_increment_exp(dt * p.velocity_gradient);
     }
     var new_F = f_increment * p.deformation_gradient;

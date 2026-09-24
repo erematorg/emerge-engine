@@ -5631,7 +5631,19 @@ fn mu_i_rheology_rate_dependence_matches_the_real_formula() {
         // Independently recompute the SAME trial p/q this update_particle
         // call must have used, from the SAME real inputs, to predict what
         // mu(I) the formula itself says should come out.
-        let f_trial = (Mat2::IDENTITY + dt * c) * f0;
+        // The law integrates `F` by the exact exponential, not by forward
+        // Euler, so this reference has to as well: it used to read
+        // `(I + dt C) F` and drifted from the real answer in the fourth
+        // digit once the law was corrected (0.580554 against 0.580323).
+        // For this scene's own `C`, a pure shear with zero diagonal, the
+        // matrix exponential is exactly `[[cosh a, sinh a], [sinh a, cosh
+        // a]]` with `a = dt * severity` -- a closed form in its own right,
+        // which keeps this check independent of the engine's own helper
+        // rather than copying the code under test.
+        let a = dt * shear_severity;
+        let increment =
+            Mat2::from_cols(Vec2::new(a.cosh(), a.sinh()), Vec2::new(a.sinh(), a.cosh()));
+        let f_trial = increment * f0;
         let sigma = singular_values_2x2(f_trial);
         let eps = Vec2::new(sigma.x.ln(), sigma.y.ln());
         let tr = eps.x + eps.y;
