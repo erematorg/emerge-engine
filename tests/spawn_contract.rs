@@ -10,14 +10,20 @@
 //! measured one, 3.1 times smaller. Initial volume multiplies stress
 //! directly, so those bodies were not the same material.
 //!
-//! Two checks, because one alone would not have caught it:
+//! Three checks, because each of the others alone missed something:
 //!
 //! - the two paths must agree, whatever the scene asked for;
+//! - they must agree for a material that sets its own initial volume too,
+//!   which the elastic check above cannot see (see
+//!   `a_fluid_body_is_the_same_whichever_path_adds_it`);
 //! - the volume they agree on must be the physically right one, which a
 //!   column at rest proves by carrying its own weight.
 extern crate emerge_engine as emerge;
 
-use emerge::{MaterialModel, NeoHookeanMaterial, SimConfig, Simulation, SlipBoundary, SpawnRegion};
+use emerge::{
+    BinghamFluidMaterial, BinghamProps, FromSI, MaterialModel, NeoHookeanMaterial, SimConfig,
+    Simulation, SlipBoundary, SpawnRegion,
+};
 use glam::{IVec2, Vec2};
 
 const GRID: usize = 48;
@@ -77,6 +83,82 @@ fn both_spawn_paths_give_a_body_the_same_initial_volume() {
         "the same body spawned two ways must carry the same initial volume: \
          Simulation::new gave {a}, add_body gave {b}, a factor of {:.2}",
         a.max(b) / a.min(b)
+    );
+}
+
+/// The same contract for a material that sets its OWN initial volume.
+///
+/// The elastic check above passed while this was broken, and could not have
+/// failed. Both paths estimate a new body's volume from its packing, then
+/// run the material's `init_particle`, and an elastic law's `init_particle`
+/// leaves the volume alone, so the estimate stands in both and they agree.
+/// A fluid's `init_particle` sets `mass / rest_density` instead, and
+/// `add_body` used to run it BEFORE the estimate while `Simulation::new`
+/// ran it after. So in `add_body` the estimate had the last word, and at a
+/// free surface the estimate inflates a particle's volume up to 2.56 times.
+///
+/// Measured before the fix (`tests/scratch_bingham_column_volume_loss.rs`):
+/// the same column carried a mean 0.250000 through `Simulation::new` and
+/// 0.280036 through `add_body`, worst particle 0.640000, and three
+/// identical columns in one world ended at mean J 0.99907, 0.94304 and
+/// 0.94441 depending only on which path had added them.
+///
+/// It has to be a yield-stress fluid WITH a storage modulus. A Newtonian
+/// fluid and a purely viscous Bingham one both declare they own their
+/// deformation volume, so the estimate skips them entirely and the order
+/// never mattered for them.
+#[test]
+fn a_fluid_body_is_the_same_whichever_path_adds_it() {
+    let config = config();
+    let props = BinghamProps {
+        rho_kg_m3: RHO_KG_M3,
+        eta_pa_s: 0.5,
+        bulk_modulus_pa: 78_480.0,
+        yield_stress_pa: 60.0,
+        shear_modulus_pa: 60.0 / 0.05,
+        cavitation_pressure_pa: BinghamProps::air_entrained_cavitation_pressure(),
+    };
+    let spawn = |x: f32| {
+        SpawnRegion {
+            spacing: SPACING,
+            box_size: COLUMN,
+            box_center: Vec2::new(x, 3.0 + COLUMN.y as f32 * 0.5),
+            material_id: 0,
+            initial_velocity_scale: 0.0,
+            ..SpawnRegion::for_sim(&config)
+        }
+        .mass_from(&props, &config)
+    };
+    let mut sim = Simulation::new(config, spawn(14.0))
+        .with_default_material(Box::new(BinghamFluidMaterial::from_physical(
+            &props, &config,
+        )))
+        .with_boundary(Box::new(SlipBoundary::new(config.boundary_thickness)));
+    let first = sim.particles().len();
+    let _ = sim.add_body(spawn(34.0));
+    let total = sim.particles().len();
+
+    let spread = |range: std::ops::Range<usize>| {
+        let p = sim.particles();
+        range
+            .map(|i| p.initial_volume[i])
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), v| {
+                (lo.min(v), hi.max(v))
+            })
+    };
+    let a = mean_initial_volume(&sim, 0..first);
+    let b = mean_initial_volume(&sim, first..total);
+    let (a_lo, a_hi) = spread(0..first);
+    let (b_lo, b_hi) = spread(first..total);
+    // The mean alone would pass a body whose edges are inflated and whose
+    // interior is shrunk to compensate, so the range must match as well.
+    assert!(
+        (a - b).abs() / a.max(b) < 1.0e-3,
+        "a fluid body must carry the same initial volume whichever path added it: Simulation::new gave a mean of {a}, add_body {b}"
+    );
+    assert!(
+        (a_hi - b_hi).abs() < 1.0e-6 && (a_lo - b_lo).abs() < 1.0e-6,
+        "a fluid body's initial volume must span the same range whichever path added it: Simulation::new gave {a_lo} to {a_hi}, add_body {b_lo} to {b_hi}"
     );
 }
 
