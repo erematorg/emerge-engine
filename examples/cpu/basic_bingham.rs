@@ -133,26 +133,47 @@ const DX_M: f32 = 0.002;
 /// Simulated time advanced per rendered frame, live-adjustable in the
 /// panel. A viewing choice, not a physics one: every material constant
 /// stays real SI and each substep is identical whatever this is set to.
-/// Asking for less simulated time per frame buys frame rate and slower
-/// motion at the same fidelity, and costs the same total work to reach a
-/// given simulated instant.
 ///
-/// Measured on this scene, headless, release (`bingham_cost_probe`):
+/// It does NOT change how fast the slump plays. The work per simulated
+/// millisecond is fixed by the substep the physics needs, about 13 ms of
+/// wall clock per simulated ms here, so halving this doubles the frame
+/// rate and leaves the playback speed where it was. What it changes is
+/// smoothness, and that is why the default is 1 ms and not 2.
+///
+/// The demo advances a FIXED slice of simulated time per frame, so a frame
+/// that takes longer is a moment where the motion on screen slows down: a
+/// stutter. At 2 ms not one frame fits the 16.7 ms a 60 Hz display allows.
+/// At 1 ms nearly all of the collapse does. Measured per frame over three
+/// simulated seconds, headless, release, physics only with no rendering, and
+/// with the demo itself closed (a running copy competing for the cores made
+/// an earlier release run read slower than the `quick` profile):
+///
+///   BINGHAM_PROBE_FRAMES=1500 cargo run --release --example bingham_cost_probe
 ///
 /// ```text
-///   1.0 ms/frame   11.0 substeps   64 fps
-///   2.0 ms/frame   22.0 substeps   27 fps
-///   5.0 ms/frame   55.0 substeps   12 fps
+///   per frame  substeps  mean     fps   collapse: over 16.7 ms, max   settled: over 16.7, over 33, max
+///   1.0 ms      10.0    14.5 ms   69        2 of 500,   22 ms            139 of 1000,   51,   255 ms
+///   2.0 ms      19.2    25.2 ms   40      250 of 250,   69 ms           1250 of 1250,   39,   189 ms
 /// ```
 ///
-/// Real-time ratio, stated rather than left to be noticed: at the 2 ms
-/// default this advances 0.054 s of slump per second of wall clock, 18
-/// times slower than life. A slump is worth watching slowly anyway, and
-/// the slider trades frame rate against smoothness without touching a
-/// single material constant. These numbers are for the 2 to 1 columns
-/// this scene now stands; the 5 to 1 ones it used to had 960 particles
-/// against 2400 and were correspondingly cheaper.
-const DT_S_DEFAULT: f32 = 0.002;
+/// Two things in that table are not understood and are recorded rather
+/// than explained away. Release is no faster than the `quick` profile here
+/// (13.6 and 24.8 ms at the same two steps). And the long frames sit in the
+/// SETTLED phase, in both profiles, while the collapse is clean. It is not
+/// particle sleep, which this scene leaves off. Sustained-load CPU
+/// throttling and background load are the untested candidates, so read the
+/// settled column as this machine, not as the physics. Rendering adds to
+/// every row.
+///
+/// Real-time ratio, stated rather than left to be noticed: at 1 ms and
+/// 69 fps this advances 0.069 s of slump per second of wall clock, 14.5
+/// times slower than life, and 16.7 times if the display caps it at 60 Hz.
+/// No setting of this reaches real time; the substep does, and it is set
+/// by the sound speed, whose own derivation is below. The one fix still
+/// open is to run the physics on its own thread and let the display
+/// interpolate at 60 Hz between the last two states, which removes the
+/// stutter without touching the physics and would serve every demo.
+const DT_S_DEFAULT: f32 = 0.001;
 
 /// Real yield stresses in pascals, spanning the three bands
 /// `BinghamFluidMaterial`'s own doc lists (biological 1-50, mud 50-500,
