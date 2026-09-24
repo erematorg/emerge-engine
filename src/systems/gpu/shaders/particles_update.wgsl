@@ -745,9 +745,23 @@ fn update_particle(p_idx: u32, pp: ptr<function, Particle>) {
         // the GPU fluid impact explosion (and of the per-substep shear damping
         // once added to mask it).
         let div_v = trace2(p.velocity_gradient);
-        var J_fluid = old_J * exp(dt * div_v);
-        if !(J_fluid > 0.0) { J_fluid = 1.0; }
-        J_fluid = clamp(J_fluid, FLUID_J_MIN, fluid_j_max);
+        // Carried in the log, the same as CPU `advance_log_volume_ratio`,
+        // and for the reason measured there: near one, an f32 resolves
+        // about 1.2e-7 while a calm flow's own increment is a thousandth
+        // of that, so multiplying `det(F)` by `exp(dt div v)` every
+        // substep loses a fixed fraction of each increment and the
+        // smallest ones vanish outright. `log_volume_strain` is free for
+        // fluids (it is Drucker-Prager's and NACC's own field), so this
+        // costs no bytes in the 128-byte particle.
+        var carried = p.log_volume_strain;
+        if carried == 0.0 && old_J != 1.0 && old_J > 0.0 {
+            carried = log(old_J);
+        }
+        var log_j = carried + dt * div_v;
+        if !(log_j > -1.0e30 && log_j < 1.0e30) { log_j = 0.0; }
+        log_j = clamp(log_j, log(FLUID_J_MIN), log(fluid_j_max));
+        p.log_volume_strain = log_j;
+        let J_fluid = exp(log_j);
         let sqrtJ = sqrt(J_fluid);
         new_F = mat2x2<f32>(vec2<f32>(sqrtJ, 0.0), vec2<f32>(0.0, sqrtJ));
 

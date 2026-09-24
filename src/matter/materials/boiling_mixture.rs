@@ -201,6 +201,7 @@
 use glam::{Mat2, Vec2};
 
 use super::cavitating_eos::CavitatingEosTable;
+use crate::materials::utils::advance_log_volume_ratio;
 use crate::materials::{ConstitutiveModel, MaterialModel, MaterialParams};
 use crate::particle::{Particle, ParticleUpdateCtx, Particles};
 
@@ -522,7 +523,21 @@ impl MaterialModel for BoilingMixtureMaterial {
     fn update_particle(&self, ctx: &mut ParticleUpdateCtx, dt: f32) {
         let old_j = ctx.deformation_gradient.determinant();
         let div_v = ctx.velocity_gradient.x_axis.x + ctx.velocity_gradient.y_axis.y;
-        let j = (old_j * (dt * div_v).exp()).clamp(self.volume_ratio_min, self.volume_ratio_max);
+        // The carried logarithm is the real state; reading J back from F
+        // and multiplying loses a fraction of every small increment (see
+        // `advance_log_volume_ratio`'s own doc for the measurement).
+        let carried = if *ctx.log_volume_strain != 0.0 || old_j == 1.0 {
+            *ctx.log_volume_strain
+        } else {
+            old_j.max(1.0e-9).ln()
+        };
+        let (log_j, j) = advance_log_volume_ratio(
+            carried,
+            dt * div_v,
+            self.volume_ratio_min,
+            self.volume_ratio_max,
+        );
+        *ctx.log_volume_strain = log_j;
         let s = j.sqrt();
         *ctx.deformation_gradient = Mat2::from_cols(Vec2::new(s, 0.0), Vec2::new(0.0, s));
         let density = (self.rest_density_grid / j)

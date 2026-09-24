@@ -3,8 +3,8 @@ use glam::{Mat2, Vec2};
 use crate::materials::physical_props::{BinghamProps, FromSI, scale_stress, scale_visc};
 use crate::materials::svd::svd2;
 use crate::materials::utils::{
-    LOG_CLAMP, MIN_J, advance_deformation_gradient, carried_volume_ratio, elastic_wave_dt,
-    hencky_strains, reconstruct_f,
+    LOG_CLAMP, MIN_J, advance_deformation_gradient, advance_log_volume_ratio, carried_volume_ratio,
+    elastic_wave_dt, hencky_strains, reconstruct_f,
 };
 use crate::materials::{ConstitutiveModel, MaterialModel, MaterialParams};
 use crate::particle::{Particle, ParticleUpdateCtx, Particles};
@@ -495,7 +495,16 @@ impl MaterialModel for BinghamFluidMaterial {
         }
         let old_j = ctx.deformation_gradient.determinant();
         let div_v = ctx.velocity_gradient.x_axis.x + ctx.velocity_gradient.y_axis.y;
-        let j = (old_j * (dt * div_v).exp()).clamp(0.5, 2.0);
+        // The carried logarithm is the real state; reading J back from F
+        // and multiplying loses a fraction of every small increment (see
+        // `advance_log_volume_ratio`'s own doc for the measurement).
+        let carried = if *ctx.log_volume_strain != 0.0 || old_j == 1.0 {
+            *ctx.log_volume_strain
+        } else {
+            old_j.max(1.0e-9).ln()
+        };
+        let (log_j, j) = advance_log_volume_ratio(carried, dt * div_v, 0.5, 2.0);
+        *ctx.log_volume_strain = log_j;
         let s = j.sqrt();
         *ctx.deformation_gradient =
             glam::Mat2::from_cols(glam::Vec2::new(s, 0.0), glam::Vec2::new(0.0, s));

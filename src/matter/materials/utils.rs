@@ -88,6 +88,39 @@ fn deformation_increment_exp_with_det(dt_velocity_gradient: Mat2) -> (Mat2, f32)
     )
 }
 
+/// One substep of the continuity equation for a material that owns its
+/// own volume, carried in the log so a small increment is not absorbed.
+///
+/// The scalar twin of `advance_deformation_gradient`, and the same
+/// lesson. A fluid used to read `J` back from its isotropic `F` each
+/// substep and multiply: `J_new = det(F) * exp(dt div v)`. Near one, an
+/// f32 has a resolution of about 1.2e-7, while a calm flow's own
+/// increment is a thousandth of that, so each step loses a fixed
+/// FRACTION of its increment to absorption and the smallest increments
+/// vanish outright. Measured with no solver and no grid
+/// (`tests/scratch_fluid_j_rounding.rs`), against an f64 replica of the
+/// same update that holds J at exactly 1.000000: f32 walked to 0.999468
+/// at a divergence of 0.2 per second, and at the finest increment it
+/// froze completely, 0.000 drift, J stuck.
+///
+/// Adding `dt div v` to `ln J` instead keeps the increment: near J = 1
+/// the logarithm is near zero, where f32 resolution is not 1.2e-7 but
+/// vanishingly small. The clamp is applied in the same place, in the log,
+/// so a bounded material stays bounded.
+///
+/// Returns the carried logarithm and the `J` it means.
+#[inline]
+pub(crate) fn advance_log_volume_ratio(
+    carried_log_j: f32,
+    dt_div_v: f32,
+    min_j: f32,
+    max_j: f32,
+) -> (f32, f32) {
+    let advanced = carried_log_j + dt_div_v;
+    let clamped = advanced.clamp(min_j.max(f32::MIN_POSITIVE).ln(), max_j.ln());
+    (clamped, clamped.exp())
+}
+
 /// The volume ratio a particle is already carrying, read from `volume`
 /// rather than recomputed from `det(F)`: near the identity that
 /// determinant is a cancelling difference, and reading it back every step
