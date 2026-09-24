@@ -26,7 +26,7 @@ extern crate emerge_engine as emerge;
 
 use emerge::{
     BinghamFluidMaterial, BinghamProps, DruckerPragerMaterial, FromSI, MaterialModel,
-    NeoHookeanMaterial, SimConfig, Simulation, SlipBoundary, SpawnRegion,
+    NeoHookeanMaterial, NewtonianFluidMaterial, SimConfig, Simulation, SlipBoundary, SpawnRegion,
 };
 use glam::{IVec2, Vec2};
 
@@ -76,6 +76,12 @@ fn volume_drift_against_layer_thickness() {
     // trip; anything else selects the elastoviscoplastic one that goes
     // through a decomposition and a reconstruction every substep.
     let viscous = which == "viscous";
+    // The control the elastic slab cannot be: a body that FLOWS and
+    // collapses like the yield-stress one, under the same stiffness and
+    // the same viscosity, but whose law never decomposes and rebuilds F.
+    // Comparing a standing elastic slab against a collapsing plastic one
+    // changes the law and the motion together; this changes only the law.
+    let newtonian = which == "newtonian";
     let dt = 0.002f32;
 
     println!(
@@ -84,13 +90,17 @@ fn volume_drift_against_layer_thickness() {
             "elastic (NeoHookean, no SVD round trip)"
         } else if sand {
             "sand (Drucker-Prager, SVD round trip)"
+        } else if newtonian {
+            "newtonian fluid (flows, no SVD)"
         } else if viscous {
             "yield-stress fluid (2 Pa, viscous branch, no SVD)"
         } else {
             "yield-stress fluid (2 Pa, SVD round trip)"
         }
     );
-    println!("  thickness   particles    mean J at 0 s   at end    drift per second   worst |J-1|");
+    println!(
+        "  thickness   particles    mean J at 0 s   at end    drift per second   per substep   worst |J-1|"
+    );
 
     for thickness in [1i32, 2, 4, 8, 16] {
         let mut config = SimConfig {
@@ -115,6 +125,17 @@ fn volume_drift_against_layer_thickness() {
             Box::new(NeoHookeanMaterial::from_young_modulus(YOUNG_PA, POISSON))
         } else if sand {
             Box::new(DruckerPragerMaterial::cohesionless(2000.0, 4000.0))
+        } else if newtonian {
+            // Built from the yield-stress material's OWN grid-unit fields,
+            // so "same stiffness, same viscosity" holds by construction
+            // rather than by redoing its unit conversion by hand.
+            let bingham = BinghamFluidMaterial::from_physical(&props, &config);
+            Box::new(NewtonianFluidMaterial::new(
+                bingham.rest_density,
+                bingham.dynamic_viscosity,
+                bingham.eos_stiffness,
+                bingham.eos_power,
+            ))
         } else {
             Box::new(BinghamFluidMaterial::from_physical(&props, &config))
         };
@@ -137,13 +158,16 @@ fn volume_drift_against_layer_thickness() {
         sim.step();
         let (start, _) = volume_state(&sim);
         let frames = (seconds / dt).round() as usize;
+        let mut substeps = 0usize;
         for _ in 0..frames {
             sim.step();
+            substeps += sim.diagnostics_snapshot().substeps_last_step;
         }
         let (end, worst) = volume_state(&sim);
         println!(
-            "  {thickness:>6} cells  {particles:>8}    {start:>11.5}   {end:>7.5}   {:>14.5} %   {worst:>9.5}",
-            100.0 * (end - start) / f64::from(seconds)
+            "  {thickness:>6} cells  {particles:>8}    {start:>11.5}   {end:>7.5}   {:>14.5} %   {:>9.2e}   {worst:>9.5}",
+            100.0 * (end - start) / f64::from(seconds),
+            (end - start) / substeps.max(1) as f64
         );
     }
 }
