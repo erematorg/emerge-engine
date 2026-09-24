@@ -82,7 +82,12 @@ fn volume_drift_against_layer_thickness() {
     // Comparing a standing elastic slab against a collapsing plastic one
     // changes the law and the motion together; this changes only the law.
     let newtonian = which == "newtonian";
-    let dt = 0.002f32;
+    // Small enough that the adaptive loop takes ONE substep a frame, so
+    // the velocity gradient read between frames IS the one the material
+    // integrated. Volume can only move through its trace, so the running
+    // sum of `dt * tr(C)` must equal `ln J` exactly. Any gap is volume
+    // that came from somewhere other than the flow.
+    let dt = env("DRIFT_DT", 0.002);
 
     println!(
         "{} slab, gravity x{gravity_fraction}, {seconds} s, 2 mm cells",
@@ -105,6 +110,10 @@ fn volume_drift_against_layer_thickness() {
     for thickness in [1i32, 2, 4, 8, 16] {
         let mut config = SimConfig {
             min_dt: 1.0e-6,
+            // Off, so a particle keeps its index: the solver rotates the
+            // array when one falls asleep, and the per-particle identity
+            // check below would then be comparing two different particles.
+            sleep_threshold: 0.0,
             max_substeps_per_step: 256,
             ..SimConfig::earth(GRID, DX_M, dt)
         };
@@ -159,15 +168,34 @@ fn volume_drift_against_layer_thickness() {
         let (start, _) = volume_state(&sim);
         let frames = (seconds / dt).round() as usize;
         let mut substeps = 0usize;
-        for _ in 0..frames {
+        let mut traced = 0.0f64;
+        let mut ln_j_start = 0.0f64;
+        for frame in 0..frames {
             sim.step();
             substeps += sim.diagnostics_snapshot().substeps_last_step;
+            let parts = sim.particles();
+            let mid = parts.len() / 2;
+            if frame == 0 {
+                ln_j_start = f64::from(parts.deformation_gradient[mid].determinant()).ln();
+            } else {
+                let c = parts.velocity_gradient[mid];
+                traced += f64::from(dt) * f64::from(c.x_axis.x + c.y_axis.y);
+            }
         }
+        let ln_j_end = f64::from(
+            sim.particles().deformation_gradient[sim.particles().len() / 2].determinant(),
+        )
+        .ln();
         let (end, worst) = volume_state(&sim);
         println!(
             "  {thickness:>6} cells  {particles:>8}    {start:>11.5}   {end:>7.5}   {:>14.5} %   {:>9.2e}   {worst:>9.5}",
             100.0 * (end - start) / f64::from(seconds),
             (end - start) / substeps.max(1) as f64
+        );
+        println!(
+            "            one particle: ln J moved {:+.3e}, its own trace(C) accounts for {traced:+.3e}, gap {:+.3e}",
+            ln_j_end - ln_j_start,
+            (ln_j_end - ln_j_start) - traced
         );
     }
 }
