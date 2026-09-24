@@ -362,13 +362,78 @@ about 0.06 % of its volume per simulated second and does not saturate:
 thirty percent over ten minutes of play, which is what the drifting-apart
 looks like on screen.
 
-Not root-caused, and no guess is recorded here beyond the one the code
-itself already names: `transfer/g2p.rs` documents a free-surface
-mechanism where a layer thinner than the kernel's own support reads as
-expanded in every depth band, fixed once in 2026-09. The material that
-drifts here is precisely the one that ends up as such a layer. Whether
-this is a residue of that or something else needs a controlled thin-layer
-probe, not this scene.
+Narrowed, and split in two by `tests/scratch_thin_layer_volume_drift.rs`.
+Both halves are measured; neither is the free-surface transfer defect this
+entry used to guess at.
+
+**The first half was arithmetic, and is fixed.** A fluid used to re-read `J`
+from its own isotropic `F` each substep and multiply by `exp(dt div v)`. Near
+one an f32 resolves about 1.2e-7 while a calm flow's increment is a thousandth
+of that, so each step lost a fixed fraction of its increment and the smallest
+ones vanished outright, freezing `J` entirely. Carrying `ln J` instead
+(`advance_log_volume_ratio`, CPU and GPU) closes it: in isolation f32 now
+tracks an f64 replica exactly where it used to walk to 0.999468, and a
+particle's volume book agrees with its own gathered flow to 1e-8 where the gap
+used to be 1.2e-4.
+
+**The second half is a one-way pressure ratchet, and is NOT fixed.** What is
+left is gained at the body's OUTLINE, three to eighteen times faster than
+inside it. Measured cause, not deduced: a fluid's pressure is clamped from
+below at `pressure_floor`, and `BinghamFluidMaterial::new` leaves that at 0.0
+while `from_physical` never converts one. A particle with `J > 1` sits below
+rest density, so its Tait pressure is negative and the clamp deletes it
+entirely. Counted on the slab sweep, EVERY expanded particle is clamped --
+106 of 106, 167 of 167, 345 of 345, 655 of 655 -- at a mean deleted pressure
+of 1.2e5 to 2.0e5 in grid units. So expansion meets no restoring force at all
+while compression meets the full one, and any symmetric noise in the
+divergence ratchets volume upward, worst where neighbours are missing.
+
+Rerunning the identical sweep with the clamp lifted, which is a diagnostic and
+not a proposal:
+
+```text
+   thickness   drift with clamp   clamp lifted    worst |J-1| with   lifted
+     2 cells      +0.0717 %/s       -0.0009        0.0255           0.0041
+     4 cells      +0.0578 %/s       +0.0119        0.0470           0.0065
+     8 cells      +0.0557 %/s       +0.0056        0.0927           0.0146
+```
+
+Five to eighty times less, and the sign inverts on the thinnest slab. The skin
+follows: 1.00362 with the clamp, 0.99999 without.
+
+Lifting it is not the fix. At sixteen cells the unclamped run panics outright,
+`adaptive timestep cannot advance the requested simulation time`: unbounded
+tension lets a fluid pull on itself arbitrarily hard. The fix is a floor with
+a physical value, which the Newtonian twin already has -- `fluid.rs` sets
+`-100_000.0` Pa gauge for dissolved-gas cavitation onset and converts it in
+its SI constructor. Bingham's own constructor does neither. That is a material
+change and is not made here.
+
+What remains after the arithmetic half, with the shipped clamp still in place
+(ten seconds at 2 ms a frame, and the rate is window-dependent because most of
+it is the settling transient: the same sweep over one second reads three to
+five times higher):
+
+```text
+   thickness    drift        worst |J-1|
+     1 cell     0.0004 %/s     0.0003
+     2 cells    0.0237 %/s     0.0300
+     4 cells    0.0212 %/s     0.0508
+     8 cells    0.0190 %/s     0.0992
+    16 cells    0.0410 %/s     0.7892
+```
+
+Measured above: the arithmetic mechanism and its fix; the clamp firing on
+every expanded particle; the drift with and without it; the panic when it is
+lifted. Hypothesis, NOT measured: that a physically grounded floor would leave
+both the drift and the stability where the lifted run put them. Nothing has
+been run at an intermediate floor.
+
+Ruled out by counting, and worth recording because this entry used to name it:
+the free-surface node exclusion in `gather_grid_to_particles`. Instrumented
+over the same sweep, it fired 0 times in 418,714,560 node evaluations, because
+P2G inserts every in-bounds node of a particle's own stencil. The invariant it
+protects is kept as a test, `a_rigid_translation_reads_no_velocity_gradient`.
 
 ### GPU snow hardens differently at a body's edge
 

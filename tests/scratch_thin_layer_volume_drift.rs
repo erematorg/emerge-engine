@@ -21,6 +21,62 @@
 //! (`neohookean` for an ordinary solid instead of the yield-stress fluid,
 //! to see whether it is one law or the transfer).
 //!
+//! # What it found
+//!
+//! The thickness sweep does not behave like a thin-layer effect: the drift
+//! does not grow as the layer thins. Splitting each slab into the particles
+//! within one cell of its own outline and the rest does separate it, over
+//! ten seconds at 2 ms a frame:
+//!
+//! ```text
+//!   thickness    skin J     interior J    ratio
+//!     1 cell     0.99986       --         flat, nothing to split
+//!     2 cells    1.00389     1.00021      18
+//!     4 cells    1.00236     1.00078       3
+//!     8 cells    1.00292     1.00051       6
+//!    16 cells    1.01527     1.00228       7
+//! ```
+//!
+//! So the volume is gained at the body's outline, three to eighteen times
+//! faster than inside it. The obvious suspect is the gather dropping nodes
+//! there: `Grid::is_extrapolated` excludes a node that received no scatter,
+//! and dropping nodes breaks the kernel's zero-first-moment identity, which
+//! is exactly what makes the affine gather blind to a rigid translation.
+//!
+//! COUNTED, and it is not that. Instrumenting the branch over this sweep:
+//! 0 extrapolated nodes of 418,714,560 gathered. The path never fires,
+//! because P2G inserts every in-bounds node of a particle's own stencil, so
+//! a particle always gathers from a complete one. The exclusion machinery
+//! (`included_gx`/`included_gy` and the column discard beneath it) is
+//! therefore inert in the current tree, which is worth its own issue but is
+//! not this. The invariant it was protecting is kept as a real test,
+//! `a_rigid_translation_reads_no_velocity_gradient`, which reads 4.4e-7 on a
+//! drifting block.
+//!
+//! What is left is a one-way pressure ratchet, and that IS measured. A
+//! fluid clamps its pressure from below at `pressure_floor`, which
+//! `BinghamFluidMaterial::new` leaves at 0.0. A particle with J > 1 is
+//! below rest density, so its Tait pressure is negative and the clamp
+//! deletes it: every expanded particle in every slab is clamped (106 of
+//! 106, 167 of 167, 345 of 345, 655 of 655), at a mean deleted pressure
+//! of 1.2e5 to 2.0e5 in grid units. Expansion meets no restoring force,
+//! compression meets the full one, so noise ratchets volume upward.
+//!
+//! Lifting the clamp (`DRIFT_PRESSURE_FLOOR=-1e9`), as a diagnostic:
+//!
+//! ```text
+//!   thickness   with clamp    lifted     worst |J-1| with   lifted
+//!     2 cells   +0.0717 %/s   -0.0009      0.0255           0.0041
+//!     4 cells   +0.0578 %/s   +0.0119      0.0470           0.0065
+//!     8 cells   +0.0557 %/s   +0.0056      0.0927           0.0146
+//! ```
+//!
+//! Five to eighty times less, sign inverted on the thinnest slab, and the
+//! skin drops from 1.00362 to 0.99999. It is a diagnostic and not a
+//! proposal: at sixteen cells the lifted run panics, unbounded tension
+//! letting a fluid pull on itself arbitrarily hard. A floor with a
+//! physical value is what the Newtonian twin already carries.
+//!
 //!   cargo test --profile quick --all-features --test scratch_thin_layer_volume_drift -- --ignored --nocapture
 extern crate emerge_engine as emerge;
 
@@ -61,6 +117,40 @@ fn volume_state(sim: &Simulation) -> (f64, f32) {
         worst = worst.max((j - 1.0).abs());
     }
     (sum / p.len() as f64, worst)
+}
+
+/// Mean volume ratio split by how close a particle sits to the body's own
+/// outline, within one cell of the left, right or top extent against the
+/// rest. The quadratic kernel reaches one and a half cells, so a particle
+/// nearer the outline than that gathers from nodes that carry no material
+/// on one side. If the residual drift is that, it lives on the skin and
+/// the interior stays flat; if it is spread evenly, it is not.
+fn skin_and_interior(sim: &Simulation) -> (f64, usize, f64, usize) {
+    let p = sim.particles();
+    let (mut lo_x, mut hi_x, mut hi_y) = (f32::MAX, f32::MIN, f32::MIN);
+    for i in 0..p.len() {
+        lo_x = lo_x.min(p.x[i].x);
+        hi_x = hi_x.max(p.x[i].x);
+        hi_y = hi_y.max(p.x[i].y);
+    }
+    let (mut skin, mut n_skin, mut core, mut n_core) = (0.0f64, 0usize, 0.0f64, 0usize);
+    for i in 0..p.len() {
+        let x = p.x[i];
+        let j = f64::from(p.deformation_gradient[i].determinant());
+        if x.x - lo_x < 1.0 || hi_x - x.x < 1.0 || hi_y - x.y < 1.0 {
+            skin += j;
+            n_skin += 1;
+        } else {
+            core += j;
+            n_core += 1;
+        }
+    }
+    (
+        skin / n_skin.max(1) as f64,
+        n_skin,
+        core / n_core.max(1) as f64,
+        n_core,
+    )
 }
 
 #[test]
@@ -130,6 +220,14 @@ fn volume_drift_against_layer_thickness() {
                 YIELD_PA / YIELD_STRAIN
             },
         };
+        // A fluid's pressure is clamped from below at `pressure_floor`, and
+        // `BinghamFluidMaterial::new` leaves it at 0.0. A particle with
+        // J > 1 is below rest density, so its Tait pressure is negative and
+        // the clamp deletes it: no restoring force at all in extension,
+        // full restoring force in compression. Any symmetric noise in the
+        // divergence then ratchets volume UPWARD. Lowering the floor lets
+        // the same law pull back, which is the test.
+        let floor = env("DRIFT_PRESSURE_FLOOR", 0.0);
         let material: Box<dyn MaterialModel> = if neohookean {
             Box::new(NeoHookeanMaterial::from_young_modulus(YOUNG_PA, POISSON))
         } else if sand {
@@ -146,8 +244,13 @@ fn volume_drift_against_layer_thickness() {
                 bingham.eos_power,
             ))
         } else {
-            Box::new(BinghamFluidMaterial::from_physical(&props, &config))
+            let mut bingham = BinghamFluidMaterial::from_physical(&props, &config);
+            bingham.pressure_floor = floor;
+            Box::new(bingham)
         };
+        // The same EOS the law uses, read back from the law's own fields so
+        // this reports what the solver computed, not a second formula.
+        let eos = BinghamFluidMaterial::from_physical(&props, &config);
         let spawn = SpawnRegion {
             spacing: 0.5,
             box_size: IVec2::new(WIDTH_CELLS, thickness),
@@ -178,6 +281,11 @@ fn volume_drift_against_layer_thickness() {
             if frame == 0 {
                 ln_j_start = f64::from(parts.deformation_gradient[mid].determinant()).ln();
             } else {
+                // Only comparable to `ln J` when the adaptive loop takes ONE
+                // substep a frame: this samples the gradient once a frame,
+                // while the material integrates it once a SUBSTEP. Raise
+                // DRIFT_DT until `substeps_last_step` reads 1 before reading
+                // the gap as anything.
                 let c = parts.velocity_gradient[mid];
                 traced += f64::from(dt) * f64::from(c.x_axis.x + c.y_axis.y);
             }
@@ -196,6 +304,30 @@ fn volume_drift_against_layer_thickness() {
             "            one particle: ln J moved {:+.3e}, its own trace(C) accounts for {traced:+.3e}, gap {:+.3e}",
             ln_j_end - ln_j_start,
             (ln_j_end - ln_j_start) - traced
+        );
+        let (skin, n_skin, core, n_core) = skin_and_interior(&sim);
+        println!(
+            "            skin {skin:.5} over {n_skin} particles, interior {core:.5} over {n_core}"
+        );
+        let parts = sim.particles();
+        let (mut expanded, mut clamped, mut raw_sum) = (0usize, 0usize, 0.0f64);
+        for i in 0..parts.len() {
+            if parts.deformation_gradient[i].determinant() <= 1.0 {
+                continue;
+            }
+            expanded += 1;
+            let density = parts.density[i]
+                .max(eos.min_density)
+                .min(eos.rest_density * 2.0);
+            let raw = eos.eos_stiffness * ((density / eos.rest_density).powf(eos.eos_power) - 1.0);
+            raw_sum += f64::from(raw);
+            if raw < floor {
+                clamped += 1;
+            }
+        }
+        println!(
+            "            floor {floor}: {clamped} of {expanded} expanded particles have their pressure clamped, mean raw {:.3e}",
+            raw_sum / expanded.max(1) as f64
         );
     }
 }
