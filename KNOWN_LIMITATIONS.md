@@ -323,6 +323,36 @@ after that, measured on the anchored body of
   Pradhana correction needs a scene where the volume gain it corrects is
   physical.
 
+### A thin spread layer keeps gaining volume
+
+Found by the user watching a demo rather than by a test: particles grow
+and drift apart the longer a scene runs. The renderer draws each particle
+deformed by its own F, so what is visible IS its volume ratio. Measured
+on the three settled columns of `basic_bingham` (`bingham_slump_probe`,
+mean J over each column):
+
+```text
+   t        2 Pa      60 Pa     1200 Pa
+   0 s     0.9998    0.9997     0.9996
+   5 s     1.0154    0.9589     0.9916
+  10 s     1.0191    0.9591     0.9915
+  20 s     1.0272    0.9594     0.9914
+```
+
+The two columns that hold a shape are flat to the fourth digit over
+twenty seconds. The soft one, which spreads into a thin wide layer, gains
+about 0.06 % of its volume per simulated second and does not saturate:
+thirty percent over ten minutes of play, which is what the drifting-apart
+looks like on screen.
+
+Not root-caused, and no guess is recorded here beyond the one the code
+itself already names: `transfer/g2p.rs` documents a free-surface
+mechanism where a layer thinner than the kernel's own support reads as
+expanded in every depth band, fixed once in 2026-09. The material that
+drifts here is precisely the one that ends up as such a layer. Whether
+this is a residue of that or something else needs a controlled thin-layer
+probe, not this scene.
+
 ### GPU snow hardens differently at a body's edge
 
 Two measurements, months apart and from opposite directions, that are

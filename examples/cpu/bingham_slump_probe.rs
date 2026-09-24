@@ -118,12 +118,19 @@ fn main() {
                         (0.5 * (d.x_axis.length_squared() + d.y_axis.length_squared())).sqrt(),
                     );
                 }
+                let mut jsum = 0.0f64;
+                let mut jn = 0u32;
+                for p in sim.particles().iter().filter(|p| p.material_id == slot) {
+                    jsum += f64::from(p.deformation_gradient.determinant());
+                    jn += 1;
+                }
                 line += &format!(
-                    "  {}[h={:.1} vmax={:.2} shear/yield={:.2}]",
+                    "  {}[h={:.1} vmax={:.2} shear/yield={:.2} meanJ={:.4}]",
                     COLUMN_LABEL[slot as usize],
                     (top - FLOOR_CELLS).max(0.0) * DX_M * 1000.0,
                     v * DX_M,
-                    peak / materials[slot as usize].yield_stress.max(1.0e-12)
+                    peak / materials[slot as usize].yield_stress.max(1.0e-12),
+                    jsum / f64::from(jn.max(1))
                 );
             }
             println!("{line}");
