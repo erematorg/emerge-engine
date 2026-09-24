@@ -95,11 +95,26 @@ fn main() {
     let mut acc = [0u64; 10];
     let mut substeps = 0usize;
     let mut peak_speed_cells_s = 0.0f32;
-    const FRAMES: usize = 120;
+    // 120 by default so the averages below stay comparable with the table
+    // in `basic_bingham`'s header. Raise it to see past the collapse.
+    let frames: usize = std::env::var("BINGHAM_PROBE_FRAMES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(120);
+    // Each frame's own wall time and substep count. A mean over a second is
+    // what the demo's panel shows, and it hides exactly the long frames a
+    // viewer sees as a stutter, because the demo advances a FIXED slice of
+    // simulated time per frame: a slow frame is a frame where the motion
+    // on screen visibly slows down.
+    let mut frame_ms = Vec::with_capacity(frames);
+    let mut frame_substeps = Vec::with_capacity(frames);
     let wall = std::time::Instant::now();
-    for _ in 0..FRAMES {
+    for _ in 0..frames {
+        let frame_start = std::time::Instant::now();
         sim.step();
+        frame_ms.push(frame_start.elapsed().as_secs_f64() * 1000.0);
         let s = sim.diagnostics_snapshot();
+        frame_substeps.push(s.substeps_last_step);
         let t = s.timing;
         substeps += s.substeps_last_step;
         peak_speed_cells_s = peak_speed_cells_s.max(s.max_particle_speed);
@@ -136,16 +151,46 @@ fn main() {
     ];
     let total = acc[9].max(1) as f64;
     println!(
-        "{FRAMES} frames in {elapsed_ms:.1} ms -> {:.2} ms/frame, {:.1} fps, {:.1} substeps/frame",
-        elapsed_ms / FRAMES as f64,
-        1000.0 * FRAMES as f64 / elapsed_ms,
-        substeps as f64 / FRAMES as f64
+        "{frames} frames in {elapsed_ms:.1} ms -> {:.2} ms/frame, {:.1} fps, {:.1} substeps/frame",
+        elapsed_ms / frames as f64,
+        1000.0 * frames as f64 / elapsed_ms,
+        substeps as f64 / frames as f64
     );
     for (name, value) in names.iter().zip(acc.iter()) {
         println!(
             "  {name:<15} {:8.2} ms/frame  {:5.1}%",
-            *value as f64 / 1000.0 / FRAMES as f64,
+            *value as f64 / 1000.0 / frames as f64,
             100.0 * *value as f64 / total
+        );
+    }
+
+    // The spread, per phase. The first half second of simulated time is
+    // the collapse, where everything moves; after it the columns sit.
+    let dt = step_seconds();
+    let split = ((0.5 / dt).round() as usize).min(frames);
+    println!("frame time spread, physics only (no rendering), per phase:");
+    println!(
+        "  phase        frames    p50 ms   p95 ms   p99 ms   max ms   >16.7 ms  >33.3 ms   substeps min-max"
+    );
+    for (label, range) in [("collapse", 0..split), ("settled", split..frames)] {
+        if range.is_empty() {
+            continue;
+        }
+        let mut t: Vec<f64> = frame_ms[range.clone()].to_vec();
+        t.sort_by(f64::total_cmp);
+        let pct = |p: f64| t[((t.len() - 1) as f64 * p).round() as usize];
+        let subs = &frame_substeps[range.clone()];
+        println!(
+            "  {label:<10} {:>7}   {:>7.2}  {:>7.2}  {:>7.2}  {:>7.2}   {:>8}  {:>8}   {:>5}-{}",
+            t.len(),
+            pct(0.50),
+            pct(0.95),
+            pct(0.99),
+            t[t.len() - 1],
+            t.iter().filter(|&&x| x > 1000.0 / 60.0).count(),
+            t.iter().filter(|&&x| x > 1000.0 / 30.0).count(),
+            subs.iter().min().unwrap_or(&0),
+            subs.iter().max().unwrap_or(&0)
         );
     }
     println!(
@@ -158,7 +203,7 @@ fn main() {
     println!(
         "  {:<15} {:8.2} ms/frame  {:5.1}%",
         "unaccounted",
-        (acc[9].saturating_sub(accounted)) as f64 / 1000.0 / FRAMES as f64,
+        (acc[9].saturating_sub(accounted)) as f64 / 1000.0 / frames as f64,
         100.0 * acc[9].saturating_sub(accounted) as f64 / total
     );
 }
