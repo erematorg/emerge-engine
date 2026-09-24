@@ -431,7 +431,7 @@ been run at an intermediate floor.
 
 Ruled out by counting, and worth recording because this entry used to name it:
 the free-surface node exclusion in `gather_grid_to_particles`. Instrumented
-over the same sweep, it fired 0 times in 418,714,560 node evaluations, because
+over the same sweep, it fired 0 times in 418,714,560 node evaluations (issue #39), because
 P2G inserts every in-bounds node of a particle's own stencil. The invariant it
 protects is kept as a test, `a_rigid_translation_reads_no_velocity_gradient`.
 
