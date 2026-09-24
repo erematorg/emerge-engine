@@ -18,6 +18,31 @@
 //! no grid: the same update in f64, and the same flow at half the step.
 //! Rounding error per unit time DOUBLES when the step halves, because
 //! there are twice as many of them. Truncation error HALVES.
+//!
+//! # What it found
+//!
+//! Swept over the size of the divergence, with the f64 replica beside it:
+//!
+//! ```text
+//!   divergence   increment a step   f32 J      f64 J       drift a step
+//!     20 /s          8e-4           1.000010   1.000008     1e-10
+//!      0.2 /s        8e-6           0.999468   1.000000    -5.3e-9
+//!      0.002 /s      8e-8           0.999658   1.000000    -3.4e-9
+//!      0.002 /s      2e-8           1.000000   1.000000     0
+//! ```
+//!
+//! At a realistic divergence the f64 replica is exact and the f32 one is
+//! not, so this is arithmetic. At the smallest increment the f32 update
+//! vanishes entirely and J freezes: below the resolution of a number near
+//! one, an increment simply has nowhere to go.
+//!
+//! Halving the step halves the drift PER STEP (-5.32, -2.81, -1.03e-9),
+//! so per unit time it is constant. That is neither plain rounding, which
+//! would double, nor truncation, which would halve: it is a relative
+//! error on each increment, the fraction f32 loses when a small number is
+//! added to one. Carrying ln J in its own accumulator, the recipe phase
+//! 1b measured for the deformation gradient, is what keeps that fraction.
+
 extern crate emerge_engine as emerge;
 
 use emerge::{MaterialModel, NewtonianFluidMaterial, Particle, Particles};
