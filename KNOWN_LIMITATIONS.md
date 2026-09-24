@@ -323,6 +323,23 @@ after that, measured on the anchored body of
   Pradhana correction needs a scene where the volume gain it corrects is
   physical.
 
+### Solids throw their friction heat away
+
+Only `BinghamFluidMaterial` and `NewtonianFluidMaterial` declare a
+specific heat. Every solid and plastic law returns the trait's default,
+so the work their yielding and friction dissipate raises nothing's
+temperature: sand shearing, metal yielding and rock fracturing are all
+adiabatic in the wrong direction, losing the energy instead of keeping
+it as heat.
+
+Found in the first pass of the core audit, alongside the spawn contract
+and mu(I)'s Euler integration. Both of those are now fixed and this one
+is not: it belongs to no phase of the plan, which is why it is written
+here rather than left in a note. It is the cross-domain energy question,
+not a one-line fix: a law that heats itself needs somewhere for that
+heat to go, which is the thermal coupling this engine has for fluids and
+not for solids.
+
 ### A thin spread layer keeps gaining volume
 
 Found by the user watching a demo rather than by a test: particles grow
