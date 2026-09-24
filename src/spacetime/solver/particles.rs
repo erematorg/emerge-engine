@@ -673,15 +673,13 @@ impl Simulation {
         let new_count = new_len - old_len;
         let sleeping_count = old_len - old_active;
 
-        // Stamp tag and init material plastic state (new particles still at [old_len..new_len]).
+        // Stamp the tag (new particles still at [old_len..new_len]). The
+        // material's own `init_particle` used to run here too, BEFORE the
+        // volume estimate below, and that one ordering was the whole of a
+        // measured bug: see the estimate's own comment further down.
         let mat_id = spawn.material_id;
         for i in old_len..new_len {
             self.particles.user_tag[i] = tag;
-            if self.materials.is_registered(mat_id) {
-                let mut p = self.particles.get(i);
-                self.materials.get(mat_id).init_particle(&mut p);
-                self.particles.set(i, p);
-            }
         }
 
         // If sleeping particles sit between the active zone and the new particles, rotate new
@@ -717,6 +715,31 @@ impl Simulation {
             group_start,
             true,
         );
+        // THEN the material's own initialisation, never before it, because
+        // `Simulation::new` does it in exactly this order and the two paths
+        // must produce the same body. They did not. `new` estimates and is
+        // then followed by `with_default_material`, which reinitialises
+        // every particle, so a material that sets its own initial volume
+        // has the last word there. Here `init_particle` used to run first,
+        // so the estimate had the last word instead, and a free-surface
+        // particle's estimated volume is up to 2.56 times its packing
+        // volume. Initial volume multiplies stress directly, so those
+        // particles pushed that much too hard.
+        //
+        // Measured on three IDENTICAL columns in one world
+        // (`tests/scratch_bingham_column_volume_loss.rs`): the body `new`
+        // started with held mean J = 0.99907 while the two this function
+        // added crushed to 0.94304, worst particle 0.603 against 0.986.
+        // Six material families set their own volume this way and all six
+        // are fluids or gases, so every fluid body added at runtime carried
+        // it.
+        if self.materials.is_registered(mat_id) {
+            for i in group_start..group_end {
+                let mut p = self.particles.get(i);
+                self.materials.get(mat_id).init_particle(&mut p);
+                self.particles.set(i, p);
+            }
+        }
         self.spatial_hash
             .borrow_mut()
             .rebuild(&self.particles.x, self.active_count);
