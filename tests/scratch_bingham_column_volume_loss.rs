@@ -1,0 +1,771 @@
+//! Where does the slump demo's middle column lose six percent of itself?
+//!
+//! Measured on `bingham_slump_probe` at the scene's own geometry, mean `J`
+//! by column over eighteen seconds:
+//!
+//! ```text
+//!   tau_0      first sample   at 18 s    change
+//!      2 Pa      0.9998       1.0004     +0.0006
+//!     60 Pa      0.9894       0.9380     -0.0514
+//!   1200 Pa      0.9925       0.9787     -0.0138
+//! ```
+//!
+//! Two separate things, and an earlier report of this wrongly called it
+//! one. There is an OFFSET already present at the first sample, and there
+//! is a loss that keeps ACCUMULATING after it. Neither is explained by the
+//! columns' own weight: `rho g h / 2` over a 22 mm column is 106 Pa against
+//! a bulk modulus of 78,480, so its own load buys `J = 0.9986`. The middle
+//! column ends 46 times past that, the right one about 9.
+//!
+//! The standing suspect is arithmetic, not physics. `BinghamFluidMaterial`
+//! takes its elastoviscoplastic branch here (all three columns have a
+//! storage modulus), and that branch rebuilds `F` through an SVD every
+//! substep: `svd2`, then `hencky_strains`, then a deviatoric rescale, then
+//! `exp`, then `reconstruct_f`. In exact arithmetic the rescale preserves
+//! volume by construction, because `eps_projected = dev * k + tr/2` leaves
+//! `tr` alone and touches only the traceless part. In f32 every one of
+//! those steps rounds relative to a singular value near one, which is the
+//! same absorption already measured and fixed on the viscous path. An
+//! isolated probe (`tests/scratch_evp_volume_rounding.rs`) put it at about
+//! 5e-8 a substep, of the right sign. Over the roughly 200,000 substeps of
+//! eighteen seconds that is about -1 percent: the right column's size, and
+//! five times too small for the middle one.
+//!
+//! What might make the middle one different is that it sits exactly ON its
+//! yield surface, so it takes the plastic branch every substep, where the
+//! right column is elastic most of the time.
+//!
+//! Three cheap tests, one per hypothesis, all on the demo geometry and one
+//! column at a time so nothing else can contribute: the DISTRIBUTION of J
+//! rather than its mean; HALVING the frame step; and raising the YIELD
+//! STRESS at a fixed storage modulus.
+//!
+//! # What they found, which is none of the above
+//!
+//! All three came back negative, and the fourth test says why.
+//!
+//! ```text
+//!   1. a 60 Pa column ALONE ends six seconds at mean J = 1.00000, with its
+//!      height bands all within 0.001 of one. There is nothing to explain.
+//!   2. the frame step from 4 ms down to 0.5 ms: +0.0003, +0.00005, -0.0003,
+//!      -0.0004 percent a second. No trend, so no per-substep arithmetic.
+//!   3. yield stress 60, 120, 600, 6000 Pa at a fixed storage modulus:
+//!      1.00000, 0.99957, 0.99831, 0.99831. Raising it makes the loss
+//!      slightly WORSE, so it is not the plastic return path either.
+//! ```
+//!
+//! The variable is not the column. Three IDENTICAL columns, same yield
+//! stress, same geometry, same everything, in one simulation:
+//!
+//! ```text
+//!   slot   created by            initial volume    mean J    worst J
+//!      0   Simulation::new         0.250000        0.99907    0.986
+//!      1   add_body                0.280036        0.94304    0.603
+//!      2   add_body                0.280036        0.94441    0.601
+//! ```
+//!
+//! So it is the SPAWN PATH. With no steps run at all, the same column built
+//! each way carries a different initial volume: `Simulation::new` gives
+//! every particle exactly 0.250000, which is the geometric packing at
+//! spacing 0.5 and cannot be a measurement, while `add_body` measures and
+//! gets 0.250000 to 0.640000, inflating free-surface particles by up to
+//! 2.56 times. Initial volume multiplies stress directly, so those
+//! particles push 2.56 times too hard and the body crushes itself.
+//!
+//! Sweeping what `Simulation::new` does on its own, four configurations,
+//! no steps: 0.025000, 0.250000, 0.001000, 0.250000, every one of them
+//! UNIFORM (min equals max) and every one of them equal to the particle's
+//! mass over its density. It never measures its body's packing, at any dx
+//! and from either mass source.
+//!
+//! `tests/spawn_contract.rs` is not wrong and is not insensitive by design:
+//! in ITS scene both bodies read identically, 0.300906 with the same
+//! 0.25-to-0.64 spread, so its equality assertion is satisfied by two
+//! measured bodies. Why the first body is measured there and not here is
+//! the open end of this trail, and so is the question of which of the two
+//! values is right. The uniform mass-over-density one is what an
+//! undeformed freshly spawned body should carry; the measured one carries
+//! the free-surface density underestimate this engine documents elsewhere,
+//! which is what makes it inflate edges.
+//!
+//!   cargo test --profile quick --all-features --test scratch_bingham_column_volume_loss -- --ignored --nocapture
+extern crate emerge_engine as emerge;
+
+use emerge::{
+    BinghamFluidMaterial, BinghamProps, FromSI, SimConfig, Simulation, SlipBoundary, SpawnRegion,
+};
+use glam::{IVec2, Vec2};
+
+// The slump demo's own scene, constant for constant.
+const GRID: usize = 64;
+const DX_M: f32 = 0.002;
+const RHO_KG_M3: f32 = 1000.0;
+const ETA_PA_S: f32 = 0.5;
+const YIELD_STRAIN: f32 = 0.05;
+const COLUMN_CELLS: IVec2 = IVec2::new(10, 20);
+const FLOOR_CELLS: f32 = 2.0;
+const BULK_PA: f32 = 78_480.0;
+
+fn env(name: &str, default: f32) -> f32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+struct Run {
+    sim: Simulation,
+    substeps: usize,
+}
+
+/// One column of the slump scene, alone in the tank. `shear_modulus_pa` is
+/// passed separately from `yield_stress_pa` so the third test can move the
+/// yield surface without moving the stiffness, the wave speed or the
+/// timestep with it.
+fn run_column(yield_stress_pa: f32, shear_modulus_pa: f32, seconds: f32, dt: f32) -> Run {
+    let config = SimConfig {
+        min_dt: 1.0e-6,
+        sleep_threshold: 0.0,
+        max_substeps_per_step: 512,
+        ..SimConfig::earth(GRID, DX_M, dt)
+    };
+    let props = BinghamProps {
+        rho_kg_m3: RHO_KG_M3,
+        eta_pa_s: ETA_PA_S,
+        bulk_modulus_pa: BULK_PA,
+        yield_stress_pa,
+        shear_modulus_pa,
+        cavitation_pressure_pa: BinghamProps::air_entrained_cavitation_pressure(),
+    };
+    let spawn = SpawnRegion {
+        spacing: 0.5,
+        box_size: COLUMN_CELLS,
+        box_center: Vec2::new(GRID as f32 * 0.5, FLOOR_CELLS + COLUMN_CELLS.y as f32 * 0.5),
+        material_id: 0,
+        initial_velocity_scale: 0.0,
+        ..SpawnRegion::for_sim(&config)
+    }
+    .mass_from(&props, &config);
+    let mut sim = Simulation::new(config, spawn)
+        .with_default_material(Box::new(BinghamFluidMaterial::from_physical(
+            &props, &config,
+        )))
+        .with_boundary(Box::new(SlipBoundary::new(config.boundary_thickness)));
+    let mut substeps = 0usize;
+    for _ in 0..(seconds / dt).round() as usize {
+        sim.step();
+        substeps += sim.diagnostics_snapshot().substeps_last_step;
+    }
+    Run { sim, substeps }
+}
+
+/// Every particle's volume ratio, sorted, so percentiles are honest.
+fn sorted_j(sim: &Simulation) -> Vec<f32> {
+    let p = sim.particles();
+    let mut v: Vec<f32> = (0..p.len())
+        .map(|i| p.deformation_gradient[i].determinant())
+        .collect();
+    v.sort_by(f32::total_cmp);
+    v
+}
+
+fn mean(v: &[f32]) -> f64 {
+    v.iter().map(|&x| f64::from(x)).sum::<f64>() / v.len().max(1) as f64
+}
+
+fn pct(v: &[f32], p: f64) -> f32 {
+    v[((v.len() - 1) as f64 * p).round() as usize]
+}
+
+// --- 1. the distribution, not the mean --------------------------------------
+
+#[test]
+#[ignore = "diagnostic probe kept for reruns, not part of the CI suite"]
+fn column_volume_distribution() {
+    let seconds = env("COLUMN_SECONDS", 18.0);
+    let dt = env("COLUMN_DT", 0.002);
+    let tau0 = env("COLUMN_TAU0", 60.0);
+    println!("tau_0 {tau0} Pa column alone, {seconds} s at {dt} s a frame");
+    println!("  when        mean J      min       p1       p5      p50      p95      max");
+
+    for (label, t) in [("step 1", dt), ("step 2", 2.0 * dt), ("end", seconds)] {
+        let run = run_column(tau0, tau0 / YIELD_STRAIN, t, dt);
+        let v = sorted_j(&run.sim);
+        println!(
+            "  {label:<9}  {:>8.5}  {:>7.5}  {:>7.5}  {:>7.5}  {:>7.5}  {:>7.5}  {:>7.5}",
+            mean(&v),
+            v[0],
+            pct(&v, 0.01),
+            pct(&v, 0.05),
+            pct(&v, 0.50),
+            pct(&v, 0.95),
+            v[v.len() - 1]
+        );
+    }
+
+    // And WHERE in the column the loss sits. A mean can be carried by a
+    // thin layer pressed against the floor; a profile cannot hide that.
+    let run = run_column(tau0, tau0 / YIELD_STRAIN, seconds, dt);
+    let p = run.sim.particles();
+    let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+    for i in 0..p.len() {
+        lo = lo.min(p.x[i].y);
+        hi = hi.max(p.x[i].y);
+    }
+    println!("  height band (floor to top)      mean J    particles");
+    const BANDS: usize = 5;
+    for b in 0..BANDS {
+        let (a, z) = (
+            lo + (hi - lo) * b as f32 / BANDS as f32,
+            lo + (hi - lo) * (b + 1) as f32 / BANDS as f32,
+        );
+        let band: Vec<f32> = (0..p.len())
+            .filter(|&i| p.x[i].y >= a && (p.x[i].y < z || b == BANDS - 1))
+            .map(|i| p.deformation_gradient[i].determinant())
+            .collect();
+        println!(
+            "  {b}: {:>5.1} to {:>5.1} mm             {:>7.5}   {:>6}",
+            (a - FLOOR_CELLS) * DX_M * 1000.0,
+            (z - FLOOR_CELLS) * DX_M * 1000.0,
+            mean(&band),
+            band.len()
+        );
+    }
+}
+
+// --- 2. halve the frame step ------------------------------------------------
+
+#[test]
+#[ignore = "diagnostic probe kept for reruns, not part of the CI suite"]
+fn column_volume_loss_against_substep() {
+    let seconds = env("COLUMN_SECONDS", 6.0);
+    let tau0 = env("COLUMN_TAU0", 60.0);
+    println!("tau_0 {tau0} Pa column, {seconds} s, frame step halved three times.");
+    println!("A per-substep arithmetic loss is constant PER SUBSTEP, so more substeps");
+    println!("for the same physical time means proportionally more of it.");
+    println!("  frame dt    substeps    mean J     loss per second   loss per substep");
+
+    for dt in [0.004f32, 0.002, 0.001, 0.0005] {
+        let run = run_column(tau0, tau0 / YIELD_STRAIN, seconds, dt);
+        let v = sorted_j(&run.sim);
+        let m = mean(&v);
+        println!(
+            "  {dt:>8.4}  {:>10}  {m:>8.5}   {:>15.6} %   {:>16.3e}",
+            run.substeps,
+            100.0 * (m - 1.0) / f64::from(seconds),
+            (m - 1.0) / run.substeps.max(1) as f64
+        );
+    }
+}
+
+// --- 3. move the yield surface, hold the stiffness --------------------------
+
+#[test]
+#[ignore = "diagnostic probe kept for reruns, not part of the CI suite"]
+fn column_volume_loss_against_yield() {
+    let seconds = env("COLUMN_SECONDS", 6.0);
+    let dt = env("COLUMN_DT", 0.002);
+    // The middle column's own storage modulus, held fixed across the sweep:
+    // the wave speed, the timestep and the elastic response stay identical,
+    // and only the yield surface moves.
+    let shear = 60.0 / YIELD_STRAIN;
+    println!(
+        "storage modulus fixed at {shear} Pa, only the yield surface moves, {seconds} s at {dt}"
+    );
+    println!("  tau_0 Pa    substeps    mean J     loss per second   loss per substep");
+
+    for tau0 in [60.0f32, 120.0, 600.0, 6000.0] {
+        let run = run_column(tau0, shear, seconds, dt);
+        let v = sorted_j(&run.sim);
+        let m = mean(&v);
+        println!(
+            "  {tau0:>8.0}  {:>10}  {m:>8.5}   {:>15.6} %   {:>16.3e}",
+            run.substeps,
+            100.0 * (m - 1.0) / f64::from(seconds),
+            (m - 1.0) / run.substeps.max(1) as f64
+        );
+    }
+}
+
+// --- 4. one column alone against all three together -------------------------
+
+/// The three tests above all run ONE column, and none of them reproduces
+/// the demo at all: a 60 Pa column alone ends six seconds at mean
+/// `J = 1.00000`, where the same column in `bingham_slump_probe` reads
+/// 0.9894 at its first sample and 0.938 at the end. Halving the step does
+/// nothing, and raising the yield stress makes the loss slightly WORSE
+/// rather than better, so it is not the plastic return path either.
+///
+/// So the variable is not the column. The demo differs in one structural
+/// way: it runs all three columns in ONE simulation, as three materials in
+/// one registry, where these tests run one material alone. This puts the
+/// two side by side on identical geometry.
+#[test]
+#[ignore = "diagnostic probe kept for reruns, not part of the CI suite"]
+fn column_volume_alone_against_three_together() {
+    let seconds = env("COLUMN_SECONDS", 6.0);
+    let dt = env("COLUMN_DT", 0.002);
+    let taus = [2.0f32, 60.0, 1200.0];
+    let xs = [12.0f32, 32.0, 52.0];
+
+    println!("{seconds} s at {dt} s a frame, the demo geometry, mean J per column");
+    println!("  tau_0 Pa     alone     together    difference");
+
+    // Alone: one material, one column, three separate simulations.
+    let mut alone = [0.0f64; 3];
+    for (k, &tau0) in taus.iter().enumerate() {
+        let run = run_column(tau0, tau0 / YIELD_STRAIN, seconds, dt);
+        alone[k] = mean(&sorted_j(&run.sim));
+    }
+
+    // Together: one simulation, three materials, exactly as the demo
+    // builds it, including each column standing at its own x.
+    let config = SimConfig {
+        min_dt: 1.0e-6,
+        sleep_threshold: 0.0,
+        max_substeps_per_step: 512,
+        ..SimConfig::earth(GRID, DX_M, dt)
+    };
+    let props = |tau0: f32| BinghamProps {
+        rho_kg_m3: RHO_KG_M3,
+        eta_pa_s: ETA_PA_S,
+        bulk_modulus_pa: BULK_PA,
+        yield_stress_pa: tau0,
+        shear_modulus_pa: tau0 / YIELD_STRAIN,
+        cavitation_pressure_pa: BinghamProps::air_entrained_cavitation_pressure(),
+    };
+    let spawn = |slot: usize| {
+        SpawnRegion {
+            spacing: 0.5,
+            box_size: COLUMN_CELLS,
+            box_center: Vec2::new(xs[slot], FLOOR_CELLS + COLUMN_CELLS.y as f32 * 0.5),
+            material_id: slot as u32,
+            initial_velocity_scale: 0.0,
+            ..SpawnRegion::for_sim(&config)
+        }
+        .mass_from(&props(taus[slot]), &config)
+    };
+    let mut sim = Simulation::new(config, spawn(0))
+        .with_default_material(Box::new(BinghamFluidMaterial::from_physical(
+            &props(taus[0]),
+            &config,
+        )))
+        .with_material(
+            1,
+            Box::new(BinghamFluidMaterial::from_physical(
+                &props(taus[1]),
+                &config,
+            )),
+        )
+        .with_material(
+            2,
+            Box::new(BinghamFluidMaterial::from_physical(
+                &props(taus[2]),
+                &config,
+            )),
+        )
+        .with_boundary(Box::new(SlipBoundary::new(config.boundary_thickness)));
+    let _ = sim.add_body(spawn(1));
+    let _ = sim.add_body(spawn(2));
+    for _ in 0..(seconds / dt).round() as usize {
+        sim.step();
+    }
+    let p = sim.particles();
+    for (k, &tau0) in taus.iter().enumerate() {
+        let v: Vec<f32> = (0..p.len())
+            .filter(|&i| p.material_id[i] == k as u32)
+            .map(|i| p.deformation_gradient[i].determinant())
+            .collect();
+        let together = mean(&v);
+        println!(
+            "  {tau0:>8.0}   {:>8.5}    {together:>8.5}    {:>+10.5}   ({} particles)",
+            alone[k],
+            together - alone[k],
+            v.len()
+        );
+    }
+}
+
+// --- 5. which companion does it, and how -----------------------------------
+
+/// Test 4 found that a 60 Pa column alone ends at mean `J = 1.00000` and
+/// the SAME column in the same tank as the other two ends at 0.94106. That
+/// is a six percent volume loss caused by bodies standing twenty cells
+/// away. Three things could carry it and this separates them.
+///
+///   - CONTACT. The columns are not as far apart as they look once they
+///     spread: the soft one deposits to a half-width of 28 mm from x = 12,
+///     reaching x = 26, and the middle one reaches back to x = 21. They
+///     meet. MPM shares one velocity field by default, so two materials
+///     that meet are welded, not merely touching.
+///   - THE SHARED TIMESTEP. One simulation takes the smallest step any of
+///     its materials demands, so the soft column is integrated at the
+///     stiff one's rate. Test 2 already argues against this, having found
+///     no per-substep loss at any step from 4 ms down to 0.5 ms, but it
+///     tested the step, not the company.
+///   - THE REGISTRY. Three materials in one slot table rather than one.
+///
+/// Each row changes exactly one of those.
+#[test]
+#[ignore = "diagnostic probe kept for reruns, not part of the CI suite"]
+fn which_companion_costs_the_middle_column_its_volume() {
+    let seconds = env("COLUMN_SECONDS", 6.0);
+    let dt = env("COLUMN_DT", 0.002);
+
+    println!("{seconds} s at {dt} s a frame, always reading the 60 Pa column");
+    println!("  companions                          grid   mean J of the 60 Pa column");
+
+    // (label, the yield stresses standing in the tank, x of each, grid)
+    let cases: [(&str, &[f32], &[f32], usize); 6] = [
+        ("alone", &[60.0], &[32.0], GRID),
+        (
+            "two more of itself",
+            &[60.0, 60.0, 60.0],
+            &[12.0, 32.0, 52.0],
+            GRID,
+        ),
+        ("the soft one only", &[60.0, 2.0], &[32.0, 12.0], GRID),
+        ("the stiff one only", &[60.0, 1200.0], &[32.0, 52.0], GRID),
+        (
+            "both, the demo",
+            &[60.0, 2.0, 1200.0],
+            &[32.0, 12.0, 52.0],
+            GRID,
+        ),
+        (
+            "both, too far to meet",
+            &[60.0, 2.0, 1200.0],
+            &[64.0, 20.0, 108.0],
+            128,
+        ),
+    ];
+
+    for (label, taus, xs, grid) in cases {
+        let config = SimConfig {
+            min_dt: 1.0e-6,
+            sleep_threshold: 0.0,
+            max_substeps_per_step: 512,
+            ..SimConfig::earth(grid, DX_M, dt)
+        };
+        let props = |tau0: f32| BinghamProps {
+            rho_kg_m3: RHO_KG_M3,
+            eta_pa_s: ETA_PA_S,
+            bulk_modulus_pa: BULK_PA,
+            yield_stress_pa: tau0,
+            shear_modulus_pa: tau0 / YIELD_STRAIN,
+            cavitation_pressure_pa: BinghamProps::air_entrained_cavitation_pressure(),
+        };
+        let spawn = |slot: usize| {
+            SpawnRegion {
+                spacing: 0.5,
+                box_size: COLUMN_CELLS,
+                box_center: Vec2::new(xs[slot], FLOOR_CELLS + COLUMN_CELLS.y as f32 * 0.5),
+                material_id: slot as u32,
+                initial_velocity_scale: 0.0,
+                ..SpawnRegion::for_sim(&config)
+            }
+            .mass_from(&props(taus[slot]), &config)
+        };
+        // Slot 0 is always the 60 Pa column, so the read below is the same
+        // body in every row.
+        let mut sim = Simulation::new(config, spawn(0))
+            .with_default_material(Box::new(BinghamFluidMaterial::from_physical(
+                &props(taus[0]),
+                &config,
+            )))
+            .with_boundary(Box::new(SlipBoundary::new(config.boundary_thickness)));
+        for (slot, &tau) in taus.iter().enumerate().skip(1) {
+            sim.set_material(
+                slot as u32,
+                Box::new(BinghamFluidMaterial::from_physical(&props(tau), &config)),
+            );
+            let _ = sim.add_body(spawn(slot));
+        }
+        for _ in 0..(seconds / dt).round() as usize {
+            sim.step();
+        }
+        let p = sim.particles();
+        let v: Vec<f32> = (0..p.len())
+            .filter(|&i| p.material_id[i] == 0)
+            .map(|i| p.deformation_gradient[i].determinant())
+            .collect();
+        println!(
+            "  {label:<34} {grid:>5}   {:>8.5}   ({} particles)",
+            mean(&v),
+            v.len()
+        );
+    }
+}
+
+// --- 6. the slot, not the material and not the neighbour --------------------
+
+/// Test 5 read the 60 Pa column at material slot 0 in the demo's own
+/// arrangement and found 0.99982. Test 4 read the SAME column, same yield
+/// stress, same x, same two neighbours, at slot 1, and found 0.94106.
+/// Position is therefore ruled out, the neighbours are ruled out, and the
+/// material is ruled out. What is left is the slot.
+///
+/// This removes the last thing that could confound it: three columns that
+/// are identical in every respect INCLUDING their yield stress, read one
+/// slot at a time. If slot 0 holds its volume and slots 1 and 2 do not,
+/// bodies added through `add_body` are not being integrated the way the
+/// body `Simulation::new` starts with is.
+#[test]
+#[ignore = "diagnostic probe kept for reruns, not part of the CI suite"]
+fn three_identical_columns_read_slot_by_slot() {
+    let seconds = env("COLUMN_SECONDS", 6.0);
+    let dt = env("COLUMN_DT", 0.002);
+    let xs = [12.0f32, 32.0, 52.0];
+
+    for tau0 in [60.0f32, 2.0] {
+        println!("three identical {tau0} Pa columns, {seconds} s at {dt} s a frame");
+        let config = SimConfig {
+            min_dt: 1.0e-6,
+            sleep_threshold: 0.0,
+            max_substeps_per_step: 512,
+            ..SimConfig::earth(GRID, DX_M, dt)
+        };
+        let props = BinghamProps {
+            rho_kg_m3: RHO_KG_M3,
+            eta_pa_s: ETA_PA_S,
+            bulk_modulus_pa: BULK_PA,
+            yield_stress_pa: tau0,
+            shear_modulus_pa: tau0 / YIELD_STRAIN,
+            cavitation_pressure_pa: BinghamProps::air_entrained_cavitation_pressure(),
+        };
+        let spawn = |slot: usize| {
+            SpawnRegion {
+                spacing: 0.5,
+                box_size: COLUMN_CELLS,
+                box_center: Vec2::new(xs[slot], FLOOR_CELLS + COLUMN_CELLS.y as f32 * 0.5),
+                material_id: slot as u32,
+                initial_velocity_scale: 0.0,
+                ..SpawnRegion::for_sim(&config)
+            }
+            .mass_from(&props, &config)
+        };
+        let mut sim = Simulation::new(config, spawn(0))
+            .with_default_material(Box::new(BinghamFluidMaterial::from_physical(
+                &props, &config,
+            )))
+            .with_boundary(Box::new(SlipBoundary::new(config.boundary_thickness)));
+        for slot in 1..3 {
+            sim.set_material(
+                slot as u32,
+                Box::new(BinghamFluidMaterial::from_physical(&props, &config)),
+            );
+            let _ = sim.add_body(spawn(slot));
+        }
+        for _ in 0..(seconds / dt).round() as usize {
+            sim.step();
+        }
+        let p = sim.particles();
+        println!("  slot   x     mean J      min J    particles   mean initial_volume");
+        for slot in 0..3u32 {
+            let idx: Vec<usize> = (0..p.len()).filter(|&i| p.material_id[i] == slot).collect();
+            let v: Vec<f32> = idx
+                .iter()
+                .map(|&i| p.deformation_gradient[i].determinant())
+                .collect();
+            let v0 = idx
+                .iter()
+                .map(|&i| f64::from(p.initial_volume[i]))
+                .sum::<f64>()
+                / idx.len().max(1) as f64;
+            println!(
+                "  {slot:>4}  {:>4.0}   {:>8.5}   {:>8.5}    {:>7}   {v0:>16.6e}",
+                xs[slot as usize],
+                mean(&v),
+                v.iter().copied().fold(f32::INFINITY, f32::min),
+                idx.len()
+            );
+        }
+    }
+}
+
+// --- 7. the two spawn paths, with no physics at all -------------------------
+
+/// Test 6 showed three identical columns carrying two different initial
+/// volumes: 0.250000 for the one `Simulation::new` starts with, 0.280036
+/// for the two that `add_body` adds. Initial volume multiplies stress
+/// directly, so those are not the same material, and the two added columns
+/// crush to a mean `J` of 0.943 with their worst particles at 0.60 while
+/// the first holds 0.999.
+///
+/// This takes the physics out entirely. No steps are run. The same column
+/// is built by each path and its initial volume read straight back.
+#[test]
+#[ignore = "diagnostic probe kept for reruns, not part of the CI suite"]
+fn the_two_spawn_paths_disagree_on_initial_volume() {
+    let config = SimConfig {
+        min_dt: 1.0e-6,
+        sleep_threshold: 0.0,
+        ..SimConfig::earth(GRID, DX_M, 0.002)
+    };
+    let props = BinghamProps {
+        rho_kg_m3: RHO_KG_M3,
+        eta_pa_s: ETA_PA_S,
+        bulk_modulus_pa: BULK_PA,
+        yield_stress_pa: 60.0,
+        shear_modulus_pa: 60.0 / YIELD_STRAIN,
+        cavitation_pressure_pa: BinghamProps::air_entrained_cavitation_pressure(),
+    };
+    let column = |x: f32, slot: u32| {
+        SpawnRegion {
+            spacing: 0.5,
+            box_size: COLUMN_CELLS,
+            box_center: Vec2::new(x, FLOOR_CELLS + COLUMN_CELLS.y as f32 * 0.5),
+            material_id: slot,
+            initial_velocity_scale: 0.0,
+            ..SpawnRegion::for_sim(&config)
+        }
+        .mass_from(&props, &config)
+    };
+    let material = || Box::new(BinghamFluidMaterial::from_physical(&props, &config));
+
+    let stats = |sim: &Simulation, slot: u32| -> (f64, f32, f32, usize) {
+        let p = sim.particles();
+        let v: Vec<f32> = (0..p.len())
+            .filter(|&i| p.material_id[i] == slot)
+            .map(|i| p.initial_volume[i])
+            .collect();
+        (
+            v.iter().map(|&x| f64::from(x)).sum::<f64>() / v.len().max(1) as f64,
+            v.iter().copied().fold(f32::INFINITY, f32::min),
+            v.iter().copied().fold(f32::NEG_INFINITY, f32::max),
+            v.len(),
+        )
+    };
+
+    // Path A: the body `Simulation::new` starts with.
+    let a = Simulation::new(config, column(32.0, 0)).with_default_material(material());
+    let (mean_a, min_a, max_a, n_a) = stats(&a, 0);
+
+    // Path B: the identical body, at the identical place, added afterwards.
+    // The first body is parked far away so it cannot touch this one.
+    let mut b = Simulation::new(config, column(8.0, 0)).with_default_material(material());
+    b.set_material(1, material());
+    let _ = b.add_body(column(32.0, 1));
+    let (mean_b, min_b, max_b, n_b) = stats(&b, 1);
+
+    println!("the same column, no steps run, initial volume in cells squared");
+    println!("  path                  mean         min         max      particles");
+    println!("  Simulation::new   {mean_a:>10.6}  {min_a:>10.6}  {max_a:>10.6}  {n_a:>10}");
+    println!("  add_body          {mean_b:>10.6}  {min_b:>10.6}  {max_b:>10.6}  {n_b:>10}");
+    println!(
+        "  add_body is {:.4} times the other. Geometric packing at spacing 0.5 is {:.6}.",
+        mean_b / mean_a,
+        0.5f32 * 0.5
+    );
+}
+
+// --- 8. why the phase 4 gate does not see it --------------------------------
+
+/// `tests/spawn_contract.rs` compares the two paths' mean initial volume
+/// and requires them within a thousandth, and it passes. Test 7 finds them
+/// 12 percent apart. One of the two measurements is framed wrong, and this
+/// runs the gate's own scene with the spread printed rather than the mean.
+#[test]
+#[ignore = "diagnostic probe kept for reruns, not part of the CI suite"]
+fn the_phase_four_gate_scene_with_its_spread_shown() {
+    use emerge::NeoHookeanMaterial;
+    let config = SimConfig {
+        min_dt: 1.0e-7,
+        max_substeps_per_step: 128,
+        ..SimConfig::earth(48, 0.01, 0.0005)
+    };
+    let mass = 1000.0 * (0.5 * 0.01f32).powi(2);
+    let spawn = |x: f32| SpawnRegion {
+        spacing: 0.5,
+        box_size: IVec2::new(6, 12),
+        box_center: Vec2::new(x, 3.0 + 12.0 * 0.5),
+        material_id: 0,
+        mass_override: Some(mass),
+        initial_velocity_scale: 0.0,
+        ..SpawnRegion::for_sim(&config)
+    };
+    let mut sim = Simulation::new(config, spawn(14.0))
+        .with_default_material(Box::new(NeoHookeanMaterial::from_young_modulus(2.0e5, 0.3)))
+        .with_boundary(Box::new(SlipBoundary::new(config.boundary_thickness)));
+    let first = sim.particles().len();
+    let _ = sim.add_body(spawn(34.0));
+    let total = sim.particles().len();
+
+    println!("the phase 4 gate scene, initial volume, no steps run");
+    println!("  body                   mean         min         max   particles");
+    for (label, range) in [("Simulation::new", 0..first), ("add_body", first..total)] {
+        let p = sim.particles();
+        let v: Vec<f32> = range.clone().map(|i| p.initial_volume[i]).collect();
+        println!(
+            "  {label:<16}  {:>10.6}  {:>10.6}  {:>10.6}  {:>9}",
+            v.iter().map(|&x| f64::from(x)).sum::<f64>() / v.len() as f64,
+            v.iter().copied().fold(f32::INFINITY, f32::min),
+            v.iter().copied().fold(f32::NEG_INFINITY, f32::max),
+            v.len()
+        );
+    }
+}
+
+// --- 9. what makes `Simulation::new` skip its own measurement ---------------
+
+/// Test 7: in the demo's configuration `Simulation::new` gives every
+/// particle exactly 0.250000, which is the geometric packing and cannot be
+/// a measurement, while `add_body` measures and gets 0.25 to 0.64. Test 8:
+/// in the phase 4 gate's configuration BOTH measure and agree exactly. So
+/// `Simulation::new`'s own estimate silently does nothing in some
+/// configurations. This sweeps the two things that differ between those
+/// scenes, one at a time, with no steps run.
+#[test]
+#[ignore = "diagnostic probe kept for reruns, not part of the CI suite"]
+fn what_makes_the_first_body_skip_its_measurement() {
+    println!("initial volume of the FIRST body, `Simulation::new` only, no steps");
+    println!("  dx_m     mass source      mean         min         max");
+    for dx in [0.01f32, 0.002] {
+        for override_mass in [true, false] {
+            let config = SimConfig {
+                min_dt: 1.0e-6,
+                ..SimConfig::earth(GRID, dx, 0.002)
+            };
+            let props = BinghamProps {
+                rho_kg_m3: RHO_KG_M3,
+                eta_pa_s: ETA_PA_S,
+                bulk_modulus_pa: BULK_PA,
+                yield_stress_pa: 60.0,
+                shear_modulus_pa: 60.0 / YIELD_STRAIN,
+                cavitation_pressure_pa: BinghamProps::air_entrained_cavitation_pressure(),
+            };
+            let base = SpawnRegion {
+                spacing: 0.5,
+                box_size: COLUMN_CELLS,
+                box_center: Vec2::new(32.0, FLOOR_CELLS + COLUMN_CELLS.y as f32 * 0.5),
+                material_id: 0,
+                initial_velocity_scale: 0.0,
+                ..SpawnRegion::for_sim(&config)
+            };
+            let spawn = if override_mass {
+                SpawnRegion {
+                    mass_override: Some(RHO_KG_M3 * (0.5 * dx).powi(2)),
+                    ..base
+                }
+            } else {
+                base.mass_from(&props, &config)
+            };
+            let sim = Simulation::new(config, spawn).with_default_material(Box::new(
+                BinghamFluidMaterial::from_physical(&props, &config),
+            ));
+            let p = sim.particles();
+            let v: Vec<f32> = (0..p.len()).map(|i| p.initial_volume[i]).collect();
+            println!(
+                "  {dx:<7} {:<15} {:>10.6}  {:>10.6}  {:>10.6}",
+                if override_mass {
+                    "mass_override"
+                } else {
+                    "mass_from"
+                },
+                v.iter().map(|&x| f64::from(x)).sum::<f64>() / v.len() as f64,
+                v.iter().copied().fold(f32::INFINITY, f32::min),
+                v.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+            );
+        }
+    }
+}
