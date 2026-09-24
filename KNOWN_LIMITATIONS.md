@@ -340,100 +340,57 @@ not a one-line fix: a law that heats itself needs somewhere for that
 heat to go, which is the thermal coupling this engine has for fluids and
 not for solids.
 
-### A thin spread layer keeps gaining volume
+### Most fluid families still cannot be pulled on
 
-Found by the user watching a demo rather than by a test: particles grow
-and drift apart the longer a scene runs. The renderer draws each particle
-deformed by its own F, so what is visible IS its volume ratio. Measured
-on the three settled columns of `basic_bingham` (`bingham_slump_probe`,
-mean J over each column):
+The Tait law these fluids use is a gauge law, zero at rest density, so a
+particle above rest volume asks for a negative pressure. That request is
+clamped at `MaterialParams::pressure_floor`, and a floor of 0.0 deletes it:
+expansion meets no restoring force while compression meets the full one, so
+any symmetric noise in the divergence ratchets volume upward forever. This is
+what made bodies visibly swell and drift apart the longer a demo ran.
 
-```text
-   t        2 Pa      60 Pa     1200 Pa
-   0 s     0.9998    0.9997     0.9996
-   5 s     1.0154    0.9589     0.9916
-  10 s     1.0191    0.9591     0.9915
-  20 s     1.0272    0.9594     0.9914
-```
+Measured, fixed and closed for the yield-stress family. Before
+`BinghamProps::cavitation_pressure_pa` existed, EVERY expanded particle in
+every slab was clamped, 105 of 105 at two cells and 657 of 657 at sixteen, and
+the slabs climbed past J = 1.002 while their own weight said they should sit
+below 0.999. With the cavitation pressure its constants derive, about -280 Pa
+from the nucleus term `2*gamma/R`, the same slabs hold flat to the fourth
+decimal over twenty seconds at 2 ms a frame (0.99986, 0.99981, 0.99988,
+0.99957, 0.99875 at one, two, four, eight and sixteen cells) and sit on the
+correct side of one. The thickest is heading for the 0.998 that `rho g h / 2K`
+predicts for 32 mm of it, which is load, not drift. Worst `|J - 1|` on that
+slab: 0.79 to 0.86 at every window measured with no floor, 0.038 with one.
 
-The two columns that hold a shape are flat to the fourth digit over
-twenty seconds. The soft one, which spreads into a thin wide layer, gains
-about 0.06 % of its volume per simulated second and does not saturate:
-thirty percent over ten minutes of play, which is what the drifting-apart
-looks like on screen.
+What is still open:
 
-Narrowed, and split in two by `tests/scratch_thin_layer_volume_drift.rs`.
-Both halves are measured; neither is the free-surface transfer defect this
-entry used to guess at.
-
-**The first half was arithmetic, and is fixed.** A fluid used to re-read `J`
-from its own isotropic `F` each substep and multiply by `exp(dt div v)`. Near
-one an f32 resolves about 1.2e-7 while a calm flow's increment is a thousandth
-of that, so each step lost a fixed fraction of its increment and the smallest
-ones vanished outright, freezing `J` entirely. Carrying `ln J` instead
-(`advance_log_volume_ratio`, CPU and GPU) closes it: in isolation f32 now
-tracks an f64 replica exactly where it used to walk to 0.999468, and a
-particle's volume book agrees with its own gathered flow to 1e-8 where the gap
-used to be 1.2e-4.
-
-**The second half is a one-way pressure ratchet, and is NOT fixed.** What is
-left is gained at the body's OUTLINE, three to eighteen times faster than
-inside it. Measured cause, not deduced: a fluid's pressure is clamped from
-below at `pressure_floor`, and `BinghamFluidMaterial::new` leaves that at 0.0
-while `from_physical` never converts one. A particle with `J > 1` sits below
-rest density, so its Tait pressure is negative and the clamp deletes it
-entirely. Counted on the slab sweep, EVERY expanded particle is clamped --
-106 of 106, 167 of 167, 345 of 345, 655 of 655 -- at a mean deleted pressure
-of 1.2e5 to 2.0e5 in grid units. So expansion meets no restoring force at all
-while compression meets the full one, and any symmetric noise in the
-divergence ratchets volume upward, worst where neighbours are missing.
-
-Rerunning the identical sweep with the clamp lifted, which is a diagnostic and
-not a proposal:
-
-```text
-   thickness   drift with clamp   clamp lifted    worst |J-1| with   lifted
-     2 cells      +0.0717 %/s       -0.0009        0.0255           0.0041
-     4 cells      +0.0578 %/s       +0.0119        0.0470           0.0065
-     8 cells      +0.0557 %/s       +0.0056        0.0927           0.0146
-```
-
-Five to eighty times less, and the sign inverts on the thinnest slab. The skin
-follows: 1.00362 with the clamp, 0.99999 without.
-
-Lifting it is not the fix. At sixteen cells the unclamped run panics outright,
-`adaptive timestep cannot advance the requested simulation time`: unbounded
-tension lets a fluid pull on itself arbitrarily hard. The fix is a floor with
-a physical value, which the Newtonian twin already has -- `fluid.rs` sets
-`-100_000.0` Pa gauge for dissolved-gas cavitation onset and converts it in
-its SI constructor. Bingham's own constructor does neither. That is a material
-change and is not made here.
-
-What remains after the arithmetic half, with the shipped clamp still in place
-(ten seconds at 2 ms a frame, and the rate is window-dependent because most of
-it is the settling transient: the same sweep over one second reads three to
-five times higher):
-
-```text
-   thickness    drift        worst |J-1|
-     1 cell     0.0004 %/s     0.0003
-     2 cells    0.0237 %/s     0.0300
-     4 cells    0.0212 %/s     0.0508
-     8 cells    0.0190 %/s     0.0992
-    16 cells    0.0410 %/s     0.7892
-```
-
-Measured above: the arithmetic mechanism and its fix; the clamp firing on
-every expanded particle; the drift with and without it; the panic when it is
-lifted. Hypothesis, NOT measured: that a physically grounded floor would leave
-both the drift and the stability where the lifted run put them. Nothing has
-been run at an intermediate floor.
+- `BoilingMixtureMaterial`, `CavitatingFluidMaterial`,
+  `IsothermalCavitatingFluidMaterial` and `GranularFluidMaterial` have not been
+  measured for this. Each has its own EOS and its own right answer, so none
+  inherits Bingham's number.
+- The needle-induced-cavitation relation is `P_c = 5E/6 + 2*gamma/R` and only
+  the nucleus term is used. The elastic term would deepen the floor and make it
+  depend on the fluid's own stiffness. Leaving it out is the conservative
+  direction and is stated at the call site, but it has not been measured.
+- `NewtonianFluidMaterial::from_physical` still states -100,000 Pa as a bare
+  constant. The same `2*gamma/R` returns it at a 1.4 micrometre nucleus, so the
+  two are one relation at two nucleus sizes, but the liquid path does not yet
+  go through it.
+- Useful floors run from about -140 Pa, where clamping stops being the
+  dominant effect, to about -2800 Pa. At -10,000 Pa the sixteen-cell slab
+  panics on a timestep it cannot represent, so the floor is bounded from below
+  by stability and not only by physics. That bound is measured on one scene.
+- Within that band, deeper is better: -560 Pa leaves 1 percent of expanded
+  particles clamped against 9 percent at -280, and half the worst `|J - 1|`.
+  The shipped value is the one the cited bound gives, not the one that
+  measures best, and the gap between them is the size of the modelling
+  question about which nucleus population is present.
 
 Ruled out by counting, and worth recording because this entry used to name it:
 the free-surface node exclusion in `gather_grid_to_particles`. Instrumented
-over the same sweep, it fired 0 times in 418,714,560 node evaluations (issue #39), because
-P2G inserts every in-bounds node of a particle's own stencil. The invariant it
-protects is kept as a test, `a_rigid_translation_reads_no_velocity_gradient`.
+over the same sweep, it fired 0 times in 418,714,560 node evaluations (issue
+ #39), because P2G inserts every in-bounds node of a particle's own stencil.
+The invariant it protects is kept as a test,
+`a_rigid_translation_reads_no_velocity_gradient`.
 
 ### GPU snow hardens differently at a body's edge
 
