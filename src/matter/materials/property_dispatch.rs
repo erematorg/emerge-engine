@@ -257,6 +257,12 @@ impl Fluid {
                     // branch is a deliberate act via `BinghamProps`, not
                     // something the liquid route turns on behind the caller.
                     shear_modulus_pa: 0.0,
+                    // A liquid carrying a yield stress is a mixed suspension, so it
+                    // carries mixed-in gas. Leaving this at 0.0 would contradict the
+                    // Newtonian branch just above, which already states its own
+                    // cavitation figure, and would contradict it in the one direction
+                    // that lets volume only ever grow.
+                    cavitation_pressure_pa: BinghamProps::air_entrained_cavitation_pressure(),
                 },
                 config,
             )),

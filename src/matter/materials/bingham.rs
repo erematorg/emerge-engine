@@ -273,6 +273,13 @@ impl FromSI<BinghamProps> for BinghamFluidMaterial {
         let rho_grid = props.rho_kg_m3 / config.reference_density_kg_m3;
         let mut material = Self::new(rho_grid, visc, eos, GAMMA, tau0);
         material.shear_modulus = shear_modulus;
+        // Converted through the same family as `tau0` and `eos`, because it
+        // is compared against the pressure those produce. `Self::new`
+        // leaves this at 0.0, which says the fluid carries no tension at
+        // all, and a fluid that cannot be pulled on can only gain volume:
+        // see `BinghamProps::cavitation_pressure_pa`.
+        material.pressure_floor =
+            scale_stress(props.cavitation_pressure_pa, props.rho_kg_m3, config);
         material
     }
 }

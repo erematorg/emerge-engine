@@ -1577,6 +1577,7 @@ fn si_bingham(
         bulk_modulus_pa: rho_kg_m3 * (10.0 * v_max).powi(2),
         yield_stress_pa,
         shear_modulus_pa: yield_stress_pa / 0.05,
+        cavitation_pressure_pa: BinghamProps::air_entrained_cavitation_pressure(),
     };
     let material = BinghamFluidMaterial::from_physical(&props, config);
     (props, material)
@@ -9910,6 +9911,7 @@ fn yield_stress_columns_slump_in_order_of_their_yield_stress() {
             bulk_modulus_pa: bulk_modulus,
             yield_stress_pa: *tau0,
             shear_modulus_pa: tau0 / YIELD_STRAIN,
+            cavitation_pressure_pa: BinghamProps::air_entrained_cavitation_pressure(),
         };
         let material = BinghamFluidMaterial::from_physical(&props, &config);
         let spawn = SpawnRegion {
@@ -10042,5 +10044,120 @@ fn a_rigid_translation_reads_no_velocity_gradient() {
     assert!(
         worst_term < bound,
         "a rigidly translating body must read no velocity gradient at all, worst entry = {worst_term:.3e} against {bound:.3e}"
+    );
+}
+
+// --- A FLUID MUST BE ABLE TO BE PULLED ON ----------------------------------
+
+/// A slab of yield-stress fluid settling under its own weight must not GAIN
+/// volume, and its expanded particles must not have their tension deleted.
+///
+/// The Tait law these fluids use is a gauge law, zero at rest density, so a
+/// particle above rest volume asks for a negative pressure. That request is
+/// clamped at `pressure_floor`, and leaving that at 0.0 deletes it outright:
+/// expansion then meets no restoring force while compression meets the full
+/// one, and any symmetric noise ratchets volume upward forever. Measured
+/// before `BinghamProps::cavitation_pressure_pa` existed, EVERY expanded
+/// particle in every slab was clamped (105 of 105 at two cells, 657 of 657 at
+/// sixteen) and the slabs climbed past J = 1.002 while their own weight said
+/// they should sit below 0.999.
+///
+/// With the cavitation pressure the constants derive, about -280 Pa, the same
+/// slabs hold flat to the fourth decimal over twenty seconds at 2 ms a frame
+/// (0.99986, 0.99981, 0.99988, 0.99957, 0.99875 at one, two, four, eight and
+/// sixteen cells) and sit on the correct side of one. The thickest is on its
+/// way to the 0.998 its own weight asks for, which is load and not drift.
+///
+/// This runs the cheapest of those slabs and asserts the two things that
+/// cannot be true at once with a ratchet present.
+#[test]
+fn a_settling_fluid_slab_does_not_gain_volume() {
+    const GRID: usize = 64;
+    const DX_M: f32 = 0.002;
+    const RHO: f32 = 1000.0;
+    const YIELD_PA: f32 = 2.0;
+    const YIELD_STRAIN: f32 = 0.05;
+    const BULK_PA: f32 = 78_480.0;
+    const SECONDS: f32 = 2.0;
+    let dt = 0.002;
+
+    let config = SimConfig {
+        min_dt: 1.0e-6,
+        sleep_threshold: 0.0,
+        max_substeps_per_step: 256,
+        ..SimConfig::earth(GRID, DX_M, dt)
+    };
+    let props = BinghamProps {
+        rho_kg_m3: RHO,
+        eta_pa_s: 0.5,
+        bulk_modulus_pa: BULK_PA,
+        yield_stress_pa: YIELD_PA,
+        shear_modulus_pa: YIELD_PA / YIELD_STRAIN,
+        cavitation_pressure_pa: BinghamProps::air_entrained_cavitation_pressure(),
+    };
+    let material = BinghamFluidMaterial::from_physical(&props, &config);
+    let floor = material.pressure_floor;
+    let (stiffness, power, rest, min_density) = (
+        material.eos_stiffness,
+        material.eos_power,
+        material.rest_density,
+        material.min_density,
+    );
+    let spawn = SpawnRegion {
+        spacing: 0.5,
+        box_size: IVec2::new(40, 2),
+        box_center: Vec2::new(GRID as f32 * 0.5, 3.0),
+        material_id: 0,
+        mass_override: Some(RHO * (0.5 * DX_M).powi(2)),
+        initial_velocity_scale: 0.0,
+        ..SpawnRegion::for_sim(&config)
+    };
+    let mut sim = Simulation::new(config, spawn)
+        .with_default_material(Box::new(material))
+        .with_boundary(Box::new(SlipBoundary::new(config.boundary_thickness)));
+
+    let mean_j = |sim: &Simulation| -> f64 {
+        let p = sim.particles();
+        (0..p.len())
+            .map(|i| f64::from(p.deformation_gradient[i].determinant()))
+            .sum::<f64>()
+            / p.len() as f64
+    };
+    // One step first: the spawn transient is not what this measures.
+    sim.step();
+    let start = mean_j(&sim);
+    for _ in 0..(SECONDS / dt).round() as usize {
+        sim.step();
+    }
+    let end = mean_j(&sim);
+
+    let parts = sim.particles();
+    let (mut expanded, mut clamped) = (0usize, 0usize);
+    for i in 0..parts.len() {
+        if parts.deformation_gradient[i].determinant() <= 1.0 {
+            continue;
+        }
+        expanded += 1;
+        let density = parts.density[i].max(min_density).min(rest * 2.0);
+        if stiffness * ((density / rest).powf(power) - 1.0) < floor {
+            clamped += 1;
+        }
+    }
+    let clamped_fraction = clamped as f64 / expanded.max(1) as f64;
+    println!(
+        "slab mean J {start:.5} to {end:.5} over {SECONDS} s, {clamped} of {expanded} expanded particles clamped"
+    );
+
+    assert!(
+        end <= start + 1.0e-4,
+        "a slab settling under its own weight must not gain volume, mean J went {start:.6} to {end:.6}"
+    );
+    assert!(
+        (end - 1.0).abs() < 1.0e-3,
+        "the slab must stay within a thousandth of its rest volume, mean J is {end:.6}"
+    );
+    assert!(
+        clamped_fraction < 0.05,
+        "a fluid that can be pulled on should rarely hit its cavitation pressure, {clamped} of {expanded} expanded particles clamped"
     );
 }

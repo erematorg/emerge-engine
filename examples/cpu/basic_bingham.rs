@@ -244,6 +244,7 @@ fn make_sim(gravity_fraction: f32, yield_scale: f32) -> (Simulation, [BinghamFlu
             // `tmp/GeoTaichi`. Holding a shape needs stored elastic shear
             // energy; this is it.
             shear_modulus_pa: tau0_pa * yield_scale / YIELD_STRAIN,
+            cavitation_pressure_pa: BinghamProps::air_entrained_cavitation_pressure(),
         };
         let mut m = BinghamFluidMaterial::from_physical(&props, &config);
         // Measured coefficients, not a substance claim: the continuous

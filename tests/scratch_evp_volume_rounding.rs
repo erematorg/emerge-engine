@@ -39,6 +39,7 @@ fn a_prescribed_shear_cycle_must_not_change_volume() {
         bulk_modulus_pa: 78_480.0,
         yield_stress_pa: 2.0,
         shear_modulus_pa: 40.0,
+        cavitation_pressure_pa: BinghamProps::air_entrained_cavitation_pressure(),
     };
     let laws: Vec<(&str, Box<dyn MaterialModel>)> = vec![
         (

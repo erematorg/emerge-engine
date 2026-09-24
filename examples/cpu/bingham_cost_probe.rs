@@ -54,6 +54,7 @@ fn main() {
         bulk_modulus_pa: bulk_modulus,
         yield_stress_pa: tau0,
         shear_modulus_pa: tau0 / YIELD_STRAIN * elastic_scale(),
+        cavitation_pressure_pa: BinghamProps::air_entrained_cavitation_pressure(),
     };
     let spawn = |slot: usize| {
         SpawnRegion {
