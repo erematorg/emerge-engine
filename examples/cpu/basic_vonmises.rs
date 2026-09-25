@@ -478,20 +478,23 @@ impl State {
         }
 
         if self.show_stress {
-            // Real, generic per-material von Mises equivalent stress (von
-            // Mises 1913) -- computed fresh every frame from each
-            // particle's OWN material's `kirchhoff_stress`, not a cached or
-            // approximated value. Scale is real, not guessed: 1/yield_stress
-            // of the shared soft/hardening blobs (MU*0.01, the two that
-            // actually visibly yield in this scene), so the heat colormap
-            // naturally saturates right around real yield onset -- the
-            // exact threshold this material's own plasticity model uses.
+            // The von Mises equivalent of each particle's deviatoric stress,
+            // computed fresh every frame from its own material's
+            // `kirchhoff_stress`. `VonMisesMaterial` yields where the
+            // deviator's Frobenius norm reaches `yield_stress`, where this
+            // field reads sqrt(3/2) of it; so the scale is one over
+            // sqrt(3/2) times the soft blobs' yield (MU*0.01), and 1 means
+            // the soft blob at yield. That holds for the soft blob only.
+            // The hardening blob's yield grows with kappa and the stiff
+            // blob's is 25 times higher, so on those two red does not mean
+            // yield (`tests/scratch_stress_view_before_after.rs`).
             let stress = self
                 .sim
                 .materials()
                 .von_mises_stress_field(self.sim.particles());
             self.renderer.set_stress_field(stress);
-            self.renderer.set_stress_scale(1.0 / (MU * 0.01));
+            self.renderer
+                .set_stress_scale(1.0 / (1.5f32.sqrt() * MU * 0.01));
         }
 
         let output = match self.gfx.surface.get_current_texture() {

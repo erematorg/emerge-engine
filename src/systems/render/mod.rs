@@ -166,12 +166,12 @@ pub enum ColorMode {
     /// unused slot after ByActivation's implicit WGSL else-branch) so the GPU shader's
     /// existing fallback `else` can keep meaning ByActivation without renumbering it.
     ByScalarField = 6,
-    /// Real per-particle von Mises equivalent stress (see
-    /// `MaterialRegistry::von_mises_stress_field`'s own doc) -- universal
-    /// across every material (every `MaterialModel` already computes a real
-    /// Kirchhoff stress tensor; this just visualizes its own real magnitude),
-    /// unlike `ByVolume` (purely volumetric, det(F)) which misses shear
-    /// activity entirely. CPU render path only for now (`Renderer::render`,
+    /// A per-particle scalar the caller computes and hands in with
+    /// `set_stress_field`, drawn through `heat` after `set_stress_scale`.
+    /// Its intended field is `MaterialRegistry::von_mises_stress_field`, the
+    /// von Mises equivalent of each particle's deviatoric stress: shear
+    /// activity, which `ByVolume` (det(F)) misses and pressure no longer
+    /// masks. CPU render path only for now (`Renderer::render`,
     /// which owns the real `&Particles`/`MaterialRegistry` needed to compute
     /// it) -- see `Renderer::set_stress_field`'s own doc for the real,
     /// disclosed reason the GPU shader path doesn't have this yet.
@@ -615,8 +615,8 @@ pub struct Renderer {
     scratch: Vec<InstanceData>,
     color_mode: ColorMode,
     vel_scale: f32,
-    /// Real per-particle von Mises equivalent stress, computed ONCE per
-    /// frame by the caller (`MaterialRegistry::von_mises_stress_field`,
+    /// Per-particle value for `ColorMode::ByStress`, computed ONCE per
+    /// frame by the caller (typically `MaterialRegistry::von_mises_stress_field`,
     /// which owns both the real `&Particles` and the material dispatch
     /// `Renderer` deliberately does not depend on) and handed in via
     /// `set_stress_field` -- the SAME real "caller precomputes real
