@@ -1,7 +1,7 @@
 extern crate emerge_engine as emerge;
 
-#[path = "../gui_common/cursor_force.rs"]
-mod cursor_force;
+#[path = "../gui_common/cursor_traction.rs"]
+mod cursor_traction;
 #[path = "../gui_common/mod.rs"]
 mod gui_common;
 
@@ -210,6 +210,20 @@ const YIELD_STRAIN: f32 = 0.05;
 /// than the column with a twentieth of its yield stress. At 2 to 1 it
 /// stays where it is put, which is the behaviour this scene is about.
 const COLUMN_CELLS: IVec2 = IVec2::new(10, 20);
+/// Particle lattice spacing, in cells. Named because the cursor needs it
+/// too: it fixes each particle's mass per unit depth, and with it the force
+/// a push in pascals has to apply.
+const SPACING: f32 = 0.5;
+/// The cursor's default push and pull `P`, its net force over its diameter
+/// (see `cursor_traction.rs`). Measured in zero gravity, a block pushed
+/// this way keeps a permanent deformation from about `P = 1` to `1.5`
+/// times its own yield stress, the same multiple for 2, 60 and 1200 Pa
+/// (`tests/scratch_bingham_cursor_yield.rs`), lower than the `2 tau_0` the
+/// mean shear `P / 2` alone would suggest. So 300 Pa yields the middle
+/// column and stays far under the right one's 1200. The slumped columns
+/// sit on their own yield surface already, so in this scene a much weaker
+/// push moves the left and middle ones.
+const CURSOR_TRACTION_PA: f32 = 300.0;
 const FLOOR_CELLS: f32 = 2.0;
 
 /// Weakly-compressible sound-speed derating (Monaghan 1994): resolving
@@ -281,7 +295,7 @@ fn make_sim(gravity_fraction: f32, yield_scale: f32) -> (Simulation, [BinghamFlu
 
     let spawn = |slot: usize, props: &BinghamProps| {
         SpawnRegion {
-            spacing: 0.5,
+            spacing: SPACING,
             box_size: COLUMN_CELLS,
             box_center: Vec2::new(COLUMN_X[slot], FLOOR_CELLS + COLUMN_CELLS.y as f32 * 0.5),
             material_id: slot as u32,
@@ -349,7 +363,9 @@ struct State {
     cursor_pos: [f32; 2],
     lmb: bool,
     rmb: bool,
-    cursor_force: cursor_force::CursorForce,
+    /// Pushes in pascals through a force field the solver integrates every
+    /// substep; see `cursor_traction.rs` for why not once per frame.
+    cursor: cursor_traction::CursorTraction,
     gravity_fraction: f32,
     yield_scale: f32,
     /// Simulated seconds advanced per rendered frame -- see `DT_S_DEFAULT`.
@@ -374,7 +390,11 @@ impl State {
         let size = window.inner_size();
         let gravity_fraction = 1.0;
         let yield_scale = 1.0;
-        let (sim, materials) = make_sim(gravity_fraction, yield_scale);
+        let (mut sim, materials) = make_sim(gravity_fraction, yield_scale);
+        let cursor =
+            cursor_traction::CursorTraction::new(5.0, CURSOR_TRACTION_PA, CURSOR_TRACTION_PA)
+                .with_lattice(RHO_KG_M3, SPACING, DX_M);
+        sim.add_force_field(Box::new(cursor.field()));
 
         let mut renderer = Renderer::new(&gfx.device, sim.particles().len(), gfx.format);
         renderer.set_camera(&gfx.queue, GRID as u32, size.width, size.height, 0.6, true);
@@ -401,7 +421,7 @@ impl State {
             cursor_pos: [0.0; 2],
             lmb: false,
             rmb: false,
-            cursor_force: cursor_force::CursorForce::new(5.0, 5.0, 5.0),
+            cursor,
             gravity_fraction,
             yield_scale,
             step_seconds: DT_S_DEFAULT,
@@ -433,7 +453,8 @@ impl State {
     }
 
     fn reset(&mut self) {
-        let (sim, materials) = make_sim(self.gravity_fraction, self.yield_scale);
+        let (mut sim, materials) = make_sim(self.gravity_fraction, self.yield_scale);
+        sim.add_force_field(Box::new(self.cursor.field()));
         self.sim = sim;
         self.materials = materials;
         self.renderer
@@ -447,20 +468,15 @@ impl State {
             .set_gravity(make_config(self.gravity_fraction).gravity);
         self.sim.set_step_duration(self.step_seconds);
 
-        let g = self.sim.config().gravity.length();
-        let cursor = self.cursor_grid();
-        if self.lmb {
-            self.cursor_force.apply(
-                self.sim.particles_mut(),
-                cursor,
-                g,
-                self.step_seconds,
-                false,
-            );
-        }
-        if self.rmb {
-            self.cursor_force
-                .apply(self.sim.particles_mut(), cursor, g, self.step_seconds, true);
+        // A traction in pascals, not a multiple of weight: the old push was
+        // `k * m * g`, so the gravity slider at zero switched the cursor off.
+        // The field reads this every substep; nothing is applied here.
+        {
+            let position = self.cursor_grid();
+            let mut cursor = self.cursor.shared();
+            cursor.position = position;
+            cursor.pushing = self.lmb;
+            cursor.pulling = self.rmb && !self.lmb;
         }
 
         self.sim.step();
@@ -507,8 +523,23 @@ impl State {
         let mut gravity_fraction = self.gravity_fraction;
         let mut yield_scale = self.yield_scale;
         let mut step_seconds = self.step_seconds;
-        let mut push_strength = self.cursor_force.push_strength;
-        let mut pull_strength = self.cursor_force.pull_strength;
+        let (mut push_pa, mut pull_pa, contact) = {
+            let cursor = self.cursor.shared();
+            (cursor.push_pa, cursor.pull_pa, cursor.contact)
+        };
+        // The cursor's own P is fixed; what it actually exerts depends on the
+        // contact it makes, and a contact narrower than the cursor exerts
+        // more. Shown, not assumed.
+        let contact_line = match contact {
+            Some(c) => format!(
+                "exerting {:.0} Pa over {:.1} mm ({} particles)",
+                c.traction_pa(),
+                c.width_m * 1000.0,
+                c.particles
+            ),
+            None if self.lmb || self.rmb => "nothing under the cursor".to_string(),
+            None => "LMB push, RMB pull".to_string(),
+        };
         let n_particles = self.sim.particles().len();
         let mut reset = false;
 
@@ -561,10 +592,19 @@ impl State {
                     ui.separator();
                     ui.label("Gravity (1.0 = real IRL 9.81 m/s2):");
                     ui.add(egui::Slider::new(&mut gravity_fraction, 0.0..=1.0));
-                    ui.label("Push strength:");
-                    ui.add(egui::Slider::new(&mut push_strength, 0.0..=15.0));
-                    ui.label("Pull strength:");
-                    ui.add(egui::Slider::new(&mut pull_strength, 0.0..=15.0));
+                    ui.label("Push P, the cursor's force over its diameter (shears ~P/2):");
+                    ui.add(
+                        egui::Slider::new(&mut push_pa, 1.0..=5000.0)
+                            .logarithmic(true)
+                            .suffix(" Pa"),
+                    );
+                    ui.label("Pull P:");
+                    ui.add(
+                        egui::Slider::new(&mut pull_pa, 1.0..=5000.0)
+                            .logarithmic(true)
+                            .suffix(" Pa"),
+                    );
+                    ui.label(&contact_line);
                     ui.separator();
                     ui.label("Same density, viscosity, bulk modulus and shape.");
                     ui.label("Left spreads, middle holds a slope, right keeps its shape.");
@@ -579,8 +619,11 @@ impl State {
         self.gravity_fraction = gravity_fraction;
         self.yield_scale = yield_scale;
         self.step_seconds = step_seconds;
-        self.cursor_force.push_strength = push_strength;
-        self.cursor_force.pull_strength = pull_strength;
+        {
+            let mut cursor = self.cursor.shared();
+            cursor.push_pa = push_pa;
+            cursor.pull_pa = pull_pa;
+        }
         if reset {
             self.reset();
         }
