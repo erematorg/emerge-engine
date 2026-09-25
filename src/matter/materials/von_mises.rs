@@ -102,6 +102,37 @@ impl VonMisesMaterial {
     pub fn soft_ductile(young_modulus: f32, poisson_ratio: f32) -> Self {
         Self::from_young_modulus(young_modulus, poisson_ratio, young_modulus * 0.005)
     }
+
+    /// The yield surface after `kappa` of accumulated equivalent plastic
+    /// strain: `yield_stress + hardening_modulus * kappa`.
+    pub fn yield_surface(&self, kappa: f32) -> f32 {
+        self.yield_stress + self.hardening_modulus * kappa
+    }
+
+    /// What the yield criterion tests, for stretches `sigma` (the singular
+    /// values of F): `2 mu |dev(eps)|`, eps the Hencky strain, returned with
+    /// the deviator itself and the trace the return mapping needs.
+    fn deviatoric_state(&self, sigma: Vec2) -> (Vec2, f32, f32) {
+        let eps = hencky_strains(sigma);
+        let tr = eps.x + eps.y;
+        let dev = eps - Vec2::splat(tr * 0.5);
+        (dev, tr, 2.0 * self.mu * dev.length())
+    }
+
+    /// Where particle `i` sits against its own yield surface: the quantity
+    /// the criterion tests over `yield_surface` of its own `kappa`, both
+    /// computed by the code the return mapping runs. Below 1 the particle is
+    /// elastic; a particle flowing plastically has been returned onto its
+    /// surface and reads 1. How far it has hardened is `kappa` itself, in
+    /// `friction_hardening`.
+    pub fn yield_ratio(&self, particles: &Particles, i: usize) -> f32 {
+        let (_, sigma, _) = svd2(particles.deformation_gradient[i]);
+        let (_, _, measure) = self.deviatoric_state(sigma);
+        measure
+            / self
+                .yield_surface(particles.friction_hardening[i])
+                .max(f32::MIN_POSITIVE)
+    }
 }
 
 impl FromSI<DuctileProps> for VonMisesMaterial {
@@ -168,14 +199,11 @@ impl MaterialModel for VonMisesMaterial {
         );
         let (u, sigma, vt) = svd2(f_trial);
 
-        let eps = hencky_strains(sigma);
-        let tr = eps.x + eps.y;
-        let dev = eps - Vec2::splat(tr * 0.5);
+        let (dev, tr, elastic_dev) = self.deviatoric_state(sigma);
         let dev_norm = dev.length();
 
         let kappa = *ctx.friction_hardening;
-        let effective_yield = self.yield_stress + self.hardening_modulus * kappa;
-        let elastic_dev = 2.0 * self.mu * dev_norm;
+        let effective_yield = self.yield_surface(kappa);
 
         let sigma_new = if elastic_dev > effective_yield && dev_norm > LOG_CLAMP {
             let denom = 2.0 * self.mu + self.hardening_modulus;
@@ -319,6 +347,37 @@ mod marginal_yield_tests {
     /// `dev.length() = d*sqrt(2)`, i.e. `d = dev_norm/sqrt(2)`.
     fn per_component_d_for_target_dev_norm(target_dev_norm: f32) -> f32 {
         target_dev_norm / std::f32::consts::SQRT_2
+    }
+
+    /// `yield_ratio` reads a state against its own surface: 0.6 for a state
+    /// at 60 percent of the threshold, and 1 once a state beyond it has
+    /// been returned, onto the surface its own hardening moved.
+    #[test]
+    fn yield_ratio_is_below_one_inside_and_one_after_a_return() {
+        let mat = VonMisesMaterial::with_hardening(2000.0, 3000.0, 100.0, 500.0);
+        let at = |fraction: f32| {
+            let d =
+                per_component_d_for_target_dev_norm(fraction * mat.yield_stress / (2.0 * mat.mu));
+            Vec2::new(d.exp(), (-d).exp())
+        };
+        let read = |sigma: Vec2, kappa: f32| {
+            let mut p = Particle::zeroed();
+            p.deformation_gradient = Mat2::from_diagonal(sigma);
+            p.friction_hardening = kappa;
+            p.mass = 1.0;
+            p.initial_volume = 1.0;
+            mat.yield_ratio(&Particles::from(vec![p]), 0)
+        };
+        let inside = read(at(0.6), 0.0);
+        assert!((inside - 0.6).abs() < 1.0e-4, "inside reads {inside}");
+
+        let (sigma_after, kappa_after) = run_one_step(&mat, at(1.5), 0.0);
+        assert!(kappa_after > 0.0, "a state beyond yield must harden");
+        let returned = read(sigma_after, kappa_after);
+        assert!(
+            (returned - 1.0).abs() < 1.0e-3,
+            "returned state reads {returned}"
+        );
     }
 
     #[test]
