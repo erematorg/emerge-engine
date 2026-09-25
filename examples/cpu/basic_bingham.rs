@@ -16,8 +16,9 @@ mod gui_common;
 /// This scene is the real laboratory test for it -- the slump test, the one
 /// on every concrete site (ASTM C143). Three identical columns are released
 /// from rest and collapse under their own weight. Same density, same
-/// viscosity, same bulk modulus, same shape, same measured optics. The ONLY
-/// independent difference is tau_0:
+/// viscosity, same bulk modulus, same shape, same measured optics. By
+/// construction the ONLY independent difference is tau_0 (but see the
+/// caveat on geometry below: the columns touch):
 ///
 ///   LEFT    tau_0 = 2 Pa     -- mucus / cytoplasm band. Spreads nearly flat.
 ///   MIDDLE  tau_0 = 60 Pa    -- the ketchup-and-mayonnaise band. Slumps
@@ -76,8 +77,9 @@ mod gui_common;
 /// and does not flow at all -- it ends where it started, 39 mm.
 ///
 /// The inversion above it assumes a thin, wide deposit (h << L), which the
-/// left and middle columns satisfy and the right one does not: it is
-/// designed not to spread, so h exceeds L and the formula reads low. That
+/// left column meets only loosely (h/L = 0.47), the middle one not at all
+/// (1.06), and the right one does not either: it is designed not to
+/// spread, so h exceeds L and the formula reads low. That
 /// is a limit of the measurement, stated rather than hidden, and it is why
 /// the standing-shear column is printed next to it.
 ///
@@ -88,10 +90,17 @@ mod gui_common;
 /// one, which does not demonstrate a yield stress: it TOPPLES, and the
 /// fall makes the stress that makes it flow. The columns are 2 to 1 now.
 ///
-/// One honest caveat on geometry: at this domain size the left column
-/// spreads far enough to reach the wall and its neighbour, so what stops
-/// it is partly the tank rather than only its own yield stress. The
-/// middle and right columns come to rest on their own.
+/// The caveat on geometry, measured (`tests/scratch_bingham_column_symmetry.rs`):
+/// the columns TOUCH, and the middle one's shape is constrained by its
+/// neighbours. The left deposit reaches the wall and the middle column,
+/// the middle deposit reaches the right column, and on this frictionless
+/// floor the whole row slides right, 7.4, 15.7 and 9.3 mm over three
+/// seconds, the last from a column that never yields. Alone in the tank the
+/// 60 Pa column spreads to about 47 mm a side, against the 21 mm in the
+/// table above. So the deposits here are not those of three independent
+/// slumps, and neither is the tau_0 read back from them. Alone, and spawned
+/// on a mirror line of the grid, each column collapses symmetrically to
+/// within a micrometre; the lean seen here is the neighbours.
 ///
 /// # Interaction
 ///
@@ -216,8 +225,9 @@ const COLUMN_CELLS: IVec2 = IVec2::new(10, 20);
 const SPACING: f32 = 0.5;
 /// The cursor's default push and pull `P`, its net force over its diameter
 /// (see `cursor_traction.rs`). Measured in zero gravity, a block pushed
-/// this way keeps a permanent deformation from about `P = 1` to `1.5`
-/// times its own yield stress, the same multiple for 2, 60 and 1200 Pa
+/// this way starts keeping a permanent deformation between `P = 1` and `2`
+/// times its own yield stress, at the same multiple for 2, 60 and 1200 Pa
+/// to within one step of the measured grid
 /// (`tests/scratch_bingham_cursor_yield.rs`), lower than the `2 tau_0` the
 /// mean shear `P / 2` alone would suggest. So 300 Pa yields the middle
 /// column and stays far under the right one's 1200. The slumped columns
