@@ -5,6 +5,8 @@ mod cursor_force;
 #[path = "../gui_common/mod.rs"]
 mod gui_common;
 
+use emerge::diagnostics::{HEAT_BANDS, OCCUPANCY_BANDS, SimSnapshot, scene_map};
+use emerge::particle::Particle;
 /// `VonMisesMaterial` interactive showcase -- closes the last real Tier-0
 /// gap for this material (previously only incidental mentions in
 /// `validate_materials.rs`'s headless sweeps and `rod_blade_and_root.rs`,
@@ -52,8 +54,23 @@ mod gui_common;
 ///
 ///   LMB push  RMB pull  V toggle own-yield view  R reset  Q quit
 ///   cargo run --example basic_vonmises --features render
+///
+/// Headless reading of the own-yield view, for a reviewer without the
+/// screen: `VONMISES_START_VIEW=yield` starts with it on (so a capture
+/// through `VONMISES_CAPTURE_DIR` shows it), and `VONMISES_LOG=<file>`
+/// writes a `FrameLogger` line per frame with, per blob, the share of its
+/// particles at yield (`yield_ratio` at least 0.99), its mean ratio, and
+/// how many particles fell back from at least 0.99 to under 0.9 since the
+/// frame before, and a text picture of what the screen shows
+/// (`scene_map`): the own-yield view in the colour map's bands (`.` blue,
+/// `:` teal, `-` green, `+` yellow to orange, `#` red), or where material
+/// is.
+/// `VONMISES_STRESS_TEST=1` scripts the pushes.
 use emerge::render::{ColorMode, Renderer};
-use emerge::{SimConfig, Simulation, SlipBoundary, SpawnRegion, VonMisesMaterial};
+use emerge::{
+    DiagnosticsPlugin, DiagnosticsRegistry, FrameLogger, SimConfig, Simulation, SlipBoundary,
+    SpawnRegion, VonMisesMaterial, per_material_stats,
+};
 use glam::{IVec2, Vec2};
 use std::sync::Arc;
 use winit::application::ApplicationHandler;
@@ -134,6 +151,59 @@ const MU: f32 = 60.0;
 const MAT_SOFT: u32 = 0;
 const MAT_HARD: u32 = 1;
 const MAT_STIFF: u32 = 2;
+
+/// The own-yield view in numbers, as a diagnostics plugin: per blob, the
+/// share of its particles at yield (`yield_ratio` at least 0.99), its mean
+/// ratio, and how many fell back from at least 0.99 to under 0.9 since the
+/// frame before. Stateful for that last count; particle order is stable in
+/// this scene, which removes none.
+struct OwnYieldPlugin {
+    materials: [VonMisesMaterial; 3],
+    last: Vec<f32>,
+}
+
+impl DiagnosticsPlugin for OwnYieldPlugin {
+    fn name(&self) -> &'static str {
+        "own_yield"
+    }
+
+    fn collect(&mut self, particles: &[Particle], _snapshot: &SimSnapshot) -> Vec<(String, f32)> {
+        let ratio: Vec<f32> = particles
+            .iter()
+            .map(|p| {
+                self.materials[p.material_id as usize]
+                    .yield_ratio_of(p.deformation_gradient, p.friction_hardening)
+            })
+            .collect();
+        let mut out = Vec::with_capacity(9);
+        for (slot, blob) in ["soft", "hard", "stiff"].iter().enumerate() {
+            let (mut n, mut at, mut sum, mut fell) = (0usize, 0usize, 0.0f32, 0usize);
+            for (i, (p, &r)) in particles.iter().zip(&ratio).enumerate() {
+                if p.material_id != slot as u32 {
+                    continue;
+                }
+                n += 1;
+                at += usize::from(r >= 0.99);
+                sum += r;
+                let was_at = self.last.get(i).is_some_and(|&last| last >= 0.99);
+                fell += usize::from(was_at && r < 0.9);
+            }
+            let n = n.max(1) as f32;
+            out.push((format!("{blob}_at_yield"), at as f32 / n));
+            out.push((format!("{blob}_ratio_mean"), sum / n));
+            out.push((format!("{blob}_fell_back"), fell as f32));
+        }
+        self.last = ratio;
+        out
+    }
+}
+
+fn own_yield_diagnostics(materials: [VonMisesMaterial; 3]) -> DiagnosticsRegistry {
+    DiagnosticsRegistry::new().with(Box::new(OwnYieldPlugin {
+        materials,
+        last: Vec::new(),
+    }))
+}
 
 /// The scene, and its three materials in slot order: the stress view reads
 /// each particle against its own material's yield surface.
@@ -267,6 +337,9 @@ struct State {
     show_stress: bool,
     /// The three materials, slot order, for that view.
     materials: [VonMisesMaterial; 3],
+    /// `VONMISES_LOG`: the own-yield view in numbers, per blob, per frame,
+    /// through `OwnYieldPlugin`.
+    yield_log: Option<(FrameLogger, DiagnosticsRegistry)>,
 }
 
 impl State {
@@ -288,7 +361,16 @@ impl State {
         // blobs -- they're the same material family (only yield/hardening
         // differ), no invented per-blob optical distinction.
         const SOIL_SIGMA_A: [f32; 3] = [0.200, 0.275, 0.550];
-        renderer.set_color_mode(ColorMode::ByPhysics);
+        let start_on_yield = std::env::var("VONMISES_START_VIEW").is_ok_and(|v| v == "yield");
+        renderer.set_color_mode(if start_on_yield {
+            ColorMode::ByStress
+        } else {
+            ColorMode::ByPhysics
+        });
+        let yield_log = std::env::var("VONMISES_LOG").ok().map(|path| {
+            let log = FrameLogger::open(path).expect("failed to open VONMISES_LOG");
+            (log, own_yield_diagnostics(materials))
+        });
         for slot in [MAT_SOFT, MAT_HARD, MAT_STIFF] {
             renderer.set_optical_params(&gfx.queue, slot as usize, SOIL_SIGMA_A);
             renderer.set_optical_scattering(&gfx.queue, slot as usize, 0.02);
@@ -362,8 +444,9 @@ impl State {
             fps_frames: 0,
             last_fps: 0.0,
             capture,
-            show_stress: false,
+            show_stress: start_on_yield,
             materials,
+            yield_log,
         }
     }
 
@@ -388,6 +471,9 @@ impl State {
     fn reset(&mut self) {
         (self.sim, self.materials) = make_sim(self.gravity_fraction);
         self.frame = 0;
+        if let Some((_, diagnostics)) = &mut self.yield_log {
+            *diagnostics = own_yield_diagnostics(self.materials);
+        }
     }
 
     fn update_and_render(&mut self, window: &Window) {
@@ -451,6 +537,36 @@ impl State {
         }
 
         self.sim.step();
+
+        if let Some((log, diagnostics)) = &mut self.yield_log {
+            let snapshot = self.sim.diagnostics_snapshot();
+            let particles = self.sim.particles().to_vec();
+            let frame = diagnostics.collect(&particles, &snapshot);
+            let extra: Vec<(&str, f32)> = frame.iter().collect();
+            log.log(
+                self.frame,
+                DT,
+                &per_material_stats(self.sim.particles()),
+                &snapshot,
+                &[(MAT_SOFT, "soft"), (MAT_HARD, "hard"), (MAT_STIFF, "stiff")],
+                &extra,
+            );
+            // What the screen shows, as text: the camera frames the whole
+            // grid, one character per cell across and two cells per
+            // character up, since a character is about twice as tall as wide.
+            let p = self.sim.particles();
+            let region = (Vec2::ZERO, Vec2::splat(GRID as f32));
+            if self.show_stress {
+                let ratio: Vec<f32> = (0..p.len())
+                    .map(|i| self.materials[p.material_id[i] as usize].yield_ratio(p, i))
+                    .collect();
+                let map = scene_map(p, region, GRID, GRID / 2, |i| ratio[i], &HEAT_BANDS);
+                log.log_map(self.frame, "own_yield", &map);
+            } else {
+                let map = scene_map(p, region, GRID, GRID / 2, |_| 1.0, &OCCUPANCY_BANDS);
+                log.log_map(self.frame, "occupancy", &map);
+            }
+        }
 
         if stress_test {
             for p in self.sim.particles().iter() {
