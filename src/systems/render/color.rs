@@ -192,3 +192,56 @@ fn material_palette(id: u32) -> [f32; 4] {
         _ => [1.00, 1.00, 1.00, 1.0],
     }
 }
+
+#[cfg(test)]
+mod heat_bands_tests {
+    use super::heat;
+    use crate::diagnostics::HEAT_BANDS;
+
+    /// The name `HEAT_BANDS` documents for a colour: its strongest channel,
+    /// or a mix of two when the second reaches 0.6 of the strongest.
+    fn read(rgb: [f32; 4]) -> char {
+        let mut channels = [(rgb[0], 'r'), (rgb[1], 'g'), (rgb[2], 'b')];
+        channels.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let [(first, a), (second, b), _] = channels;
+        if second >= 0.6 * first {
+            match (a.min(b), a.max(b)) {
+                ('b', 'g') => return ':',
+                ('g', 'r') => return '+',
+                _ => {}
+            }
+        }
+        match a {
+            'b' => '.',
+            'g' => '-',
+            _ => '#',
+        }
+    }
+
+    /// The text map (`diagnostics::scene_map`) draws `heat`'s values with
+    /// `HEAT_BANDS`. Sweep `heat` over its whole range and check every value
+    /// lands in the band its colour reads as, away from the rounding at each
+    /// threshold, so a change to either shows here.
+    #[test]
+    fn heat_bands_read_like_the_heat_colour_map() {
+        let thresholds: Vec<f32> = HEAT_BANDS.iter().skip(1).map(|(t, _)| *t).collect();
+        for step in 0..=1000 {
+            let value = step as f32 / 1000.0;
+            if thresholds.iter().any(|t| (value - t).abs() < 0.005) {
+                continue;
+            }
+            let band = HEAT_BANDS
+                .iter()
+                .rev()
+                .find(|(threshold, _)| value >= *threshold)
+                .map(|(_, c)| *c);
+            assert_eq!(
+                band,
+                Some(read(heat(value))),
+                "heat({value}) = {:?} reads as {:?}, HEAT_BANDS draws {band:?}",
+                heat(value),
+                read(heat(value))
+            );
+        }
+    }
+}

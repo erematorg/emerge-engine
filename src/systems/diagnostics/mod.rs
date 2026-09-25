@@ -2,6 +2,7 @@ pub mod logger;
 pub mod per_material;
 pub mod plugin;
 pub mod rules;
+pub mod scene_map;
 pub mod snapshot;
 
 pub use logger::FrameLogger;
@@ -13,6 +14,7 @@ pub use plugin::{
     MaterialCountPlugin, RollingPlugin, ThermalStatsPlugin,
 };
 pub use rules::{StabilityStatus, StabilityThresholds, evaluate_stability};
+pub use scene_map::{HEAT_BANDS, OCCUPANCY_BANDS, scene_map};
 pub use snapshot::{
     RodSnapshot, SiSnapshot, SimSnapshot, StepTiming, collect_rod_snapshot, collect_snapshot,
     collect_snapshot_particles_only,
