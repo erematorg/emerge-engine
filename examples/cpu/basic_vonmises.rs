@@ -10,40 +10,45 @@ mod gui_common;
 /// `validate_materials.rs`'s headless sweeps and `rod_blade_and_root.rs`,
 /// no real interactive scene anywhere in the repo).
 ///
-/// Three blobs, same drop, same elastic stiffness (lambda=30, mu=60 -- grid-
-/// native, NOT migrated to real SI (2026-09-06): this was identical to
-/// `basic_jellies.rs`'s own `CorotatedMaterial` blob when written, but
-/// jellies has since moved to real E=500 Pa soft tissue, and every
-/// yield_stress/hardening_modulus below is expressed as a MU-relative ratio,
-/// tuned through several documented empirical passes against THIS elastic
-/// wave speed at THIS drop height/gravity -- rescaling mu would shift the
-/// impact-strain-vs-wave-speed relationship those passes calibrated against,
-/// not just the absolute numbers, so it needs the same real drop-height/
-/// gravity re-sweep basic_jellies.rs went through, not a direct substitution.
-/// Real, disclosed, deferred, not silently dropped), differing ONLY in
-/// yield_stress/hardening_modulus -- isolates what those two parameters
-/// actually do instead of bundling it with a stiffness change:
+/// Three blobs, same drop. LEFT and MIDDLE share one elastic stiffness
+/// (lambda=30, mu=60 -- grid-native, NOT migrated to real SI: this was
+/// identical to `basic_jellies.rs`'s own `CorotatedMaterial` blob when
+/// written, but jellies has since moved to real E=500 Pa soft tissue, and
+/// every yield_stress/hardening_modulus below is expressed as a MU-relative
+/// ratio, tuned through several documented empirical passes against THIS
+/// elastic wave speed at THIS drop height/gravity -- rescaling mu would
+/// shift the impact-strain-vs-wave-speed relationship those passes
+/// calibrated against, not just the absolute numbers, so it needs the same
+/// real drop-height/gravity re-sweep basic_jellies.rs went through, not a
+/// direct substitution. Real, disclosed, deferred, not silently dropped).
+/// RIGHT is five times stiffer; `make_sim` says why a higher yield alone
+/// could not make it resist the impact:
 ///
-///   - LEFT   (soft, perfect plasticity): yield_stress=mu*0.05,
+///   - LEFT   (soft, perfect plasticity): yield_stress=mu*0.01,
 ///     hardening_modulus=0 -- dents on impact and STAYS dented; hit it again
 ///     and it dents by roughly the same amount each time (no memory of prior
 ///     yielding).
-///   - MIDDLE (soft, hardening):          yield_stress=mu*0.05,
-///     hardening_modulus=mu*0.3 -- dents a lot on the FIRST hit, then
+///   - MIDDLE (soft, hardening):          yield_stress=mu*0.01,
+///     hardening_modulus=mu*0.03 -- dents a lot on the FIRST hit, then
 ///     visibly resists more on each subsequent hit as its own yield surface
 ///     grows (kappa printed live below makes this literal, not just visual).
-///   - RIGHT  (stiff, near-elastic):       yield_stress=mu*2.0 -- rarely
-///     crosses yield under a normal drop/push, so it behaves close to a bare
-///     elastic solid and keeps bouncing.
+///   - RIGHT  (stiff): lambda and mu five times LEFT's, yield_stress=0.05 of
+///     its own mu. Meant to stay close to a bare elastic solid, but measured
+///     headless it does not: on landing every particle is past 0.01 of
+///     accumulated plastic strain and the median is 0.88
+///     (`tests/scratch_stress_view_before_after.rs`). Rebuilding the three
+///     blobs from real metals is issue #46.
 ///
-/// That last point is deliberate, not an oversight: unlike
-/// `basic_jellies.rs`'s NeoHookean/Corotated blobs (which have NO damping of
-/// any kind and bounce indefinitely, a real, disclosed, accepted property of
-/// that demo), a VonMises blob that actually yields dissipates real energy
-/// irreversibly through plastic flow and settles ON ITS OWN -- no Cundall
-/// damping or other numerical relaxation is enabled in this scene. The LEFT
-/// and MIDDLE blobs settling while the RIGHT one keeps bouncing IS the demo:
-/// plasticity as real, physical, mechanical damping, not a numerical crutch.
+/// That last point was the intent, not what the scene is measured to do, and
+/// whether the RIGHT blob still keeps bouncing has not been re-measured
+/// since. The intent: unlike `basic_jellies.rs`'s NeoHookean/Corotated blobs
+/// (which have NO damping of any kind and bounce indefinitely, a real,
+/// disclosed, accepted property of that demo), a VonMises blob that actually
+/// yields dissipates real energy irreversibly through plastic flow and
+/// settles ON ITS OWN -- no Cundall damping or other numerical relaxation is
+/// enabled in this scene. The LEFT and MIDDLE blobs settling while the RIGHT
+/// one keeps bouncing was meant to be the demo: plasticity as real, physical,
+/// mechanical damping, not a numerical crutch.
 ///
 ///   LMB push  RMB pull  V toggle real stress field  R reset  Q quit
 ///   cargo run --example basic_vonmises --features render
