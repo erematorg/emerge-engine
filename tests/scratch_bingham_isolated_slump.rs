@@ -242,3 +242,295 @@ fn each_column_alone_on_a_slip_and_a_gripping_floor() {
         }
     }
 }
+
+/// Does the bottom row of MATERIAL stay put, not only the floor's nodes?
+///
+/// `each_column_alone_on_a_slip_and_a_gripping_floor` counts floor nodes
+/// that slide, and finds 91 to 93 percent of them held while the deposits
+/// spread. That is measured on the wall layer, the nodes at y = 0 and 1,
+/// and the particles start above it at y = 2: the bottom row also reads
+/// unconstrained nodes above itself, so it can travel while the wall nodes
+/// under it stick. On screen the slumped 60 Pa deposit's lattice rows run
+/// outward all the way down to the floor, which is what a sliding base
+/// looks like. This follows the bottom row of particles themselves.
+#[test]
+#[ignore = "diagnostic probe kept for reruns, not part of the CI suite"]
+fn the_bottom_row_of_material_on_each_floor() {
+    let seconds = env("SLUMP_SECONDS", 3.0);
+    let dt = env("SLUMP_DT", 0.001);
+    let tau0 = env("SLUMP_TAU", 60.0);
+    println!("{tau0} Pa column alone, {seconds} s: its bottom row of particles, start against end");
+    println!("  floor          start span mm     end span mm      mean |dx| mm   largest |dx| mm");
+    for (label, mu) in [("slip", None), ("friction 1", Some(1.0f32))] {
+        let config = SimConfig {
+            min_dt: 1.0e-5,
+            max_substeps_per_step: 256,
+            ..SimConfig::earth(GRID, DX_M, dt)
+        };
+        let props = BinghamProps {
+            rho_kg_m3: RHO_KG_M3,
+            eta_pa_s: ETA_PA_S,
+            bulk_modulus_pa: bulk_modulus_pa(),
+            yield_stress_pa: tau0,
+            shear_modulus_pa: tau0 / YIELD_STRAIN,
+            cavitation_pressure_pa: BinghamProps::air_entrained_cavitation_pressure(),
+        };
+        let axis = GRID as f32 * 0.5;
+        let spawn = SpawnRegion {
+            spacing: 0.5,
+            box_size: COLUMN_CELLS,
+            box_center: Vec2::new(axis + 0.25, FLOOR_CELLS + COLUMN_CELLS.y as f32 * 0.5),
+            material_id: 0,
+            initial_velocity_scale: 0.0,
+            ..SpawnRegion::for_sim(&config)
+        }
+        .mass_from(&props, &config);
+        let floor: Box<dyn BoundaryCondition> = match mu {
+            None => Box::new(SlipBoundary::new(config.boundary_thickness)),
+            Some(m) => Box::new(FrictionBoundary::new(config.boundary_thickness, m)),
+        };
+        let mut sim = Simulation::new(config, spawn)
+            .with_default_material(Box::new(BinghamFluidMaterial::from_physical(
+                &props, &config,
+            )))
+            .with_boundary(floor);
+        // The bottom row: every particle spawned on the lowest lattice line.
+        let bottom: Vec<(usize, f32)> = {
+            let p = sim.particles();
+            let lowest = (0..p.len()).map(|i| p.x[i].y).fold(f32::MAX, f32::min);
+            (0..p.len())
+                .filter(|&i| p.x[i].y < lowest + 0.25)
+                .map(|i| (i, p.x[i].x))
+                .collect()
+        };
+        for _ in 0..(seconds / dt).round() as usize {
+            sim.step();
+        }
+        let p = sim.particles();
+        let span = |xs: &mut dyn Iterator<Item = f32>| {
+            xs.fold((f32::MAX, f32::MIN), |(lo, hi), x| (lo.min(x), hi.max(x)))
+        };
+        let (s0, s1) = span(&mut bottom.iter().map(|&(_, x)| x));
+        let (e0, e1) = span(&mut bottom.iter().map(|&(i, _)| p.x[i].x));
+        let moves: Vec<f32> = bottom
+            .iter()
+            .map(|&(i, x0)| (p.x[i].x - x0).abs())
+            .collect();
+        let mean = moves.iter().sum::<f32>() / moves.len() as f32;
+        let most = moves.iter().copied().fold(0.0f32, f32::max);
+        let mm = DX_M * 1000.0;
+        println!(
+            "  {label:<12} {:>6.1} to {:>6.1}   {:>6.1} to {:>6.1}   {:>10.2}     {:>10.2}",
+            (s0 - axis) * mm,
+            (s1 - axis) * mm,
+            (e0 - axis) * mm,
+            (e1 - axis) * mm,
+            mean * mm,
+            most * mm
+        );
+    }
+}
+
+/// Does a slumped deposit RING before it stops?
+///
+/// Watching the demo, the 60 Pa deposit sways for a long while after it
+/// slumps. The standing suspect is the model: below its yield stress the
+/// elastoviscoplastic branch is elastic with no dissipation at all (issue
+/// #43), and a deposit comes to rest exactly on its yield surface, so it
+/// should oscillate as an elastic body and lose energy only when a swing
+/// carries part of it back over yield. That predicts a slow, weakly damped
+/// oscillation, at roughly the shear-wave period of the deposit. This
+/// follows the column's vertical centre-of-mass velocity: oscillation shows
+/// as sign changes, damping as how fast their amplitude falls.
+#[test]
+#[ignore = "diagnostic probe kept for reruns, not part of the CI suite"]
+fn a_slumped_deposit_rings_before_it_stops() {
+    let seconds = env("SLUMP_SECONDS", 4.0);
+    let dt = env("SLUMP_DT", 0.001);
+    let tau0 = env("SLUMP_TAU", 60.0);
+    let config = SimConfig {
+        min_dt: 1.0e-5,
+        max_substeps_per_step: 256,
+        ..SimConfig::earth(GRID, DX_M, dt)
+    };
+    let props = BinghamProps {
+        rho_kg_m3: RHO_KG_M3,
+        eta_pa_s: ETA_PA_S,
+        bulk_modulus_pa: bulk_modulus_pa(),
+        yield_stress_pa: tau0,
+        shear_modulus_pa: tau0 / YIELD_STRAIN,
+        cavitation_pressure_pa: BinghamProps::air_entrained_cavitation_pressure(),
+    };
+    let spawn = SpawnRegion {
+        spacing: 0.5,
+        box_size: COLUMN_CELLS,
+        box_center: Vec2::new(
+            GRID as f32 * 0.5 + 0.25,
+            FLOOR_CELLS + COLUMN_CELLS.y as f32 * 0.5,
+        ),
+        material_id: 0,
+        initial_velocity_scale: 0.0,
+        ..SpawnRegion::for_sim(&config)
+    }
+    .mass_from(&props, &config);
+    let mut sim = Simulation::new(config, spawn)
+        .with_default_material(Box::new(BinghamFluidMaterial::from_physical(
+            &props, &config,
+        )))
+        .with_boundary(Box::new(FrictionBoundary::new(
+            config.boundary_thickness,
+            1.0,
+        )));
+    let shear_wave = (props.shear_modulus_pa / RHO_KG_M3).sqrt();
+    println!("{tau0} Pa column alone on the gripping floor; shear-wave speed {shear_wave:.2} m/s");
+    println!(
+        "  window        centre-of-mass vy swings   largest |vy| mm/s   largest particle speed mm/s"
+    );
+    let frames = (seconds / dt).round() as usize;
+    let window = (0.5 / dt).round() as usize;
+    let (mut crossings, mut peak_vy, mut peak_v, mut last_sign) = (0usize, 0.0f32, 0.0f32, 0.0f32);
+    for frame in 0..frames {
+        sim.step();
+        let p = sim.particles();
+        let n = p.len() as f32;
+        let vy = p.v.iter().map(|v| v.y).sum::<f32>() / n * DX_M * 1000.0;
+        let vmax = p.v.iter().fold(0.0f32, |m, v| m.max(v.length())) * DX_M * 1000.0;
+        // Ignore the first half second, the collapse itself.
+        if frame >= window {
+            let sign = vy.signum();
+            if last_sign != 0.0 && sign != last_sign && vy.abs() > 1.0e-4 {
+                crossings += 1;
+            }
+            if vy.abs() > 1.0e-4 {
+                last_sign = sign;
+            }
+            peak_vy = peak_vy.max(vy.abs());
+            peak_v = peak_v.max(vmax);
+        }
+        if frame >= window && (frame + 1) % window == 0 {
+            let t1 = (frame + 1) as f32 * dt;
+            println!(
+                "  {:.1} to {:.1} s        {crossings:>6}             {peak_vy:>10.3}             {peak_v:>10.3}",
+                t1 - 0.5,
+                t1
+            );
+            crossings = 0;
+            peak_vy = 0.0;
+            peak_v = 0.0;
+        }
+    }
+}
+
+/// Is the dilated bottom layer the gripping floor, or the wall itself?
+///
+/// On the demo's scene the slumped deposits' mean volume ratio sits above
+/// one, and all of that excess is in the band of particles next to the
+/// floor: J = 1.0108 there under the 60 Pa deposit, the grid-gathered
+/// density 0.990 of rest, the law's raw pressure -556 Pa, a fifth of the
+/// band on the cavitation floor (`tests/scratch_bingham_deposit_state.rs`).
+/// Two things could hold it. The gripping floor, holding the base while
+/// the material above flows outward, stretches it; or the wall itself,
+/// where the kernel reaches into the empty boundary layer and gathers too
+/// little density, the way it does at a free surface. Changing only the
+/// floor separates them: the wall is there on both floors, the grip only
+/// on one.
+///
+/// Found, 60 Pa, five seconds at 1 ms: the grip. On the gripping floor the
+/// band ends at J 1.0157, 29.5 percent of it at the cavitation pressure; on
+/// the slip floor at 0.9995 and 2.2 percent. The dilation builds during the
+/// impact, 0.998 at 20 ms, 1.005 at 50 ms, 1.016 by 0.2 s, and then stays
+/// frozen to the fourth decimal while the deposit rings down. It is set by
+/// the flow and held, not a ratchet at rest. What in the gripped update
+/// stretches the layer is not established: issue #44.
+#[test]
+#[ignore = "diagnostic probe kept for reruns, not part of the CI suite"]
+fn the_bottom_layer_volume_on_each_floor() {
+    let seconds = env("SLUMP_SECONDS", 3.0);
+    let dt = env("SLUMP_DT", 0.001);
+    let tau0 = env("SLUMP_TAU", 60.0);
+    println!(
+        "{tau0} Pa column alone, {seconds} s: the band of particles within 1.5 cells of the floor"
+    );
+    println!(
+        "  floor        time   particles   mean J    gathered rho/rho0   on the cavitation floor   rest of the deposit mean J   fastest particle"
+    );
+    for (label, mu) in [("slip", None), ("friction 1", Some(1.0f32))] {
+        let config = SimConfig {
+            min_dt: 1.0e-5,
+            max_substeps_per_step: 256,
+            ..SimConfig::earth(GRID, DX_M, dt)
+        };
+        let props = BinghamProps {
+            rho_kg_m3: RHO_KG_M3,
+            eta_pa_s: ETA_PA_S,
+            bulk_modulus_pa: bulk_modulus_pa(),
+            yield_stress_pa: tau0,
+            shear_modulus_pa: tau0 / YIELD_STRAIN,
+            cavitation_pressure_pa: BinghamProps::air_entrained_cavitation_pressure(),
+        };
+        let material = BinghamFluidMaterial::from_physical(&props, &config);
+        let (stiff, power, rest, min_d, floor_p) = (
+            material.eos_stiffness,
+            material.eos_power,
+            material.rest_density,
+            material.min_density,
+            material.pressure_floor,
+        );
+        let spawn = SpawnRegion {
+            spacing: 0.5,
+            box_size: COLUMN_CELLS,
+            box_center: Vec2::new(
+                GRID as f32 * 0.5 + 0.25,
+                FLOOR_CELLS + COLUMN_CELLS.y as f32 * 0.5,
+            ),
+            material_id: 0,
+            initial_velocity_scale: 0.0,
+            ..SpawnRegion::for_sim(&config)
+        }
+        .mass_from(&props, &config);
+        let wall: Box<dyn BoundaryCondition> = match mu {
+            None => Box::new(SlipBoundary::new(config.boundary_thickness)),
+            Some(m) => Box::new(FrictionBoundary::new(config.boundary_thickness, m)),
+        };
+        let mut sim = Simulation::new(config, spawn)
+            .with_default_material(Box::new(material))
+            .with_boundary(wall);
+        let frames = (seconds / dt).round() as usize;
+        for frame in 1..=frames {
+            sim.step();
+            // Five looks during the run: when the dilation appears says
+            // whether it is set by the flow or keeps growing at rest.
+            if frame % (frames / 5).max(1) != 0 {
+                continue;
+            }
+            let p = sim.particles();
+            let (mut nb, mut jb, mut rb, mut cb, mut nr, mut jr) =
+                (0usize, 0.0f64, 0.0f64, 0usize, 0usize, 0.0f64);
+            for i in 0..p.len() {
+                let j = f64::from(p.deformation_gradient[i].determinant());
+                if p.x[i].y < FLOOR_CELLS + 1.5 {
+                    let density = p.density[i].max(min_d).min(rest * 2.0);
+                    nb += 1;
+                    jb += j;
+                    rb += f64::from(density / rest);
+                    if stiff * ((density / rest).powf(power) - 1.0) < floor_p {
+                        cb += 1;
+                    }
+                } else {
+                    nr += 1;
+                    jr += j;
+                }
+            }
+            let vmax = (0..p.len()).map(|i| p.v[i].length()).fold(0.0f32, f32::max);
+            println!(
+                "  {label:<12} t={:.1}s {nb:>5}   {:>8.5}      {:>8.5}              {:>5.1} %                  {:>8.5}      {:.2} mm/s",
+                frame as f32 * dt,
+                jb / nb.max(1) as f64,
+                rb / nb.max(1) as f64,
+                100.0 * cb as f64 / nb.max(1) as f64,
+                jr / nr.max(1) as f64,
+                vmax * DX_M * 1000.0
+            );
+        }
+    }
+}
