@@ -255,13 +255,15 @@ impl MaterialRegistry {
     ///
     /// It shows shear, not how close a material is to yielding: each
     /// material states its yield criterion in its own measure.
-    /// `VonMisesMaterial` yields where the Frobenius norm of the deviator,
-    /// `sqrt(2 J2)`, reaches its `yield_stress`, so this field reads
-    /// `sqrt(3/2) yield_stress` there. `BinghamFluidMaterial` yields where
-    /// `sqrt(J2)` reaches `yield_stress`, so it reads `sqrt(3) yield_stress`.
-    /// A view that means "at yield" divides by each particle's own yield in
-    /// its own measure, which one display scale cannot do across materials
-    /// (`tests/scratch_stress_view_before_after.rs`).
+    /// `VonMisesMaterial` yields where `2 mu |dev(eps)|`, eps the Hencky
+    /// strain, reaches its `yield_stress`; at small strain that is the
+    /// Frobenius norm of the deviator, `sqrt(2 J2)`, and this field reads
+    /// `sqrt(3/2) yield_stress` there, while at strains of order one the
+    /// stress reads lower. `BinghamFluidMaterial` yields where `sqrt(J2)`
+    /// reaches `yield_stress`, so it reads `sqrt(3) yield_stress`. A view
+    /// that means "at yield" asks each material for its own criterion
+    /// (`VonMisesMaterial::yield_ratio`), which one display scale cannot
+    /// replace (`tests/scratch_stress_view_before_after.rs`).
     pub fn von_mises_stress_field(&self, particles: &Particles) -> Vec<f32> {
         (0..particles.len())
             .map(|i| {
@@ -508,10 +510,10 @@ mod von_mises_tests {
         );
     }
 
-    /// The factor the doc states for `VonMisesMaterial`: at its yield, the
-    /// deviator's Frobenius norm equals `yield_stress`, and this field reads
-    /// `sqrt(3/2)` of it. Shear chosen as a pure `sxy`, whose Frobenius norm
-    /// is `sqrt(2) sxy`.
+    /// The factor the doc states for `VonMisesMaterial` at small strain: at
+    /// its yield the deviator's Frobenius norm equals `yield_stress`, and
+    /// this field reads `sqrt(3/2)` of it. Shear chosen as a pure `sxy`,
+    /// whose Frobenius norm is `sqrt(2) sxy`.
     #[test]
     fn at_frobenius_yield_reads_root_3_over_2_of_the_yield() {
         let yield_stress = 12.0;
