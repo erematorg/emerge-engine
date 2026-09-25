@@ -4478,3 +4478,86 @@ fn diag_surface_reconstruction_real_cost_vs_grid_volume_and_particles() {
         );
     }
 }
+
+/// Every camera goes through `region_projection`. Framed whole, the grid must
+/// come out as `set_camera` drew it before it called that function (the
+/// closed form below is that version's, restated); a region must fill the
+/// window along one axis, centred, with square pixels. Both window
+/// orientations, since the fit switches axis between them.
+#[test]
+fn region_projection_frames_a_region_and_the_whole_grid() {
+    let close = |a: f32, b: f32| (a - b).abs() <= 1.0e-5 * a.abs().max(b.abs()).max(1.0);
+    for (w, h) in [(1280u32, 720u32), (720, 1280), (900, 900)] {
+        let aspect = w as f32 / h as f32;
+        let gr = 160.0f32;
+        let before = if aspect >= 1.0 {
+            (2.0 / (gr * aspect), -1.0 / aspect, 2.0 / gr, -1.0)
+        } else {
+            (2.0 / gr, -1.0, 2.0 * aspect / gr, -aspect)
+        };
+        let now = Renderer::region_projection(Vec2::ZERO, Vec2::splat(gr), w, h);
+        assert!(
+            close(now.0, before.0)
+                && close(now.1, before.1)
+                && close(now.2, before.2)
+                && close(now.3, before.3),
+            "{w}x{h}: whole grid {now:?}, set_camera drew {before:?}"
+        );
+
+        // A wide strip and a tall one.
+        for (min, max) in [
+            (Vec2::new(30.0, 2.0), Vec2::new(150.0, 40.0)),
+            (Vec2::new(70.0, 2.0), Vec2::new(90.0, 120.0)),
+        ] {
+            let (sx, tx, sy, ty) = Renderer::region_projection(min, max, w, h);
+            let ndc = |p: Vec2| Vec2::new(p.x * sx + tx, p.y * sy + ty);
+            let centre = ndc((min + max) * 0.5);
+            assert!(centre.length() < 1.0e-5, "{w}x{h}: centre at {centre}");
+            let (lo, hi) = (ndc(min), ndc(max));
+            assert!(
+                lo.cmpge(Vec2::splat(-1.0 - 1.0e-5)).all()
+                    && hi.cmple(Vec2::splat(1.0 + 1.0e-5)).all(),
+                "{w}x{h}: region {min}..{max} spills out of the window, {lo}..{hi}"
+            );
+            assert!(
+                close(hi.x, 1.0) || close(hi.y, 1.0),
+                "{w}x{h}: region {min}..{max} fills neither axis, {lo}..{hi}"
+            );
+            // Square pixels: a cell spans as many pixels across as up.
+            assert!(
+                close(sx * w as f32, sy * h as f32),
+                "{w}x{h}: cells are not square"
+            );
+        }
+    }
+}
+
+/// The round trip the cursor depends on, through a real renderer: a point
+/// drawn under `set_camera_region` and read back by `screen_to_grid` comes
+/// back where it was, and the framed strip's ends land on the window's
+/// edges.
+#[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
+fn a_cursor_reads_back_the_point_a_region_camera_drew() {
+    let (device, queue) = headless_device();
+    let mut r = Renderer::new(&device, 16, wgpu::TextureFormat::Rgba8UnormSrgb);
+    // Wider than either window, so it fills the width in both.
+    let (min, max) = (Vec2::new(30.0, 2.0), Vec2::new(150.0, 40.0));
+    for (w, h) in [(1280u32, 720u32), (720, 1280)] {
+        r.set_camera_region(&queue, (min, max), w, h, 0.6, true);
+        for p in [min, max, (min + max) * 0.5, Vec2::new(41.3, 17.9)] {
+            let (x, y) = r.grid_to_screen(p.x, p.y, w, h);
+            let (gx, gy) = r.screen_to_grid(x, y, w, h);
+            assert!(
+                (gx - p.x).abs() < 1.0e-3 && (gy - p.y).abs() < 1.0e-3,
+                "{w}x{h}: {p} drawn at ({x}, {y}) reads back as ({gx}, {gy})"
+            );
+        }
+        let (left, _) = r.grid_to_screen(min.x, min.y, w, h);
+        let (right, _) = r.grid_to_screen(max.x, min.y, w, h);
+        assert!(
+            left.abs() < 1.0e-2 && (right - w as f32).abs() < 1.0e-2,
+            "{w}x{h}: strip drawn from x = {left} to {right} px"
+        );
+    }
+}

@@ -11,6 +11,8 @@
 ///   Pass `sim.particle_buffer()` + `sim.particle_count()`. No `sync_particles_blocking()`.
 use std::mem;
 
+use glam::Vec2;
+
 use crate::particle::{Particle, Particles};
 use crate::systems::gpu::MAX_RENDER_MATERIAL_SLOTS;
 
@@ -895,6 +897,33 @@ impl Renderer {
 
     // ── Configuration ─────────────────────────────────────────────────────────
 
+    /// The orthographic projection that frames the grid rectangle from `min`
+    /// to `max`, in cells, in a `width` x `height` window: `(sx, tx, sy, ty)`,
+    /// a grid point `(x, y)` landing at NDC `(x * sx + tx, y * sy + ty)`. The
+    /// rectangle fills the window along whichever axis it reaches first,
+    /// centred, with square pixels.
+    ///
+    /// Every camera goes through this one function: `set_camera` frames the
+    /// whole grid with it, `set_camera_region` a part. A caller that maps a
+    /// cursor without holding the renderer inverts the same numbers, so what
+    /// was drawn and what a click reads back cannot drift apart.
+    pub fn region_projection(
+        min: Vec2,
+        max: Vec2,
+        width: u32,
+        height: u32,
+    ) -> (f32, f32, f32, f32) {
+        let size = (max - min).max(Vec2::splat(1.0e-3));
+        let centre = (min + max) * 0.5;
+        let aspect = width.max(1) as f32 / height.max(1) as f32;
+        // NDC per cell along y; along x it is divided by the aspect so a
+        // cell is as many pixels wide as it is tall. The rectangle must fit
+        // both ways: 2 NDC across the height, 2 * aspect across the width.
+        let s = (2.0 / size.y).min(2.0 * aspect / size.x);
+        let (sx, sy) = (s / aspect, s);
+        (sx, -sx * centre.x, sy, -sy * centre.y)
+    }
+
     /// Call at init and on every resize.
     pub fn set_camera(
         &mut self,
@@ -905,15 +934,45 @@ impl Renderer {
         particle_scale: f32,
         round_particles: bool,
     ) {
-        let gr = grid_res as f32;
-        let aspect = width.max(1) as f32 / height.max(1) as f32;
-        let (sx, tx, sy, ty) = if aspect >= 1.0 {
-            (2.0 / (gr * aspect), -1.0 / aspect, 2.0 / gr, -1.0)
-        } else {
-            (2.0 / gr, -1.0, 2.0 * aspect / gr, -aspect)
-        };
+        let (sx, tx, sy, ty) =
+            Self::region_projection(Vec2::ZERO, Vec2::splat(grid_res as f32), width, height);
         self.cached_ortho = (sx, tx, sy, ty);
         self.cached_grid_res = grid_res;
+        queue.write_buffer(
+            &self.camera_buffer,
+            0,
+            bytemuck::bytes_of(&CameraParams {
+                view_proj: [
+                    sx, 0.0, 0.0, 0.0, 0.0, sy, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, tx, ty, 0.0, 1.0,
+                ],
+                particle_scale,
+                round_particles: round_particles as u32,
+                _pad: [0.0; 2],
+            }),
+        );
+    }
+
+    /// Frames a rectangle of the grid instead of the whole of it: the
+    /// rectangle from `min` to `max`, in grid cells, fills the window along
+    /// whichever axis it reaches first, centred, with square pixels.
+    ///
+    /// A scene whose material occupies a thin strip of a large grid is
+    /// otherwise drawn small, because `set_camera` always shows every cell.
+    /// This writes the same cached projection `set_camera` does, so
+    /// `screen_to_grid` and `grid_to_screen` stay exact under it. It does not
+    /// set the grid resolution `render_grid_volume` reads; that path needs
+    /// `set_camera` to have run once.
+    pub fn set_camera_region(
+        &mut self,
+        queue: &wgpu::Queue,
+        region: (Vec2, Vec2),
+        width: u32,
+        height: u32,
+        particle_scale: f32,
+        round_particles: bool,
+    ) {
+        let (sx, tx, sy, ty) = Self::region_projection(region.0, region.1, width, height);
+        self.cached_ortho = (sx, tx, sy, ty);
         queue.write_buffer(
             &self.camera_buffer,
             0,
