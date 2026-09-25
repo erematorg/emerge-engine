@@ -126,12 +126,19 @@ impl VonMisesMaterial {
     /// surface and reads 1. How far it has hardened is `kappa` itself, in
     /// `friction_hardening`.
     pub fn yield_ratio(&self, particles: &Particles, i: usize) -> f32 {
-        let (_, sigma, _) = svd2(particles.deformation_gradient[i]);
+        self.yield_ratio_of(
+            particles.deformation_gradient[i],
+            particles.friction_hardening[i],
+        )
+    }
+
+    /// `yield_ratio` for one particle's deformation gradient and `kappa`,
+    /// for callers that hold a `Particle` rather than the store, such as a
+    /// `DiagnosticsPlugin`.
+    pub fn yield_ratio_of(&self, deformation_gradient: Mat2, kappa: f32) -> f32 {
+        let (_, sigma, _) = svd2(deformation_gradient);
         let (_, _, measure) = self.deviatoric_state(sigma);
-        measure
-            / self
-                .yield_surface(particles.friction_hardening[i])
-                .max(f32::MIN_POSITIVE)
+        measure / self.yield_surface(kappa).max(f32::MIN_POSITIVE)
     }
 }
 
