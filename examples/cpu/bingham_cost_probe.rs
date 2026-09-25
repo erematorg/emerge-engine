@@ -11,7 +11,15 @@ use emerge::Simulation;
 use emerge::{BinghamFluidMaterial, BinghamProps, FromSI, SimConfig, SlipBoundary, SpawnRegion};
 use glam::{IVec2, Vec2};
 
-const GRID: usize = 64;
+/// The demo's grid, overridable with `BINGHAM_PROBE_GRID` to price a wider
+/// tank: the same three columns at the same places, more empty cells around
+/// them. The grid is sparse, so the question is whether empty cells cost.
+fn grid() -> usize {
+    std::env::var("BINGHAM_PROBE_GRID")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64)
+}
 const DX_M: f32 = 0.002;
 /// Simulated seconds advanced per frame, overridable so the frame-rate
 /// against playback-speed trade can be swept rather than asserted.
@@ -43,7 +51,7 @@ fn main() {
     let config = SimConfig {
         min_dt: 1.0e-5,
         max_substeps_per_step: 256,
-        ..SimConfig::earth(GRID, DX_M, step_seconds())
+        ..SimConfig::earth(grid(), DX_M, step_seconds())
     };
     let v_max = (2.0 * 9.81 * COLUMN.y as f32 * DX_M).sqrt();
     let bulk_modulus = RHO * (10.0 * v_max).powi(2);
