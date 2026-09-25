@@ -8,17 +8,25 @@
 extern crate emerge_engine as emerge;
 
 use emerge::Simulation;
-use emerge::{BinghamFluidMaterial, BinghamProps, FromSI, SimConfig, SlipBoundary, SpawnRegion};
+use emerge::{
+    BinghamFluidMaterial, BinghamProps, FrictionBoundary, FromSI, SimConfig, SpawnRegion,
+};
 use glam::{IVec2, Vec2};
 
-/// The demo's grid, overridable with `BINGHAM_PROBE_GRID` to price a wider
-/// tank: the same three columns at the same places, more empty cells around
-/// them. The grid is sparse, so the question is whether empty cells cost.
+/// The demo's grid, 160 cells, overridable with `BINGHAM_PROBE_GRID` to
+/// price a different tank: the same three columns at the same places, more
+/// or fewer empty cells around them. The grid is sparse, so the question is
+/// whether empty cells cost.
+///
+/// This probe keeps its own copy of the scene rather than including
+/// `bingham_slump_scene.rs`, because it builds the materials itself to
+/// offer `BINGHAM_PROBE_ELASTIC`; the geometry, floor and constants below
+/// must match that file.
 fn grid() -> usize {
     std::env::var("BINGHAM_PROBE_GRID")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(64)
+        .unwrap_or(160)
 }
 const DX_M: f32 = 0.002;
 /// Simulated seconds advanced per frame, overridable so the frame-rate
@@ -35,7 +43,7 @@ const FLOOR: f32 = 2.0;
 const COLUMN: IVec2 = IVec2::new(10, 20);
 const YIELD_STRAIN: f32 = 0.05;
 const YIELDS: [f32; 3] = [2.0, 60.0, 1200.0];
-const COLUMN_X: [f32; 3] = [12.0, 32.0, 52.0];
+const COLUMN_X: [f32; 3] = [57.0, 125.0, 148.0];
 
 /// `BINGHAM_PROBE_ELASTIC=0` measures the purely viscous branch instead, so
 /// the cost of the elastoviscoplastic branch's own SVD work is attributable
@@ -95,7 +103,10 @@ fn main() {
                 &config,
             )),
         )
-        .with_boundary(Box::new(SlipBoundary::new(config.boundary_thickness)));
+        .with_boundary(Box::new(FrictionBoundary::new(
+            config.boundary_thickness,
+            1.0,
+        )));
     let _ = sim.add_body(spawn(1));
     let _ = sim.add_body(spawn(2));
 

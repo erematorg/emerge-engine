@@ -16,9 +16,9 @@ mod gui_common;
 /// This scene is the real laboratory test for it -- the slump test, the one
 /// on every concrete site (ASTM C143). Three identical columns are released
 /// from rest and collapse under their own weight. Same density, same
-/// viscosity, same bulk modulus, same shape, same measured optics. By
-/// construction the ONLY independent difference is tau_0 (but see the
-/// caveat on geometry below: the columns touch):
+/// viscosity, same bulk modulus, same shape, same measured optics, and they
+/// stand far enough apart that their deposits never meet. The ONLY
+/// independent difference is tau_0:
 ///
 ///   LEFT    tau_0 = 2 Pa     -- mucus / cytoplasm band. Spreads nearly flat.
 ///   MIDDLE  tau_0 = 60 Pa    -- the ketchup-and-mayonnaise band. Slumps
@@ -49,58 +49,87 @@ mod gui_common;
 ///
 /// # What the printed numbers mean
 ///
-/// A slump is not just a picture -- it measures tau_0. A deposit at rest on
-/// a flat floor settles where its own weight can no longer shear it, giving
-/// the thin-layer deposit shape `h^2 = 2 (tau_0 / rho g) L` (Liu & Mei,
-/// J. Fluid Mech. 207, 1989; the basis of Roussel & Coussot's "fifty-cent
-/// rheometer", J. Rheol. 49, 2005). Inverting it turns the measured pile
-/// back into a yield stress:
+/// A slump is not just a picture -- it measures tau_0, but only through a
+/// relation that holds for the shape the deposit ends in. The demo picks
+/// the relation from what it sees, never from the tau_0 that went in:
+/// choosing by the answer would make the reading circular.
 ///
-///   tau_0_measured = rho * g * h^2 / (2 L)
+/// - A THIN deposit (h/L at most 0.1, a declared bound) is read by a force
+///   balance. At rest, the yield stress at the base holds up the hydrostatic
+///   pressure gradient, `tau_0 = rho g h |dh/dx|`; integrated from the front,
+///   where h = 0, to the centre, where it is h over a half-width L, that is
+///   `tau_0 = rho g h^2 / (2 L)`. Exact only as h/L goes to zero.
+/// - A deposit that SLUMPED without thinning is read by the planar law
+///   Staron, Lagree, Ray and Popinet fitted to their own simulations of
+///   two-dimensional Bingham columns on a no-slip base ("Scaling laws for
+///   the slumping of a Bingham plastic fluid", J. Rheol. 57, 1265, 2013,
+///   their eq. 13). Simulations, not experiments: "No experimental data were
+///   available to test the results of the numerical simulations of Bingham
+///   fluid", in their words. The law:
+///   `H / R0 = 3.01 (tau_0 / (rho g R0))^0.66`, R0 the initial half-width,
+///   fitted over `0.06 <= tau_0 / (rho g R0) <= 1.6` with a correlation of
+///   0.95. Inverted, and only trusted inside that range.
+/// - A column that HELD ITS SHAPE has not revealed tau_0, only a floor: by
+///   the same paper's eq. 14 a column slumps only when `H0 / R0` exceeds
+///   `3.01 (tau_0 / (rho g R0))^0.66`, so not slumping bounds it from below.
+/// - Anything else says "no valid reading".
 ///
-/// The diagnostic prints that next to the tau_0 that went in. Measured
-/// headless on this scene (`bingham_slump_probe`), from a 39 mm column,
-/// two simulated seconds, with every column at rest:
+/// Measured headless on this scene (`bingham_slump_probe`, which builds it
+/// from the same `bingham_slump_scene.rs`), eight simulated seconds, release:
 ///
 /// ```text
-///     tau_0 in   deposit h   half-width L   read back   standing shear
-///        2 Pa      13.4 mm      28.7 mm        31 Pa    1.18 of its yield
-///       60 Pa      22.5 mm      21.2 mm       117 Pa    1.00
-///     1200 Pa      39.0 mm      10.0 mm       749 Pa    0.66
+///     tau_0 in   deposit h   half-width L   h/L    standing shear   read back
+///        2 Pa       5.5 mm      96.0 mm     0.06       1.18         1.6 Pa, thin layer, creeping
+///       60 Pa      20.9 mm      26.3 mm     0.79       0.98          56 Pa, planar law
+///     1200 Pa      38.9 mm       9.5 mm     4.08       0.34        > 151 Pa, held its shape
 /// ```
 ///
-/// The last column is the one that does not depend on any geometry, and it
-/// is what actually proves the law: at rest a yield-stress fluid holds a
-/// shear stress up to tau_0 and no further. The middle column sits at
-/// exactly 1.00 of its own yield, which is a material at its limit holding
-/// a slope. The right one sits at 0.66, below its yield, so it is elastic
-/// and does not flow at all -- it ends where it started, 39 mm.
+/// Each reading is what its relation is worth and no more. The 2 Pa deposit
+/// is the one point squarely inside a relation, and it is still creeping at
+/// 0.9 mm/s, so its 1.6 Pa keeps falling slowly; the panel marks it
+/// provisional and shows the speed. The 60 Pa one is read by a
+/// fitted law, not an exact one. The 1200 Pa one gives a bound, which it
+/// satisfies.
 ///
-/// The inversion above it assumes a thin, wide deposit (h << L), which the
-/// left column meets only loosely (h/L = 0.47), the middle one not at all
-/// (1.06), and the right one does not either: it is designed not to
-/// spread, so h exceeds L and the formula reads low. That
-/// is a limit of the measurement, stated rather than hidden, and it is why
-/// the standing-shear column is printed next to it.
+/// The standing-shear column does not depend on any geometry, and it is
+/// what actually tests the law: at rest a yield-stress fluid holds a shear
+/// stress up to tau_0 and no further. The middle column sits at 0.98 of its
+/// own yield, a material at its limit holding a slope. The right one sits at
+/// 0.34, well below, so it is elastic and does not flow. The left one reads
+/// 1.18, above its yield, because it has not stopped: it is still flowing.
 ///
-/// An earlier version of this table was never produced by this scene at
-/// all: it claimed a 31 mm column and a right-hand deposit of 20.5 mm
-/// where the engine, at that very commit, gives 8.9 mm. What it was
-/// describing was a column of 8 mm across standing 40 mm tall, five to
-/// one, which does not demonstrate a yield stress: it TOPPLES, and the
-/// fall makes the stress that makes it flow. The columns are 2 to 1 now.
+/// The floor grips. On a frictionless one the thin-layer reading comes out
+/// five to ten times low, because without basal shear the material spreads
+/// too far to be a slump test at all (`tests/scratch_bingham_isolated_slump.rs`).
 ///
-/// The caveat on geometry, measured (`tests/scratch_bingham_column_symmetry.rs`):
-/// the columns TOUCH, and the middle one's shape is constrained by its
-/// neighbours. The left deposit reaches the wall and the middle column,
-/// the middle deposit reaches the right column, and on this frictionless
-/// floor the whole row slides right, 7.4, 15.7 and 9.3 mm over three
-/// seconds, the last from a column that never yields. Alone in the tank the
-/// 60 Pa column spreads to about 47 mm a side, against the 21 mm in the
-/// table above. So the deposits here are not those of three independent
-/// slumps, and neither is the tau_0 read back from them. Alone, and spawned
-/// on a mirror line of the grid, each column collapses symmetrically to
-/// within a micrometre; the lean seen here is the neighbours.
+/// The grip leaves a mark of its own, at the floor. The lowest quarter of
+/// each slumped deposit ends about one percent dilated, a volume ratio of
+/// 1.010 under the 2 Pa deposit and 1.011 under the 60 Pa one, with a fifth
+/// to a quarter of its particles at the cavitation pressure, the most
+/// tension the law allows; every band above it sits at 1 within 1e-3. It is
+/// the grip, not the wall: the 60 Pa column alone, its particles within a
+/// cell and a half of the floor, ends at 1.016 on this floor and 0.9995 on a
+/// slip one, and the dilation appears during the impact, in the first fifth
+/// of a second, then stays frozen (`tests/scratch_bingham_isolated_slump.rs`).
+/// So the mean volume ratio above one, 1.0044 and 1.0033, is that bottom
+/// layer, not the deposits. In every band, the bottom one included, the
+/// vertical stress carries the weight overhead to within 14 percent in the
+/// middle deposit and 10 in the right; the left one, three cells thick, is
+/// too thin to split that finely (`tests/scratch_bingham_deposit_state.rs`).
+/// Why a gripping floor stretches the layer it grips is not established:
+/// issue #44.
+///
+/// Two earlier versions of this table were wrong, and how is worth keeping.
+/// The first was never produced by this scene: it described columns 8 mm
+/// across and 40 mm tall, five to one, which do not demonstrate a yield
+/// stress, they TOPPLE, and the fall makes the stress that makes them flow;
+/// the columns became 2 to 1. The second was produced by this scene, on a
+/// 64-cell tank and a frictionless floor, and its columns touched: the left
+/// deposit reached the middle one, the middle one the right, and the whole
+/// row slid. It read 117 Pa for the 60 Pa column. Alone on that same floor
+/// the column reads 11.2 Pa; its neighbours had raised the reading tenfold.
+/// The tank is now wide enough, and spaced, from each column's measured
+/// spread alone (`bingham_slump_scene.rs`).
 ///
 /// # Interaction
 ///
@@ -114,30 +143,24 @@ mod gui_common;
 /// advances. It is a viewing choice, not a physics one: the cost of a frame
 /// is dominated by the acoustic CFL condition, which fixes how many
 /// substeps a millisecond of this material costs, so asking for less
-/// simulated time per frame buys frame rate and slower motion at exactly
-/// the same physical fidelity.
+/// simulated time per frame buys frame rate and smoothness at exactly the
+/// same physical fidelity. It does not slow the slump down: the frame rate
+/// rises in the same proportion, and the playback speed stays where it was.
 ///
-///   LMB push  RMB pull  V toggle real shear-stress field  R reset  Q quit
+///   LMB push  RMB pull  V toggle shear / own yield  R reset  Q quit
 ///   cargo run --release --example basic_bingham --features render
+#[path = "bingham_slump_scene.rs"]
+mod bingham_slump_scene;
+use bingham_slump_scene::*;
 use emerge::render::{ColorMode, Renderer};
-use emerge::{
-    BinghamFluidMaterial, BinghamProps, FromSI, SimConfig, Simulation, SlipBoundary, SpawnRegion,
-};
-use glam::{IVec2, Vec2};
+use emerge::{BinghamFluidMaterial, MaterialModel, Simulation};
+use glam::Vec2;
 use std::sync::Arc;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
-
-const GRID: usize = 64;
-
-/// 2 mm cells -- a 12.8 cm tabletop tank, the scale a slump of a few
-/// centilitres actually happens at. Deposit height scales as tau_0/(rho g),
-/// millimetres for these materials, so a metre-scale domain would collapse
-/// the whole effect into a single cell.
-const DX_M: f32 = 0.002;
 
 /// Simulated time advanced per rendered frame, live-adjustable in the
 /// panel. A viewing choice, not a physics one: every material constant
@@ -151,32 +174,36 @@ const DX_M: f32 = 0.002;
 ///
 /// The demo advances a FIXED slice of simulated time per frame, so a frame
 /// that takes longer is a moment where the motion on screen slows down: a
-/// stutter. At 2 ms not one frame fits the 16.7 ms a 60 Hz display allows.
-/// At 1 ms nearly all of the collapse does. Measured per frame over three
-/// simulated seconds, headless, release, physics only with no rendering, and
-/// with the demo itself closed (a running copy competing for the cores made
-/// an earlier release run read slower than the `quick` profile):
+/// stutter. At 2 ms not one frame fits the 16.7 ms a 60 Hz display allows;
+/// at 1 ms most do. Measured per frame over three simulated seconds on this
+/// scene, headless, release, physics only with no rendering, with the demo
+/// itself closed (a running copy competing for the cores once made a
+/// release run read slow):
 ///
 ///   BINGHAM_PROBE_FRAMES=1500 cargo run --release --example bingham_cost_probe
 ///
 /// ```text
 ///   per frame  substeps  mean     fps   collapse: over 16.7 ms, max   settled: over 16.7, over 33, max
-///   1.0 ms      10.0    14.5 ms   69        2 of 500,   22 ms            139 of 1000,   51,   255 ms
-///   2.0 ms      19.2    25.2 ms   40      250 of 250,   69 ms           1250 of 1250,   39,   189 ms
+///   1.0 ms      10.0    16.2 ms   62       81 of 500,   43 ms            276 of 1000,   19,    73 ms
+///   2.0 ms      19.0    31.2 ms   32      250 of 250,  114 ms           1250 of 1250,  219,   399 ms
 /// ```
 ///
-/// Two things in that table are not understood and are recorded rather
-/// than explained away. Release is no faster than the `quick` profile here
-/// (13.6 and 24.8 ms at the same two steps). And the long frames sit in the
-/// SETTLED phase, in both profiles, while the collapse is clean. It is not
-/// particle sleep, which this scene leaves off. Sustained-load CPU
-/// throttling and background load are the untested candidates, so read the
-/// settled column as this machine, not as the physics. Rendering adds to
-/// every row.
+/// Read the timing as this machine, not as the physics: `bingham_slump_probe`
+/// ran the same scene at 1 ms in the same build and averaged 12.8 ms a
+/// frame, 27 percent under this table's 16.2. The substep counts are the
+/// part that does not move. Release is no faster than the `quick` profile
+/// here, which is expected rather than odd: `quick` inherits `release` and
+/// only drops link-time optimisation and runs 16 codegen units instead of
+/// one, which a loop bound by arithmetic barely notices. Why the long
+/// frames gather in the settled phase is not established; it is not
+/// particle sleep, which this scene leaves off, and the solver's own
+/// per-phase timing, printed for the worst frames only, would say whether
+/// it is the engine or the machine. Rendering adds to every row.
 ///
 /// Real-time ratio, stated rather than left to be noticed: at 1 ms and
-/// 69 fps this advances 0.069 s of slump per second of wall clock, 14.5
-/// times slower than life, and 16.7 times if the display caps it at 60 Hz.
+/// 62 to 78 fps this advances 0.062 to 0.078 s of slump per second of wall
+/// clock, 13 to 16 times slower than life, and 16.7 times if the display
+/// caps it at 60 Hz.
 /// No setting of this reaches real time; the substep does, and it is set
 /// by the sound speed, whose own derivation is below. The one fix still
 /// open is to run the physics on its own thread and let the display
@@ -184,45 +211,6 @@ const DX_M: f32 = 0.002;
 /// stutter without touching the physics and would serve every demo.
 const DT_S_DEFAULT: f32 = 0.001;
 
-/// Real yield stresses in pascals, spanning the three bands
-/// `BinghamFluidMaterial`'s own doc lists (biological 1-50, mud 50-500,
-/// lava 100-2000). Everything else about the three columns is identical.
-const YIELD_STRESS_PA: [f32; 3] = [2.0, 60.0, 1200.0];
-/// Position, not a baked-in yield stress: the panel's slider rescales all
-/// three, so a label naming a pascal value would go stale the moment it
-/// moves. The `in=` field in each readout carries the live value.
-const COLUMN_LABEL: [&str; 3] = ["left", "mid", "right"];
-const COLUMN_X: [f32; 3] = [12.0, 32.0, 52.0];
-
-/// Water-based suspensions, so the density is water's.
-const RHO_KG_M3: f32 = 1000.0;
-
-/// Plastic (post-yield) viscosity, identical for all three columns -- this
-/// scene varies exactly one parameter, and this is not it. Inside the
-/// 0.1-5 Pa.s band the same doc gives for wet clay.
-const ETA_PA_S: f32 = 0.5;
-
-/// Yield strain, tau_0/G: how far a yield-stress fluid can be sheared
-/// before it starts to flow. Real ones measure in the 1-10% band pretty
-/// much regardless of what they are, so 5% is a stated property of the
-/// material class rather than three unrelated numbers picked per column.
-/// It is what ties each column's storage modulus to its own tau_0, so
-/// tau_0 stays the single independent variable of the scene.
-const YIELD_STRAIN: f32 = 0.05;
-
-/// 20 mm across for 40 tall. The scene used to stand these columns at
-/// 8 mm across, an aspect ratio of 5 to 1, and the stiffest one did not
-/// demonstrate a yield stress at all: it stood while the soft ones spread,
-/// then TOPPLED, and the fall generated the stress that made it flow.
-/// Measured (`bingham_slump_probe`): its standing shear sat at 0.59 of its
-/// own yield, crossed 1.05 at the instant it fell, and it ended flatter
-/// than the column with a twentieth of its yield stress. At 2 to 1 it
-/// stays where it is put, which is the behaviour this scene is about.
-const COLUMN_CELLS: IVec2 = IVec2::new(10, 20);
-/// Particle lattice spacing, in cells. Named because the cursor needs it
-/// too: it fixes each particle's mass per unit depth, and with it the force
-/// a push in pascals has to apply.
-const SPACING: f32 = 0.5;
 /// The cursor's default push and pull `P`, its net force over its diameter
 /// (see `cursor_traction.rs`). Measured in zero gravity, a block pushed
 /// this way starts keeping a permanent deformation between `P = 1` and `2`
@@ -234,135 +222,61 @@ const SPACING: f32 = 0.5;
 /// sit on their own yield surface already, so in this scene a much weaker
 /// push moves the left and middle ones.
 const CURSOR_TRACTION_PA: f32 = 300.0;
-const FLOOR_CELLS: f32 = 2.0;
 
-/// Weakly-compressible sound-speed derating (Monaghan 1994): resolving
-/// water's real 1483 m/s would cost roughly 15000 substeps per frame, so
-/// the reference sound speed is 10x the fastest flow speed this scene can
-/// produce, which holds density fluctuation under 1%. `v_max` comes from
-/// free fall over the column's own height, not from a tuned number, and the
-/// bulk modulus is then the definition `K = rho c^2`.
-fn bulk_modulus_pa() -> f32 {
-    let column_height_m = COLUMN_CELLS.y as f32 * DX_M;
-    let v_max = (2.0 * 9.81 * column_height_m).sqrt();
-    let c_ref = 10.0 * v_max;
-    RHO_KG_M3 * c_ref * c_ref
+/// Half-widths, in cells, that `COLUMN_X` leaves each deposit: what they
+/// measure alone once settled, the softest rounded up because it still
+/// creeps. See `COLUMN_X`.
+const DEPOSIT_HALF_WIDTH_CELLS: [f32; 3] = [50.0, 13.2, 4.8];
+
+/// The stage the slump ends on, in cells: every deposit at its settled
+/// width, the columns' full height, the floor, and three cells of margin.
+/// The camera starts on this rather than on the standing columns, so it
+/// does not have to zoom out while the softest one spreads; on screen that
+/// read as the particles shrinking.
+fn stage() -> (Vec2, Vec2) {
+    let left = COLUMN_X[0] - DEPOSIT_HALF_WIDTH_CELLS[0];
+    let right = COLUMN_X[2] + DEPOSIT_HALF_WIDTH_CELLS[2];
+    let top = FLOOR_CELLS + COLUMN_CELLS.y as f32;
+    (
+        Vec2::new(left - 3.0, 0.0),
+        Vec2::new(right + 3.0, top + 3.0),
+    )
 }
 
-fn make_config(gravity_fraction: f32) -> SimConfig {
-    let mut config = SimConfig {
-        // The acoustic CFL bound here is ~2e-4 s, below the 1e-3 s default
-        // floor; leaving the default would clamp the substep above its own
-        // stability limit.
-        min_dt: 1.0e-5,
-        // Real arithmetic, not a knob turned until it stopped complaining.
-        // The acoustic CFL bound at this sound speed is ~74 us, so a 5 ms
-        // frame genuinely needs ~68 substeps, and the 64 default is a
-        // budget rather than a physics cap (see its own doc). 256 leaves
-        // room for the compression transient at first contact, where the
-        // Tait EOS raises the local sound speed above its rest value.
-        max_substeps_per_step: 256,
-        ..SimConfig::earth(GRID, DX_M, DT_S_DEFAULT)
-    };
-    config.gravity *= gravity_fraction;
-    config
-}
-
-/// All three columns, built through the SI property route so every number
-/// entered is a real pascal. The materials come back too: their grid-unit
-/// `yield_stress` is what the shear-stress colour scale normalizes by.
-fn make_sim(gravity_fraction: f32, yield_scale: f32) -> (Simulation, [BinghamFluidMaterial; 3]) {
-    let config = make_config(gravity_fraction);
-    let k_pa = bulk_modulus_pa();
-
-    let build = |tau0_pa: f32| {
-        let props = BinghamProps {
-            rho_kg_m3: RHO_KG_M3,
-            eta_pa_s: ETA_PA_S,
-            bulk_modulus_pa: k_pa,
-            yield_stress_pa: tau0_pa * yield_scale,
-            // The storage modulus below the yield point. Without it this
-            // material computes its deviatoric stress purely from the
-            // CURRENT rate of strain, so at rest it has none and all three
-            // columns collapse into identical puddles -- the model's own
-            // limitation, not a bug, confirmed against the same model in
-            // `tmp/GeoTaichi`. Holding a shape needs stored elastic shear
-            // energy; this is it.
-            shear_modulus_pa: tau0_pa * yield_scale / YIELD_STRAIN,
-            cavitation_pressure_pa: BinghamProps::air_entrained_cavitation_pressure(),
-        };
-        let mut m = BinghamFluidMaterial::from_physical(&props, &config);
-        // Measured coefficients, not a substance claim: the continuous
-        // phase of all three is water, so all three get water's measured
-        // absorption (Pope & Fry 1997). The suspended solids have their own
-        // spectrum this engine holds no measurement for; that stays a named
-        // gap rather than an invented tint. Identical across the three, so
-        // nothing distinguishes them visually except how they move.
-        m.optics = Some(emerge::materials::optical::pure_water());
-        m.specific_heat_j_kg_k = 4182.0; // water, CRC Handbook
-        (m, props)
-    };
-
-    let spawn = |slot: usize, props: &BinghamProps| {
-        SpawnRegion {
-            spacing: SPACING,
-            box_size: COLUMN_CELLS,
-            box_center: Vec2::new(COLUMN_X[slot], FLOOR_CELLS + COLUMN_CELLS.y as f32 * 0.5),
-            material_id: slot as u32,
-            initial_velocity_scale: 0.0,
-            ..SpawnRegion::for_sim(&config)
-        }
-        // Real density -> real particle mass, rather than a hand-picked one.
-        .mass_from(props, &config)
-    };
-
-    let (m0, p0) = build(YIELD_STRESS_PA[0]);
-    let (m1, p1) = build(YIELD_STRESS_PA[1]);
-    let (m2, p2) = build(YIELD_STRESS_PA[2]);
-
-    let mut sim = Simulation::new(config, spawn(0, &p0))
-        .with_default_material(Box::new(m0))
-        .with_material(1, Box::new(m1))
-        .with_material(2, Box::new(m2))
-        .with_boundary(Box::new(SlipBoundary::new(config.boundary_thickness)));
-    let _ = sim.add_body(spawn(1, &p1));
-    let _ = sim.add_body(spawn(2, &p2));
-    (sim, [m0, m1, m2])
-}
-
-/// Turn each deposit back into a yield stress and compare it with the one
-/// that was entered -- see this file's header for the relation and its
-/// stated limits.
-fn print_slump(sim: &Simulation, elapsed_s: f32, yield_scale: f32) {
-    const G: f32 = 9.81;
-    let mut line = format!("SLUMP t={elapsed_s:.2}s");
-    for slot in 0..3u32 {
-        let (mut top, mut lo, mut hi, mut n) = (f32::MIN, f32::MAX, f32::MIN, 0u32);
-        let mut speed = 0.0f32;
-        for p in sim.particles().iter().filter(|p| p.material_id == slot) {
-            top = top.max(p.x.y);
-            lo = lo.min(p.x.x);
-            hi = hi.max(p.x.x);
-            speed = speed.max(p.v.length());
-            n += 1;
-        }
-        if n == 0 {
-            continue;
-        }
-        let h_m = (top - FLOOR_CELLS).max(0.0) * DX_M;
-        let half_width_m = ((hi - lo) * 0.5).max(1.0e-6) * DX_M;
-        let tau_measured = RHO_KG_M3 * G * h_m * h_m / (2.0 * half_width_m);
-        line += &format!(
-            "  {}[h={:.1}mm L={:.1}mm in={:.0} meas={:.0} vmax={:.3}]",
-            COLUMN_LABEL[slot as usize],
-            h_m * 1000.0,
-            half_width_m * 1000.0,
-            YIELD_STRESS_PA[slot as usize] * yield_scale,
-            tau_measured,
-            speed,
-        );
+/// Every particle, a margin of three cells, and the floor: what the camera
+/// must still contain if a push carries material off the stage.
+fn footprint(sim: &Simulation) -> (Vec2, Vec2) {
+    let (mut lo, mut hi) = (Vec2::splat(f32::MAX), Vec2::splat(f32::MIN));
+    for p in sim.particles().iter() {
+        lo = lo.min(p.x);
+        hi = hi.max(p.x);
     }
-    println!("{line}");
+    (Vec2::new(lo.x - 3.0, 0.0), hi + Vec2::splat(3.0))
+}
+
+/// Each deposit's shape and what it says about its yield stress, next to
+/// the one that went in -- see this file's header for the relations and
+/// their limits. One line per column, for the panel; the console gets them
+/// with the shape every hundred frames.
+fn read_deposits(
+    sim: &Simulation,
+    watches: &mut [SlumpWatch; 3],
+    yield_scale: f32,
+    g: f32,
+) -> [String; 3] {
+    std::array::from_fn(|slot| {
+        let tau_in = YIELD_STRESS_PA[slot] * yield_scale;
+        match deposit(sim, slot as u32) {
+            Some((h_m, half_width_m, speed)) => format!(
+                "{} ({tau_in:.0} Pa in, h {:.1} mm, L {:.1} mm): {}",
+                COLUMN_LABEL[slot],
+                h_m * 1000.0,
+                half_width_m * 1000.0,
+                describe(&watches[slot].read(h_m, half_width_m, speed, g))
+            ),
+            None => format!("{} ({tau_in:.0} Pa in): gone", COLUMN_LABEL[slot]),
+        }
+    })
 }
 
 struct State {
@@ -387,11 +301,21 @@ struct State {
     fps_timer: std::time::Instant,
     fps_frames: u64,
     last_fps: f32,
-    /// Real deviatoric (shear) stress field. For a Bingham fluid this IS
-    /// the quantity the yield criterion tests, so the colour scale is
-    /// normalized by the middle column's own tau_0: the map saturates
-    /// exactly where that material starts to flow.
+    /// Colour each particle by the shear its yield criterion tests, divided
+    /// by its OWN column's tau_0: blue well below yield, red from the moment
+    /// a material starts to flow, in all three columns at once. Pressure is
+    /// left out on purpose. The engine's generic stress view,
+    /// `von_mises_stress_field`, takes the plane-stress von Mises of the full
+    /// stress, where a pure pressure reads as its own magnitude; on these
+    /// deposits that painted their weight, not their shear
+    /// (`tests/scratch_bingham_deposit_state.rs`).
     show_stress: bool,
+    /// The region the camera frames: the stage the slump ends on, grown
+    /// only if a push carries material off it, never shrunk; reset with the
+    /// scene.
+    view: (Vec2, Vec2),
+    /// Whether each column's collapse is over, for its reading.
+    watches: [SlumpWatch; 3],
 }
 
 impl State {
@@ -400,14 +324,15 @@ impl State {
         let size = window.inner_size();
         let gravity_fraction = 1.0;
         let yield_scale = 1.0;
-        let (mut sim, materials) = make_sim(gravity_fraction, yield_scale);
+        let (mut sim, materials) = make_sim(gravity_fraction, yield_scale, DT_S_DEFAULT);
         let cursor =
             cursor_traction::CursorTraction::new(5.0, CURSOR_TRACTION_PA, CURSOR_TRACTION_PA)
                 .with_lattice(RHO_KG_M3, SPACING, DX_M);
         sim.add_force_field(Box::new(cursor.field()));
 
         let mut renderer = Renderer::new(&gfx.device, sim.particles().len(), gfx.format);
-        renderer.set_camera(&gfx.queue, GRID as u32, size.width, size.height, 0.6, true);
+        let view = stage();
+        renderer.set_camera_region(&gfx.queue, view, size.width, size.height, 0.6, true);
         renderer.set_color_mode(ColorMode::ByPhysics);
         // Optical coefficients read straight off the materials, so nothing
         // about the colour is typed into this file.
@@ -421,7 +346,7 @@ impl State {
             "  same rho={RHO_KG_M3} kg/m3, eta={ETA_PA_S} Pa.s, K={:.0} Pa -- only tau_0 differs: {YIELD_STRESS_PA:?} Pa",
             bulk_modulus_pa(),
         );
-        println!("  LMB push  RMB pull  V shear-stress field  R reset  Q quit");
+        println!("  LMB push  RMB pull  V shear / own yield  R reset  Q quit");
 
         Self {
             gfx,
@@ -441,6 +366,8 @@ impl State {
             fps_frames: 0,
             last_fps: 0.0,
             show_stress: false,
+            view,
+            watches: Default::default(),
         }
     }
 
@@ -450,20 +377,22 @@ impl State {
             return;
         }
         self.renderer
-            .set_camera(&self.gfx.queue, GRID as u32, w, h, 0.6, true);
+            .set_camera_region(&self.gfx.queue, self.view, w, h, 0.6, true);
     }
 
     fn cursor_grid(&self) -> Vec2 {
+        // The camera frames a region, not the whole grid, so the cursor is
+        // read back through that region's projection.
         gui_common::cursor_to_grid(
             self.cursor_pos,
             self.gfx.surface_config.width,
             self.gfx.surface_config.height,
-            GRID,
+            self.view,
         )
     }
 
     fn reset(&mut self) {
-        let (mut sim, materials) = make_sim(self.gravity_fraction, self.yield_scale);
+        let (mut sim, materials) = make_sim(self.gravity_fraction, self.yield_scale, DT_S_DEFAULT);
         sim.add_force_field(Box::new(self.cursor.field()));
         self.sim = sim;
         self.materials = materials;
@@ -471,11 +400,19 @@ impl State {
             .adopt_material_optics(&self.gfx.queue, self.sim.materials());
         self.frame = 0;
         self.elapsed_s = 0.0;
+        self.view = stage();
+        self.watches = Default::default();
+        let (w, h) = (
+            self.gfx.surface_config.width,
+            self.gfx.surface_config.height,
+        );
+        self.renderer
+            .set_camera_region(&self.gfx.queue, self.view, w, h, 0.6, true);
     }
 
     fn update_and_render(&mut self, window: &Window) {
         self.sim
-            .set_gravity(make_config(self.gravity_fraction).gravity);
+            .set_gravity(make_config(self.gravity_fraction, DT_S_DEFAULT).gravity);
         self.sim.set_step_duration(self.step_seconds);
 
         // A traction in pascals, not a multiple of weight: the old push was
@@ -491,8 +428,21 @@ impl State {
 
         self.sim.step();
 
+        let g = 9.81 * self.gravity_fraction;
+        let readings = read_deposits(&self.sim, &mut self.watches, self.yield_scale, g);
         if self.frame.is_multiple_of(100) {
-            print_slump(&self.sim, self.elapsed_s, self.yield_scale);
+            println!("SLUMP t={:.2}s  {}", self.elapsed_s, readings.join("  "));
+        }
+        let (lo, hi) = footprint(&self.sim);
+        let grown = (self.view.0.min(lo), self.view.1.max(hi));
+        if grown != self.view {
+            self.view = grown;
+            let (w, h) = (
+                self.gfx.surface_config.width,
+                self.gfx.surface_config.height,
+            );
+            self.renderer
+                .set_camera_region(&self.gfx.queue, self.view, w, h, 0.6, true);
         }
 
         self.frame += 1;
@@ -505,13 +455,15 @@ impl State {
         }
 
         if self.show_stress {
-            let stress = self
-                .sim
-                .materials()
-                .von_mises_stress_field(self.sim.particles());
-            self.renderer.set_stress_field(stress);
-            self.renderer
-                .set_stress_scale(1.0 / self.materials[1].yield_stress.max(1.0e-9));
+            let p = self.sim.particles();
+            let shear: Vec<f32> = (0..p.len())
+                .map(|i| {
+                    let m = &self.materials[p.material_id[i] as usize];
+                    deviatoric_shear(m.kirchhoff_stress(p, i)) / m.yield_stress.max(1.0e-12)
+                })
+                .collect();
+            self.renderer.set_stress_field(shear);
+            self.renderer.set_stress_scale(1.0);
         }
 
         let output = match self.gfx.surface.get_current_texture() {
@@ -618,7 +570,12 @@ impl State {
                     ui.separator();
                     ui.label("Same density, viscosity, bulk modulus and shape.");
                     ui.label("Left spreads, middle holds a slope, right keeps its shape.");
-                    ui.label("V = shear stress, saturating at the middle column's yield.");
+                    ui.separator();
+                    ui.label("What each deposit says about its own yield stress:");
+                    for line in &readings {
+                        ui.label(line);
+                    }
+                    ui.label("V = shear / its own yield stress: red at yield, blue well below.");
                     ui.separator();
                     ui.label("LMB push  RMB pull  V stress  R reset  Q quit");
                     if ui.button("Reset").clicked() {
