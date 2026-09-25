@@ -409,6 +409,32 @@ over the same sweep, it fired 0 times in 418,714,560 node evaluations (issue
 The invariant it protects is kept as a test,
 `a_rigid_translation_reads_no_velocity_gradient`.
 
+### A yield-stress fluid below its yield rings forever
+
+`BinghamFluidMaterial`'s elastoviscoplastic branch (Saramito 2007, as a
+radial return with a Perzyna viscous overstress) is purely elastic below its
+yield stress: the viscosity only acts once the material flows. So a block
+loaded under its yield and released has nothing to take the energy out, and
+it rebounds and rings indefinitely. Seen directly in
+`tests/scratch_bingham_cursor_yield.rs`: in zero gravity a 1200 Pa block
+pushed at half its yield and released keeps oscillating, which is what gives
+that row its higher floor, 0.15 mm of apparent change of shape at x0.5
+against 0.006 for the 60 Pa block.
+
+It is also a departure from the model this branch cites. Woodbridge, Fonte
+and Juel (arXiv 2609.12229, 2026, a yield-stress spreading study built on
+the Saramito family) describe it as: "Below yield, the material behaves as a
+linear viscoelastic solid". The dissipation below yield comes from a solvent
+viscosity acting at all stresses, which this radial-return version keeps
+only inside the plastic flow. A real gel dissipates below yield too. The
+same paper notes that one solvent viscosity cannot match both the flow well
+above yield and the sub-yield response, so the coefficient would have to be
+measured for the sub-yield regime on its own.
+
+Declared (2), not a bug: every column that sits at rest in a scene is
+unaffected, and only a column set vibrating below yield shows it. Closing
+it means a viscous term acting below yield as well, with that coefficient.
+
 ### GPU snow hardens differently at a body's edge
 
 Two measurements, months apart and from opposite directions, that are
