@@ -435,6 +435,16 @@ Declared (2), not a bug: every column that sits at rest in a scene is
 unaffected, and only a column set vibrating below yield shows it. Closing
 it means a viscous term acting below yield as well, with that coefficient.
 
+### A settled yield-stress deposit's shear jumps between lines of particles
+
+On the slump demo's 60 Pa deposit, the shear over its own yield differs
+between a particle and its neighbours by 0.075 on average, against a spread
+of 0.168 across the whole deposit; the demo's stress view shows it as
+stripes. It is not the gripping floor: 0.070 on a slip floor against 0.074,
+and strongest in the top band, not the bottom one
+(`tests/scratch_bingham_deposit_state.rs`, `the_stripes_on_each_floor`).
+Cause not established; no issue yet.
+
 ### GPU snow hardens differently at a body's edge
 
 Two measurements, months apart and from opposite directions, that are
