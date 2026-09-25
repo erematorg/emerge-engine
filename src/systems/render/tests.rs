@@ -644,26 +644,16 @@ fn gpu_thermal_emission_gets_bluer_with_temperature() {
 /// must show up as that color roughly at the texture center the camera
 /// maps them to -- not the clear color (0.05, 0.05, 0.08).
 ///
-/// `#[ignore]`d, real and not a false alarm to delete (2026-08-15, see
-/// `basic_fluids_gpu_blank_render_unconfirmed` memory): FAILS as written,
-/// full-texture pixel scan finds zero particle-colored pixels. Diagnostic
-/// buffer reads (see the `eprintln!` below, and `render_cpu_produces_
-/// visible_particle_pixels_control` next to this test) proved
-/// `storage_instances` AND `instance_buffer` both hold fully correct data
+/// `#[ignore]`d, and failing on real hardware since it was written: issue
+/// #45. The full-texture scan finds no particle-coloured pixel; the
+/// brightest pixel is the clear colour itself, `[63, 63, 80, 255]`, so
+/// nothing brighter than the background is written. The buffer reads below
+/// show `storage_instances` and `instance_buffer` both holding correct data
 /// (`position=[10.0, 16.0]`, `color=[0.35, 0.65, 1.0, 1.0]`) after
-/// `render_gpu` runs -- the compute-shader prep and the GPU->GPU copy are
-/// BOTH provably correct. The CPU control test fails the *exact same way*
-/// under these *exact same* tiny-texture (64x64) / small-quad
-/// (`particle_scale=0.6` -> ~2.4px quads at this camera scale) parameters,
-/// which points at either a shared `draw_pass` issue or a sub-pixel
-/// rasterization edge case specific to this synthetic test's scale/the
-/// `headless_device()` (`PowerPreference::None`, possibly a software
-/// rasterizer) -- NOT proven to be the same root cause as the live blank
-/// window in `basic_fluids_gpu.rs` (which renders far more particles at a
-/// far larger window size). Left `#[ignore]`d rather than fixed blind:
-/// resolving which of these explanations is real needs either a
-/// larger-texture variant of this exact test or the user's own live check.
-#[ignore = "real, reproducible failure -- root cause ambiguous (shared draw_pass vs tiny-quad/headless-rasterizer edge case), not proven to match the live basic_fluids_gpu.rs blank-render finding; see basic_fluids_gpu_blank_render_unconfirmed memory"]
+/// `render_gpu`, and the CPU control next to this test fails the same way,
+/// so the loss is after instance preparation and common to both paths.
+/// Where exactly is not measured; the issue lists what would tell.
+#[ignore = "fails on real hardware, nothing reaches the target: issue #45"]
 #[test]
 fn render_gpu_produces_visible_particle_pixels_not_just_clear_color() {
     use crate::gpu::GpuSimulation;
@@ -763,11 +753,14 @@ fn render_gpu_produces_visible_particle_pixels_not_just_clear_color() {
             &raw2[8..12],
         );
     }
+    // What the texture holds instead, so a failure says what it read.
+    let brightest = readback_brightest_pixel(&device, &queue, &texture, 64, 64);
     assert!(
         found_particle_color,
         "render_gpu must produce visible material-0 (blue) particle pixels \
          near the texture center, not just the clear color -- prep_instances.wgsl \
-         either isn't running, isn't writing real data, or isn't reaching the draw pass"
+         either isn't running, isn't writing real data, or isn't reaching the draw pass; \
+         brightest pixel in the target {brightest:?}"
     );
 }
 
@@ -776,12 +769,9 @@ fn render_gpu_produces_visible_particle_pixels_not_just_clear_color() {
 /// blank result is specific to the GPU compute-prep path or a shared
 /// `draw_pass`/pipeline problem that would affect both.
 ///
-/// `#[ignore]`d alongside the test above (2026-08-15): also FAILS under
-/// these exact tiny-texture/small-quad parameters, which is what shifted
-/// this investigation's conclusion from "render_gpu-specific bug" to
-/// "ambiguous, possibly a shared or test-scale-specific issue" -- see that
-/// test's own doc for the full reasoning.
-#[ignore = "same real, ambiguous failure as render_gpu_produces_visible_particle_pixels_not_just_clear_color -- kept as the paired control, see that test's doc"]
+/// `#[ignore]`d alongside the test above and failing the same way, issue
+/// #45: the brightest pixel is the clear colour.
+#[ignore = "fails on real hardware like the GPU test above: issue #45"]
 #[test]
 fn render_cpu_produces_visible_particle_pixels_control() {
     use crate::{MaterialRegistry, NeoHookeanMaterial, SimConfig, SpawnRegion, build_particles};
@@ -837,10 +827,12 @@ fn render_cpu_produces_visible_particle_pixels_control() {
             break;
         }
     }
+    let brightest = readback_brightest_pixel(&device, &queue, &texture, 64, 64);
     assert!(
         found_particle_color,
         "control: CPU render_slice() must produce visible particle pixels with the \
-         exact same scene/camera/texture params as the GPU test above"
+         exact same scene/camera/texture params as the GPU test above; brightest \
+         pixel in the target {brightest:?}"
     );
 }
 
