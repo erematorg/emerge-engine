@@ -298,3 +298,90 @@ fn the_blob_shapes_now() {
         }
     }
 }
+
+/// The strand that climbs the right wall on landing and falls back later
+/// like a snake: which of the wall, its lack of friction and the reduced
+/// gravity makes it? The stiff blob alone, the demo's constants, four
+/// variants; printed, the highest particle after landing (frames 40 to 240)
+/// against the blob's starting top.
+///
+/// Found: only the blob next to the right wall, on the slip wall, at the
+/// demo's gravity throws a jet, and it tops the blob's starting top (27.4
+/// against 26.5). In the middle the highest is 13.6; with wall friction 0.5
+/// or 1, 11.3 and 11.1; at ten times the gravity, 14.5. The jet needs the
+/// wall, its lack of friction and the reduced gravity together. No energy
+/// balance was measured, so whether a few particles gain energy in the jet
+/// is open.
+#[test]
+#[ignore = "diagnostic probe kept for reruns, not part of the CI suite"]
+fn the_right_wall_jet() {
+    let stiff = VonMisesMaterial::new(LAMBDA * 5.0, MU * 5.0, MU * 5.0 * 0.05);
+    for (label, x, friction, gravity) in [
+        (
+            "next to the right wall, slip wall, demo gravity",
+            50.0f32,
+            None,
+            0.003f32,
+        ),
+        ("in the middle, walls far", 32.0, None, 0.003),
+        (
+            "next to the right wall, wall friction 0.5",
+            50.0,
+            Some(0.5f32),
+            0.003,
+        ),
+        (
+            "next to the right wall, wall friction 1",
+            50.0,
+            Some(1.0),
+            0.003,
+        ),
+        (
+            "next to the right wall, slip wall, ten times the gravity",
+            50.0,
+            None,
+            0.03,
+        ),
+    ] {
+        let mut config = SimConfig {
+            min_dt: 0.01,
+            max_substeps_per_step: 8,
+            ..SimConfig::earth(GRID, 0.01, DT)
+        };
+        config.gravity *= gravity;
+        let spawn = SpawnRegion {
+            spacing: 0.5,
+            box_size: IVec2::new(14, 14),
+            box_center: Vec2::new(x, 20.0),
+            material_id: 0,
+            initial_velocity_scale: 0.0,
+            ..SpawnRegion::for_sim(&config)
+        };
+        let wall: Box<dyn emerge::BoundaryCondition> = match friction {
+            None => Box::new(SlipBoundary::new(config.boundary_thickness)),
+            Some(mu) => Box::new(emerge::FrictionBoundary::new(config.boundary_thickness, mu)),
+        };
+        let mut sim = Simulation::new(config, spawn)
+            .with_default_material(Box::new(stiff))
+            .with_boundary(wall);
+        let top = |sim: &Simulation| {
+            sim.particles()
+                .x
+                .iter()
+                .map(|p| p.y)
+                .fold(f32::MIN, f32::max)
+        };
+        let start = top(&sim);
+        let mut highest = f32::MIN;
+        for frame in 1..=240 {
+            sim.step();
+            if frame >= 40 {
+                highest = highest.max(top(&sim));
+            }
+        }
+        let above = sim.particles().x.iter().filter(|p| p.y > start).count();
+        println!(
+            "{label:<58} start top {start:.1}, highest after landing {highest:.1}, particles above the start at the end {above}"
+        );
+    }
+}
