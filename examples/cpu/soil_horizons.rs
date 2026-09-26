@@ -11,7 +11,7 @@ mod gui_common;
 ///                                     (closest existing loose/low-cohesion preset)
 ///   A (mineral+organic topsoil)   -> GranularFluidMaterial::saturated_loam
 ///                                     ("loam" IS the real A-horizon texture class)
-///   B (clay-illuviated subsoil)   -> NaccMaterial::wet_soil (Cam-Clay -- real clay
+///   B (clay-illuviated subsoil)   -> NaccMaterial::kaolin (Cam-Clay -- real clay
 ///                                     accumulation zone)
 ///   C (weathered parent material) -> DruckerPragerMaterial::dilatant (denser,
 ///                                     closer to intact rock than A/O)
@@ -66,8 +66,23 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 const GRID: usize = 64;
-const DT: f32 = 0.1;
+/// Simulated time per rendered frame. The CFL condition of these four
+/// materials asks for about 49 substeps per 0.1 of simulated time, whatever
+/// the cursor does, so the old 0.1 per frame could not fit its 16-substep
+/// budget and the solver stopped on the first frame. Measured headless
+/// (`soil_horizons_cost_probe`, release):
+///
+/// ```text
+///   0.1   per frame   48.4 substeps   239 ms    4 fps
+///   0.02  per frame   10.0 substeps    35 ms   29 fps
+///   0.01  per frame    5.0 substeps    21 ms   49 fps (45 under the strongest press)
+/// ```
+///
+/// 0.01 leaves the budget three times the need. Materials are unchanged; the
+/// scene plays slower instead.
+const DT: f32 = 0.01;
 const SPACING: f32 = 0.5;
+const GRAVITY_MAGNITUDE: f32 = 0.3;
 
 const O_ID: u32 = 0;
 const A_ID: u32 = 1;
@@ -92,8 +107,18 @@ const A_THICKNESS: f32 = 8.0;
 const B_THICKNESS: f32 = 14.0;
 const C_THICKNESS: f32 = 16.0;
 
+/// Mean stress a layer already carries from everything above it, in grid
+/// units: the weight per cell of each layer above plus half of its own,
+/// times gravity, turned into a mean stress with Jaky's earth-pressure
+/// coefficient at rest, `K0 = 1 - sin(phi')`, so `p = sigma_v (1 + K0)/2`
+/// in plane strain. A soil in place has carried this for a long time, so
+/// its clay starts preconsolidated under it instead of as fresh slurry.
+const CLAY_FRICTION_ANGLE_SIN: f32 = 0.436; // kaolin, 25.9 degrees
+
 const DIG_RADIUS: f32 = 4.0;
-const DIG_STRENGTH: f32 = 10.0;
+/// Velocity change per unit of simulated time, applied as `DIG_RATE * DT`
+/// each frame so digging does not depend on the frame time.
+const DIG_RATE: f32 = 100.0;
 
 // Real footstep-force probe: hold F at the cursor to press straight down, like a
 // creature's foot loading the ground. PRESS_RADIUS approximates a real footprint
@@ -153,7 +178,7 @@ fn make_sim() -> Simulation {
         // SimConfig::earth) -- tuned down for a calmer, more legible demo at this
         // grid scale, same disclosed convention `basic_showcase.rs`/`fire_spread.rs`
         // already use.
-        gravity: Vec2::new(0.0, -0.3),
+        gravity: Vec2::new(0.0, -GRAVITY_MAGNITUDE),
         ..SimConfig::earth(GRID, 0.01, DT)
     };
 
@@ -175,7 +200,15 @@ fn make_sim() -> Simulation {
     // module doc's A-horizon note).
     let a_horizon = GranularFluidMaterial::saturated_loam(1200.0, 0.3);
     // B: clay-illuviated subsoil -- Non-Associated Cam-Clay, real wet-clay regime.
-    let b_horizon = NaccMaterial::wet_soil(1800.0, 0.3);
+    let mut b_horizon = NaccMaterial::kaolin(1800.0, 0.3);
+    // Areal density is a spawn's own particle mass over its cell area, and
+    // the B horizon lies under O and A plus half of itself.
+    let areal = |ratio: f32| ratio / (SPACING * SPACING);
+    let sigma_v = GRAVITY_MAGNITUDE
+        * (areal(O_DENSITY_RATIO) * O_THICKNESS
+            + areal(A_DENSITY_RATIO) * A_THICKNESS
+            + areal(B_DENSITY_RATIO) * B_THICKNESS * 0.5);
+    b_horizon.initial_preconsolidation = sigma_v * (2.0 - CLAY_FRICTION_ANGLE_SIN) * 0.5;
     // C: weathered parent material -- denser, closer to intact rock.
     let c_horizon = DruckerPragerMaterial::dilatant(2400.0, 0.3);
 
@@ -218,7 +251,6 @@ fn make_sim() -> Simulation {
             box_size: IVec2::new(COLUMN_HALF_WIDTH * 2, thickness.round().max(1.0) as i32),
             box_center: Vec2::new(center_x, y_bottom + thickness * 0.5),
             material_id,
-            precompute_initial_volumes: true,
             mass_override: Some(density_ratio),
             ..SpawnRegion::for_sim(&config)
         };
@@ -404,9 +436,9 @@ impl State {
     fn update_and_render(&mut self, window: &Window) {
         if self.lmb || self.rmb {
             let mag = if self.lmb {
-                DIG_STRENGTH
+                DIG_RATE * DT
             } else {
-                -DIG_STRENGTH
+                -DIG_RATE * DT
             };
             self.sim
                 .apply_radial_impulse(self.cursor_grid(), DIG_RADIUS, mag);

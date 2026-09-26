@@ -117,10 +117,15 @@ fn cantilever_with_optional_particles(with_particles: bool, steps: usize) -> (Op
     solver.add_rod(emerge::rod::Rod::new(rod_points, material));
 
     if with_particles {
+        // The 0.05-cell sag margin below was set for a load of 1.0 per
+        // particle. Particle mass is now derived from grid density (0.25 at
+        // this spacing), which leaves only a 0.028-cell margin, so the load
+        // is fixed explicitly rather than lowering the margin.
         let particle_spawn = SpawnRegion {
             spacing: 0.5,
             box_size: IVec2::new(1, 1),
             box_center: Vec2::new(9.0, 25.5),
+            mass_override: Some(1.0),
             ..SpawnRegion::for_sim(solver.config())
         };
         let _ = solver.add_body(particle_spawn);

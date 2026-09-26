@@ -193,6 +193,33 @@ impl FrameLogger {
         }
         line.push_str("]}");
 
+        self.write_line(&line);
+    }
+
+    /// Append one text picture from [`crate::diagnostics::scene_map`] as
+    /// its own line, `{"frame":N,"map":"<name>","rows":[...]}`, top row
+    /// first, so the log shows where things are as well as how much. Read
+    /// one back with
+    /// `jq -r 'select(.map=="<name>" and .frame==N) | .rows[]' run.ndjson`.
+    pub fn log_map(&mut self, frame: u64, name: &str, rows: &[String]) {
+        let escape = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+        let mut line = format!(
+            "{{\"frame\":{frame},\"map\":\"{}\",\"rows\":[",
+            escape(name)
+        );
+        for (i, row) in rows.iter().enumerate() {
+            if i > 0 {
+                line.push(',');
+            }
+            line.push('"');
+            line.push_str(&escape(row));
+            line.push('"');
+        }
+        line.push_str("]}");
+        self.write_line(&line);
+    }
+
+    fn write_line(&mut self, line: &str) {
         let _ = writeln!(self.writer, "{}", line);
         self.calls_since_flush += 1;
         if self.calls_since_flush >= FLUSH_EVERY {

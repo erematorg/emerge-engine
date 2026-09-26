@@ -106,7 +106,6 @@ fn sand_angle_of_repose_is_physical() {
         box_size: IVec2::new(8, 16),
         box_center: Vec2::new(GRID as f32 * 0.5, FLOOR + 8.0),
         material_id: 0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
 
@@ -210,6 +209,7 @@ fn sand_angle_of_repose_is_physical() {
 /// evidence the missing boundary friction, not some deeper collapse-
 /// dynamics issue, was what forced such a low value in the first place.
 #[test]
+#[ignore = "slow: about 5 min in the CI debug profile, runs in the slow-tests workflow"]
 fn sand_collapse_with_phase_gated_relaxation_after_dynamics() {
     // Local, WIDER grid than the shared module GRID=64 -- that domain is
     // only just barely large enough for the baseline test's own dynamics
@@ -233,7 +233,6 @@ fn sand_collapse_with_phase_gated_relaxation_after_dynamics() {
         box_size: IVec2::new(8, 16),
         box_center: Vec2::new(LOCAL_GRID as f32 * 0.5, FLOOR + 8.0),
         material_id: 0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
 
@@ -354,7 +353,6 @@ fn diag_pour_apic_blend_sweep_after_real_boundary_friction_fix() {
             box_size: IVec2::new(4, 1),
             box_center: Vec2::new(cx, POUR_FLOOR + 0.5),
             material_id: 0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         let mut solver = Simulation::new(config, seed)
@@ -372,7 +370,6 @@ fn diag_pour_apic_blend_sweep_after_real_boundary_friction_fix() {
                 box_size: IVec2::new(3, 1),
                 box_center: Vec2::new(cx, surface_y + DROP_GAP_CELLS),
                 material_id: 0,
-                precompute_initial_volumes: true,
                 rng_seed: 400 + i as u32,
                 position_jitter: 0.15,
                 ..SpawnRegion::for_sim(solver.config())
@@ -430,7 +427,6 @@ fn diag_pour_boundary_mu_fast_probe() {
             box_size: IVec2::new(4, 1),
             box_center: Vec2::new(cx, POUR_FLOOR + 0.5),
             material_id: 0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         let mut solver = Simulation::new(config, seed)
@@ -448,7 +444,6 @@ fn diag_pour_boundary_mu_fast_probe() {
                 box_size: IVec2::new(3, 1),
                 box_center: Vec2::new(cx, surface_y + DROP_GAP_CELLS),
                 material_id: 0,
-                precompute_initial_volumes: true,
                 rng_seed: 400 + i as u32,
                 position_jitter: 0.15,
                 ..SpawnRegion::for_sim(solver.config())
@@ -511,7 +506,6 @@ fn sand_collapse_relaxation_long_horizon_plateau_check() {
         box_size: IVec2::new(8, 16),
         box_center: Vec2::new(LOCAL_GRID as f32 * 0.5, FLOOR + 8.0),
         material_id: 0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let sand = DruckerPragerMaterial::from_young_modulus(1.0e5, 0.2);
@@ -577,7 +571,6 @@ fn diag_static_kinetic_hysteresis_calibration_sweep() {
             box_size: IVec2::new(8, 16),
             box_center: Vec2::new(LOCAL_GRID as f32 * 0.5, FLOOR + 8.0),
             material_id: 0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         let mut sand = DruckerPragerMaterial::from_young_modulus(1.0e5, 0.2);
@@ -665,7 +658,6 @@ fn static_kinetic_hysteresis_long_horizon_full_confirmation() {
         box_size: IVec2::new(8, 16),
         box_center: Vec2::new(LOCAL_GRID as f32 * 0.5, FLOOR + 8.0),
         material_id: 0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let mut sand = DruckerPragerMaterial::from_young_modulus(1.0e5, 0.2);
@@ -731,7 +723,6 @@ fn diag_static_friction_boost_performance_probe() {
             box_size: IVec2::new(8, 16),
             box_center: Vec2::new(LOCAL_GRID as f32 * 0.5, FLOOR + 8.0),
             material_id: 0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         let mut sand = DruckerPragerMaterial::from_young_modulus(1.0e5, 0.2);
@@ -797,7 +788,6 @@ fn diag_mui_rheology_long_horizon_hold_vs_dp_baseline() {
             box_size: IVec2::new(8, 16),
             box_center: Vec2::new(LOCAL_GRID as f32 * 0.5, FLOOR + 8.0),
             material_id: 0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         let sand = DruckerPragerMaterial::from_young_modulus(1.0e5, 0.2);
@@ -835,7 +825,6 @@ fn diag_mui_rheology_long_horizon_hold_vs_dp_baseline() {
             box_size: IVec2::new(8, 16),
             box_center: Vec2::new(LOCAL_GRID as f32 * 0.5, FLOOR + 8.0),
             material_id: 0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         let sand = MuIRheologyMaterial::from_young_modulus(1.0e5, 0.2);
@@ -908,7 +897,6 @@ fn diag_preshaped_vs_collapsed_internal_state_comparison() {
             box_size: IVec2::new((2.0 * hb).ceil() as i32 + 4, height.ceil() as i32 + 4),
             box_center: Vec2::new(cx, FLOOR + 2.0 + height * 0.5),
             material_id: 0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         let sand = DruckerPragerMaterial::from_young_modulus(1.0e5, 0.2);
@@ -937,7 +925,6 @@ fn diag_preshaped_vs_collapsed_internal_state_comparison() {
             box_size: IVec2::new(8, 16),
             box_center: Vec2::new(LOCAL_GRID as f32 * 0.5, FLOOR + 8.0),
             material_id: 0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         let sand = DruckerPragerMaterial::from_young_modulus(1.0e5, 0.2);
@@ -1002,7 +989,6 @@ fn diag_collapsed_pile_after_internal_state_reset() {
         box_size: IVec2::new(8, 16),
         box_center: Vec2::new(LOCAL_GRID as f32 * 0.5, FLOOR + 8.0),
         material_id: 0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let sand = DruckerPragerMaterial::from_young_modulus(1.0e5, 0.2);
@@ -1078,7 +1064,6 @@ fn diag_preshaped_vs_collapsed_packing_regularity() {
             box_size: IVec2::new((2.0 * hb).ceil() as i32 + 4, height.ceil() as i32 + 4),
             box_center: Vec2::new(cx, FLOOR + 2.0 + height * 0.5),
             material_id: 0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         let sand = DruckerPragerMaterial::from_young_modulus(1.0e5, 0.2);
@@ -1105,7 +1090,6 @@ fn diag_preshaped_vs_collapsed_packing_regularity() {
             box_size: IVec2::new(8, 16),
             box_center: Vec2::new(LOCAL_GRID as f32 * 0.5, FLOOR + 8.0),
             material_id: 0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         let sand = DruckerPragerMaterial::from_young_modulus(1.0e5, 0.2);
@@ -1192,7 +1176,6 @@ fn diag_preshaped_pile_with_realistic_jitter_still_holds() {
         box_size: IVec2::new((2.0 * hb).ceil() as i32 + 4, height.ceil() as i32 + 4),
         box_center: Vec2::new(cx, FLOOR + 2.0 + height * 0.5),
         material_id: 0,
-        precompute_initial_volumes: true,
         position_jitter: 0.2, // the ONLY change from the proven recipe
         rng_seed: 1234,
         ..SpawnRegion::for_sim(&config)
@@ -1695,6 +1678,7 @@ fn diag_preshaped_pile_with_realistic_jitter_still_holds() {
 /// requires the structural (non-local/Cosserat) direction, not another
 /// numerics patch of this shape.
 #[test]
+#[ignore = "slow: about 6 min in the CI debug profile, runs in the slow-tests workflow"]
 fn sand_preshaped_pile_at_30deg_holds_its_slope() {
     let target_angle: f32 = 30.0;
     let height = 12.0; // cells (2x the original 6 -- confirms result is resolution-independent)
@@ -1716,7 +1700,6 @@ fn sand_preshaped_pile_at_30deg_holds_its_slope() {
         ),
         box_center: Vec2::new(cx, FLOOR + 2.0 + height * 0.5),
         material_id: 0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
 
@@ -1800,6 +1783,7 @@ fn sand_preshaped_pile_at_30deg_holds_its_slope() {
 /// question of whether confinement itself was load-bearing for this result
 /// is answered -- see the FIFTEENTH FINDING test immediately below: it is not.
 #[test]
+#[ignore = "slow: about 5 min in the CI debug profile, runs in the slow-tests workflow"]
 fn confined_pile_with_cundall_damping_reaches_real_repose_angle() {
     let target_angle: f32 = 30.0;
     let height = 12.0f32;
@@ -1819,7 +1803,6 @@ fn confined_pile_with_cundall_damping_reaches_real_repose_angle() {
         ),
         box_center: Vec2::new(cx, FLOOR + 2.0 + height * 0.5),
         material_id: 0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let sand = DruckerPragerMaterial::from_young_modulus(1.0e5, 0.2);
@@ -1878,6 +1861,7 @@ fn confined_pile_with_cundall_damping_reaches_real_repose_angle() {
 /// 12000/25000/50000/100000 steps, zero drift -- a genuine fixed point, not a
 /// slow ongoing creep that happens to be small over 6000 steps.
 #[test]
+#[ignore = "slow: about 6 min in the CI debug profile, runs in the slow-tests workflow"]
 fn unconfined_pile_with_cundall_damping_reaches_real_repose_angle() {
     let target_angle: f32 = 30.0;
     let height = 12.0f32;
@@ -1897,7 +1881,6 @@ fn unconfined_pile_with_cundall_damping_reaches_real_repose_angle() {
         ),
         box_center: Vec2::new(cx, FLOOR + 2.0 + height * 0.5),
         material_id: 0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let sand = DruckerPragerMaterial::from_young_modulus(1.0e5, 0.2);
@@ -1989,7 +1972,6 @@ fn sand_pile_built_by_slow_pour_holds_real_repose_angle() {
         box_size: IVec2::new(4, 1),
         box_center: Vec2::new(cx, POUR_FLOOR + 0.5),
         material_id: 0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let mut solver = Simulation::new(config, seed)
@@ -2006,7 +1988,6 @@ fn sand_pile_built_by_slow_pour_holds_real_repose_angle() {
             box_size: IVec2::new(6, 2),
             box_center: Vec2::new(cx, POUR_FLOOR + DROP_HEIGHT_CELLS),
             material_id: 0,
-            precompute_initial_volumes: true,
             rng_seed: 100 + i as u32,
             position_jitter: 0.1,
             ..SpawnRegion::for_sim(solver.config())
@@ -2077,6 +2058,7 @@ fn sand_pile_built_by_slow_pour_holds_real_repose_angle() {
 /// passing is NOT a claim the repose target is met, only that a real,
 /// disclosed experiment ran and produced a real, recorded number.
 #[test]
+#[ignore = "slow: about 11 min in the CI debug profile, runs in the slow-tests workflow"]
 fn sand_pile_built_by_slow_pour_with_phase_gated_damping() {
     const POUR_GRID: usize = 128;
     const POUR_DT: f32 = 0.016;
@@ -2100,7 +2082,6 @@ fn sand_pile_built_by_slow_pour_with_phase_gated_damping() {
         box_size: IVec2::new(4, 1),
         box_center: Vec2::new(cx, POUR_FLOOR + 0.5),
         material_id: 0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let mut solver = Simulation::new(config, seed)
@@ -2113,7 +2094,6 @@ fn sand_pile_built_by_slow_pour_with_phase_gated_damping() {
             box_size: IVec2::new(6, 2),
             box_center: Vec2::new(cx, POUR_FLOOR + DROP_HEIGHT_CELLS),
             material_id: 0,
-            precompute_initial_volumes: true,
             rng_seed: 100 + i as u32,
             position_jitter: 0.1,
             ..SpawnRegion::for_sim(solver.config())
@@ -2198,7 +2178,6 @@ fn sand_pile_built_by_slow_pour_tracking_real_surface_height() {
         box_size: IVec2::new(4, 1),
         box_center: Vec2::new(cx, POUR_FLOOR + 0.5),
         material_id: 0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let mut solver = Simulation::new(config, seed)
@@ -2225,7 +2204,6 @@ fn sand_pile_built_by_slow_pour_tracking_real_surface_height() {
             box_size: IVec2::new(3, 1),
             box_center: Vec2::new(cx, surface_y + DROP_GAP_CELLS),
             material_id: 0,
-            precompute_initial_volumes: true,
             rng_seed: 200 + i as u32,
             position_jitter: 0.15,
             ..SpawnRegion::for_sim(solver.config())
@@ -2296,7 +2274,6 @@ fn sand_pile_built_by_slow_pour_with_pradhana_correction() {
         box_size: IVec2::new(4, 1),
         box_center: Vec2::new(cx, POUR_FLOOR + 0.5),
         material_id: 0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let mut solver = Simulation::new(config, seed)
@@ -2321,7 +2298,6 @@ fn sand_pile_built_by_slow_pour_with_pradhana_correction() {
             box_size: IVec2::new(3, 1),
             box_center: Vec2::new(cx, surface_y + DROP_GAP_CELLS),
             material_id: 0,
-            precompute_initial_volumes: true,
             rng_seed: 200 + i as u32,
             position_jitter: 0.15,
             ..SpawnRegion::for_sim(solver.config())
@@ -2396,7 +2372,6 @@ fn diag_single_batch_impact_stress_ratio_trace() {
         box_size: IVec2::new(40, 8),
         box_center: Vec2::new(cx, FLOOR + 4.0),
         material_id: 0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let mut solver = Simulation::new(config, bed)
@@ -2418,7 +2393,6 @@ fn diag_single_batch_impact_stress_ratio_trace() {
         box_size: IVec2::new(3, 1),
         box_center: Vec2::new(cx, bed_top + 2.0),
         material_id: 0,
-        precompute_initial_volumes: true,
         rng_seed: 777,
         position_jitter: 0.15,
         ..SpawnRegion::for_sim(solver.config())
@@ -2532,7 +2506,6 @@ fn sand_pile_built_by_pour_with_randomized_drop_position() {
         box_size: IVec2::new(4, 1),
         box_center: Vec2::new(cx, POUR_FLOOR + 0.5),
         material_id: 0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let mut solver = Simulation::new(config, seed)
@@ -2571,7 +2544,6 @@ fn sand_pile_built_by_pour_with_randomized_drop_position() {
             box_size: IVec2::new(3, 1),
             box_center: Vec2::new(drop_x, surface_y + DROP_GAP_CELLS),
             material_id: 0,
-            precompute_initial_volumes: true,
             rng_seed: 300 + i as u32,
             position_jitter: 0.15,
             ..SpawnRegion::for_sim(solver.config())
@@ -2641,7 +2613,6 @@ fn diag_batch_impact_on_sloped_flank_stress_ratio_trace() {
         ),
         box_center: Vec2::new(cx, FLOOR + 2.0 + HEIGHT_CELLS * 0.5),
         material_id: 0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let mut solver = Simulation::new(config, bounding_box)
@@ -2674,7 +2645,6 @@ fn diag_batch_impact_on_sloped_flank_stress_ratio_trace() {
         box_size: IVec2::new(3, 1),
         box_center: Vec2::new(flank_x, surface_y + 2.0),
         material_id: 0,
-        precompute_initial_volumes: true,
         rng_seed: 888,
         position_jitter: 0.15,
         ..SpawnRegion::for_sim(solver.config())
@@ -2819,7 +2789,6 @@ fn sand_pile_built_by_patient_pour_matching_real_creep_timescale() {
         box_size: IVec2::new(4, 1),
         box_center: Vec2::new(cx, POUR_FLOOR + 0.5),
         material_id: 0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let mut solver = Simulation::new(config, seed)
@@ -2847,7 +2816,6 @@ fn sand_pile_built_by_patient_pour_matching_real_creep_timescale() {
             box_size: IVec2::new(3, 1),
             box_center: Vec2::new(cx, surface_y + DROP_GAP_CELLS),
             material_id: 0,
-            precompute_initial_volumes: true,
             rng_seed: 400 + i as u32,
             position_jitter: 0.15,
             ..SpawnRegion::for_sim(solver.config())
@@ -2948,7 +2916,6 @@ fn sand_column_collapse_runout_matches_lajeunesse_scaling() {
         box_size: IVec2::new(8, 16),
         box_center: Vec2::new(BIG_GRID as f32 * 0.5, FLOOR + 8.0),
         material_id: 0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let mut sand = DruckerPragerMaterial::from_young_modulus(1.0e5, 0.2);
@@ -3003,7 +2970,6 @@ fn neohookean_drop_energy_is_bounded() {
         spacing: 0.5,
         box_size: IVec2::new(6, 6),
         box_center: Vec2::new(GRID as f32 * 0.5, FLOOR + drop_height),
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
 
@@ -3094,7 +3060,6 @@ fn fluid_spreads_more_than_elastic_under_gravity() {
         spacing: 0.5,
         box_size: IVec2::new(initial_side, initial_side),
         box_center: center,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(config)
     };
 
@@ -3184,7 +3149,6 @@ fn fluid_spreads_more_than_elastic_under_gravity_with_spatial_sort() {
         spacing: 0.5,
         box_size: IVec2::new(initial_side, initial_side),
         box_center: center,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(config)
     };
 
@@ -3275,7 +3239,6 @@ fn fluid_dam_break_collapses_and_runs_out_away_from_wall() {
         spacing: 0.5,
         box_size: IVec2::new(width_cells, height_cells),
         box_center: center,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let mut solver = Simulation::new(config, spawn)
@@ -3399,7 +3362,6 @@ fn fluid_mixes_via_real_advection_not_left_segregated() {
         spacing: 0.5,
         box_size: IVec2::new(side, side),
         box_center: left_center,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let mut solver = Simulation::new(config, left_spawn)
@@ -3410,7 +3372,6 @@ fn fluid_mixes_via_real_advection_not_left_segregated() {
         spacing: 0.5,
         box_size: IVec2::new(side, side),
         box_center: right_center,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let _ = solver.add_body(right_spawn); // tag unused -- particles are identified by
@@ -3519,7 +3480,6 @@ fn fluid_energy_and_c_norm_over_run(rest_density: f32, apic_blend: f32) -> (f32,
         spacing: 0.5,
         box_size: IVec2::new(initial_side, initial_side),
         box_center: center,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let mut solver = Simulation::new(config, spawn)
@@ -3618,7 +3578,6 @@ fn asflip_preserves_more_relative_velocity_between_separating_halves() {
             spacing: 0.5,
             box_size: IVec2::new(side, side),
             box_center: center,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         // Very soft NeoHookean -- present only so the material system has something
@@ -3695,7 +3654,6 @@ fn asflip_preserves_momentum_conservation_under_free_fall() {
         spacing: 0.5,
         box_size: IVec2::new(6, 6),
         box_center: Vec2::new(GRID as f32 * 0.5, GRID as f32 * 0.75),
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let mut solver = Simulation::new(config, spawn)
@@ -4054,7 +4012,6 @@ fn earth_gravity_freefall_velocity_matches_gt() {
         spacing: 0.5,
         box_size: glam::IVec2::new(4, 4),
         box_center: glam::Vec2::new(32.0, 48.0), // near top, clear of floor
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
 
@@ -4217,7 +4174,6 @@ fn hydrostatic_pressure_matches_rho_g_h() {
         spacing: 0.5,
         box_size: glam::IVec2::new(width, 6),
         box_center: glam::Vec2::new(GRID_RES as f32 * 0.5, 5.0),
-        precompute_initial_volumes: true,
         mass_override: Some(water.particle_mass(0.5, &config)),
         ..SpawnRegion::for_sim(&config)
     };
@@ -4443,7 +4399,9 @@ fn physical_props_produce_valid_params() {
         model: PlasticityModel::CamClay {
             friction: 1.2,
             cohesion: 0.1,
-            hardening_factor: 2.0,
+            compression_index: 0.12,
+            swelling_index: 0.023,
+            void_ratio: 1.7,
         },
     };
     assert!(
@@ -4770,7 +4728,6 @@ fn diag_collapsed_pile_after_full_tensor_state_reset() {
         box_size: IVec2::new(8, 16),
         box_center: Vec2::new(LOCAL_GRID as f32 * 0.5, FLOOR + 8.0),
         material_id: 0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let sand = DruckerPragerMaterial::from_young_modulus(1.0e5, 0.2);
@@ -4851,7 +4808,6 @@ fn diag_collapsed_pile_after_deformation_gradient_only_reset() {
         box_size: IVec2::new(8, 16),
         box_center: Vec2::new(LOCAL_GRID as f32 * 0.5, FLOOR + 8.0),
         material_id: 0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let sand = DruckerPragerMaterial::from_young_modulus(1.0e5, 0.2);
@@ -4921,7 +4877,6 @@ fn diag_elastic_relaxation_calibration_sweep() {
             box_size: IVec2::new(8, 16),
             box_center: Vec2::new(LOCAL_GRID as f32 * 0.5, FLOOR + 8.0),
             material_id: 0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         let mut sand = DruckerPragerMaterial::from_young_modulus(1.0e5, 0.2);
@@ -4993,7 +4948,6 @@ fn diag_elastic_relaxation_aggressive_rate_sweep() {
             box_size: IVec2::new(8, 16),
             box_center: Vec2::new(LOCAL_GRID as f32 * 0.5, FLOOR + 8.0),
             material_id: 0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         let mut sand = DruckerPragerMaterial::from_young_modulus(1.0e5, 0.2);
@@ -5063,7 +5017,6 @@ fn diag_post_event_relax_calibration_sweep() {
             box_size: IVec2::new(8, 16),
             box_center: Vec2::new(LOCAL_GRID as f32 * 0.5, FLOOR + 8.0),
             material_id: 0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         let mut sand = DruckerPragerMaterial::from_young_modulus(1.0e5, 0.2);
@@ -5153,7 +5106,6 @@ fn post_event_relax_long_horizon_full_confirmation() {
         box_size: IVec2::new(8, 16),
         box_center: Vec2::new(LOCAL_GRID as f32 * 0.5, FLOOR + 8.0),
         material_id: 0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let mut sand = DruckerPragerMaterial::from_young_modulus(1.0e5, 0.2);
@@ -5229,7 +5181,6 @@ fn post_event_relax_switch_step_sensitivity() {
             box_size: IVec2::new(8, 16),
             box_center: Vec2::new(LOCAL_GRID as f32 * 0.5, FLOOR + 8.0),
             material_id: 0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         let mut sand = DruckerPragerMaterial::from_young_modulus(1.0e5, 0.2);
@@ -5271,6 +5222,7 @@ fn post_event_relax_switch_step_sensitivity() {
 /// they plateau at genuinely different angles, that's (b) -- switch_step is
 /// a real, load-bearing physical parameter, not just a convenience knob.
 #[test]
+#[ignore = "research probe: 3 x 101 000 steps, over 2 h in the quick profile; its measured answer is recorded below, rerun by hand"]
 fn post_event_relax_switch_step_long_horizon_convergence_comparison() {
     const LOCAL_GRID: usize = 128;
 
@@ -5285,7 +5237,6 @@ fn post_event_relax_switch_step_long_horizon_convergence_comparison() {
             box_size: IVec2::new(8, 16),
             box_center: Vec2::new(LOCAL_GRID as f32 * 0.5, FLOOR + 8.0),
             material_id: 0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         let mut sand = DruckerPragerMaterial::from_young_modulus(1.0e5, 0.2);
@@ -5367,6 +5318,7 @@ fn post_event_relax_switch_step_long_horizon_convergence_comparison() {
 /// real, honest reason a switch is needed -- reported either way, not
 /// assumed.
 #[test]
+#[ignore = "slow: about 22 min in the CI debug profile, runs in the slow-tests workflow"]
 fn post_event_relax_constant_damping_from_start_no_switch() {
     const LOCAL_GRID: usize = 128;
     let config = SimConfig {
@@ -5380,7 +5332,6 @@ fn post_event_relax_constant_damping_from_start_no_switch() {
         box_size: IVec2::new(8, 16),
         box_center: Vec2::new(LOCAL_GRID as f32 * 0.5, FLOOR + 8.0),
         material_id: 0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let mut sand = DruckerPragerMaterial::from_young_modulus(1.0e5, 0.2);
@@ -5440,6 +5391,7 @@ fn post_event_relax_constant_damping_from_start_no_switch() {
 /// that is a genuine fix. If it just slides like plain DP, that's a real,
 /// honest negative result too -- reported either way.
 #[test]
+#[ignore = "slow: over 44 min in the CI debug profile, runs in the slow-tests workflow"]
 fn mu_i_rheology_column_collapse_natural_arrest_check() {
     use emerge::MuIRheologyMaterial;
     const LOCAL_GRID: usize = 128;
@@ -5454,7 +5406,6 @@ fn mu_i_rheology_column_collapse_natural_arrest_check() {
         box_size: IVec2::new(8, 16),
         box_center: Vec2::new(LOCAL_GRID as f32 * 0.5, FLOOR + 8.0),
         material_id: 0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     // dense_packed: mu_static=tan(30deg), mu_dynamic=tan(40deg) -- real dry-sand
@@ -5680,7 +5631,19 @@ fn mu_i_rheology_rate_dependence_matches_the_real_formula() {
         // Independently recompute the SAME trial p/q this update_particle
         // call must have used, from the SAME real inputs, to predict what
         // mu(I) the formula itself says should come out.
-        let f_trial = (Mat2::IDENTITY + dt * c) * f0;
+        // The law integrates `F` by the exact exponential, not by forward
+        // Euler, so this reference has to as well: it used to read
+        // `(I + dt C) F` and drifted from the real answer in the fourth
+        // digit once the law was corrected (0.580554 against 0.580323).
+        // For this scene's own `C`, a pure shear with zero diagonal, the
+        // matrix exponential is exactly `[[cosh a, sinh a], [sinh a, cosh
+        // a]]` with `a = dt * severity` -- a closed form in its own right,
+        // which keeps this check independent of the engine's own helper
+        // rather than copying the code under test.
+        let a = dt * shear_severity;
+        let increment =
+            Mat2::from_cols(Vec2::new(a.cosh(), a.sinh()), Vec2::new(a.sinh(), a.cosh()));
+        let f_trial = increment * f0;
         let sigma = singular_values_2x2(f_trial);
         let eps = Vec2::new(sigma.x.ln(), sigma.y.ln());
         let tr = eps.x + eps.y;
@@ -5747,7 +5710,6 @@ fn mu_i_rheology_survives_a_real_cursor_push() {
         box_size: IVec2::new(20, 8),
         box_center: Vec2::new(GRID as f32 * 0.5, FLOOR + 4.0),
         material_id: 0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let sand = MuIRheologyMaterial::dense_packed(1.0e5, 0.2);
@@ -5829,7 +5791,6 @@ fn diag_hardening_state_saturation_during_plain_collapse() {
         box_size: IVec2::new(8, 16),
         box_center: Vec2::new(LOCAL_GRID as f32 * 0.5, FLOOR + 8.0),
         material_id: 0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     // Plain Klar 2016 defaults, no hacks: friction_angle=35deg (h0),
@@ -5890,7 +5851,6 @@ fn diag_ke_peak_triggered_switch_sensitivity() {
             box_size: IVec2::new(8, 16),
             box_center: Vec2::new(LOCAL_GRID as f32 * 0.5, FLOOR + 8.0),
             material_id: 0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         let mut sand = DruckerPragerMaterial::cohesionless(1.0e5, 0.2);
@@ -5961,7 +5921,6 @@ fn diag_constant_realistic_cundall_coefficient_sweep() {
             box_size: IVec2::new(8, 16),
             box_center: Vec2::new(LOCAL_GRID as f32 * 0.5, FLOOR + 8.0),
             material_id: 0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         let mut sand = DruckerPragerMaterial::cohesionless(1.0e5, 0.2);
@@ -6013,7 +5972,6 @@ fn diag_hardening_relaxation_calibration_sweep() {
             box_size: IVec2::new(8, 16),
             box_center: Vec2::new(LOCAL_GRID as f32 * 0.5, FLOOR + 8.0),
             material_id: 0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         let mut sand = DruckerPragerMaterial::from_young_modulus(1.0e5, 0.2);
@@ -6076,7 +6034,6 @@ fn diag_real_strain_rate_norm_during_holding_phase() {
         box_size: IVec2::new(8, 16),
         box_center: Vec2::new(LOCAL_GRID as f32 * 0.5, FLOOR + 8.0),
         material_id: 0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let sand = DruckerPragerMaterial::from_young_modulus(1.0e5, 0.2);
@@ -6144,7 +6101,6 @@ fn diag_j_and_plastic_memory_drift_long_horizon() {
         box_size: IVec2::new(8, 16),
         box_center: Vec2::new(LOCAL_GRID as f32 * 0.5, FLOOR + 8.0),
         material_id: 0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let sand = DruckerPragerMaterial::from_young_modulus(1.0e5, 0.2);
@@ -6359,7 +6315,6 @@ fn diag_pradhana_flag_reaches_real_particles_through_g2p() {
         box_size: IVec2::new(4, 1),
         box_center: Vec2::new(cx, POUR_FLOOR + 0.5),
         material_id: 0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let mut solver = Simulation::new(config, seed)
@@ -6378,7 +6333,6 @@ fn diag_pradhana_flag_reaches_real_particles_through_g2p() {
             box_size: IVec2::new(3, 1),
             box_center: Vec2::new(cx, surface_y + 2.0),
             material_id: 0,
-            precompute_initial_volumes: true,
             rng_seed: 200 + i as u32,
             position_jitter: 0.15,
             ..SpawnRegion::for_sim(solver.config())

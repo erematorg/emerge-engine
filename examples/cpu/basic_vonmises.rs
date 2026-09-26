@@ -5,50 +5,72 @@ mod cursor_force;
 #[path = "../gui_common/mod.rs"]
 mod gui_common;
 
+use emerge::diagnostics::{HEAT_BANDS, OCCUPANCY_BANDS, SimSnapshot, scene_map};
+use emerge::particle::Particle;
 /// `VonMisesMaterial` interactive showcase -- closes the last real Tier-0
 /// gap for this material (previously only incidental mentions in
 /// `validate_materials.rs`'s headless sweeps and `rod_blade_and_root.rs`,
 /// no real interactive scene anywhere in the repo).
 ///
-/// Three blobs, same drop, same elastic stiffness (lambda=30, mu=60 -- grid-
-/// native, NOT migrated to real SI (2026-09-06): this was identical to
-/// `basic_jellies.rs`'s own `CorotatedMaterial` blob when written, but
-/// jellies has since moved to real E=500 Pa soft tissue, and every
-/// yield_stress/hardening_modulus below is expressed as a MU-relative ratio,
-/// tuned through several documented empirical passes against THIS elastic
-/// wave speed at THIS drop height/gravity -- rescaling mu would shift the
-/// impact-strain-vs-wave-speed relationship those passes calibrated against,
-/// not just the absolute numbers, so it needs the same real drop-height/
-/// gravity re-sweep basic_jellies.rs went through, not a direct substitution.
-/// Real, disclosed, deferred, not silently dropped), differing ONLY in
-/// yield_stress/hardening_modulus -- isolates what those two parameters
-/// actually do instead of bundling it with a stiffness change:
+/// Three blobs, same drop. LEFT and MIDDLE share one elastic stiffness
+/// (lambda=30, mu=60 -- grid-native, NOT migrated to real SI: this was
+/// identical to `basic_jellies.rs`'s own `CorotatedMaterial` blob when
+/// written, but jellies has since moved to real E=500 Pa soft tissue, and
+/// every yield_stress/hardening_modulus below is expressed as a MU-relative
+/// ratio, tuned through several documented empirical passes against THIS
+/// elastic wave speed at THIS drop height/gravity -- rescaling mu would
+/// shift the impact-strain-vs-wave-speed relationship those passes
+/// calibrated against, not just the absolute numbers, so it needs the same
+/// real drop-height/gravity re-sweep basic_jellies.rs went through, not a
+/// direct substitution. Real, disclosed, deferred, not silently dropped).
+/// RIGHT is five times stiffer; `make_sim` says why a higher yield alone
+/// could not make it resist the impact:
 ///
-///   - LEFT   (soft, perfect plasticity): yield_stress=mu*0.05,
+///   - LEFT   (soft, perfect plasticity): yield_stress=mu*0.01,
 ///     hardening_modulus=0 -- dents on impact and STAYS dented; hit it again
 ///     and it dents by roughly the same amount each time (no memory of prior
 ///     yielding).
-///   - MIDDLE (soft, hardening):          yield_stress=mu*0.05,
-///     hardening_modulus=mu*0.3 -- dents a lot on the FIRST hit, then
+///   - MIDDLE (soft, hardening):          yield_stress=mu*0.01,
+///     hardening_modulus=mu*0.03 -- dents a lot on the FIRST hit, then
 ///     visibly resists more on each subsequent hit as its own yield surface
 ///     grows (kappa printed live below makes this literal, not just visual).
-///   - RIGHT  (stiff, near-elastic):       yield_stress=mu*2.0 -- rarely
-///     crosses yield under a normal drop/push, so it behaves close to a bare
-///     elastic solid and keeps bouncing.
+///   - RIGHT  (stiff): lambda and mu five times LEFT's, yield_stress=0.05 of
+///     its own mu. Meant to stay close to a bare elastic solid, but measured
+///     headless it does not: on landing every particle is past 0.01 of
+///     accumulated plastic strain and the median is 0.88
+///     (`tests/scratch_stress_view_before_after.rs`). Rebuilding the three
+///     blobs from real metals is issue #46.
 ///
-/// That last point is deliberate, not an oversight: unlike
-/// `basic_jellies.rs`'s NeoHookean/Corotated blobs (which have NO damping of
-/// any kind and bounce indefinitely, a real, disclosed, accepted property of
-/// that demo), a VonMises blob that actually yields dissipates real energy
-/// irreversibly through plastic flow and settles ON ITS OWN -- no Cundall
-/// damping or other numerical relaxation is enabled in this scene. The LEFT
-/// and MIDDLE blobs settling while the RIGHT one keeps bouncing IS the demo:
-/// plasticity as real, physical, mechanical damping, not a numerical crutch.
+/// That last point was the intent, not what the scene is measured to do, and
+/// whether the RIGHT blob still keeps bouncing has not been re-measured
+/// since. The intent: unlike `basic_jellies.rs`'s NeoHookean/Corotated blobs
+/// (which have NO damping of any kind and bounce indefinitely, a real,
+/// disclosed, accepted property of that demo), a VonMises blob that actually
+/// yields dissipates real energy irreversibly through plastic flow and
+/// settles ON ITS OWN -- no Cundall damping or other numerical relaxation is
+/// enabled in this scene. The LEFT and MIDDLE blobs settling while the RIGHT
+/// one keeps bouncing was meant to be the demo: plasticity as real, physical,
+/// mechanical damping, not a numerical crutch.
 ///
-///   LMB push  RMB pull  V toggle real stress field  R reset  Q quit
+///   LMB push  RMB pull  V toggle own-yield view  R reset  Q quit
 ///   cargo run --example basic_vonmises --features render
+///
+/// Headless reading of the own-yield view, for a reviewer without the
+/// screen: `VONMISES_START_VIEW=yield` starts with it on (so a capture
+/// through `VONMISES_CAPTURE_DIR` shows it), and `VONMISES_LOG=<file>`
+/// writes a `FrameLogger` line per frame with, per blob, the share of its
+/// particles at yield (`yield_ratio` at least 0.99), its mean ratio, and
+/// how many particles fell back from at least 0.99 to under 0.9 since the
+/// frame before, and a text picture of what the screen shows
+/// (`scene_map`): the own-yield view in the colour map's bands (`.` blue,
+/// `:` teal, `-` green, `+` yellow to orange, `#` red), or where material
+/// is.
+/// `VONMISES_STRESS_TEST=1` scripts the pushes.
 use emerge::render::{ColorMode, Renderer};
-use emerge::{SimConfig, Simulation, SlipBoundary, SpawnRegion, VonMisesMaterial};
+use emerge::{
+    DiagnosticsPlugin, DiagnosticsRegistry, FrameLogger, SimConfig, Simulation, SlipBoundary,
+    SpawnRegion, VonMisesMaterial, per_material_stats,
+};
 use glam::{IVec2, Vec2};
 use std::sync::Arc;
 use winit::application::ApplicationHandler;
@@ -130,7 +152,62 @@ const MAT_SOFT: u32 = 0;
 const MAT_HARD: u32 = 1;
 const MAT_STIFF: u32 = 2;
 
-fn make_sim(gravity_fraction: f32) -> Simulation {
+/// The own-yield view in numbers, as a diagnostics plugin: per blob, the
+/// share of its particles at yield (`yield_ratio` at least 0.99), its mean
+/// ratio, and how many fell back from at least 0.99 to under 0.9 since the
+/// frame before. Stateful for that last count; particle order is stable in
+/// this scene, which removes none.
+struct OwnYieldPlugin {
+    materials: [VonMisesMaterial; 3],
+    last: Vec<f32>,
+}
+
+impl DiagnosticsPlugin for OwnYieldPlugin {
+    fn name(&self) -> &'static str {
+        "own_yield"
+    }
+
+    fn collect(&mut self, particles: &[Particle], _snapshot: &SimSnapshot) -> Vec<(String, f32)> {
+        let ratio: Vec<f32> = particles
+            .iter()
+            .map(|p| {
+                self.materials[p.material_id as usize]
+                    .yield_ratio_of(p.deformation_gradient, p.friction_hardening)
+            })
+            .collect();
+        let mut out = Vec::with_capacity(9);
+        for (slot, blob) in ["soft", "hard", "stiff"].iter().enumerate() {
+            let (mut n, mut at, mut sum, mut fell) = (0usize, 0usize, 0.0f32, 0usize);
+            for (i, (p, &r)) in particles.iter().zip(&ratio).enumerate() {
+                if p.material_id != slot as u32 {
+                    continue;
+                }
+                n += 1;
+                at += usize::from(r >= 0.99);
+                sum += r;
+                let was_at = self.last.get(i).is_some_and(|&last| last >= 0.99);
+                fell += usize::from(was_at && r < 0.9);
+            }
+            let n = n.max(1) as f32;
+            out.push((format!("{blob}_at_yield"), at as f32 / n));
+            out.push((format!("{blob}_ratio_mean"), sum / n));
+            out.push((format!("{blob}_fell_back"), fell as f32));
+        }
+        self.last = ratio;
+        out
+    }
+}
+
+fn own_yield_diagnostics(materials: [VonMisesMaterial; 3]) -> DiagnosticsRegistry {
+    DiagnosticsRegistry::new().with(Box::new(OwnYieldPlugin {
+        materials,
+        last: Vec::new(),
+    }))
+}
+
+/// The scene, and its three materials in slot order: the stress view reads
+/// each particle against its own material's yield surface.
+fn make_sim(gravity_fraction: f32) -> (Simulation, [VonMisesMaterial; 3]) {
     let mut config = SimConfig {
         min_dt: 0.01,
         max_substeps_per_step: 8,
@@ -143,7 +220,6 @@ fn make_sim(gravity_fraction: f32) -> Simulation {
         box_size: IVec2::new(14, 14),
         box_center: c,
         material_id: mat,
-        precompute_initial_volumes: true,
         initial_velocity_scale: 0.0,
         ..SpawnRegion::for_sim(&config)
     };
@@ -161,8 +237,8 @@ fn make_sim(gravity_fraction: f32) -> Simulation {
     // threshold (steel vs. clay differ in E, not only in sigma_Y/E) -- so
     // "stiff" now gets a genuinely higher lambda/mu (5x), which raises its
     // own c and lowers its impact-induced strain directly, on top of the
-    // same real yield/mu ratio range CLAUDE.md's own cited lava/clay values
-    // use (~0.3%-5%). Gravity also cut further for a gentler, resolvable
+    // same real yield/mu ratio range `VonMisesMaterial`'s own cited lava/clay
+    // values use (~0.3%-5%). Gravity also cut further for a gentler, resolvable
     // impact rather than another shock.
     let soft = VonMisesMaterial::new(LAMBDA, MU, MU * 0.01);
     // Real regression fix (calibration, found by the scripted stress test):
@@ -187,7 +263,7 @@ fn make_sim(gravity_fraction: f32) -> Simulation {
         .with_boundary(Box::new(SlipBoundary::new(config.boundary_thickness)));
     let _ = solver.add_body(spawn(Vec2::new(32.0, 20.0), MAT_HARD));
     let _ = solver.add_body(spawn(Vec2::new(50.0, 20.0), MAT_STIFF));
-    solver
+    (solver, [soft, hard, stiff])
 }
 
 /// Per-material worst-case readout -- `friction_hardening` IS kappa
@@ -251,14 +327,19 @@ struct State {
     fps_frames: u64,
     last_fps: f32,
     capture: Option<CaptureState>,
-    // Real per-material von Mises equivalent stress field (`ColorMode::
-    // ByStress`, wired here 2026-09-15 -- see `MaterialRegistry::
-    // von_mises_stress_field`'s own doc for the formula). Toggled with V:
-    // this is the ideal place to show it, since the whole point of this
-    // scene IS watching where/when a material actually crosses its own
-    // yield surface -- the raw stress field makes that mechanism visible
-    // directly instead of only inferring it from shape change afterward.
+    // Toggled with V: each particle against its OWN yield surface
+    // (`VonMisesMaterial::yield_ratio`), since the whole point of this scene
+    // IS watching where/when a material actually crosses it -- visible
+    // directly instead of only inferred from shape change afterward. Red
+    // says "at or beyond its yield", never how far beyond: a particle the
+    // return mapping has put back on its surface reads 1 however much it
+    // has flowed. How far is kappa (`friction_hardening`), printed live.
     show_stress: bool,
+    /// The three materials, slot order, for that view.
+    materials: [VonMisesMaterial; 3],
+    /// `VONMISES_LOG`: the own-yield view in numbers, per blob, per frame,
+    /// through `OwnYieldPlugin`.
+    yield_log: Option<(FrameLogger, DiagnosticsRegistry)>,
 }
 
 impl State {
@@ -266,7 +347,7 @@ impl State {
         let gfx = gui_common::Gfx::new(&window).await;
         let size = window.inner_size();
         let gravity_fraction = 0.003;
-        let sim = make_sim(gravity_fraction);
+        let (sim, materials) = make_sim(gravity_fraction);
 
         let mut renderer = Renderer::new(&gfx.device, sim.particles().len(), gfx.format);
         renderer.set_camera(&gfx.queue, GRID as u32, size.width, size.height, 0.6, true);
@@ -280,7 +361,16 @@ impl State {
         // blobs -- they're the same material family (only yield/hardening
         // differ), no invented per-blob optical distinction.
         const SOIL_SIGMA_A: [f32; 3] = [0.200, 0.275, 0.550];
-        renderer.set_color_mode(ColorMode::ByPhysics);
+        let start_on_yield = std::env::var("VONMISES_START_VIEW").is_ok_and(|v| v == "yield");
+        renderer.set_color_mode(if start_on_yield {
+            ColorMode::ByStress
+        } else {
+            ColorMode::ByPhysics
+        });
+        let yield_log = std::env::var("VONMISES_LOG").ok().map(|path| {
+            let log = FrameLogger::open(path).expect("failed to open VONMISES_LOG");
+            (log, own_yield_diagnostics(materials))
+        });
         for slot in [MAT_SOFT, MAT_HARD, MAT_STIFF] {
             renderer.set_optical_params(&gfx.queue, slot as usize, SOIL_SIGMA_A);
             renderer.set_optical_scattering(&gfx.queue, slot as usize, 0.02);
@@ -337,7 +427,7 @@ impl State {
         });
 
         println!(
-            "basic_vonmises: {} particles (3 blobs: soft/hardening/stiff)  |  LMB push  RMB pull  V toggle real stress field  R reset  Q quit",
+            "basic_vonmises: {} particles (3 blobs: soft/hardening/stiff)  |  LMB push  RMB pull  V toggle own-yield view  R reset  Q quit",
             sim.particles().len()
         );
         Self {
@@ -354,7 +444,9 @@ impl State {
             fps_frames: 0,
             last_fps: 0.0,
             capture,
-            show_stress: false,
+            show_stress: start_on_yield,
+            materials,
+            yield_log,
         }
     }
 
@@ -377,8 +469,11 @@ impl State {
     }
 
     fn reset(&mut self) {
-        self.sim = make_sim(self.gravity_fraction);
+        (self.sim, self.materials) = make_sim(self.gravity_fraction);
         self.frame = 0;
+        if let Some((_, diagnostics)) = &mut self.yield_log {
+            *diagnostics = own_yield_diagnostics(self.materials);
+        }
     }
 
     fn update_and_render(&mut self, window: &Window) {
@@ -443,6 +538,36 @@ impl State {
 
         self.sim.step();
 
+        if let Some((log, diagnostics)) = &mut self.yield_log {
+            let snapshot = self.sim.diagnostics_snapshot();
+            let particles = self.sim.particles().to_vec();
+            let frame = diagnostics.collect(&particles, &snapshot);
+            let extra: Vec<(&str, f32)> = frame.iter().collect();
+            log.log(
+                self.frame,
+                DT,
+                &per_material_stats(self.sim.particles()),
+                &snapshot,
+                &[(MAT_SOFT, "soft"), (MAT_HARD, "hard"), (MAT_STIFF, "stiff")],
+                &extra,
+            );
+            // What the screen shows, as text: the camera frames the whole
+            // grid, one character per cell across and two cells per
+            // character up, since a character is about twice as tall as wide.
+            let p = self.sim.particles();
+            let region = (Vec2::ZERO, Vec2::splat(GRID as f32));
+            if self.show_stress {
+                let ratio: Vec<f32> = (0..p.len())
+                    .map(|i| self.materials[p.material_id[i] as usize].yield_ratio(p, i))
+                    .collect();
+                let map = scene_map(p, region, GRID, GRID / 2, |i| ratio[i], &HEAT_BANDS);
+                log.log_map(self.frame, "own_yield", &map);
+            } else {
+                let map = scene_map(p, region, GRID, GRID / 2, |_| 1.0, &OCCUPANCY_BANDS);
+                log.log_map(self.frame, "occupancy", &map);
+            }
+        }
+
         if stress_test {
             for p in self.sim.particles().iter() {
                 let bad = !p.x.is_finite()
@@ -479,20 +604,19 @@ impl State {
         }
 
         if self.show_stress {
-            // Real, generic per-material von Mises equivalent stress (von
-            // Mises 1913) -- computed fresh every frame from each
-            // particle's OWN material's `kirchhoff_stress`, not a cached or
-            // approximated value. Scale is real, not guessed: 1/yield_stress
-            // of the shared soft/hardening blobs (MU*0.01, the two that
-            // actually visibly yield in this scene), so the heat colormap
-            // naturally saturates right around real yield onset -- the
-            // exact threshold this material's own plasticity model uses.
-            let stress = self
-                .sim
-                .materials()
-                .von_mises_stress_field(self.sim.particles());
-            self.renderer.set_stress_field(stress);
-            self.renderer.set_stress_scale(1.0 / (MU * 0.01));
+            // Each particle against its own yield surface, by the code its
+            // material's return mapping runs: below 1 elastic, 1 on the
+            // surface, which is where a particle flowing plastically sits
+            // whether it has just reached yield or flowed a long way.
+            // One scale for all three blobs cannot say that: the hardening
+            // blob's yield grows with kappa and the stiff blob's is 25 times
+            // the soft one's (`tests/scratch_stress_view_before_after.rs`).
+            let p = self.sim.particles();
+            let ratio: Vec<f32> = (0..p.len())
+                .map(|i| self.materials[p.material_id[i] as usize].yield_ratio(p, i))
+                .collect();
+            self.renderer.set_stress_field(ratio);
+            self.renderer.set_stress_scale(1.0);
         }
 
         let output = match self.gfx.surface.get_current_texture() {
@@ -577,10 +701,11 @@ impl State {
                     ui.separator();
                     ui.label("Left = soft/perfect plasticity");
                     ui.label("Middle = soft, hardens as it yields");
-                    ui.label("Right = stiff/near-elastic, keeps bouncing");
-                    ui.label("Color = ByVolume: cool = compressed, warm = stretched");
+                    ui.label("Right = 5x stiffer, yields on landing too (issue #46)");
+                    ui.label("Color = soil optics; V = each particle against its own yield:");
+                    ui.label("  red = at or beyond yield (not how far), blue = well inside");
                     ui.separator();
-                    ui.label("LMB push  RMB pull  V toggle real stress field  R reset  Q quit");
+                    ui.label("LMB push  RMB pull  V toggle own-yield view  R reset  Q quit");
                     if ui.button("Reset").clicked() {
                         reset = true;
                     }
@@ -659,7 +784,10 @@ impl ApplicationHandler for App {
                         } else {
                             ColorMode::ByPhysics
                         });
-                        println!("stress field {}", if s.show_stress { "ON" } else { "off" });
+                        println!(
+                            "own-yield view {}",
+                            if s.show_stress { "ON" } else { "off" }
+                        );
                     }
                     _ => {}
                 }

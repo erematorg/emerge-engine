@@ -97,7 +97,6 @@ fn make_sim() -> (
         box_size: IVec2::new(24, 6),
         box_center: body_center,
         material_id: MAT_BODY,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let ratchet = Arc::new(RatchetFrictionBoundary::new(4, 0.1, 0.95, Vec2::X));
@@ -140,7 +139,6 @@ fn make_sim() -> (
             box_size: IVec2::new(2, GRASS_BLADE_HEIGHT_CELLS),
             box_center: blade_center,
             material_id: grass_mat_id.0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(solver.config())
         };
         let _tag = solver.add_body(blade_spawn);

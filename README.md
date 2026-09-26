@@ -108,7 +108,6 @@ let mut sim = Simulation::empty(config)
 let _ = sim.add_body(SpawnRegion {
     box_size: IVec2::new(12, 12),
     box_center: Vec2::new(24.0, 40.0),
-    precompute_initial_volumes: true,
     ..SpawnRegion::for_sim(&config)
 });
 
@@ -116,7 +115,6 @@ let _ = sim.add_body(SpawnRegion {
     box_size: IVec2::new(12, 8),
     box_center: Vec2::new(40.0, 36.0),
     material_id: WATER,
-    precompute_initial_volumes: true,
     ..SpawnRegion::for_sim(&config)
 });
 

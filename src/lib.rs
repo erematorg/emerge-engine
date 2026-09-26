@@ -118,11 +118,13 @@ pub use solver::density::compute_density_grid;
 /// initial particle regions for `GpuSimulation::new` or to merge multiple regions.
 ///
 /// Respects `SpawnRegion::shape` (box or disk), jitter, and material assignment.
-/// For solid/plastic materials, call with `spawn.precompute_volumes()` or
-/// follow up with `estimate_particle_volumes` when a kernel-measured initial
-/// volume is required. `GpuSimulation::new` subsequently runs each registered
-/// material's initializer; strict WC-MPM liquids establish `V0=m/rho0` there
-/// and must not use a kernel-density estimate as EOS state.
+/// Initial volume is always measured from the particles' own packing, the same
+/// contract `Simulation::new` and `add_body` follow, so a body is the same body
+/// whichever path built it. `GpuSimulation::new` subsequently runs each
+/// registered material's initializer; strict WC-MPM liquids establish
+/// `V0=m/rho0` there and must not use a kernel-density estimate as EOS state,
+/// which is why that measurement can be overwritten for them rather than
+/// skipped here.
 ///
 /// LP pattern:
 /// ```rust,no_run
@@ -139,9 +141,7 @@ pub fn build_particles(config: &SimConfig, spawn: SpawnRegion) -> Vec<Particle> 
     use crate::solver::LcgRng;
     let mut rng = LcgRng::new(spawn.rng_seed);
     let mut particles = crate::solver::initialize_particles(config, spawn, &mut rng);
-    if spawn.precompute_initial_volumes {
-        estimate_particle_volumes(&mut particles, config.grid_res);
-    }
+    estimate_particle_volumes(&mut particles, config.grid_res);
     particles
 }
 

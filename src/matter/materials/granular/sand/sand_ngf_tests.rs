@@ -159,7 +159,6 @@ mod ngf_verification_tests {
                 FLOOR / cell_m + 8.0 * resolution_scale as f32,
             ),
             material_id: 0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         let mut sand = DruckerPragerMaterial::from_physical(
@@ -225,7 +224,6 @@ mod ngf_verification_tests {
                 FLOOR / cell_m + 8.0 * resolution_scale as f32,
             ),
             material_id: 0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         let mut sand = DruckerPragerMaterial::from_physical(
@@ -324,7 +322,6 @@ mod ngf_verification_tests {
             box_size: IVec2::new(8, 16),
             box_center: Vec2::new(GRID as f32 * 0.5, FLOOR / CELL_M + 8.0),
             material_id: 0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         let mut sand = DruckerPragerMaterial::from_physical(
@@ -401,7 +398,6 @@ mod ngf_verification_tests {
             box_size: IVec2::new(8, 16),
             box_center: Vec2::new(GRID as f32 * 0.5, FLOOR / CELL_M + 8.0),
             material_id: 0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         let mut sand = DruckerPragerMaterial::from_physical(
@@ -492,7 +488,6 @@ mod ngf_verification_tests {
             box_size: IVec2::new(8, 16),
             box_center: Vec2::new(GRID as f32 * 0.5, FLOOR / CELL_M + 8.0),
             material_id: 0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         let mut sand = DruckerPragerMaterial::from_physical(
@@ -557,7 +552,6 @@ mod ngf_verification_tests {
             box_size: IVec2::new(8, 16),
             box_center: Vec2::new(GRID as f32 * 0.5, FLOOR / CELL_M + 8.0),
             material_id: 0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         let sand = DruckerPragerMaterial::from_physical(
@@ -635,7 +629,6 @@ mod ngf_verification_tests {
             box_size: IVec2::new(8, 16),
             box_center: Vec2::new(GRID as f32 * 0.5, FLOOR / CELL_M + 8.0),
             material_id: 0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         let mut sand = DruckerPragerMaterial::from_physical(
@@ -708,7 +701,6 @@ mod ngf_verification_tests {
             box_size: IVec2::new(8, 16),
             box_center: Vec2::new(GRID as f32 * 0.5, FLOOR / CELL_M + 8.0),
             material_id: 0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         let mut sand = DruckerPragerMaterial::from_physical(
@@ -823,7 +815,6 @@ mod ngf_verification_tests {
             box_size: IVec2::new(8, 16),
             box_center: Vec2::new(GRID as f32 * 0.5, FLOOR / CELL_M + 8.0),
             material_id: 0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         let sand = DruckerPragerMaterial::from_physical(
@@ -935,7 +926,6 @@ mod ngf_verification_tests {
             box_size: IVec2::new(8, 16),
             box_center: Vec2::new(GRID as f32 * 0.5, FLOOR / CELL_M + 8.0),
             material_id: 0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         let mut sand = DruckerPragerMaterial::from_physical(
@@ -1038,7 +1028,6 @@ mod ngf_verification_tests {
                 box_size: IVec2::new(8, 16),
                 box_center: Vec2::new(GRID as f32 * 0.5, FLOOR / CELL_M + 8.0),
                 material_id: 0,
-                precompute_initial_volumes: true,
                 ..SpawnRegion::for_sim(&config)
             };
             let sand = DruckerPragerMaterial::from_physical(
@@ -1121,7 +1110,6 @@ mod ngf_verification_tests {
                 box_size: IVec2::new(8, 16),
                 box_center: Vec2::new(GRID as f32 * 0.5, FLOOR / CELL_M + 8.0),
                 material_id: 0,
-                precompute_initial_volumes: true,
                 ..SpawnRegion::for_sim(&config)
             };
             let mut sand = DruckerPragerMaterial::from_physical(
@@ -1311,7 +1299,6 @@ mod ngf_verification_tests {
                 box_size: IVec2::new(8, 16),
                 box_center: Vec2::new(grid as f32 * 0.5, FLOOR_M / cell_m + 8.0),
                 material_id: 0,
-                precompute_initial_volumes: true,
                 ..SpawnRegion::for_sim(&config)
             };
             let mut sand = DruckerPragerMaterial::from_physical(
@@ -1437,7 +1424,6 @@ mod ngf_verification_tests {
                 box_size: IVec2::new(8, 16),
                 box_center: Vec2::new(grid as f32 * 0.5, FLOOR_M / cell_m + 8.0),
                 material_id: 0,
-                precompute_initial_volumes: true,
                 ..SpawnRegion::for_sim(&config)
             };
             let mut sand = DruckerPragerMaterial::from_physical(

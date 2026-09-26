@@ -84,9 +84,17 @@ pub struct MaterialParams {
     pub thermal_expansion: f32,
 
     // --- Granular-fluid / fluid extended (GPU-synced) ---
-    /// GranularFluid-only EOS pressure lower bound.  Strict WC-MPM liquids use
-    /// the unmodified Tait law; a free-surface cavitation model is not encoded
-    /// in this union field.
+    /// Lower bound on EOS pressure, in grid units: the tension a fluid
+    /// carries before it is taken to have cavitated. Read by every fluid,
+    /// not only GranularFluid -- `p2g.wgsl`'s `kirchhoff` applies it inside
+    /// the `model == 1u` branch, the same clamp the CPU laws apply, so the
+    /// two paths share one number and cannot drift apart.
+    ///
+    /// Its SI source is each family's own measured coefficient:
+    /// `BinghamProps::cavitation_pressure_pa` for a yield-stress fluid,
+    /// `NewtonianFluidMaterial::from_physical`'s dissolved-gas figure for a
+    /// liquid. Zero is not a neutral default here, it states that the fluid
+    /// carries no tension at all.
     pub pressure_floor: f32,
     /// Fluid: bulk (second) viscosity ζ -- adds ζ·(∇·v)·I to Cauchy stress.
     /// 0.0 = off (Stokes assumption).

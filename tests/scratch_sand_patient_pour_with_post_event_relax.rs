@@ -82,7 +82,6 @@ fn patient_pour_with_post_event_relax_threshold() {
         box_size: IVec2::new(4, 1),
         box_center: Vec2::new(cx, POUR_FLOOR + 0.5),
         material_id: 0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let mut solver = Simulation::new(config, seed)
@@ -110,7 +109,6 @@ fn patient_pour_with_post_event_relax_threshold() {
             box_size: IVec2::new(3, 1),
             box_center: Vec2::new(cx, surface_y + DROP_GAP_CELLS),
             material_id: 0,
-            precompute_initial_volumes: true,
             rng_seed: 400 + i as u32,
             position_jitter: 0.15,
             ..SpawnRegion::for_sim(solver.config())

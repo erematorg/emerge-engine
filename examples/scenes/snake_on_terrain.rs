@@ -67,7 +67,6 @@ pub fn terrain_spawn(config: &SimConfig) -> SpawnRegion {
         box_size: IVec2::new(100, 12),
         box_center: Vec2::new(64.0, 10.0),
         material_id: 0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(config)
     }
 }
@@ -86,7 +85,6 @@ pub fn snake_spawn(config: &SimConfig, material_id: u32) -> SpawnRegion {
         box_size: IVec2::new(36, 4),
         box_center: BODY_CENTER,
         material_id,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(config)
     }
 }

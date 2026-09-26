@@ -70,7 +70,6 @@ fn step_keeps_particles_inside_domain() {
 #[test]
 fn precomputed_volumes_are_positive() {
     let spawn = SpawnRegion {
-        precompute_initial_volumes: true,
         ..SpawnRegion::default()
     };
     let solver = Simulation::new(SimConfig::default(), spawn);
@@ -128,7 +127,6 @@ fn no_compression_hanging_body_has_no_passive_volume_ratchet() {
         spacing: 0.5,
         box_size: IVec2::new(6, 6),
         box_center: Vec2::splat(32.0),
-        precompute_initial_volumes: true,
         initial_velocity_scale: 0.0,
         ..SpawnRegion::for_sim(&config)
     };
@@ -210,7 +208,6 @@ fn pinned_grid_support_transmits_reaction_to_connected_elastic_body() {
         spacing: 0.5,
         box_size: IVec2::new(6, 6),
         box_center: Vec2::splat(32.0),
-        precompute_initial_volumes: true,
         initial_velocity_scale: 0.0,
         ..SpawnRegion::for_sim(&config)
     };
@@ -713,8 +710,8 @@ fn permafrost_thaws_at_freezing_point_with_real_latent_heat_debit() {
         config.grid_res,
     );
 
-    let frozen = NaccMaterial::wet_soil(900.0 * 8.0, 0.3);
-    let thawed = WithLatentHeat::new(NaccMaterial::wet_soil(900.0, 0.3), LATENT_HEAT_FUSION);
+    let frozen = NaccMaterial::kaolin(900.0 * 8.0, 0.3);
+    let thawed = WithLatentHeat::new(NaccMaterial::kaolin(900.0, 0.3), LATENT_HEAT_FUSION);
 
     let mut solver = Simulation::new(config, small_spawn_config(16.0))
         .with_default_material(Box::new(frozen))
@@ -776,8 +773,8 @@ fn permafrost_thaws_at_freezing_point_with_real_latent_heat_debit() {
 #[test]
 fn frozen_ground_resists_a_strike_more_than_thawed_ground() {
     let config = small_solver_config(); // real default gravity -- see below for why
-    let frozen_mat = NaccMaterial::wet_soil(900.0 * 8.0, 0.3);
-    let thawed_mat = NaccMaterial::wet_soil(900.0, 0.3);
+    let frozen_mat = NaccMaterial::kaolin(900.0 * 8.0, 0.3);
+    let thawed_mat = NaccMaterial::kaolin(900.0, 0.3);
 
     // NACC's elastic predictor bug fix (2026-07-31, `nacc.rs::update_particle`)
     // exposed that this test's ORIGINAL zero-gravity setup was measuring a
@@ -2217,6 +2214,7 @@ fn gravity_well_cutoff_prevents_far_particles_from_moving() {
 /// physically equivalent but particle-ID-permuted.
 #[cfg(feature = "gpu")]
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn gpu_cpu_parity() {
     use emerge::gpu::GpuSimulation;
     use emerge::materials::MaterialRegistry;
@@ -2289,6 +2287,7 @@ fn gpu_cpu_parity() {
 /// for that tighter, CPU-only proof of the formula itself).
 #[cfg(feature = "gpu")]
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn von_mises_gpu_cpu_single_substep_matches_with_imposed_shear() {
     use emerge::gpu::GpuSimulation;
     use emerge::materials::MaterialRegistry;
@@ -2399,6 +2398,7 @@ fn von_mises_gpu_cpu_single_substep_matches_with_imposed_shear() {
 /// return mapping on CPU and GPU.
 #[cfg(feature = "gpu")]
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn rankine_gpu_cpu_single_substep_matches_with_imposed_tension() {
     use emerge::gpu::GpuSimulation;
     use emerge::materials::MaterialRegistry;
@@ -2476,6 +2476,7 @@ fn rankine_gpu_cpu_single_substep_matches_with_imposed_tension() {
 /// increment, Jp accumulation, and hardening update on CPU and GPU.
 #[cfg(feature = "gpu")]
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn snow_gpu_cpu_single_substep_matches_with_imposed_compression() {
     use emerge::gpu::GpuSimulation;
     use emerge::materials::MaterialRegistry;
@@ -2573,6 +2574,7 @@ fn snow_gpu_cpu_single_substep_matches_with_imposed_compression() {
 /// extensions from the comparison.
 #[cfg(feature = "gpu")]
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn drucker_prager_gpu_cpu_single_substep_matches_with_imposed_shear() {
     use emerge::gpu::GpuSimulation;
     use emerge::materials::MaterialRegistry;
@@ -2648,6 +2650,7 @@ fn drucker_prager_gpu_cpu_single_substep_matches_with_imposed_shear() {
 /// three mechanisms advances identically on CPU and GPU.
 #[cfg(feature = "gpu")]
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn granular_fluid_gpu_cpu_single_substep_matches_with_imposed_compression() {
     use emerge::gpu::GpuSimulation;
     use emerge::materials::MaterialRegistry;
@@ -2734,6 +2737,7 @@ fn granular_fluid_gpu_cpu_single_substep_matches_with_imposed_compression() {
 /// an open, ignored diagnostic rather than silently dropped.
 #[cfg(feature = "gpu")]
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn von_mises_gpu_cpu_bounded_agreement_under_soft_contact() {
     use emerge::gpu::GpuSimulation;
     use emerge::materials::MaterialRegistry;
@@ -2865,6 +2869,7 @@ fn von_mises_gpu_cpu_bounded_agreement_under_soft_contact() {
 /// previously-missing coverage, not a formality.
 #[cfg(feature = "gpu")]
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn elastic_family_gpu_cpu_single_substep_matches_under_combined_shear_and_spin() {
     use emerge::gpu::GpuSimulation;
     use emerge::materials::MaterialRegistry;
@@ -3033,6 +3038,7 @@ fn diag_von_mises_gpu_cpu_diverges_under_violent_impact() {
 /// closed-form tests for that tighter, CPU-only proof of the formula.
 #[cfg(feature = "gpu")]
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn bingham_gpu_cpu_single_substep_matches_with_imposed_shear() {
     use emerge::gpu::GpuSimulation;
     use emerge::materials::MaterialRegistry;
@@ -3118,6 +3124,7 @@ fn bingham_gpu_cpu_single_substep_matches_with_imposed_shear() {
 /// as an open, ignored diagnostic rather than silently dropped.
 #[cfg(feature = "gpu")]
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn bingham_gpu_cpu_bounded_agreement_under_soft_contact() {
     use emerge::gpu::GpuSimulation;
     use emerge::materials::MaterialRegistry;
@@ -3266,6 +3273,7 @@ fn diag_bingham_gpu_cpu_diverges_under_violent_impact() {
 #[cfg(feature = "gpu")]
 #[test]
 #[should_panic(expected = "NaccMaterial")]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn gpu_simulation_rejects_a_real_nacc_material() {
     use emerge::gpu::GpuSimulation;
     use emerge::materials::MaterialRegistry;
@@ -3275,7 +3283,7 @@ fn gpu_simulation_rejects_a_real_nacc_material() {
         dt: 0.002,
         ..SimConfig::default()
     };
-    let material = NaccMaterial::soft_clay(5.0e4, 0.3);
+    let material = NaccMaterial::kaolin(5.0e4, 0.3);
     let cpu =
         Simulation::new(config, small_spawn_config(16.0)).with_default_material(Box::new(material));
 
@@ -3320,7 +3328,7 @@ fn sand_mui_stable_after_many_steps() {
 
 #[test]
 fn nacc_stable_after_many_steps() {
-    let nacc = NaccMaterial::soft_clay(5.0e4, 0.3);
+    let nacc = NaccMaterial::kaolin(5.0e4, 0.3);
     let config = SimConfig {
         gravity: Vec2::new(0.0, -0.3),
         ..small_solver_config()
@@ -3468,7 +3476,6 @@ fn sand_q_stays_bounded_once_settled() {
         spacing: 0.5,
         box_size: IVec2::new(18, 14),
         box_center: Vec2::new(32.0, 40.0),
-        precompute_initial_volumes: true,
         position_jitter: 0.5,
         rng_seed: 11,
         ..SpawnRegion::for_sim(&config)
@@ -3560,7 +3567,6 @@ fn build_mixture_scene(drag_coefficient: f32) -> Simulation {
         box_center: Vec2::new(16.0, 16.0),
         material_id: 0,
         initial_velocity_scale: 0.0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let fluid_spawn = SpawnRegion {
@@ -3569,7 +3575,6 @@ fn build_mixture_scene(drag_coefficient: f32) -> Simulation {
         box_center: Vec2::new(16.0, 16.0),
         material_id: 1,
         initial_velocity_scale: 0.0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let solid = WithMixturePhase::new(
@@ -3665,7 +3670,6 @@ fn diag_sand_only_no_mixture_long_horizon_erupts_or_not() {
         box_size: IVec2::new(56, 10),
         box_center: Vec2::new(48.0, 8.0),
         material_id: MAT_SAND,
-        precompute_initial_volumes: true,
         mass_override: Some(1.8),
         ..SpawnRegion::for_sim(&config)
     };
@@ -3776,7 +3780,6 @@ fn water_saturates_nearby_sand_through_the_real_solver() {
         box_center: Vec2::new(16.0, 16.0),
         material_id: 0,
         initial_velocity_scale: 0.0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     // Offset, not co-located: real "water sitting on sand" only wets the
@@ -3789,7 +3792,6 @@ fn water_saturates_nearby_sand_through_the_real_solver() {
         box_center: Vec2::new(16.0, 21.0),
         material_id: 1,
         initial_velocity_scale: 0.0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let sand = DruckerPragerMaterial {

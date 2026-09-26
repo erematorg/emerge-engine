@@ -3,7 +3,7 @@ extern crate emerge_engine as emerge;
 #[path = "../gui_common/coords.rs"]
 mod gui_common;
 
-/// Real permafrost freeze/thaw -- a block of ice-bonded soil (`NaccMaterial::wet_soil`
+/// Real permafrost freeze/thaw -- a block of ice-bonded soil (`NaccMaterial::kaolin`
 /// at 250x its own thawed stiffness) that genuinely softens once real ambient warming
 /// pushes it past the real freezing point (273.15K), same mechanism verified in
 /// `tests/solver.rs::permafrost_thaws_at_freezing_point_with_real_latent_heat_debit`
@@ -43,6 +43,8 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 const GRID: usize = 64;
+const GRAVITY_MAGNITUDE: f32 = 0.3;
+const BLOCK_CELLS: IVec2 = IVec2::new(32, 20);
 const DT: f32 = 0.02;
 
 const FROZEN_ID: u32 = 0;
@@ -63,6 +65,14 @@ const AMBIENT_RATE: f32 = 15.0; // K/s while holding W or C -- demo pacing, not 
 // soil vs ~23-30 GPa frozen fine sand) -- see module doc for the original citation.
 const THAWED_STIFFNESS: f32 = 18000.0;
 const FROZEN_STIFFNESS: f32 = THAWED_STIFFNESS * 250.0;
+
+/// Mean stress a layer already carries from everything above it, in grid
+/// units: the weight per cell of each layer above plus half of its own,
+/// times gravity, turned into a mean stress with Jaky's earth-pressure
+/// coefficient at rest, `K0 = 1 - sin(phi')`, so `p = sigma_v (1 + K0)/2`
+/// in plane strain. A soil in place has carried this for a long time, so
+/// its clay starts preconsolidated under it instead of as fresh slurry.
+const CLAY_FRICTION_ANGLE_SIN: f32 = 0.436; // kaolin, 25.9 degrees
 
 const STRIKE_RADIUS: f32 = 3.0;
 const STRIKE_FORCE_STEP: f32 = 10.0;
@@ -98,7 +108,7 @@ struct State {
 fn make_sim() -> Simulation {
     let config = SimConfig {
         max_substeps_per_step: 64,
-        gravity: Vec2::new(0.0, -0.3),
+        gravity: Vec2::new(0.0, -GRAVITY_MAGNITUDE),
         ..SimConfig::earth(GRID, 0.01, DT)
     };
 
@@ -114,11 +124,15 @@ fn make_sim() -> Simulation {
         config.grid_res,
     );
 
-    let frozen = NaccMaterial::wet_soil(FROZEN_STIFFNESS, 0.3);
-    let thawed = WithLatentHeat::new(
-        NaccMaterial::wet_soil(THAWED_STIFFNESS, 0.3),
-        LATENT_HEAT_FUSION,
-    );
+    // The block is BLOCK_CELLS.y deep at the default grid density, so its
+    // clay starts consolidated under the weight above its own mid-depth.
+    let sigma_v = GRAVITY_MAGNITUDE * BLOCK_CELLS.y as f32 * 0.5;
+    let preconsolidation = sigma_v * (2.0 - CLAY_FRICTION_ANGLE_SIN) * 0.5;
+    let mut frozen = NaccMaterial::kaolin(FROZEN_STIFFNESS, 0.3);
+    frozen.initial_preconsolidation = preconsolidation;
+    let mut thawed_clay = NaccMaterial::kaolin(THAWED_STIFFNESS, 0.3);
+    thawed_clay.initial_preconsolidation = preconsolidation;
+    let thawed = WithLatentHeat::new(thawed_clay, LATENT_HEAT_FUSION);
 
     let mut solver = Simulation::empty(config)
         .with_material(FROZEN_ID, Box::new(frozen))
@@ -137,10 +151,9 @@ fn make_sim() -> Simulation {
 
     let spawn = SpawnRegion {
         spacing: 0.5,
-        box_size: IVec2::new(32, 20),
+        box_size: BLOCK_CELLS,
         box_center: Vec2::new(32.0, 12.0),
         material_id: FROZEN_ID,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let _ = solver.add_body(spawn);

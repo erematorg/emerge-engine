@@ -1,13 +1,13 @@
 extern crate emerge_engine as emerge;
 
-/// TEMP diagnostic (2026-09-18) -- first real, live test of the new GPU port
-/// of the CPU-proven Chorin-style fluid incompressibility pressure
-/// projection (`src/systems/gpu/shaders/fluid_pressure.wgsl`). Reuses the
-/// EXACT wall-contact geometry `examples/cpu/fluid_pressure_projection.rs`
-/// already proved stable on CPU (~90fps at the real, correct
-/// `gravity_fraction: 0.003`, confirmed earlier the same day) -- the
-/// hardest scene this technique has real, positive evidence for. This is
-/// the real go/no-go check for whether the GPU port reproduces that.
+/// Diagnostic for the GPU port of the Chorin-style pressure projection
+/// (`src/systems/gpu/shaders/fluid_pressure.wgsl`), on the same wall-contact
+/// geometry as `examples/cpu/fluid_pressure_projection.rs` at its
+/// `gravity_fraction: 0.003`. Both backends survive 120 frames (the CPU at
+/// ~90 fps, the GPU faster), but on both the volume ratio J sits at the
+/// [0.5, 2.0] safety clamp from about frame 20 onward: the frame rates
+/// measure cost, not a valid incompressible run. See the pressure
+/// projection entry in `KNOWN_LIMITATIONS.md`.
 ///
 ///   cargo run --example fluid_pressure_projection_gpu_check --features gpu
 use emerge::gpu::GpuSimulation;
@@ -78,7 +78,6 @@ fn main() {
             box_center: Vec2::new(11.0, 30.0),
             material_id: MAT_WATER,
             initial_velocity_scale: 0.0,
-            precompute_initial_volumes: true,
             mass_override: Some(WATER_MASS),
             ..SpawnRegion::for_sim(&config)
         },

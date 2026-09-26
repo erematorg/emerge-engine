@@ -232,8 +232,55 @@ path = "examples/cpu/basic_membrane.rs"
 required-features = ["render"]
 
 [[example]]
+name = "cfl_margin_probe"
+path = "examples/cpu/cfl_margin_probe.rs"
+
+[[example]]
+name = "cfl_impact_probe"
+path = "examples/cpu/cfl_impact_probe.rs"
+
+[[example]]
+name = "bingham_slump_probe"
+path = "examples/cpu/bingham_slump_probe.rs"
+
+[[example]]
 name = "bingham_cost_probe"
 path = "examples/cpu/bingham_cost_probe.rs"
+
+[[example]]
+name = "nacc_law_probe"
+path = "examples/cpu/nacc_law_probe.rs"
+
+[[example]]
+name = "basic_oedometer"
+path = "examples/cpu/basic_oedometer.rs"
+required-features = ["render"]
+
+[[example]]
+name = "oedometer_cost_probe"
+path = "examples/cpu/oedometer_cost_probe.rs"
+
+[[example]]
+name = "nacc_cost_probe"
+path = "examples/cpu/nacc_cost_probe.rs"
+
+[[example]]
+name = "basic_boiling"
+path = "examples/cpu/basic_boiling.rs"
+required-features = ["render"]
+
+[[example]]
+name = "boiling_cost_probe"
+path = "examples/cpu/boiling_cost_probe.rs"
+
+[[example]]
+name = "basic_cavitation"
+path = "examples/cpu/basic_cavitation.rs"
+required-features = ["render"]
+
+[[example]]
+name = "cavitation_cost_probe"
+path = "examples/cpu/cavitation_cost_probe.rs"
 
 [[example]]
 name = "mui_cost_probe"
@@ -401,6 +448,10 @@ required-features = ["render"]
 name = "permafrost"
 path = "examples/cpu/permafrost.rs"
 required-features = ["render"]
+
+[[example]]
+name = "soil_horizons_cost_probe"
+path = "examples/cpu/soil_horizons_cost_probe.rs"
 
 [[example]]
 name = "soil_horizons"

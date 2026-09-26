@@ -13,7 +13,8 @@ use emerge::{SimConfig, Simulation, SlipBoundary, SpawnRegion};
 use glam::{IVec2, Vec2};
 
 const GRID: usize = 32;
-const MAT_SAND: u32 = 1;
+// Slot 0: the only material registered, through `with_default_material`.
+const MAT_SAND: u32 = 0;
 
 fn make_sand() -> DruckerPragerMaterial {
     let mut m = DruckerPragerMaterial::cohesionless(6.0e5, 0.3);
@@ -33,7 +34,6 @@ fn make_sim(implicit: bool) -> Simulation {
         box_size: IVec2::new(8, 8),
         box_center: Vec2::new(16.0, 20.0),
         material_id: MAT_SAND,
-        precompute_initial_volumes: true,
         position_jitter: 0.2,
         rng_seed: 7,
         mass_override: Some(0.25),
@@ -83,7 +83,6 @@ fn make_sim_at(implicit: bool, center_y: f32) -> Simulation {
         box_size: IVec2::new(8, 8),
         box_center: Vec2::new(16.0, center_y),
         material_id: MAT_SAND,
-        precompute_initial_volumes: true,
         position_jitter: 0.2,
         rng_seed: 7,
         mass_override: Some(0.25),

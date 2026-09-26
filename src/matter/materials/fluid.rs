@@ -1,7 +1,7 @@
 use glam::{Mat2, Vec2};
 
 use crate::materials::physical_props::{FromSI, NewtonianFluid, scale_stress, scale_visc};
-use crate::materials::utils::von_neumann_richtmyer_q;
+use crate::materials::utils::{advance_log_volume_ratio, von_neumann_richtmyer_q};
 use crate::materials::{ConstitutiveModel, MaterialModel, MaterialParams};
 use crate::particle::{Particle, ParticleUpdateCtx, Particles};
 
@@ -293,8 +293,8 @@ impl MaterialModel for NewtonianFluidMaterial {
     // `cac544b` file (confirmed: `git show 6234d06:...` has no override
     // either) -- but the CURRENT (non-reverted) engine's spawn contract
     // relies on materials that own their volume/density state to set them
-    // exactly here, overriding `SpawnRegion::precompute_initial_volumes`'s
-    // own kernel-density estimate (a real, legitimate default for materials
+    // exactly here, overriding the spawn's own kernel-density estimate
+    // (which every body now gets, a real, legitimate default for materials
     // that DON'T have an exact analytical initial state, but wrong for a
     // strict fluid, which does: V0 = mass/rest_density exactly). Without
     // this override, that kernel estimate was the only thing setting
@@ -550,7 +550,17 @@ impl MaterialModel for NewtonianFluidMaterial {
         // a rigid floor at eos_stiffness=50) hits BOTH bounds EXACTLY --
         // min_j_seen=0.5000, max_j_seen=2.0000 -- over 250 real steps. Under
         // a hard impact this clamp is load-bearing, not vestigial; keep it.
-        let j = (old_j * (dt * div_v).exp()).clamp(0.5, 2.0);
+        // `old_j` above is only the fallback: the carried logarithm is the
+        // real state, because reading J back from F and multiplying loses a
+        // fraction of every small increment (see
+        // `advance_log_volume_ratio`'s own doc for the measurement).
+        let carried = if *ctx.log_volume_strain != 0.0 || old_j == 1.0 {
+            *ctx.log_volume_strain
+        } else {
+            old_j.max(1.0e-9).ln()
+        };
+        let (log_j, j) = advance_log_volume_ratio(carried, dt * div_v, 0.5, 2.0);
+        *ctx.log_volume_strain = log_j;
         let s = j.sqrt();
         *ctx.deformation_gradient =
             glam::Mat2::from_cols(glam::Vec2::new(s, 0.0), glam::Vec2::new(0.0, s));

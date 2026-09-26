@@ -27,7 +27,6 @@ fn box_spawn(config: &SimConfig, side: i32, center: Vec2, material_id: u32) -> S
         box_size: IVec2::splat(side),
         box_center: center,
         material_id,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(config)
     }
 }

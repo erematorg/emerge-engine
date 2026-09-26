@@ -386,8 +386,7 @@ fn build_initial_batch(config: &SimConfig) -> Vec<emerge::Particle> {
             .at(center)
             .disk(POUR_RADIUS)
             .spacing(0.5)
-            .material(MAT_ID)
-            .precompute_volumes(),
+            .material(MAT_ID),
     )
 }
 

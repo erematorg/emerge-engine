@@ -118,7 +118,6 @@ fn make_sim() -> Simulation {
             box_size: IVec2::new(12, 12),
             box_center: Vec2::new(x_center, 10.0),
             material_id,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         let _ = solver.add_body(spawn);

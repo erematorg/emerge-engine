@@ -221,6 +221,8 @@ impl GpuSimulation {
             self.buffers
                 .readback_blocking(&self.device, &self.queue, self.particle_count);
         self.rebuild_spatial_hash();
+        // The GPU has just been drained, so the last frame's stats are ready too.
+        self.sync_frame_stats();
     }
 
     /// Like `sync_particles_blocking`, but only for the given particle index ranges --

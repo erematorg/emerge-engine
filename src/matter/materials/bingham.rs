@@ -3,7 +3,8 @@ use glam::{Mat2, Vec2};
 use crate::materials::physical_props::{BinghamProps, FromSI, scale_stress, scale_visc};
 use crate::materials::svd::svd2;
 use crate::materials::utils::{
-    LOG_CLAMP, MIN_J, deformation_increment_exp, elastic_wave_dt, hencky_strains, reconstruct_f,
+    LOG_CLAMP, MIN_J, advance_deformation_gradient, advance_log_volume_ratio, carried_volume_ratio,
+    elastic_wave_dt, hencky_strains, reconstruct_f,
 };
 use crate::materials::{ConstitutiveModel, MaterialModel, MaterialParams};
 use crate::particle::{Particle, ParticleUpdateCtx, Particles};
@@ -272,6 +273,13 @@ impl FromSI<BinghamProps> for BinghamFluidMaterial {
         let rho_grid = props.rho_kg_m3 / config.reference_density_kg_m3;
         let mut material = Self::new(rho_grid, visc, eos, GAMMA, tau0);
         material.shear_modulus = shear_modulus;
+        // Converted through the same family as `tau0` and `eos`, because it
+        // is compared against the pressure those produce. `Self::new`
+        // leaves this at 0.0, which says the fluid carries no tension at
+        // all, and a fluid that cannot be pulled on can only gain volume:
+        // see `BinghamProps::cavitation_pressure_pa`.
+        material.pressure_floor =
+            scale_stress(props.cavitation_pressure_pa, props.rho_kg_m3, config);
         material
     }
 }
@@ -308,8 +316,11 @@ impl BinghamFluidMaterial {
     /// purely viscous branch it imposes no viscous timestep restriction of
     /// its own.
     fn update_elastoviscoplastic(&self, ctx: &mut ParticleUpdateCtx, dt: f32) {
-        let f_trial =
-            deformation_increment_exp(dt * *ctx.velocity_gradient) * *ctx.deformation_gradient;
+        let (f_trial, _) = advance_deformation_gradient(
+            *ctx.deformation_gradient,
+            dt * *ctx.velocity_gradient,
+            carried_volume_ratio(*ctx.volume, ctx.initial_volume),
+        );
         let (u, sigma, vt) = svd2(f_trial);
 
         let eps = hencky_strains(sigma);
@@ -491,7 +502,16 @@ impl MaterialModel for BinghamFluidMaterial {
         }
         let old_j = ctx.deformation_gradient.determinant();
         let div_v = ctx.velocity_gradient.x_axis.x + ctx.velocity_gradient.y_axis.y;
-        let j = (old_j * (dt * div_v).exp()).clamp(0.5, 2.0);
+        // The carried logarithm is the real state; reading J back from F
+        // and multiplying loses a fraction of every small increment (see
+        // `advance_log_volume_ratio`'s own doc for the measurement).
+        let carried = if *ctx.log_volume_strain != 0.0 || old_j == 1.0 {
+            *ctx.log_volume_strain
+        } else {
+            old_j.max(1.0e-9).ln()
+        };
+        let (log_j, j) = advance_log_volume_ratio(carried, dt * div_v, 0.5, 2.0);
+        *ctx.log_volume_strain = log_j;
         let s = j.sqrt();
         *ctx.deformation_gradient =
             glam::Mat2::from_cols(glam::Vec2::new(s, 0.0), glam::Vec2::new(0.0, s));
@@ -532,14 +552,20 @@ impl MaterialModel for BinghamFluidMaterial {
     /// The elastoviscoplastic branch has no WGSL counterpart: `params()`
     /// uploads `ConstitutiveModel::Fluid`, and `p2g.wgsl`'s fluid arm reads
     /// the rate of strain, not the stored elastic strain this branch keeps
-    /// in `F`. Asking for the CPU update at least keeps `F` and the plastic
-    /// state on the real yield surface every substep, exactly the
-    /// arrangement already documented for `NaccMaterial`; the stress
-    /// feeding that same substep's transfer is still the fluid one. Stated
-    /// plainly rather than left to be discovered: this branch is CPU-only
-    /// until the shader gains a matching arm.
+    /// in `F`. On the GPU the CPU update does not rescue it: it runs once
+    /// per frame with a single substep's dt, and re-uploading its copy makes
+    /// the GPU simulation advance at half speed (a free fall reaches -49.0
+    /// instead of -98.1 cells/s after 0.1 s). The stress feeding the
+    /// transfer is still the fluid one. This branch is CPU-only until the
+    /// shader gains a matching arm.
     fn needs_cpu_update(&self) -> bool {
         self.shear_modulus > 0.0
+    }
+
+    fn gpu_unsupported_reason(&self) -> Option<&'static str> {
+        (self.shear_modulus > 0.0).then_some(
+            "BinghamFluidMaterial with a shear modulus (the elastoviscoplastic branch) has no GPU stress path: the GPU runs the viscous fluid law and the per-frame CPU update advances only half the simulated time",
+        )
     }
 
     fn params(&self) -> MaterialParams {

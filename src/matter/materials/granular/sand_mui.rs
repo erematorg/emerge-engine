@@ -3,8 +3,8 @@ use glam::{Mat2, Vec2};
 use crate::materials::physical_props::{FromSI, GranularProps, scale_lame};
 use crate::materials::svd::svd2;
 use crate::materials::utils::{
-    MIN_J, corotated_elastic_stress, elastic_wave_dt, hencky_strains, lame_from_young,
-    reconstruct_f,
+    MIN_J, advance_deformation_gradient, carried_volume_ratio, corotated_elastic_stress,
+    elastic_wave_dt, hencky_strains, lame_from_young, reconstruct_f,
 };
 use crate::materials::{ConstitutiveModel, MaterialModel, MaterialParams};
 use crate::particle::{Particle, ParticleUpdateCtx, Particles};
@@ -182,7 +182,16 @@ impl MaterialModel for MuIRheologyMaterial {
     }
 
     fn update_particle(&self, ctx: &mut ParticleUpdateCtx, dt: f32) {
-        let f_trial = (Mat2::IDENTITY + dt * *ctx.velocity_gradient) * *ctx.deformation_gradient;
+        // Exponential increment, like every other law in this engine. This
+        // one integrated `(I + dt C) F` on its own until now, the last of
+        // the three defects the first audit pass found: forward Euler's
+        // determinant carries a systematic `dt^2 det(C)` term, which a
+        // granular law reads as real compaction it then hardens on.
+        let (f_trial, _) = advance_deformation_gradient(
+            *ctx.deformation_gradient,
+            dt * *ctx.velocity_gradient,
+            carried_volume_ratio(*ctx.volume, ctx.initial_volume),
+        );
         let (u, sigma, vt) = svd2(f_trial);
 
         let eps = hencky_strains(sigma);

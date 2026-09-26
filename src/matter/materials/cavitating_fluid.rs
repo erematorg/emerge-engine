@@ -23,6 +23,7 @@
 use glam::{Mat2, Vec2};
 
 use super::cavitating_eos::{CavitatingEosParams, CavitatingEosTable};
+use crate::materials::utils::advance_log_volume_ratio;
 use crate::materials::{ConstitutiveModel, MaterialModel, MaterialParams};
 use crate::particle::{Particle, ParticleUpdateCtx, Particles};
 
@@ -133,10 +134,21 @@ impl MaterialModel for IsothermalCavitatingFluidMaterial {
         ConstitutiveModel::Fluid
     }
 
+    fn gpu_unsupported_reason(&self) -> Option<&'static str> {
+        Some(
+            "IsothermalCavitatingFluidMaterial has no GPU stress path: it uploads as a plain Tait fluid, so the GPU would run without cavitation",
+        )
+    }
+
     /// Same real contract as `NewtonianFluidMaterial::init_particle` --
     /// see that method's own doc for why a strict fluid must set
     /// `initial_volume`/`volume`/`density` exactly here (V0=m/rho0,
     /// rho=rho0), not rely on `SpawnRegion`'s own kernel-density estimate.
+    /// A scene that spawns this at a density other than the liquid
+    /// reference must set the lattice spacing AND
+    /// `SpawnRegion::initial_deformation_gradient` together -- see
+    /// `cavitating_eos`'s own module doc for the measured cost of
+    /// setting only one of the two.
     fn init_particle(&self, particle: &mut Particle) {
         let j = particle.deformation_gradient.determinant();
         particle.initial_volume = particle.mass / self.rest_density_grid;
@@ -259,7 +271,21 @@ impl MaterialModel for IsothermalCavitatingFluidMaterial {
     fn update_particle(&self, ctx: &mut ParticleUpdateCtx, dt: f32) {
         let old_j = ctx.deformation_gradient.determinant();
         let div_v = ctx.velocity_gradient.x_axis.x + ctx.velocity_gradient.y_axis.y;
-        let j = (old_j * (dt * div_v).exp()).clamp(self.volume_ratio_min, self.volume_ratio_max);
+        // The carried logarithm is the real state; reading J back from F
+        // and multiplying loses a fraction of every small increment (see
+        // `advance_log_volume_ratio`'s own doc for the measurement).
+        let carried = if *ctx.log_volume_strain != 0.0 || old_j == 1.0 {
+            *ctx.log_volume_strain
+        } else {
+            old_j.max(1.0e-9).ln()
+        };
+        let (log_j, j) = advance_log_volume_ratio(
+            carried,
+            dt * div_v,
+            self.volume_ratio_min,
+            self.volume_ratio_max,
+        );
+        *ctx.log_volume_strain = log_j;
         let s = j.sqrt();
         *ctx.deformation_gradient = Mat2::from_cols(Vec2::new(s, 0.0), Vec2::new(0.0, s));
         // Real, disclosed correction (2026-08-30) -- same F/V/rho
@@ -282,14 +308,8 @@ impl MaterialModel for IsothermalCavitatingFluidMaterial {
         false
     }
 
-    /// Real, disclosed limitation: NOT yet wired for GPU -- this material
-    /// is CPU-only for now, same real "CPU correctness first, GPU port
-    /// second" standing rule `IdealGasMaterial` was built under. If this
-    /// material is ever registered with a `GpuSimulation`, it will be
-    /// silently misread as a zero-stiffness `NewtonianFluidMaterial` --
-    /// real, disclosed, NOT YET guarded against at construction; a real,
-    /// loud rejection or a genuine new GPU constitutive branch is the
-    /// correct fix, not attempted here.
+    /// CPU-only: on the GPU this material would upload as a plain Tait
+    /// fluid, so `GpuSimulation` refuses it (`gpu_unsupported_reason`).
     ///
     /// Real, disclosed correction (2026-08-30): `params()` is NOT purely
     /// GPU-facing metadata -- `eos_power`
@@ -459,6 +479,17 @@ impl MaterialModel for CavitatingFluidMaterial {
         ConstitutiveModel::Fluid
     }
 
+    fn gpu_unsupported_reason(&self) -> Option<&'static str> {
+        Some(
+            "CavitatingFluidMaterial has no GPU stress path: it uploads as a plain Tait fluid, so the GPU would run without cavitation",
+        )
+    }
+
+    /// A scene that spawns this at a density other than the liquid
+    /// reference must set the lattice spacing AND
+    /// `SpawnRegion::initial_deformation_gradient` together -- see
+    /// `cavitating_eos`'s own module doc for the measured cost of
+    /// setting only one of the two.
     fn init_particle(&self, particle: &mut Particle) {
         let j = particle.deformation_gradient.determinant();
         particle.initial_volume = particle.mass / self.rest_density_grid;
@@ -564,7 +595,21 @@ impl MaterialModel for CavitatingFluidMaterial {
     fn update_particle(&self, ctx: &mut ParticleUpdateCtx, dt: f32) {
         let old_j = ctx.deformation_gradient.determinant();
         let div_v = ctx.velocity_gradient.x_axis.x + ctx.velocity_gradient.y_axis.y;
-        let j = (old_j * (dt * div_v).exp()).clamp(self.volume_ratio_min, self.volume_ratio_max);
+        // The carried logarithm is the real state; reading J back from F
+        // and multiplying loses a fraction of every small increment (see
+        // `advance_log_volume_ratio`'s own doc for the measurement).
+        let carried = if *ctx.log_volume_strain != 0.0 || old_j == 1.0 {
+            *ctx.log_volume_strain
+        } else {
+            old_j.max(1.0e-9).ln()
+        };
+        let (log_j, j) = advance_log_volume_ratio(
+            carried,
+            dt * div_v,
+            self.volume_ratio_min,
+            self.volume_ratio_max,
+        );
+        *ctx.log_volume_strain = log_j;
         let s = j.sqrt();
         *ctx.deformation_gradient = Mat2::from_cols(Vec2::new(s, 0.0), Vec2::new(0.0, s));
         let density = (self.rest_density_grid / j)
@@ -883,6 +928,24 @@ mod tests {
              rest={:?} compressing={:?}",
             stress_rest.x_axis.x,
             stress_compressing.x_axis.x
+        );
+    }
+
+    #[test]
+    fn gpu_refuses_both_cavitating_fluids() {
+        let table = real_table();
+        let isothermal =
+            IsothermalCavitatingFluidMaterial::new(table.reconstruct(300.0), 1.0, 1.0e-3, 0.5, 8.0);
+        let coupled = CavitatingFluidMaterial::new(table, 1.0, 1.0e-3, 0.5, 8.0);
+        assert!(
+            isothermal
+                .gpu_unsupported_reason()
+                .is_some_and(|r| r.starts_with("IsothermalCavitatingFluidMaterial"))
+        );
+        assert!(
+            coupled
+                .gpu_unsupported_reason()
+                .is_some_and(|r| r.starts_with("CavitatingFluidMaterial"))
         );
     }
 

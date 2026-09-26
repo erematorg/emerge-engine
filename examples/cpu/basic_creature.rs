@@ -178,7 +178,6 @@ fn make_sim() -> (
         box_size: IVec2::new(36, 4),
         box_center: body_center,
         material_id: MAT_BODY,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     // Arc'd so this exact instance is shared between the solver (which drives

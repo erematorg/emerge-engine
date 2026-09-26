@@ -113,10 +113,9 @@ pub enum ConstitutiveModel {
     NoCompression = 12,
     /// Ideal gas EOS (p=ρRT) -- CPU only. GPU shaders (`p2g.wgsl`,
     /// `particles_update.wgsl`) have no case-13 branch yet; an unrecognised
-    /// `mat.model` falls through their `default: { return mat2x2<f32>(); }`
-    /// arm, i.e. zero stress on GPU today. Real, disclosed limitation, not
-    /// silent -- see `IdealGasMaterial`'s own doc. CPU correctness first, GPU
-    /// port second (per this engine's own standing development rule).
+    /// `mat.model` would fall through their `default: { return mat2x2<f32>(); }`
+    /// arm to zero stress, so `GpuSimulation` refuses to start with it (see
+    /// `MaterialModel::gpu_unsupported_reason`).
     Gas = 13,
 }
 
@@ -393,6 +392,14 @@ pub trait MaterialModel: Send + Sync + core::fmt::Debug + AsAny {
         false
     }
 
+    /// Why `GpuSimulation` cannot run this material, or `None` when the GPU
+    /// shaders implement its law. The GPU solver refuses to start with any
+    /// material that gives a reason, instead of running another law in its
+    /// place. The reason starts with the material's type name.
+    fn gpu_unsupported_reason(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Whether this material consumes an optional kernel-density measurement.
     ///
     /// This is for models whose constitutive law explicitly uses that sampled
@@ -647,6 +654,9 @@ macro_rules! forward_material_model_common {
         }
         fn needs_cpu_update(&self) -> bool {
             self.inner.needs_cpu_update()
+        }
+        fn gpu_unsupported_reason(&self) -> Option<&'static str> {
+            self.inner.gpu_unsupported_reason()
         }
         fn needs_density_recompute(&self) -> bool {
             self.inner.needs_density_recompute()

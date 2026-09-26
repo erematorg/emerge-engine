@@ -100,7 +100,6 @@ fn main() {
         box_size,
         box_center,
         material_id: MAT_WATER,
-        precompute_initial_volumes: true,
         mass_override: Some(WATER_MASS),
         ..SpawnRegion::for_sim(&config)
     };

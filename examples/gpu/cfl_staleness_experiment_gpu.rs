@@ -122,7 +122,6 @@ fn main() {
         box_size: IVec2::new(14, 52),
         box_center: Vec2::new(20.0, 30.0),
         material_id: MAT_WATER,
-        precompute_initial_volumes: true,
         mass_override: Some(WATER_MASS),
         ..SpawnRegion::for_sim(&config)
     };

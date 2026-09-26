@@ -124,8 +124,12 @@ pub enum PlasticityModel {
         friction: f32,
         /// Cohesion β. 0.0 = no tensile strength (standard soil).
         cohesion: f32,
-        /// Hardening factor ξ. 0.0 = perfect plasticity (no cap growth).
-        hardening_factor: f32,
+        /// Compression index λ of the soil's oedometer curve.
+        compression_index: f32,
+        /// Swelling index κ of the same curve.
+        swelling_index: f32,
+        /// Void ratio e at the reference state.
+        void_ratio: f32,
     },
 }
 
@@ -397,9 +401,19 @@ pub struct NaccProps {
     /// Cohesion β (0.0 = no tensile strength). NOT an SI quantity, passed
     /// through unconverted.
     pub cohesion: f32,
-    /// Hardening factor ξ (0.0 = perfect plasticity, no hardening). NOT an
-    /// SI quantity, passed through unconverted.
-    pub hardening_factor: f32,
+    /// Compression index λ of the soil's own oedometer curve (slope of the
+    /// normal compression line in e against ln p'). Dimensionless.
+    pub compression_index: f32,
+    /// Swelling index κ of the same curve (unload-reload slope), usually a
+    /// third to a fifth of the compression index. Dimensionless.
+    pub swelling_index: f32,
+    /// Void ratio e at the reference state, so the hardening exponent is
+    /// `(1 + e) / (compression_index - swelling_index)`.
+    pub void_ratio: f32,
+    /// Preconsolidation pressure in Pa, the largest mean effective stress
+    /// the soil has carried before (oedometer test, Casagrande 1936). 0.0 =
+    /// a soil that has never been loaded.
+    pub preconsolidation_pa: f32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -429,6 +443,109 @@ pub struct BinghamProps {
     /// rest; a positive value selects the elastoviscoplastic form that can.
     /// See `BinghamFluidMaterial::shear_modulus`.
     pub shear_modulus_pa: f32,
+    /// Gauge pressure `[Pa]` at which this fluid cavitates and stops
+    /// carrying tension. Negative. The Tait law this material uses is a
+    /// gauge law, zero at rest density, so a particle above rest volume
+    /// asks for a negative pressure; this is how far down that request is
+    /// honoured before the fluid is taken to have opened a cavity instead.
+    ///
+    /// It is a coefficient of THIS fluid, not a number borrowed from a pure
+    /// liquid: `BinghamProps::cavitation_pressure_from_nucleus` builds it
+    /// from two independent published figures rather than stating it. One of
+    /// those, the nucleus radius, is a class boundary rather than a
+    /// measurement, and that is said where it is defined.
+    ///
+    /// Leaving it at 0.0 is a real physical statement and not a neutral
+    /// default. It says the fluid carries no tension at all, so expansion
+    /// meets no restoring force while compression meets the full one, and
+    /// any symmetric noise in the divergence ratchets volume upward. That
+    /// was measured: every expanded particle in every slab of
+    /// `tests/scratch_thin_layer_volume_drift.rs` had its pressure deleted.
+    pub cavitation_pressure_pa: f32,
+}
+
+impl BinghamProps {
+    /// Surface tension `[N/m]` measured ON yield-stress fluids, not assumed
+    /// from the liquid they are built in: Mohammadigoushki and Shoele,
+    /// "Cavitation Rheology of Model Yield Stress Fluids Based on Carbopol",
+    /// Langmuir 39(22), 7672-7683, 2023 (arXiv 2304.03187) measure
+    /// 70 +/- 3 mN/m by needle-induced cavitation across Carbopol gels, and
+    /// find it
+    /// INDEPENDENT of the rheology over yield stresses of 0.5 to 120 Pa.
+    /// That independence is why one value can serve a whole family of
+    /// yield-stress fluids, and why a demo may share it across columns that
+    /// differ only in yield stress.
+    pub const YIELD_STRESS_FLUID_SURFACE_TENSION_N_M: f32 = 0.070;
+
+    /// Radius `[m]` of the largest gas nucleus an ordinarily mixed paste
+    /// carries. The Federal Highway Administration's petrographic manual
+    /// (FHWA-HRT-04-150, "Petrographic Methods of Examining Hardened
+    /// Concrete", July 2006, chapter 6) describes entrained voids as
+    /// "spherical voids larger than the capillaries, but less than 1 mm on
+    /// the lapped surface", anything above 1 mm being classed as entrapped
+    /// instead.
+    ///
+    /// Read that for what it is: 1 mm is the boundary of a CLASS in a
+    /// petrographic manual for HARDENED concrete, not the largest bubble
+    /// anyone measured in a fresh paste. Entrapped voids above 1 mm exist
+    /// too and would set a shallower threshold still. So the radius here is
+    /// a declared modelling choice standing on a published class boundary,
+    /// not a measurement, and it is the least defensible number in this
+    /// file.
+    ///
+    /// What makes it usable anyway is that it barely matters:
+    /// `tests/scratch_thin_layer_volume_drift.rs` sweeps this floor and
+    /// finds the slab behaves much the same anywhere from -280 to -2800 Pa,
+    /// a factor of ten.
+    pub const ENTRAINED_AIR_NUCLEUS_RADIUS_M: f32 = 500.0e-6;
+
+    /// Cavitation pressure `[Pa gauge, negative]` from the nucleus term of
+    /// the needle-induced-cavitation relation `P_c = 5E/6 + 2*gamma/R`
+    /// (Mohammadigoushki and Shoele, above, their Eq. 3): a cavity of
+    /// radius `R` runs away once the pressure difference across its own
+    /// surface tension is exceeded.
+    ///
+    /// One extrapolation, stated rather than hidden. That paper measures a
+    /// cavity INJECTED at a needle tip, so its `R` is the needle's own
+    /// inner radius, swept from 76 to 850 micrometres. Applying the same
+    /// relation to a gas nucleus already sitting in the fluid is the same
+    /// Laplace physics with a different cavity, and it is not what the
+    /// experiment tested. The radius used here does at least sit inside the
+    /// window they measured over.
+    ///
+    /// The elastic term `5E/6` is deliberately NOT included. It would make
+    /// the floor depend on the fluid's own stiffness, so two fluids that
+    /// differ only in yield stress would no longer share a value, and it
+    /// deepens the floor, which is the permissive direction. Leaving it out
+    /// keeps the shallower, more conservative threshold and keeps the
+    /// coefficient a property of the nucleus rather than of the rheology.
+    /// Adding it back is the natural refinement, and it is measurable.
+    ///
+    /// This relation also reproduces the figure the Newtonian twin already
+    /// ships: `NewtonianFluidMaterial::from_physical` uses -100,000 Pa for
+    /// practical dissolved-gas cavitation, and `2*gamma/R` returns that at
+    /// a nucleus radius of 1.4 micrometres. The two are the same
+    /// physics at two nucleus sizes, not two conventions: a clean liquid
+    /// carries only sub-micron nuclei, an ordinarily mixed paste carries
+    /// bubbles two hundred times larger, and cavitates that much sooner.
+    pub fn cavitation_pressure_from_nucleus(
+        surface_tension_n_m: f32,
+        nucleus_radius_m: f32,
+    ) -> f32 {
+        -2.0 * surface_tension_n_m / nucleus_radius_m.max(f32::MIN_POSITIVE)
+    }
+
+    /// The cavitation pressure of an ordinarily mixed, air-entrained paste,
+    /// from this type's own two constants. About -280 Pa. Half derived and
+    /// half declared: the surface tension is measured on this fluid family,
+    /// the nucleus radius is a class boundary read off a petrographic
+    /// manual. See `ENTRAINED_AIR_NUCLEUS_RADIUS_M`.
+    pub fn air_entrained_cavitation_pressure() -> f32 {
+        Self::cavitation_pressure_from_nucleus(
+            Self::YIELD_STRESS_FLUID_SURFACE_TENSION_N_M,
+            Self::ENTRAINED_AIR_NUCLEUS_RADIUS_M,
+        )
+    }
 }
 
 // ── Scaling helpers (pub(super) -- used by material impls) ─────────────────────

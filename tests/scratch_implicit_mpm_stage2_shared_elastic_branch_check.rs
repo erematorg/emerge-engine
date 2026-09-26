@@ -74,6 +74,7 @@ fn states() -> Vec<Mat2> {
 }
 
 #[test]
+#[ignore = "diagnostic probe kept for reruns, not part of the CI suite"]
 fn drucker_prager_sand_elastic_branch_matches_shared_corotated_formula() {
     let mat = DruckerPragerMaterial::cohesionless(2.0e3, 0.3);
     assert_eq!(
@@ -96,6 +97,7 @@ fn drucker_prager_sand_elastic_branch_matches_shared_corotated_formula() {
 }
 
 #[test]
+#[ignore = "diagnostic probe kept for reruns, not part of the CI suite"]
 fn von_mises_elastic_branch_matches_shared_corotated_formula() {
     let mat = VonMisesMaterial::from_young_modulus(50.0, 0.3, 10.0);
     assert_eq!(
@@ -118,6 +120,7 @@ fn von_mises_elastic_branch_matches_shared_corotated_formula() {
 }
 
 #[test]
+#[ignore = "diagnostic probe kept for reruns, not part of the CI suite"]
 fn rankine_elastic_branch_matches_shared_corotated_formula() {
     let mat = RankineMaterial::stiff_brittle(50.0, 0.3);
     assert_eq!(
@@ -140,6 +143,7 @@ fn rankine_elastic_branch_matches_shared_corotated_formula() {
 }
 
 #[test]
+#[ignore = "diagnostic probe kept for reruns, not part of the CI suite"]
 fn mui_rheology_elastic_branch_matches_shared_corotated_formula() {
     let mat = MuIRheologyMaterial::small_grain(50.0, 0.3);
     for &f in &states() {

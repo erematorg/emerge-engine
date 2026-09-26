@@ -38,7 +38,6 @@ fn moving_block_makes_a_resting_neighbor_block_react_through_the_grid() {
         box_size: IVec2::new(4, 4),
         box_center: Vec2::new(14.0, 24.0),
         material_id: 0,
-        precompute_initial_volumes: true,
         initial_velocity_scale: 0.0,
         ..SpawnRegion::for_sim(&config)
     };
@@ -60,7 +59,6 @@ fn moving_block_makes_a_resting_neighbor_block_react_through_the_grid() {
         box_size: IVec2::new(4, 4),
         box_center: Vec2::new(24.0, 24.0),
         material_id: 0,
-        precompute_initial_volumes: true,
         initial_velocity_scale: 0.0,
         ..SpawnRegion::for_sim(&config)
     };

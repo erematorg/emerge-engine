@@ -140,7 +140,6 @@ fn make_sim(wind_enabled: bool) -> Simulation {
         box_size: IVec2::new(STALK_WIDTH_BASE, STALK_HEIGHT),
         box_center: Vec2::new(STALK_CENTER_X, 9.0 + STALK_HEIGHT as f32 / 2.0),
         material_id: MAT_STALK,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
 

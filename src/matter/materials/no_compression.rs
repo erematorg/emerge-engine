@@ -3,7 +3,7 @@ use glam::{Mat2, Vec2};
 use crate::materials::physical_props::{Elastic, FromSI, scale_lame};
 use crate::materials::svd::svd2;
 use crate::materials::utils::{
-    MIN_J, deformation_increment_exp, elastic_wave_dt, hencky_strains,
+    MIN_J, advance_deformation_gradient, carried_volume_ratio, elastic_wave_dt, hencky_strains,
     reconstruct_stress_from_principal,
 };
 use crate::materials::{ConstitutiveModel, MaterialModel, MaterialParams};
@@ -104,6 +104,12 @@ impl MaterialModel for NoCompressionMaterial {
         ConstitutiveModel::NoCompression
     }
 
+    fn gpu_unsupported_reason(&self) -> Option<&'static str> {
+        Some(
+            "NoCompressionMaterial has no GPU stress path (issue #29): the shaders have no case for it and there is no CPU fallback, so it would run with zero stress",
+        )
+    }
+
     fn kirchhoff_stress(&self, particles: &Particles, i: usize) -> Mat2 {
         let f = particles.deformation_gradient[i];
         let j = f.determinant();
@@ -145,10 +151,13 @@ impl MaterialModel for NoCompressionMaterial {
     /// solution of the continuum kinematic equation `dF/dt=C*F`; it is the
     /// physical correction, not an admissibility clamp.
     fn update_particle(&self, ctx: &mut crate::particle::ParticleUpdateCtx, dt: f32) {
-        let f_new =
-            deformation_increment_exp(dt * *ctx.velocity_gradient) * *ctx.deformation_gradient;
+        let (f_new, carried) = advance_deformation_gradient(
+            *ctx.deformation_gradient,
+            dt * *ctx.velocity_gradient,
+            carried_volume_ratio(*ctx.volume, ctx.initial_volume),
+        );
         *ctx.deformation_gradient = f_new;
-        let j = f_new.determinant().max(MIN_J);
+        let j = carried.max(MIN_J);
         let v = (ctx.initial_volume * j).max(1.0e-6);
         *ctx.volume = v;
         *ctx.density = ctx.mass / v;

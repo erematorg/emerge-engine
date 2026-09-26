@@ -61,7 +61,6 @@ fn box_body(config: &SimConfig, side: i32) -> SpawnRegion {
         spacing: 0.5,
         box_size: IVec2::splat(side),
         box_center: Vec2::splat(GRID as f32 * 0.5),
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(config)
     }
 }
@@ -312,7 +311,6 @@ fn build_mixed_sim(n_each: usize) -> Simulation {
     let jelly_spawn = SpawnRegion {
         box_size: IVec2::splat(side),
         box_center: Vec2::new(GRID as f32 * 0.3, GRID as f32 * 0.6),
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let sand_spawn = SpawnRegion {
@@ -320,7 +318,6 @@ fn build_mixed_sim(n_each: usize) -> Simulation {
         box_size: IVec2::splat(side),
         box_center: Vec2::new(GRID as f32 * 0.5, GRID as f32 * 0.25),
         material_id: SAND_ID,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let water_spawn = SpawnRegion {
@@ -328,7 +325,6 @@ fn build_mixed_sim(n_each: usize) -> Simulation {
         box_size: IVec2::splat(side),
         box_center: Vec2::new(GRID as f32 * 0.7, GRID as f32 * 0.6),
         material_id: WATER_ID,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
 
@@ -390,7 +386,6 @@ fn build_material_count_sim(k: usize) -> Simulation {
                 box_size: IVec2::splat(side),
                 box_center: center,
                 material_id: i as u32,
-                precompute_initial_volumes: true,
                 ..SpawnRegion::for_sim(&config)
             }
         })
@@ -467,7 +462,6 @@ fn build_grid_res_sim(grid_res: usize) -> Simulation {
         spacing: 0.5,
         box_size: IVec2::splat(side),
         box_center: Vec2::splat(grid_res as f32 * 0.5),
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let (l, u) = lame_from_young(5.0e4, 0.3);
@@ -546,7 +540,6 @@ mod gpu_benches {
             spacing: 0.5,
             box_size: IVec2::splat(side),
             box_center: Vec2::splat(grid_res as f32 * 0.5),
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         let particles = build_particles(&config, spawn);
@@ -618,7 +611,6 @@ mod gpu_benches {
             spacing: 0.5,
             box_size: IVec2::splat(side),
             box_center: Vec2::splat(grid_res as f32 * 0.5),
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         let particles = build_particles(&config, spawn);
@@ -663,7 +655,6 @@ mod gpu_benches {
             spacing: 0.5,
             box_size: IVec2::splat(side),
             box_center: Vec2::splat(grid_res as f32 * 0.5),
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         let particles = build_particles(&config, spawn);

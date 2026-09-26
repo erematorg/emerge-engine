@@ -275,7 +275,6 @@ fn make_sim_data(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) -> GpuSimul
             box_size: IVec2::new(70, 4),
             box_center: Vec2::new(32.0, 4.0),
             material_id: SAND_ID,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         },
     );
@@ -563,7 +562,6 @@ impl State {
                     box_size: IVec2::new(6, 6),
                     box_center: self.cursor_grid(),
                     material_id,
-                    precompute_initial_volumes: true,
                     ..SpawnRegion::for_sim(self.sim.config())
                 };
                 // SpawnRegion::fits_in_sim, not hand-derived margin math --

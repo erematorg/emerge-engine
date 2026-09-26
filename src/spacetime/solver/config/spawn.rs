@@ -47,7 +47,6 @@ pub struct SpawnRegion {
     pub box_center: Vec2,
     pub shape: SpawnShape,
     pub initial_deformation_gradient: Mat2,
-    pub precompute_initial_volumes: bool,
     /// Randomized initial speed. Each particle gets a random velocity in [−scale/2, +scale/2]².
     /// 0.0 = at rest (default). Small values (0.1–1.0) add visual variety.
     pub initial_velocity_scale: f32,
@@ -87,7 +86,6 @@ impl Default for SpawnRegion {
             box_center: Vec2::splat(32.0),
             shape: SpawnShape::Box,
             initial_deformation_gradient: Mat2::IDENTITY,
-            precompute_initial_volumes: false,
             initial_velocity_scale: 0.0,
             position_jitter: 0.0,
             rng_seed: 1,
@@ -168,15 +166,6 @@ impl SpawnRegion {
         let si_kg = props.particle_mass(self.spacing, config);
         let to_grid = 1.0 / (config.reference_density_kg_m3 * config.dx_meters * config.dx_meters);
         self.mass_override = Some(si_kg * to_grid);
-        self
-    }
-
-    /// Run a P2G density pass after spawning to compute physically accurate initial volumes.
-    ///
-    /// Use for elastic solids and dense granular materials where incorrect initial density
-    /// would cause a pressure spike on the first substep. Costs one extra P2G pass at spawn.
-    pub const fn precompute_volumes(mut self) -> Self {
-        self.precompute_initial_volumes = true;
         self
     }
 

@@ -315,7 +315,6 @@ fn make_sim(mode: Mode) -> Simulation {
                 ),
                 box_center: Vec2::new(cx, FLOOR + 2.0 + PRESHAPED_HEIGHT_CELLS * 0.5),
                 material_id: 0,
-                precompute_initial_volumes: true,
                 ..SpawnRegion::for_sim(&config)
             };
             let sand = DruckerPragerMaterial::from_young_modulus(1.0e5, 0.2);
@@ -347,7 +346,6 @@ fn make_sim(mode: Mode) -> Simulation {
                 box_size: IVec2::new(8, 16),
                 box_center: Vec2::new(GRID as f32 * 0.5, FLOOR + 8.0),
                 material_id: 0,
-                precompute_initial_volumes: true,
                 ..SpawnRegion::for_sim(&config)
             };
             let mut sand = DruckerPragerMaterial::from_young_modulus(1.0e5, 0.2);
@@ -400,7 +398,6 @@ fn make_sim(mode: Mode) -> Simulation {
                 ),
                 box_center: terrain_center,
                 material_id: 0,
-                precompute_initial_volumes: true,
                 position_jitter: 0.3,
                 ..SpawnRegion::for_sim(&config)
             };
@@ -665,7 +662,6 @@ impl State {
                     box_size: IVec2::new(1, 1),
                     box_center: Vec2::new(cursor.x, y),
                     material_id: 0,
-                    precompute_initial_volumes: true,
                     position_jitter: 0.2,
                     rng_seed: self.pour_rng.0 as u32,
                     ..SpawnRegion::default()

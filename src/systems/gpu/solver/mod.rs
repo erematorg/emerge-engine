@@ -64,7 +64,13 @@ pub struct GpuSimulation {
     /// buffer's actual end.
     particle_capacity: usize,
     last_sub_dt: f32,
+    /// Substeps the GPU actually ran in the last frame whose stats were read back
+    /// (see `sync_frame_stats`), not the count encoded for it.
     last_substeps: usize,
+    /// Frame time the GPU could not advance in that same frame.
+    last_sim_time_dropped: f32,
+    /// Frame stats readback begun at the end of the last `step_frame`.
+    pending_frame_stats: Option<ReadbackResult>,
     /// One-frame-lagged max particle speed -- mirrors CPU's own
     /// `Simulation::last_max_particle_speed` exactly (same convention, same
     /// consumer: `SimConfig::fluid_near_wall_compression_mach_margin`'s
@@ -304,64 +310,11 @@ impl GpuSimulation {
         particles: Vec<Particle>,
         registry: MaterialRegistry,
     ) -> Self {
-        // Real regression guard (corrected -- a first version of this check
-        // read `MaterialParams::model` from `all_params()` and looked for
-        // `10`, which is UNREACHABLE: `NaccMaterial::params()` deliberately
-        // emits `ConstitutiveModel::NeoHookean as u32` (2), not its own
-        // `constitutive_model()` value (10) -- see that method's own
-        // comment ("GPU uses NeoHookean stress... Plasticity runs CPU-only
-        // via needs_cpu_update=true"). So a real NaccMaterial's GPU stress
-        // is NOT zero -- it silently runs `case 2u`'s NeoHookean law
-        // (`kappa*ln(J)`) instead of NACC's own real volumetric law
-        // (`kappa/2*(J^2-1)`, see `nacc.rs::kirchhoff_stress`), which is
-        // the actual, original finding here (external review). Its
-        // `needs_cpu_update` fallback (issue #5) DOES correctly re-project
-        // `deformation_gradient` onto the real Cam-Clay yield surface every
-        // frame, but the STRESS feeding that substep's P2G grid transfer is
-        // still NeoHookean's, not NACC's. Must check the real trait method
-        // (`constitutive_model()`, via `constitutive_model_of`), not the
-        // GPU-upload params -- those are exactly the two things this bug
-        // conflates. See `ConstitutiveModel::Nacc`'s own doc for the full
-        // finding. Fail loudly here instead of silently running the wrong
-        // constitutive law -- use `GranularFluidMaterial` instead, already
-        // fully GPU-native.
-        for id in 0..registry.len() as u32 {
-            if registry.constitutive_model_of(id) == crate::materials::ConstitutiveModel::Nacc {
-                panic!(
-                    "NaccMaterial (material_id {id}) has no real GPU stress path -- its \
-                     params() deliberately uploads as NeoHookean (model 2), so p2g.wgsl \
-                     silently runs NeoHookean's kappa*ln(J) volumetric law instead of \
-                     NACC's own kappa/2*(J^2-1) (see ConstitutiveModel::Nacc's own doc). \
-                     Its CPU plasticity fallback (issue #5) keeps F on the right yield \
-                     surface, but the stress driving grid momentum transfer is still \
-                     wrong. Use GranularFluidMaterial instead for a GPU-native \
-                     granular-fluid scene."
-                );
-            }
-        }
-
-        // Real fix, issue #29: `NoCompressionMaterial` has no `p2g.wgsl`/
-        // `particles_update.wgsl` case at all (unlike NACC above, no
-        // compensating CPU fallback exists either) -- an unrecognised
-        // `mat.model` falls through to `default: { return mat2x2<f32>(); }`,
-        // exact zero stress every substep. A cable/membrane/tendon would
-        // silently free-fall with no tension resistance, contradicting the
-        // material's entire purpose. Fail loudly here instead, same pattern
-        // as NACC's own guard -- no real GPU stress path exists yet for
-        // this model, see issue #29 for the WGSL-port option, not pursued
-        // here.
-        for id in 0..registry.len() as u32 {
-            if registry.constitutive_model_of(id)
-                == crate::materials::ConstitutiveModel::NoCompression
-            {
-                panic!(
-                    "NoCompressionMaterial (material_id {id}) has no GPU stress path at all -- \
-                     p2g.wgsl/particles_update.wgsl have no case for this model and there is no \
-                     CPU fallback, so it would silently run with exact zero stress (see \
-                     ConstitutiveModel::NoCompression's own doc). Use this material on the CPU \
-                     Simulation backend instead until issue #29's real WGSL port lands."
-                );
-            }
+        // A material whose law the shaders do not implement would run with
+        // another law in its place (zero stress, plain Tait fluid, NeoHookean
+        // volume law), so refuse to start rather than simulate it wrongly.
+        if let Some((id, reason)) = registry.first_gpu_unsupported() {
+            panic!("material_id {id} cannot run on GpuSimulation: {reason}");
         }
 
         let material_params = registry.all_params();
@@ -427,6 +380,8 @@ impl GpuSimulation {
             particle_capacity: particle_count,
             last_sub_dt: config.dt,
             last_substeps: 0,
+            last_sim_time_dropped: 0.0,
+            pending_frame_stats: None,
             last_max_particle_speed: 0.0,
             frame_index: 0,
             last_spawn_frame: 0,

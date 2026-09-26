@@ -3,9 +3,9 @@ use glam::{Mat2, Vec2};
 use crate::materials::physical_props::{BrittleProps, FromSI, scale_lame, scale_stress};
 use crate::materials::svd::svd2;
 use crate::materials::utils::{
-    MIN_J, RANKINE_MIN_RESIDUAL_TENSILE_FRACTION, corotated_elastic_stress,
-    deformation_increment_exp, elastic_wave_dt, hencky_strains, lame_from_young,
-    rankine_damage_saturation_point, reconstruct_f, stress_to_hencky,
+    MIN_J, RANKINE_MIN_RESIDUAL_TENSILE_FRACTION, advance_deformation_gradient,
+    carried_volume_ratio, corotated_elastic_stress, elastic_wave_dt, hencky_strains,
+    lame_from_young, rankine_damage_saturation_point, reconstruct_f, stress_to_hencky,
 };
 use crate::materials::{ConstitutiveModel, MaterialModel, MaterialParams};
 use crate::particle::{ParticleUpdateCtx, Particles};
@@ -433,8 +433,11 @@ impl MaterialModel for RankineMaterial {
     }
 
     fn update_particle(&self, ctx: &mut ParticleUpdateCtx, dt: f32) {
-        let f_trial =
-            deformation_increment_exp(dt * *ctx.velocity_gradient) * *ctx.deformation_gradient;
+        let (f_trial, _) = advance_deformation_gradient(
+            *ctx.deformation_gradient,
+            dt * *ctx.velocity_gradient,
+            carried_volume_ratio(*ctx.volume, ctx.initial_volume),
+        );
         let (u, sigma, vt) = svd2(f_trial);
 
         let eps = hencky_strains(sigma);

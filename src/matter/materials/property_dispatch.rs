@@ -103,19 +103,31 @@ impl Elastoplastic {
             CamClay {
                 friction,
                 cohesion,
-                hardening_factor,
+                compression_index,
+                swelling_index,
+                void_ratio,
             } => Box::new(NaccMaterial::from_physical(
                 &NaccProps {
                     elastic: self.elastic,
                     friction,
                     cohesion,
-                    hardening_factor,
+                    compression_index,
+                    swelling_index,
+                    void_ratio,
+                    preconsolidation_pa: 0.0,
                 },
                 config,
             )),
         }
     }
 
+    /// See `Elastic::particle_mass` -- density lives in `self.elastic.rho_kg_m3`.
+    pub fn particle_mass(&self, spacing: f32, config: &crate::SimConfig) -> f32 {
+        self.elastic.particle_mass(spacing, config)
+    }
+}
+
+impl NaccProps {
     /// See `Elastic::particle_mass` -- density lives in `self.elastic.rho_kg_m3`.
     pub fn particle_mass(&self, spacing: f32, config: &crate::SimConfig) -> f32 {
         self.elastic.particle_mass(spacing, config)
@@ -245,6 +257,12 @@ impl Fluid {
                     // branch is a deliberate act via `BinghamProps`, not
                     // something the liquid route turns on behind the caller.
                     shear_modulus_pa: 0.0,
+                    // A liquid carrying a yield stress is a mixed suspension, so it
+                    // carries mixed-in gas. Leaving this at 0.0 would contradict the
+                    // Newtonian branch just above, which already states its own
+                    // cavitation figure, and would contradict it in the one direction
+                    // that lets volume only ever grow.
+                    cavitation_pressure_pa: BinghamProps::air_entrained_cavitation_pressure(),
                 },
                 config,
             )),
@@ -302,6 +320,7 @@ forward_particle_mass!(
     Fluid,
     BinghamProps,
     GranularProps,
+    NaccProps,
 );
 
 #[cfg(test)]
@@ -402,14 +421,17 @@ mod particle_mass_tests {
             nu: 0.3,
             rho_kg_m3: 1800.0,
         };
-        let (friction, cohesion, hardening_factor) = (1.2, 0.1, 2.0);
+        let (friction, cohesion) = (1.2, 0.1);
+        let (compression_index, swelling_index, void_ratio) = (0.12, 0.023, 1.7);
 
         let via_dispatch = Elastoplastic {
             elastic,
             model: PlasticityModel::CamClay {
                 friction,
                 cohesion,
-                hardening_factor,
+                compression_index,
+                swelling_index,
+                void_ratio,
             },
         }
         .material(&config);
@@ -419,7 +441,10 @@ mod particle_mass_tests {
                 elastic,
                 friction,
                 cohesion,
-                hardening_factor,
+                compression_index,
+                swelling_index,
+                void_ratio,
+                preconsolidation_pa: 0.0,
             },
             &config,
         );
@@ -443,7 +468,9 @@ mod particle_mass_tests {
             model: PlasticityModel::CamClay {
                 friction,
                 cohesion,
-                hardening_factor,
+                compression_index,
+                swelling_index,
+                void_ratio,
             },
         };
         assert!((ep.particle_mass(spacing, &config) - expected_mass).abs() < 1e-9);

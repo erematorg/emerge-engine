@@ -52,7 +52,6 @@ fn make_sim(max_substeps_per_step: usize) -> Simulation {
         box_size: IVec2::new(22, 14),
         box_center: Vec2::new(19.0, 9.0),
         material_id: SAND_ID,
-        precompute_initial_volumes: true,
         mass_override: Some(sand_mass),
         ..SpawnRegion::for_sim(&config)
     });
@@ -61,7 +60,6 @@ fn make_sim(max_substeps_per_step: usize) -> Simulation {
         box_size: IVec2::new(22, 14),
         box_center: Vec2::new(45.0, 9.0),
         material_id: FLUID_ID,
-        precompute_initial_volumes: true,
         mass_override: Some(0.1 * SPACING * SPACING),
         ..SpawnRegion::for_sim(&config)
     });
@@ -70,7 +68,6 @@ fn make_sim(max_substeps_per_step: usize) -> Simulation {
         box_size: IVec2::new(12, 12),
         box_center: Vec2::new(32.0, 46.0),
         material_id: ELASTIC_ID,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     });
     solver
@@ -220,7 +217,7 @@ fn basic_showcase_substep_cost_breakdown_by_material() {
     let config = *sim.config();
     let particles = sim.particles();
 
-    // Real spawn-time density per material (precompute_initial_volumes:true
+    // Real spawn-time density per material (the spawn measures V0
     // means this is each material's own true rest density, before any
     // compression) -- read from the actual spawned scene, not assumed.
     let spawn_state_of = |mat_id: u32| {

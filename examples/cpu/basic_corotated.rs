@@ -94,7 +94,6 @@ fn make_sim(gravity_fraction: f32, step_seconds: f32) -> Simulation {
             box_size: BLOCK_CELLS,
             box_center: Vec2::new(BLOCK_X[slot], DROP_Y),
             material_id: mat,
-            precompute_initial_volumes: true,
             initial_velocity_scale: 0.0,
             ..SpawnRegion::for_sim(&config)
         }

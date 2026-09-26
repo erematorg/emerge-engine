@@ -103,7 +103,6 @@ fn make_sim() -> Simulation {
         box_size: IVec2::new(8, 16),
         box_center: Vec2::new(GRID as f32 * 0.5, FLOOR + 8.0),
         material_id: 0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let mut sand = DruckerPragerMaterial::from_young_modulus(1.0e5, 0.2);

@@ -138,7 +138,6 @@ fn make_sim(temperature_k: f32, density_spread: f32, gravity_fraction: f32) -> S
         spacing: SPACING,
         material_id: mat0,
         mass_override: Some(mass_for(AMBIENT_RHO_KG_M3 * ratio0)),
-        precompute_initial_volumes: true,
         initial_velocity_scale: 0.0,
         rng_seed: 11,
         // Same real, already-established reasoning as basic_sand.rs: a
@@ -163,7 +162,6 @@ fn make_sim(temperature_k: f32, density_spread: f32, gravity_fraction: f32) -> S
             spacing: SPACING,
             material_id: mat,
             mass_override: Some(mass_for(AMBIENT_RHO_KG_M3 * ratio)),
-            precompute_initial_volumes: true,
             initial_velocity_scale: 0.0,
             rng_seed: 11 + mat,
             position_jitter: 0.3,

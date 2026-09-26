@@ -36,6 +36,7 @@ fn gpu_available() -> bool {
 /// proving it didn't just avoid panicking by luck), (3) the blocking sync
 /// methods are also safe no-ops (don't panic touching a "dead" device).
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn step_frame_becomes_safe_noop_once_device_lost() {
     if !gpu_available() {
         return;
@@ -48,7 +49,6 @@ fn step_frame_becomes_safe_noop_once_device_lost() {
         spacing: 0.5,
         box_size: IVec2::new(4, 4),
         box_center: Vec2::new(16.0, 16.0),
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let particles = crate::build_particles(&config, spawn);
@@ -114,6 +114,7 @@ fn step_frame_becomes_safe_noop_once_device_lost() {
 /// test process; with it installed, it must set `device_lost` instead -- no
 /// panic, `device_lost_reason()` reports it.
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn uncaptured_destroyed_buffer_error_sets_device_lost_not_a_panic() {
     if !gpu_available() {
         return;
@@ -126,7 +127,6 @@ fn uncaptured_destroyed_buffer_error_sets_device_lost_not_a_panic() {
         spacing: 0.5,
         box_size: IVec2::new(4, 4),
         box_center: Vec2::new(16.0, 16.0),
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let particles = crate::build_particles(&config, spawn);
@@ -188,6 +188,7 @@ fn uncaptured_destroyed_buffer_error_sets_device_lost_not_a_panic() {
 /// this file). Static code inspection is what actually backs that claim:
 /// `with_device()`'s body contains no `set_device_lost_callback` call.
 #[test]
+#[ignore = "needs a real GPU adapter: run manually on hardware, see CONTRIBUTING.md"]
 fn with_device_instances_need_explicit_opt_in_for_device_lost_detection() {
     if !gpu_available() {
         return;

@@ -137,7 +137,7 @@ const CELL_CENTER_OFFSET:   f32 = 0.5;
 // This substep's timestep and velocity cap, decided on the GPU at the end of the previous
 // substep -- see `adaptive_cfl.wgsl`. `substep_dt()`/`vel_limit` are the CPU's
 // frame-start values and are NOT authoritative any more (the GPU may only tighten them).
-@group(2) @binding(37) var<storage, read_write> adaptive_dt: array<atomic<u32>, 4>;
+@group(2) @binding(37) var<storage, read_write> adaptive_dt: array<atomic<u32>, 5>;
 
 // Cached per invocation: this is an atomic storage load, and reading it at every use
 // site cost ~40% of a substep (measured: 0.29 -> 0.41ms per substep on the dam break).
@@ -631,7 +631,7 @@ fn g2p_asflip_fused_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Remaining tensor-F model SandMuI (8) stays on the original path until
     // their own plastic projections receive the same audit.
     var f_increment = identity + dt * p.velocity_gradient;
-    if mat.model == 2u || mat.model == 3u || mat.model == 4u || mat.model == 5u || mat.model == 6u || mat.model == 7u || mat.model == 9u || mat.model == 11u {
+    if mat.model == 2u || mat.model == 3u || mat.model == 4u || mat.model == 5u || mat.model == 6u || mat.model == 7u || mat.model == 8u || mat.model == 9u || mat.model == 11u {
         f_increment = deformation_increment_exp(dt * p.velocity_gradient);
     }
     var new_F = f_increment * p.deformation_gradient;
@@ -720,14 +720,10 @@ fn g2p_asflip_fused_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    // Light damping for plasticity models -- applied to BOTH v_store (p.v, persists for
-    // next g2p gather) and v_position (this substep's own position advance), same
-    // damping ratio, keeping ASFLIP's two velocities mutually consistent with how the
-    // single-velocity (non-ASFLIP) path already behaves under this damping.
-    if mat.model != 0u && mat.model != 1u && mat.model != 2u && mat.model != 3u && mat.model != 9u {
-        p.v *= 0.999;
-        v_position *= 0.999;
-    }
+    // No velocity damping here either, for the same measured reason as the
+    // fused pass's twin in `particles_update.wgsl`: see that file. This
+    // site damped BOTH of ASFLIP's velocities, so it cost the same in the
+    // position advance as in the stored velocity.
 
     // Position: x = x + v_position * dt -- v_position, NOT p.v, is ASFLIP's real point:
     // while separating (gamma=1) this equals p.v exactly; while compressing (gamma=0)

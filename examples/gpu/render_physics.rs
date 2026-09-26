@@ -133,7 +133,6 @@ impl State {
                 box_size: IVec2::new(GRID as i32 - 8, 12),
                 box_center: Vec2::new(GRID as f32 * 0.5, 9.0),
                 material_id: WATER_ID,
-                precompute_initial_volumes: true,
                 ..SpawnRegion::for_sim(&config)
             },
         );
@@ -145,7 +144,6 @@ impl State {
                 box_size: IVec2::new(GRID as i32 - 8, 8),
                 box_center: Vec2::new(GRID as f32 * 0.5, 17.0),
                 material_id: BLOB_ID,
-                precompute_initial_volumes: true,
                 ..SpawnRegion::for_sim(&config)
             },
         ));

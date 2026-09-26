@@ -4,6 +4,20 @@
 //! unmodified to WCMPM, since both are explicit, particle-based,
 //! density-from-deformation methods).
 //!
+//! # Laying a scene down on this EOS: both halves, or neither
+//!
+//! Every material in this family reads its density from `det(F)` and
+//! nothing else, while the grid reads it from how far apart the
+//! particles sit. A scene that wants a body at rest at a density other
+//! than the liquid reference has to set BOTH: the lattice spacing, so
+//! the grid sees that density, and `SpawnRegion::initial_deformation_
+//! gradient`, so the particle's own bookkeeping agrees. Either one alone
+//! is a pressure shock, not a scene: measured on the boiling mixture at
+//! a vapour quality of 0.19 (`examples/cpu/basic_boiling.rs`), spacing
+//! without the gradient throws particles at 151 m/s on the first frame,
+//! against 0.01 m/s once both are set. Nothing warns about it, because
+//! each half on its own is a legal state.
+//!
 //! Real gap this addresses (2026-08-30): confirmed live (water-jmax +
 //! divergence-decomposition diagnostics, `phase_states_gui.rs`, see
 //! project memory) that `NewtonianFluidMaterial`'s flat `pressure_floor`
@@ -320,8 +334,7 @@ fn mixture_derivative_raw(
 /// `f32`'s own ~1.19e-7 relative precision next to `1.0`, so
 /// `1.0-ratio^2` rounds to EXACTLY `1.0`, giving `x_cut=1.0` and this
 /// whole function returning exactly `0.0` -- not a small-but-real cutoff,
-/// a total loss of the analytic answer. Computed in `f64` instead (matches
-/// Codex's own general "precompute in f64" guidance) -- `f64`'s ~2.2e-16
+/// a total loss of the analytic answer. Computed in `f64` instead: `f64`'s ~2.2e-16
 /// relative precision keeps `1.0-ratio^2` real and nonzero for any
 /// physically sane `c_min/s_max` ratio this module's own real materials
 /// use.
@@ -1627,7 +1640,7 @@ mod tests {
     /// exercise -- band existence, real density ordering, monotonic
     /// pressure, C^1 junction continuity, and finite/positive patch
     /// derivatives. A dense sweep BETWEEN table nodes is exactly what a
-    /// single-`T` test cannot catch (Codex's own point) -- this sweep is
+    /// single-`T` test cannot catch -- this sweep is
     /// the real, direct construction at each sampled `T`, not yet a table
     /// lookup (the table itself is real, separate, still-open work).
     #[test]

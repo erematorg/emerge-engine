@@ -58,18 +58,26 @@ fn make_buffer(
     })
 }
 
+/// `adaptive_dt` and its staging copy: 8 u32 slots, 5 in use. Rounded up to a
+/// multiple of 8 bytes so the whole buffer can be mapped.
+const ADAPTIVE_DT_BYTES: u64 = 8 * mem::size_of::<u32>() as u64;
+
 /// All persistent GPU buffers for one GpuSimulation instance.
 pub struct GpuBuffers {
     /// Particle data -- STORAGE | COPY_DST | COPY_SRC.
     pub particles: wgpu::Buffer,
     /// Grid cells, zeroed each substep by grid_clear pass -- STORAGE
-    /// The GPU's own adaptive substep timestep, 4 x u32 (f32 bit patterns):
-    /// `[0]` this substep's dt (0 = the frame's time is spent, every pass skips),
-    /// `[1]` frame time still to advance, `[2]` running min of the next substep's CFL
-    /// bound (atomicMin over particles, positive floats compare as their bit patterns),
-    /// `[3]` frame time advanced so far. Written by `adaptive_cfl.wgsl::cfl_commit_main`
-    /// at the end of every substep and seeded by the CPU at the start of each frame.
+    /// The GPU's own adaptive substep timestep, 5 used u32 slots (f32 bit patterns
+    /// unless noted) in an 8-slot buffer: `[0]` this substep's dt (0 = the frame's time
+    /// is spent, every pass skips), `[1]` frame time still to advance, `[2]` running min
+    /// of the next substep's CFL bound (atomicMin over particles, positive floats compare
+    /// as their bit patterns), `[3]` frame time actually executed, `[4]` substeps
+    /// actually executed (u32). Written by `adaptive_cfl.wgsl::cfl_commit_main` at the
+    /// end of every substep, seeded by the CPU at the start of each frame, and copied
+    /// to `frame_stats_staging` at the end of it.
     pub adaptive_dt: wgpu::Buffer,
+    /// Mappable copy of `adaptive_dt`, read back asynchronously after each frame.
+    pub frame_stats_staging: wgpu::Buffer,
     pub grid: wgpu::Buffer,
     /// One MaterialParams per registered material slot -- UNIFORM | COPY_DST
     pub materials: wgpu::Buffer,
@@ -466,8 +474,16 @@ impl GpuBuffers {
         let adaptive_dt = make_buffer(
             device,
             "mpm_adaptive_dt",
-            4 * mem::size_of::<u32>() as u64,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            ADAPTIVE_DT_BYTES,
+            wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+        );
+        let frame_stats_staging = make_buffer(
+            device,
+            "mpm_frame_stats_staging",
+            ADAPTIVE_DT_BYTES,
+            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         );
         let thermal_scalar_bytes = (grid_res * grid_res * mem::size_of::<f32>()) as u64;
         let thermal_mass = make_buffer(
@@ -584,6 +600,7 @@ impl GpuBuffers {
         Self {
             particles,
             adaptive_dt,
+            frame_stats_staging,
             grid,
             materials,
             step_params_pool,
@@ -691,11 +708,15 @@ impl GpuBuffers {
     /// (`dt0`, also the cap the GPU may only go below) and the frame time left after it.
     /// See the `adaptive_dt` field's doc for the slot layout.
     pub fn upload_adaptive_dt(&self, queue: &wgpu::Queue, dt0: f32, frame_dt: f32) {
-        let state: [u32; 4] = [
+        let state: [u32; 8] = [
             dt0.to_bits(),
             (frame_dt - dt0).max(0.0).to_bits(),
             f32::MAX.to_bits(),
-            dt0.to_bits(),
+            0.0_f32.to_bits(),
+            0,
+            0,
+            0,
+            0,
         ];
         queue.write_buffer(&self.adaptive_dt, 0, bytemuck::bytes_of(&state));
     }

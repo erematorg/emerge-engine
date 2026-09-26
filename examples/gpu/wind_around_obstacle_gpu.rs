@@ -62,7 +62,6 @@ fn make_sim_data(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) -> GpuSimul
         box_size: IVec2::new(6, 40),
         box_center: Vec2::new(6.0, 32.0),
         material_id: 0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let particles = build_particles(&config, spawn);

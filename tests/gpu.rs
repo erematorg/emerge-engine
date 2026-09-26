@@ -80,8 +80,7 @@ mod gpu_tests {
                 .at(center)
                 .disk(5.0)
                 .spacing(0.5)
-                .material(mat)
-                .precompute_volumes(),
+                .material(mat),
         )
     }
 
@@ -227,7 +226,6 @@ mod gpu_tests {
                 box_size: glam::IVec2::new(8, 8),
                 box_center: Vec2::splat(16.0),
                 material_id: 0,
-                precompute_initial_volumes: true,
                 ..SpawnRegion::for_sim(&config)
             },
         );
@@ -313,7 +311,6 @@ mod gpu_tests {
                 box_size: glam::IVec2::new(8, 8),
                 box_center: Vec2::splat(16.0),
                 material_id: 0,
-                precompute_initial_volumes: true,
                 ..SpawnRegion::for_sim(&config)
             },
         );
@@ -381,7 +378,6 @@ mod gpu_tests {
                 box_size: glam::IVec2::new(8, 8),
                 box_center: Vec2::new(32.0, 16.0),
                 material_id: 0,
-                precompute_initial_volumes: true,
                 ..SpawnRegion::for_sim(&config)
             },
         );
@@ -450,7 +446,6 @@ mod gpu_tests {
                 box_size: glam::IVec2::new(8, 8),
                 box_center: Vec2::splat(16.0),
                 material_id: 0,
-                precompute_initial_volumes: true,
                 ..SpawnRegion::for_sim(&config)
             },
         );
@@ -522,7 +517,6 @@ mod gpu_tests {
                 box_size: glam::IVec2::new(16, 8),
                 box_center: Vec2::splat(16.0),
                 material_id: 0,
-                precompute_initial_volumes: true,
                 ..SpawnRegion::for_sim(&config)
             },
         );
@@ -618,7 +612,6 @@ mod gpu_tests {
                 box_size: glam::IVec2::new(8, 8),
                 box_center: Vec2::splat(16.0),
                 material_id: 0,
-                precompute_initial_volumes: true,
                 ..SpawnRegion::for_sim(&config)
             },
         );
@@ -890,7 +883,6 @@ mod gpu_tests {
             spacing: 0.5,
             box_size: glam::IVec2::new(18, 14),
             box_center: Vec2::new(32.0, 40.0),
-            precompute_initial_volumes: true,
             position_jitter: 0.5,
             rng_seed: 11,
             ..SpawnRegion::for_sim(&config)
@@ -965,7 +957,6 @@ mod gpu_tests {
             spacing: 0.5,
             box_size: glam::IVec2::new(8, 16),
             box_center: Vec2::new(BIG_GRID as f32 * 0.5, 2.0 + 8.0),
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         let particles = build_particles(&config, spawn);
@@ -1029,7 +1020,6 @@ mod gpu_tests {
             spacing: 0.5,
             box_size: glam::IVec2::new(8, 16),
             box_center: Vec2::new(GRID_RES as f32 * 0.5, 2.0 + 8.0),
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         let particles = build_particles(&config, spawn);
@@ -2310,7 +2300,6 @@ mod gpu_tests {
                     spacing: 0.5,
                     box_size: glam::IVec2::splat(side),
                     box_center: Vec2::splat(GRID_RES as f32 * 0.5),
-                    precompute_initial_volumes: true,
                     ..SpawnRegion::for_sim(&config)
                 },
             );
@@ -2371,7 +2360,6 @@ mod gpu_tests {
                 spacing: 0.5,
                 box_size: glam::IVec2::splat(side),
                 box_center: Vec2::splat(GRID_RES as f32 * 0.5),
-                precompute_initial_volumes: true,
                 ..SpawnRegion::for_sim(&config)
             },
         );
@@ -2436,7 +2424,6 @@ mod gpu_tests {
                     spacing: 0.5,
                     box_size: glam::IVec2::splat(side),
                     box_center: Vec2::splat(GRID_RES as f32 * 0.5),
-                    precompute_initial_volumes: true,
                     ..SpawnRegion::for_sim(&config)
                 },
             );
@@ -2499,7 +2486,6 @@ mod gpu_tests {
                     spacing: 0.5,
                     box_size: glam::IVec2::splat(side),
                     box_center: Vec2::splat(GRID_RES as f32 * 0.5),
-                    precompute_initial_volumes: true,
                     ..SpawnRegion::for_sim(&config)
                 },
             );
@@ -2569,7 +2555,6 @@ mod gpu_tests {
                         spacing: 0.5,
                         box_size: glam::IVec2::splat(side),
                         box_center: Vec2::splat(GRID_RES as f32 * 0.5),
-                        precompute_initial_volumes: true,
                         ..SpawnRegion::for_sim(&config)
                     },
                 );
@@ -2647,7 +2632,6 @@ mod gpu_tests {
                 spacing: 0.5,
                 box_size: glam::IVec2::splat(side),
                 box_center: Vec2::splat(GRID_RES as f32 * 0.5),
-                precompute_initial_volumes: true,
                 ..SpawnRegion::for_sim(&config)
             },
         );
@@ -2729,7 +2713,6 @@ mod gpu_tests {
                         spacing: 0.5,
                         box_size: glam::IVec2::splat(side),
                         box_center: Vec2::splat(GRID_RES as f32 * 0.5),
-                        precompute_initial_volumes: true,
                         ..SpawnRegion::for_sim(&config)
                     },
                 );
@@ -2809,7 +2792,6 @@ mod gpu_tests {
                 spacing: 0.5,
                 box_size: glam::IVec2::splat(side),
                 box_center: Vec2::splat(GRID_RES as f32 * 0.5),
-                precompute_initial_volumes: true,
                 ..SpawnRegion::for_sim(&config)
             },
         );
@@ -2888,7 +2870,6 @@ mod gpu_tests {
                 spacing: 0.5,
                 box_size: glam::IVec2::new(4, 4),
                 box_center: Vec2::splat(GRID_RES as f32 * 0.5),
-                precompute_initial_volumes: true,
                 ..SpawnRegion::for_sim(&config)
             },
         );
@@ -2966,7 +2947,6 @@ mod gpu_tests {
                 spacing: 0.5,
                 box_size: glam::IVec2::splat(side),
                 box_center: Vec2::splat(GRID_RES as f32 * 0.5),
-                precompute_initial_volumes: true,
                 ..SpawnRegion::for_sim(&config)
             },
         );
@@ -3055,7 +3035,6 @@ mod gpu_tests {
                     spacing: 0.5,
                     box_size: glam::IVec2::splat(side),
                     box_center: Vec2::splat(GRID_RES as f32 * 0.5),
-                    precompute_initial_volumes: true,
                     ..SpawnRegion::for_sim(&config)
                 },
             );
@@ -3149,7 +3128,6 @@ mod gpu_tests {
                     spacing: 0.5,
                     box_size: glam::IVec2::splat(side),
                     box_center: Vec2::splat(GRID_RES as f32 * 0.5),
-                    precompute_initial_volumes: true,
                     ..SpawnRegion::for_sim(&config)
                 },
             );
@@ -3318,7 +3296,6 @@ mod gpu_tests {
                     spacing: 0.5,
                     box_size: glam::IVec2::splat(side),
                     box_center: Vec2::splat(GRID_RES as f32 * 0.5),
-                    precompute_initial_volumes: true,
                     ..SpawnRegion::for_sim(&config)
                 },
             );
@@ -3393,7 +3370,6 @@ mod gpu_tests {
                 box_size: glam::IVec2::new(GRID_RES as i32 - 20, 40),
                 box_center: Vec2::new(GRID_RES as f32 * 0.5, 30.0),
                 material_id: SAND_ID,
-                precompute_initial_volumes: true,
                 ..SpawnRegion::for_sim(&config)
             },
         );
@@ -3404,7 +3380,6 @@ mod gpu_tests {
                 box_size: glam::IVec2::new(60, 30),
                 box_center: Vec2::new(GRID_RES as f32 * 0.3, 90.0),
                 material_id: WATER_ID,
-                precompute_initial_volumes: true,
                 ..SpawnRegion::for_sim(&config)
             },
         );
@@ -3415,7 +3390,6 @@ mod gpu_tests {
                 box_size: glam::IVec2::new(40, 40),
                 box_center: Vec2::new(GRID_RES as f32 * 0.7, 100.0),
                 material_id: 0, // default = viscoelastic creature body
-                precompute_initial_volumes: true,
                 ..SpawnRegion::for_sim(&config)
             },
         );
@@ -3584,7 +3558,6 @@ mod gpu_tests {
             spacing: 0.5,
             box_size: glam::IVec2::new(18, 14),
             box_center: Vec2::new(32.0, 40.0),
-            precompute_initial_volumes: true,
             position_jitter: 0.5,
             rng_seed: 11,
             ..SpawnRegion::for_sim(&config)
@@ -3639,8 +3612,7 @@ mod gpu_tests {
                 .at(center)
                 .disk(4.0)
                 .spacing(0.5)
-                .material(0)
-                .precompute_volumes(),
+                .material(0),
         );
         let grip_mass_total: f32 = grip_particles.iter().map(|p| p.mass).sum();
         let grip_count = grip_particles.len();
@@ -3655,8 +3627,7 @@ mod gpu_tests {
                 .at(center + Vec2::new(2.0, 0.0)) // overlapping, not identical, offset
                 .disk(4.0)
                 .spacing(0.5)
-                .material(0)
-                .precompute_volumes(),
+                .material(0),
         );
         assert!(
             !rest_particles.is_empty(),
@@ -3759,8 +3730,7 @@ mod gpu_tests {
                     .at(center)
                     .disk(3.0)
                     .spacing(0.125)
-                    .material(0)
-                    .precompute_volumes(),
+                    .material(0),
             );
             for particle in &mut particles {
                 particle.contact_group = contact_group;
@@ -3893,8 +3863,7 @@ mod gpu_tests {
                 .at(center)
                 .disk(4.0)
                 .spacing(0.5)
-                .material(0)
-                .precompute_volumes(),
+                .material(0),
         );
         for p in &mut grip_particles {
             p.contact_group = 1;
@@ -3905,8 +3874,7 @@ mod gpu_tests {
                 .at(center + Vec2::new(2.0, 0.0))
                 .disk(4.0)
                 .spacing(0.5)
-                .material(0)
-                .precompute_volumes(),
+                .material(0),
         );
         let mut particles = grip_particles;
         particles.extend(rest_particles);
@@ -4008,7 +3976,6 @@ mod gpu_tests {
                     box_size: IVec2::new(6, 6),
                     box_center: Vec2::new(32.0, 11.6),
                     material_id: 0,
-                    precompute_initial_volumes: true,
                     ..SpawnRegion::for_sim(&config)
                 },
             );
@@ -4027,7 +3994,6 @@ mod gpu_tests {
                 box_size: IVec2::new(48, 8),
                 box_center: Vec2::new(32.0, 8.0),
                 material_id: floor_mat_id.id(),
-                precompute_initial_volumes: true,
                 ..SpawnRegion::for_sim(solver.config())
             };
             solver.spawn_region(floor_spawn);
@@ -4136,7 +4102,6 @@ mod gpu_tests {
                     box_size: IVec2::new(6, 6),
                     box_center: Vec2::new(32.0, 11.6),
                     material_id: 0,
-                    precompute_initial_volumes: true,
                     ..SpawnRegion::for_sim(&config)
                 },
             );
@@ -4157,7 +4122,6 @@ mod gpu_tests {
                 box_size: IVec2::new(48, 8),
                 box_center: Vec2::new(32.0, 8.0),
                 material_id: floor_mat_id.id(),
-                precompute_initial_volumes: true,
                 ..SpawnRegion::for_sim(solver.config())
             };
             solver.spawn_region(floor_spawn);
@@ -4237,7 +4201,6 @@ mod gpu_tests {
                 box_size: IVec2::new(100, 12),
                 box_center: Vec2::new(64.0, 10.0),
                 material_id: 0,
-                precompute_initial_volumes: true,
                 ..SpawnRegion::for_sim(&config)
             },
         );
@@ -4253,7 +4216,6 @@ mod gpu_tests {
             box_size: IVec2::new(36, 4),
             box_center: Vec2::new(64.0, 20.0),
             material_id: snake_mat_id.id(),
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(solver.config())
         };
         let snake_range = solver.spawn_region(snake_spawn);
@@ -4370,7 +4332,6 @@ mod gpu_tests {
                 box_size: IVec2::new(100, 12),
                 box_center: Vec2::new(64.0, 10.0),
                 material_id: 0,
-                precompute_initial_volumes: true,
                 ..SpawnRegion::for_sim(&config)
             },
         );
@@ -4392,7 +4353,6 @@ mod gpu_tests {
             box_size: IVec2::new(36, 4),
             box_center: BODY_CENTER,
             material_id: snake_mat_id.id(),
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(solver.config())
         };
         let snake_range = solver.spawn_region(snake_spawn);
@@ -4529,7 +4489,6 @@ mod gpu_tests {
                 box_size: IVec2::new(300, 36),
                 box_center: Vec2::new(160.0, 30.0),
                 material_id: 0,
-                precompute_initial_volumes: true,
                 ..SpawnRegion::for_sim(&config)
             },
         );
@@ -4545,7 +4504,6 @@ mod gpu_tests {
             box_size: IVec2::new(108, 12),
             box_center: Vec2::new(160.0, 60.0),
             material_id: snake_mat_id.id(),
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(solver.config())
         };
         let snake_range = solver.spawn_region(snake_spawn);
@@ -4980,7 +4938,6 @@ mod gpu_tests {
                 spacing: 0.5,
                 box_size: IVec2::new(side, side),
                 box_center: center,
-                precompute_initial_volumes: true,
                 ..SpawnRegion::for_sim(&config)
             };
             let mut particles = build_particles(&config, spawn);
@@ -5105,7 +5062,6 @@ mod gpu_tests {
             box_size: IVec2::new(16, 16),
             box_center: Vec2::new(cx, 48.0),
             material_id: mat,
-            precompute_initial_volumes: true,
             rng_seed: seed,
             ..SpawnRegion::for_sim(&config)
         };
@@ -5185,7 +5141,6 @@ mod gpu_tests {
             box_size: IVec2::new(18, 14),
             box_center: Vec2::new(17.0, 40.0),
             material_id: 0,
-            precompute_initial_volumes: true,
             rng_seed: 11,
             position_jitter: 0.5,
             ..SpawnRegion::for_sim(&config)
@@ -5266,7 +5221,6 @@ mod gpu_tests {
             box_size: IVec2::new(16, 16),
             box_center: Vec2::new(cx, 48.0),
             material_id: mat,
-            precompute_initial_volumes: true,
             rng_seed: seed,
             ..SpawnRegion::for_sim(&config)
         };
@@ -5360,7 +5314,6 @@ mod gpu_tests {
             box_size: IVec2::new(16, 16),
             box_center: Vec2::new(cx, 48.0),
             material_id: mat,
-            precompute_initial_volumes: true,
             rng_seed: seed,
             ..SpawnRegion::for_sim(&config)
         };
@@ -5494,7 +5447,6 @@ mod gpu_tests {
             box_size: IVec2::new(16, 16),
             box_center: Vec2::new(32.0, 55.0),
             material_id: 0,
-            precompute_initial_volumes: true,
             ..SpawnRegion::for_sim(&config)
         };
         let particles = build_particles(&config, spawn);
@@ -5609,7 +5561,6 @@ mod gpu_tests {
             box_size: IVec2::new(16, 16),
             box_center: Vec2::new(cx, 48.0),
             material_id: mat,
-            precompute_initial_volumes: true,
             rng_seed: seed,
             ..SpawnRegion::for_sim(&config)
         };
@@ -5730,7 +5681,6 @@ mod gpu_tests {
             box_size: IVec2::new(14, 52),
             box_center: Vec2::new(11.0, 30.0),
             material_id: MAT_WATER,
-            precompute_initial_volumes: true,
             mass_override: Some(WATER_MASS),
             ..SpawnRegion::for_sim(&config)
         };
@@ -5739,7 +5689,6 @@ mod gpu_tests {
             box_size: IVec2::new(16, 18),
             box_center: Vec2::new(50.0, 38.0),
             material_id: MAT_MUD,
-            precompute_initial_volumes: true,
             mass_override: Some(MUD_MASS),
             ..SpawnRegion::for_sim(&config)
         };
@@ -5802,6 +5751,61 @@ mod gpu_tests {
             "GpuSimulation::new must panic when a NoCompressionMaterial is registered -- \
              it has no real GPU stress path and no CPU fallback, silently running with \
              zero tension resistance otherwise"
+        );
+    }
+
+    /// A calm frame: the GPU reports the substeps it really ran, within the
+    /// configured budget, and no dropped time.
+    #[test]
+    fn gpu_frame_stats_report_executed_substeps_without_dropped_time() {
+        if !gpu_available() {
+            return;
+        }
+        let config = small_config();
+        let particles = spawn_disk(&config, Vec2::splat(16.0), 0);
+        let registry =
+            MaterialRegistry::with_default(Box::new(NeoHookeanMaterial::new(100.0, 50.0)));
+        let mut solver = block_on(GpuSimulation::new(config, particles, registry));
+        for _ in 0..5 {
+            solver.step_frame();
+        }
+        solver.sync_particles_blocking();
+        let substeps = solver.last_substeps();
+        assert!(
+            (1..=config.max_substeps_per_step).contains(&substeps),
+            "executed substeps must be counted: got {substeps}"
+        );
+        assert!(
+            solver.last_sim_time_dropped() <= 1.0e-9,
+            "a calm frame must advance its whole dt: dropped {}",
+            solver.last_sim_time_dropped()
+        );
+    }
+
+    /// A stiff solid over a long frame with a two-substep budget cannot cover
+    /// the frame: the GPU must report the time it did not advance instead of
+    /// dropping it silently.
+    #[test]
+    fn gpu_frame_stats_report_dropped_time_when_substeps_run_out() {
+        if !gpu_available() {
+            return;
+        }
+        let config = SimConfig {
+            max_substeps_per_step: 2,
+            ..SimConfig::standard(32, 0.1, Vec2::new(0.0, -0.3))
+        };
+        let particles = spawn_disk(&config, Vec2::splat(16.0), 0);
+        let registry =
+            MaterialRegistry::with_default(Box::new(NeoHookeanMaterial::new(1.0e5, 5.0e4)));
+        let mut solver = block_on(GpuSimulation::new(config, particles, registry));
+        solver.step_frame();
+        solver.sync_particles_blocking();
+        let dropped = solver.last_sim_time_dropped();
+        assert_eq!(solver.last_substeps(), 2, "both budgeted substeps run");
+        assert!(
+            dropped > 0.0 && dropped < config.dt,
+            "the frame's unadvanced time must be reported: dropped {dropped} of {}",
+            config.dt
         );
     }
 }

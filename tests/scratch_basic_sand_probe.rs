@@ -41,7 +41,6 @@ fn make_sim(max_substeps_per_step: usize, gravity_fraction: f32) -> Simulation {
         box_size: IVec2::new(18, 14),
         box_center: c,
         material_id: mat,
-        precompute_initial_volumes: true,
         initial_velocity_scale: 0.0,
         rng_seed: seed,
         position_jitter: 0.5,

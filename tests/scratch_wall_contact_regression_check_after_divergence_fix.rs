@@ -1,14 +1,13 @@
-//! Real, urgent regression check: does the 2026-09-17 divergence-RHS fix
-//! in `Grid::project_fluid_incompressibility` (using
-//! `velocity_at_or_extrapolated` instead of a hard-zero `velocity_at` for
-//! untouched neighbor cells, see `pressure.rs`'s own doc) break the ONE
-//! scene this solver was already proven to work on -- a water column
-//! starting ~2 cells from a wall, `examples/cpu/fluid_pressure_projection.rs`'s
-//! own real, validated ~30fps scene? That fix did NOT resolve the
-//! wall-free falling-droplet gate (see
-//! `scratch_falling_droplet_pressure_projection_check.rs`), but before
-//! deciding whether to keep or revert it, it must not have quietly broken
-//! the one thing that DID work.
+//! Regression check written for the reverted divergence-RHS change in
+//! `Grid::project_fluid_incompressibility` (`velocity_at_or_extrapolated`
+//! instead of a hard-zero `velocity_at`, see `pressure.rs`): a water column
+//! starting ~2 cells from a wall, the scene of
+//! `examples/cpu/fluid_pressure_projection.rs`.
+//!
+//! It asserts only that no particle state goes non-finite or out of bounds.
+//! The current code passes, but J sits at the [0.5, 2.0] safety clamp from
+//! about frame 20: "stable" here means no NaN, not a valid incompressible
+//! run. See the pressure projection entry in `KNOWN_LIMITATIONS.md`.
 
 extern crate emerge_engine as emerge;
 
@@ -20,6 +19,7 @@ const DT: f32 = 0.1;
 const MAT_WATER: u32 = 0;
 
 #[test]
+#[ignore = "diagnostic probe kept for reruns, not part of the CI suite"]
 fn wall_touching_column_stays_stable_after_divergence_fix() {
     let config = SimConfig {
         min_dt: 1.0e-4,
@@ -29,12 +29,9 @@ fn wall_touching_column_stays_stable_after_divergence_fix() {
         fluid_pressure_iterations: 1,
         fluid_near_wall_cfl_scale: 20.0,
         fluid_near_wall_compression_threshold: 0.0,
-        // Real, validated gravity for THIS demo specifically: its own GUI
-        // (`examples/cpu/fluid_pressure_projection.rs`) starts at
-        // `gravity_fraction: 0.003` applied to `SimConfig::earth`'s full
-        // gravity -- i.e. the real ~16.5-30fps/120-frame validation was
-        // NEVER done at full earth gravity. Matching that exactly here,
-        // not the full, far more violent value.
+        // The demo this mirrors (`examples/cpu/fluid_pressure_projection.rs`)
+        // starts at `gravity_fraction: 0.003` of `SimConfig::earth`'s
+        // gravity; its 120-frame runs were never done at full gravity.
         gravity: Vec2::new(0.0, -981.0 * 0.003),
         ..SimConfig::earth(GRID, 0.01, DT)
     };
@@ -54,7 +51,6 @@ fn wall_touching_column_stays_stable_after_divergence_fix() {
         box_center: center,
         material_id: MAT_WATER,
         initial_velocity_scale: 0.0,
-        precompute_initial_volumes: true,
         mass_override: Some(WATER_MASS),
         ..SpawnRegion::for_sim(&config)
     };

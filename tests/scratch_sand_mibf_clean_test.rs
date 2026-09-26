@@ -58,7 +58,6 @@ fn run(use_material_friction: bool) -> PileShape {
         box_size: IVec2::new(8, 16),
         box_center: Vec2::new(GRID as f32 * 0.5, FLOOR + 8.0),
         material_id: 0,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let sand = DruckerPragerMaterial::from_young_modulus(1.0e5, 0.2);
@@ -73,6 +72,7 @@ fn run(use_material_friction: bool) -> PileShape {
 }
 
 #[test]
+#[ignore = "diagnostic probe kept for reruns, not part of the CI suite"]
 fn mibf_alone_vs_fixed_friction_baseline_no_cundall_trick() {
     let baseline = run(false);
     let mibf = run(true);

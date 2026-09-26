@@ -1,8 +1,10 @@
 use glam::{Mat2, Vec2};
 
-use crate::materials::physical_props::{FromSI, NaccProps, scale_lame};
+use crate::materials::physical_props::{FromSI, NaccProps, scale_lame, scale_stress};
 use crate::materials::svd::svd2;
-use crate::materials::utils::{MIN_J, deformation_increment_exp, elastic_wave_dt, lame_from_young};
+use crate::materials::utils::{
+    MIN_J, advance_deformation_gradient, carried_volume_ratio, elastic_wave_dt, lame_from_young,
+};
 use crate::materials::{ConstitutiveModel, MaterialModel, MaterialParams};
 use crate::particle::{Particle, ParticleUpdateCtx, Particles};
 
@@ -51,8 +53,10 @@ pub struct NaccMaterial {
     /// Cohesion (beta β) -- shifts yield surface min tip.
     /// 0.0 = no tensile strength (standard). 1.0 = symmetric around p=0.
     pub cohesion: f32,
-    /// Hardening factor ξ. Controls how fast p₀ grows: p₀ = κ·(1e-5 + sinh(ξ·max(−α,0))).
-    /// 0.0 = no hardening (perfect plasticity cap). Typical: 1.0–5.0.
+    /// Hardening exponent ξ: p₀ = p_ref·exp(−ξ·α). For a real soil it is
+    /// `v / (λ − κ_cc)` from its own oedometer curve -- specific volume over
+    /// the gap between the compression and swelling indices -- so it runs
+    /// about 15 to 30 for clays. 0.0 = no hardening (perfect plasticity cap).
     pub hardening_factor: f32,
     /// Enable volumetric hardening. If false, p₀ stays fixed (perfect plasticity cap).
     pub hardening_enabled: bool,
@@ -110,6 +114,14 @@ pub struct NaccMaterial {
     /// not the full non-monotonic real curve. 0.0 (default) = byte-identical
     /// to every existing preset/scene that doesn't opt in.
     pub saturation_cohesion_coeff: f32,
+    /// Preconsolidation pressure the soil starts from, in the same grid stress
+    /// units as `kappa`: the largest mean effective stress it has carried
+    /// before, measured in the oedometer test (Casagrande 1936). It is the
+    /// soil's memory of past load: below it the soil responds elastically,
+    /// beyond it it compacts and hardens. 0.0 (default) falls back to the
+    /// engine's floor, `kappa * 1e-5`, i.e. a soil that has never been
+    /// loaded. Set it in pascals through `NaccProps`.
+    pub initial_preconsolidation: f32,
 }
 
 /// Named-field alternative to [`NaccMaterial::new`]'s 5 positional `f32`
@@ -147,6 +159,7 @@ impl NaccMaterial {
             min_density: 1.0e-6,
             elastic_viscosity: 0.0,
             saturation_cohesion_coeff: 0.0,
+            initial_preconsolidation: 0.0,
         }
     }
 
@@ -187,56 +200,53 @@ impl NaccMaterial {
         Self::new(mu, kappa, friction, cohesion, hardening_factor)
     }
 
-    /// Saturated soft clay: M=1.2, β=0, ξ=2 (Klar 2016 soft clay params).
-    pub fn soft_clay(young_modulus: f32, poisson_ratio: f32) -> Self {
+    /// Kaolin, from true triaxial tests on spestone kaolin at Cambridge:
+    /// compression index 0.245, swelling index 0.027, specific volume 2.479
+    /// at 150 kPa, stress ratio M 0.75 (Muir Wood, Mackenzie and Chan,
+    /// "Selection of Parameters for Numerical Predictions", Predictive Soil
+    /// Mechanics, Wroth Memorial Symposium 1992, pp. 496-512; test L1, after
+    /// Wood and Wroth 1972, Wood 1974, Airey and Wood 1988).
+    ///
+    /// The hardening exponent is this file's own `v / (lambda - kappa)`,
+    /// 2.479 / 0.218 = 11.4, and the friction slope is the 2D relation at the
+    /// friction angle their M implies (19.5 degrees), not the triaxial 0.75.
+    /// Their paper also reads a second, equally measured swelling index (0.042,
+    /// the average unload slope rather than the initial one), which would give
+    /// 12.2 instead, and anchors the elastic response at that state: bulk
+    /// modulus `v p' / kappa` = 13.8 MPa at 150 kPa with Poisson's ratio 0.270,
+    /// i.e. about 19 MPa of Young's modulus, for a scene that wants this soil
+    /// in real units.
+    ///
+    /// Cross-checked against a second, independent kaolin set (GeoTaichi's own
+    /// element tests: 0.12, 0.023, void ratio 1.7, M 1.02), which gives 27.8
+    /// and a 2D slope of 0.785. The two differ by 2.4 times, almost all of it
+    /// in the compression index: real kaolins prepared and loaded differently
+    /// are that far apart, so a scene that needs its own soil should pass its
+    /// own numbers through `NaccProps` rather than lean on this preset.
+    pub fn kaolin(young_modulus: f32, poisson_ratio: f32) -> Self {
         let (lambda, mu) = lame_from_young(young_modulus, poisson_ratio);
-        // 2D plane-strain bulk modulus (kappa = lambda + mu, not the 3D
-        // lambda + 2*mu/3 an earlier version used to match sparkl -- see
-        // elastic.rs's ConstitutiveModel impl for the full derivation/fix note).
-        let kappa = lambda + mu;
-        Self::new(mu, kappa, 1.2, 0.0, 2.0)
+        Self::new(mu, lambda + mu, 0.577, 0.0, 11.4)
     }
 
-    /// Wet compressed soil (paddy field, river bank): M=1.0, β=0, ξ=3.
-    pub fn wet_soil(young_modulus: f32, poisson_ratio: f32) -> Self {
-        let (lambda, mu) = lame_from_young(young_modulus, poisson_ratio);
-        // 2D plane-strain bulk modulus (kappa = lambda + mu, not the 3D
-        // lambda + 2*mu/3 an earlier version used to match sparkl -- see
-        // elastic.rs's ConstitutiveModel impl for the full derivation/fix note).
-        let kappa = lambda + mu;
-        Self::new(mu, kappa, 1.0, 0.0, 3.0)
+    /// Reference preconsolidation pressure, in grid stress units: what the
+    /// soil starts from, either the pressure it was consolidated under or the
+    /// engine's own floor for a soil that has never carried a load.
+    pub fn reference_preconsolidation(&self) -> f32 {
+        self.initial_preconsolidation.max(self.kappa * 1.0e-5)
     }
 
-    /// High critical-slope, low hardening: M=1.5, β=0, ξ=1. Soft material under large compression.
-    pub fn low_hardening(young_modulus: f32, poisson_ratio: f32) -> Self {
-        let (lambda, mu) = lame_from_young(young_modulus, poisson_ratio);
-        // 2D plane-strain bulk modulus (kappa = lambda + mu, not the 3D
-        // lambda + 2*mu/3 an earlier version used to match sparkl -- see
-        // elastic.rs's ConstitutiveModel impl for the full derivation/fix note).
-        let kappa = lambda + mu;
-        Self::new(mu, kappa, 1.5, 0.0, 1.0)
-    }
-
-    /// Peat / organic soil (USDA Histosol order): M=1.2, β=0, ξ=0.5 -- the LOWEST
-    /// hardening_factor in this family, real and deliberate: peat's single most
-    /// defining geotechnical trait is extreme compressibility, its real compression
-    /// index (Cc) runs roughly an order of magnitude beyond mineral clays (Mesri &
-    /// Ajlouni 2007, "Engineering Properties of Fibrous Peats", ASCE J. Geotech.
-    /// Geoenviron. Eng.) -- meaning a peat needs far more real plastic volumetric
-    /// strain than any mineral soil here before building up meaningful
-    /// preconsolidation resistance (p0 growth, this material's own hardening
-    /// mechanism, scales with xi -- see `project`'s own doc). Friction slope M kept
-    /// near `wet_soil`'s (fibrous peat's real shear resistance from fiber
-    /// interlocking is a real, separate, well-documented effect, but less
-    /// distinctive than its compressibility -- not this preset's point of
-    /// differentiation). HONEST DISCLOSURE, same standard as every other preset in
-    /// this file: the constitutive LAW (Cam-Clay) and the qualitative direction
-    /// (very low hardening_factor) are real and cited; the exact numeric value 0.5
-    /// is illustrative, not fitted to a specific measured peat dataset.
-    pub fn peat(young_modulus: f32, poisson_ratio: f32) -> Self {
-        let (lambda, mu) = lame_from_young(young_modulus, poisson_ratio);
-        let kappa = lambda + mu;
-        Self::new(mu, kappa, 1.2, 0.0, 0.5)
+    /// Preconsolidation pressure p0, in grid stress units, for the plastic
+    /// volumetric state `alpha` (negative after plastic compaction).
+    ///
+    /// Real Cam-Clay hardening (Roscoe and Burland 1968): p0 grows in
+    /// proportion to itself, `p0 = p_ref exp(-xi alpha)`, so the pressure a
+    /// soil can carry rises by a fixed FRACTION per unit of plastic
+    /// compaction. The hardening modulus is therefore `xi p0`, small at the
+    /// low pressures near a free surface and large deep in a column, which is
+    /// what makes a fresh deposit compact strongly under its first load.
+    pub fn preconsolidation_pressure(&self, alpha: f32) -> f32 {
+        (self.reference_preconsolidation() * (-self.hardening_factor * alpha).exp())
+            .max(self.kappa * 1.0e-5)
     }
 
     /// NACC yield surface projection. Returns updated (F, alpha).
@@ -255,7 +265,6 @@ impl NaccMaterial {
     /// cohesion_bonus_pa` is the dimensionally exact generalization, not an
     /// approximation -- 0.0 reproduces the original `β·p₀` bit-for-bit.
     fn project(&self, f: Mat2, mut alpha: f32, cohesion_bonus_pa: f32) -> (Mat2, f32) {
-        let xi = self.hardening_factor;
         let beta = self.cohesion;
         let m = self.friction;
 
@@ -266,7 +275,7 @@ impl NaccMaterial {
         let sv_sq_trace = sv_sq.x + sv_sq.y;
 
         // Current preconsolidation pressure.
-        let p0 = self.kappa * (1.0e-5 + (xi * (-alpha).max(0.0)).sinh());
+        let p0 = self.preconsolidation_pressure(alpha);
         // See this function's own doc: generalizes every `beta*p0` below to
         // include the real, separate saturation-cohesion contribution.
         let cohesive_shift_pa = beta * p0 + cohesion_bonus_pa;
@@ -284,12 +293,16 @@ impl NaccMaterial {
 
         // Case A: past max cap (over-consolidation / compressive failure).
         if p_tr > p0 {
-            let j_n1 = (-2.0 * p0 / self.kappa + 1.0).max(1.0e-8_f32).sqrt();
+            let j_old_cap = (-2.0 * p0 / self.kappa + 1.0).max(1.0e-8_f32).sqrt();
+            let j_n1 = if self.hardening_enabled {
+                let (j_n1, compaction) = self.cap_return(j_e_tr, j_old_cap, alpha);
+                alpha -= compaction;
+                j_n1
+            } else {
+                j_old_cap
+            };
             let sv_new = j_n1.powf(0.5); // J^(1/2) since d=2
             let sigma_new = Vec2::splat(sv_new);
-            if self.hardening_enabled {
-                alpha += (j_e_tr / j_n1).ln();
-            }
             return (reconstruct(u, sigma_new, vt), alpha);
         }
 
@@ -321,31 +334,32 @@ impl NaccMaterial {
 
         // Hardening: move p₀ to reduce y to zero. `β·p₀` generalized to
         // `cohesive_shift_pa` throughout -- see this function's own doc.
+        let mut y1 = y1;
         if self.hardening_enabled
             && p0 > 1.0e-4
             && p_tr < p0 - 1.0e-4
             && p_tr > -cohesive_shift_pa + 1.0e-4
         {
-            let p_c = (p0 - cohesive_shift_pa) * 0.5;
             let q_tr = (2.0_f32).sqrt() * s_tr.length();
-            let dir = Vec2::new(p_c - p_tr, -q_tr);
-            let dir = dir.normalize_or_zero();
-            let c = m * m * (p_c + cohesive_shift_pa) * (p_c - p0);
-            let b = m * m * dir.x * (2.0 * p_c - p0 + cohesive_shift_pa);
-            let a = m * m * dir.x * dir.x + (1.0 + 2.0 * beta) * dir.y * dir.y;
-            let discr = (b * b - 4.0 * a * c).max(0.0).sqrt();
-            let l1 = (-b + discr) / (2.0 * a);
-            let l2 = (-b - discr) / (2.0 * a);
-            let p1 = p_c + l1 * dir.x;
-            let p2 = p_c + l2 * dir.x;
-            let p_x = if (p_tr - p_c) * (p1 - p_c) > 0.0 {
-                p1
-            } else {
-                p2
+            // The return direction is the ray from the start-of-step centre
+            // through the trial state; only the hardening is taken at the end.
+            let centre = f64::from((p0 - cohesive_shift_pa) * 0.5);
+            let increment = |alpha_end: f64| {
+                self.ray_increment(alpha_end, centre, p_tr, q_tr, j_e_tr, cohesion_bonus_pa)
             };
-            let j_e_x = (-2.0 * p_x / self.kappa + 1.0).abs().max(1.0e-8_f32).sqrt();
-            if j_e_x > 1.0e-4 {
-                alpha += (j_e_tr / j_e_x).ln();
+            let start = increment(f64::from(alpha));
+            if start < 0.0 {
+                // Wet side: the soil hardens. Evaluated at the end of the step,
+                // as on the cap, so the surface the stress is projected onto is
+                // the hardened one (see `ray_increment`).
+                let alpha_end = self.hardened_alpha(f64::from(alpha), start, increment);
+                alpha = alpha_end as f32;
+                let p0_end = self.preconsolidation_pressure(alpha);
+                let shift_end = beta * p0_end + cohesion_bonus_pa;
+                y1 = m * m * (p_tr + shift_end) * (p_tr - p0_end);
+            } else if start.is_finite() {
+                // Dry side: softening, still evaluated at the start of the step.
+                alpha += start as f32;
             }
         }
 
@@ -358,6 +372,138 @@ impl NaccMaterial {
 
         let sv_new = Vec2::new(b_n1.x.max(1.0e-8_f32).sqrt(), b_n1.y.max(1.0e-8_f32).sqrt());
         (reconstruct(u, sv_new, vt), alpha)
+    }
+
+    /// Plastic volume change the shear-and-compression branch gives one step,
+    /// `ln(j_tr / J_x)`: `J_x` is where the ray from `centre` (on the p axis)
+    /// through the trial state `(p_tr, q_tr)` meets the ellipse whose
+    /// preconsolidation pressure comes from `alpha_end`. Negative on the wet
+    /// side of the ellipse (hardening), positive on the dry side. Infinite
+    /// when the ray does not reach a usable volume ratio, in which case alpha
+    /// is left unchanged.
+    fn ray_increment(
+        &self,
+        alpha_end: f64,
+        centre: f64,
+        p_tr: f32,
+        q_tr: f32,
+        j_tr: f32,
+        cohesion_bonus_pa: f32,
+    ) -> f64 {
+        let kappa = f64::from(self.kappa);
+        let m_sq = f64::from(self.friction) * f64::from(self.friction);
+        let beta = f64::from(self.cohesion);
+        let p0 = f64::from(self.preconsolidation_pressure(alpha_end as f32));
+        let shift = beta * p0 + f64::from(cohesion_bonus_pa);
+        let (p_tr, q_tr) = (f64::from(p_tr), f64::from(q_tr));
+        let p_c = centre;
+        let (dx, dy) = (p_c - p_tr, -q_tr);
+        let len = (dx * dx + dy * dy).sqrt();
+        if len <= 0.0 {
+            return f64::INFINITY;
+        }
+        let (dx, dy) = (dx / len, dy / len);
+        let c = m_sq * (p_c + shift) * (p_c - p0);
+        let b = m_sq * dx * (2.0 * p_c + shift - p0);
+        let a = m_sq * dx * dx + (1.0 + 2.0 * beta) * dy * dy;
+        let discr = (b * b - 4.0 * a * c).max(0.0).sqrt();
+        let p1 = p_c + (-b + discr) / (2.0 * a) * dx;
+        let p2 = p_c + (-b - discr) / (2.0 * a) * dx;
+        let p_x = if (p_tr - p_c) * (p1 - p_c) > 0.0 {
+            p1
+        } else {
+            p2
+        };
+        let j_x = (1.0 - 2.0 * p_x / kappa).abs().max(1.0e-16).sqrt();
+        if j_x > 1.0e-4 {
+            (f64::from(j_tr) / j_x).ln()
+        } else {
+            f64::INFINITY
+        }
+    }
+
+    /// End-of-step alpha on the wet side: the root of
+    /// `alpha_end = alpha + ray_increment(alpha_end)` along a fixed ray.
+    /// Hardened ellipses are nested, so along that ray the increment grows
+    /// monotonically with hardening: the residual decreases strictly, the
+    /// start-of-step answer `alpha + start` lies beyond the root, and the
+    /// root is bracketed between it and `alpha`. Solved in f64 by the Illinois
+    /// variant of false position, which keeps the bracket and converges in a
+    /// few iterations.
+    fn hardened_alpha(&self, alpha: f64, start: f64, increment: impl Fn(f64) -> f64) -> f64 {
+        let residual = |a: f64| alpha + increment(a) - a;
+        let (mut lo, mut hi) = (alpha + start, alpha);
+        let (mut r_lo, mut r_hi) = (residual(lo), residual(hi));
+        if !(r_lo > 0.0 && r_hi < 0.0) {
+            return lo;
+        }
+        let mut kept_lo_last = None;
+        for _ in 0..40 {
+            let x = hi - r_hi * (hi - lo) / (r_hi - r_lo);
+            let r = residual(x);
+            if r > 0.0 {
+                lo = x;
+                r_lo = r;
+                if kept_lo_last == Some(false) {
+                    r_hi *= 0.5;
+                }
+                kept_lo_last = Some(false);
+            } else {
+                hi = x;
+                r_hi = r;
+                if kept_lo_last == Some(true) {
+                    r_lo *= 0.5;
+                }
+                kept_lo_last = Some(true);
+            }
+            if r == 0.0 || hi - lo <= 1.0e-12 * alpha.abs().max(1.0e-6) {
+                break;
+            }
+        }
+        0.5 * (lo + hi)
+    }
+
+    /// Volume ratio J at which a trial state beyond the cap comes to rest,
+    /// with the hardening evaluated at the end of the step (backward Euler,
+    /// Simo & Hughes 1998, ch. 3): the carried pressure `kappa/2 (1 - J^2)`
+    /// must equal `p0` hardened by this same step's plastic compaction
+    /// `u = ln(J / j_tr)`. Hardening evaluated at the start of the step
+    /// instead leaves p0 above the carried pressure by `(xi - 1)` times the
+    /// overshoot, so the soil would remember a load it never carried.
+    ///
+    /// The residual decreases and is concave in `u`, and it is <= 0 at the
+    /// old cap (`j_old_cap`, no hardening), so Newton started there converges
+    /// monotonically to the root. Returns J and `u`; `u` comes straight from
+    /// the f64 solve because `ln(J / j_tr)` of a ratio this close to 1 loses
+    /// most of its digits in f32.
+    fn cap_return(&self, j_tr: f32, j_old_cap: f32, alpha: f32) -> (f32, f32) {
+        let kappa = f64::from(self.kappa);
+        let xi = f64::from(self.hardening_factor);
+        let p_ref = f64::from(self.reference_preconsolidation());
+        let (j_tr, alpha) = (f64::from(j_tr), f64::from(alpha));
+        let mut u = (f64::from(j_old_cap) / j_tr).ln();
+        if u <= 0.0 {
+            return (j_old_cap, 0.0);
+        }
+        for _ in 0..30 {
+            let j_sq = j_tr * j_tr * (2.0 * u).exp();
+            // p0 as a function of the compaction `u` this step adds, and its
+            // derivative: the law is exponential, so both come from one term.
+            let floor = kappa * 1.0e-5;
+            let grown = p_ref * (xi * (u - alpha)).exp();
+            let (p0, dp0_du) = if grown > floor {
+                (grown, xi * grown)
+            } else {
+                (floor, 0.0)
+            };
+            let residual = 0.5 * kappa * (1.0 - j_sq) - p0;
+            let step = residual / (-kappa * j_sq - dp0_du);
+            u = (u - step).max(0.0);
+            if step.abs() < 1.0e-12 {
+                break;
+            }
+        }
+        ((j_tr * u.exp()) as f32, u as f32)
     }
 }
 
@@ -380,13 +526,19 @@ impl FromSI<NaccProps> for NaccMaterial {
         // lambda + 2*mu/3) -- applied here to the now-correctly-SI-scaled
         // lambda/mu, not the raw grid-unit ones `from_young_modulus` uses.
         let kappa = lambda + mu;
-        Self::new(
-            mu,
-            kappa,
-            props.friction,
-            props.cohesion,
-            props.hardening_factor,
-        )
+        assert!(
+            props.compression_index > props.swelling_index,
+            "a soil's compression index must exceed its swelling index: \
+             lambda={} kappa={}",
+            props.compression_index,
+            props.swelling_index
+        );
+        // Real Cam-Clay hardening exponent, v / (lambda - kappa).
+        let hardening = (1.0 + props.void_ratio) / (props.compression_index - props.swelling_index);
+        let mut material = Self::new(mu, kappa, props.friction, props.cohesion, hardening);
+        material.initial_preconsolidation =
+            scale_stress(props.preconsolidation_pa, props.elastic.rho_kg_m3, config);
+        material
     }
 }
 
@@ -453,8 +605,11 @@ impl MaterialModel for NaccMaterial {
         // Exact constant-C integration prevents forward Euler's O(dt^2)
         // volume drift from being mistaken for permanent Cam-Clay cap
         // plasticity and accumulated preconsolidation history.
-        let f_trial =
-            deformation_increment_exp(dt * *ctx.velocity_gradient) * *ctx.deformation_gradient;
+        let (f_trial, _) = advance_deformation_gradient(
+            *ctx.deformation_gradient,
+            dt * *ctx.velocity_gradient,
+            carried_volume_ratio(*ctx.volume, ctx.initial_volume),
+        );
         let alpha = *ctx.log_volume_strain;
         let (new_f, new_alpha) =
             self.project(f_trial, alpha, self.cohesion_bonus_pa(ctx.scalar_field));
@@ -472,11 +627,19 @@ impl MaterialModel for NaccMaterial {
     }
 
     fn init_particle(&self, particle: &mut Particle) {
-        particle.log_volume_strain = 0.0; // nacc_alpha starts at 0 (unstressed)
+        // alpha counts plastic compaction since the reference state, and the
+        // reference state is the preconsolidation the material was given.
+        particle.log_volume_strain = 0.0;
     }
 
     fn needs_cpu_update(&self) -> bool {
         true
+    }
+
+    fn gpu_unsupported_reason(&self) -> Option<&'static str> {
+        Some(
+            "NaccMaterial has no GPU stress path: it uploads as NeoHookean, so the GPU runs kappa ln(J) instead of Cam-Clay's kappa/2 (J^2 - 1); use GranularFluidMaterial for a GPU granular-fluid scene",
+        )
     }
 
     fn timestep_bound(
@@ -599,7 +762,7 @@ mod marginal_yield_tests {
 
     #[test]
     fn rigid_rotation_preserves_volume_and_cam_clay_history() {
-        let mat = NaccMaterial::soft_clay(5.0e4, 0.3);
+        let mat = NaccMaterial::kaolin(5.0e4, 0.3);
         let mut particles = rate_particle(Mat2::IDENTITY, 0.0);
         let omega = 1.7;
         let dt = 0.2;
@@ -615,8 +778,9 @@ mod marginal_yield_tests {
 
     #[test]
     fn opposite_subcap_rates_are_reversible_without_alpha_ratchet() {
-        let mat = NaccMaterial::new(3000.0, 2000.0, 1.2, 0.0, 2.0);
-        let alpha = -0.1;
+        let mut mat = NaccMaterial::new(3000.0, 2000.0, 1.2, 0.0, 2.0);
+        mat.initial_preconsolidation = 402.0; // carries the 97.5 below its cap
+        let alpha = 0.0;
         let baseline = Mat2::from_diagonal(Vec2::splat(0.95));
         let mut particles = rate_particle(baseline, alpha);
         let rate = Mat2::from_diagonal(Vec2::new(0.001, -0.001));
@@ -631,9 +795,10 @@ mod marginal_yield_tests {
 
     #[test]
     fn exponential_trial_respects_both_sides_of_compression_cap() {
-        let mat = NaccMaterial::new(3000.0, 2000.0, 1.2, 0.0, 2.0);
-        let alpha = -0.1;
-        let p0 = mat.kappa * (1.0e-5 + (mat.hardening_factor * -alpha).sinh());
+        let mut mat = NaccMaterial::new(3000.0, 2000.0, 1.2, 0.0, 2.0);
+        mat.initial_preconsolidation = 402.0;
+        let alpha = 0.0;
+        let p0 = mat.preconsolidation_pressure(alpha);
         let j_cap = (1.0 - 2.0 * p0 / mat.kappa).sqrt();
         let dt = 0.1;
 
@@ -650,12 +815,22 @@ mod marginal_yield_tests {
         let mut outside = rate_particle(Mat2::IDENTITY, alpha);
         let outside_rate = Mat2::from_diagonal(Vec2::splat(sigma_outside.ln() / dt));
         run_rate_step(&mat, &mut outside, outside_rate, dt);
+        // The cap hardens during the step, so the state comes to rest between
+        // the old cap and the trial, exactly on the hardened cap.
+        let j_after = outside.deformation_gradient[0].determinant();
+        let alpha_after = outside.log_volume_strain[0];
+        let p0_after = mat.preconsolidation_pressure(alpha_after);
+        let p_after = pressure_from_j(mat.kappa, j_after);
         assert!(
-            (outside.deformation_gradient[0].determinant() - j_cap).abs() < 3.0e-6,
-            "trial beyond the cap must project to its analytical J: expected={j_cap}, got={}",
-            outside.deformation_gradient[0].determinant()
+            j_after < j_cap && j_after > j_outside - 3.0e-6,
+            "trial beyond the cap must stop between the trial J={j_outside} and the old cap \
+             J={j_cap}, got {j_after}"
         );
-        assert!(outside.log_volume_strain[0] < alpha);
+        assert!(
+            (p_after - p0_after).abs() <= 1.0e-3 * p0_after,
+            "the state must sit on the hardened cap: p={p_after} p0={p0_after}"
+        );
+        assert!(alpha_after < alpha);
     }
 
     /// A trial state comfortably INSIDE the yield ellipse (real confining
@@ -680,8 +855,9 @@ mod marginal_yield_tests {
     ///    confining pressure present, not shear alone.
     #[test]
     fn small_elastic_strain_is_not_projected() {
-        let mat = NaccMaterial::new(3000.0, 2000.0, 1.2, 0.0, 2.0);
-        let alpha = -1.0; // real pre-consolidation, gives a meaningfully large p0
+        let mut mat = NaccMaterial::new(3000.0, 2000.0, 1.2, 0.0, 2.0);
+        mat.initial_preconsolidation = 7254.0; // a heavily preconsolidated soil
+        let alpha = 0.0;
         // Real isotropic confining compression (sv=0.999 each way, giving
         // p_tr~4.0, comfortably inside p0~7254) PLUS a tiny shear on top --
         // this is the physically meaningful "small elastic strain" case: real
@@ -699,43 +875,132 @@ mod marginal_yield_tests {
         );
     }
 
-    /// Real behavioral distinctness, not just a different field value: after the
-    /// SAME prior compaction history (same alpha, representing identical past
-    /// loading), `peat` (hardening_factor=0.5, the lowest in this family) must
-    /// have built up LESS compression-cap resistance (p0) than `wet_soil`
-    /// (hardening_factor=3.0) -- p0's own formula (`kappa*(1e-5+sinh(xi*max(
-    /// -alpha,0)))`) grows with xi at any fixed nonzero alpha, so a lower
-    /// hardening_factor means less real preconsolidation resistance builds up per
-    /// unit of past compaction, matching peat's own real, cited defining trait
-    /// (extreme compressibility, Mesri & Ajlouni 2007). Note: at the neutral
-    /// alpha=0 start state every preset's p0 is identical regardless of
-    /// hardening_factor (sinh(xi*0)=0 for any xi) -- this only differentiates
-    /// once real prior compaction (alpha != 0) has happened, so this test starts
-    /// from alpha=-1.0, the same "real pre-consolidation" convention
-    /// `small_elastic_strain_is_not_projected` above already uses.
+    /// On virgin isotropic loading the soil sits on its cap, so after every
+    /// step its preconsolidation pressure must equal the pressure it carries:
+    /// p0 remembers the largest load, never more.
     #[test]
-    fn peat_hardens_slower_than_wet_soil_after_the_same_prior_compaction() {
-        let peat = NaccMaterial::peat(3000.0, 0.3);
-        let wet_soil = NaccMaterial::wet_soil(3000.0, 0.3);
-        assert!(
-            peat.hardening_factor < wet_soil.hardening_factor,
-            "peat must have the lowest hardening_factor in this family: \
-             peat={} wet_soil={}",
-            peat.hardening_factor,
-            wet_soil.hardening_factor
-        );
+    fn virgin_loading_keeps_p0_equal_to_the_carried_pressure() {
+        for xi in [0.5_f32, 2.0, 27.8] {
+            let mat = NaccMaterial::new(3000.0, 2000.0, 1.2, 0.0, xi);
+            let (mut f, mut alpha) = (Mat2::IDENTITY, 0.0_f32);
+            for step in 0..40 {
+                f = Mat2::from_diagonal(Vec2::splat(0.9995)) * f;
+                (f, alpha) = mat.project(f, alpha, 0.0);
+                let p = pressure_from_j(mat.kappa, f.determinant());
+                let p0 = mat.preconsolidation_pressure(alpha);
+                // `p = kappa/2 (1 - J^2)` cancels catastrophically in f32 while
+                // the carried pressure is still near the floor, so the
+                // invariant is read once it is out of that noise.
+                if p < mat.kappa * 1.0e-3 {
+                    continue;
+                }
+                assert!(
+                    (p0 - p).abs() <= 1.0e-3 * p,
+                    "xi={xi} step {step}: p0={p0} must equal the carried pressure p={p}"
+                );
+            }
+        }
+    }
 
-        let alpha: f32 = -1.0; // same real prior compaction for both
-        let p0 = |mat: &NaccMaterial| {
-            mat.kappa * (1.0e-5 + (mat.hardening_factor * (-alpha).max(0.0)).sinh())
-        };
-        let peat_p0 = p0(&peat);
-        let wet_soil_p0 = p0(&wet_soil);
+    /// Principal-stress summary `(p, |s|)` of a deformation gradient, with the
+    /// same formulas `project` uses.
+    fn p_and_shear(mat: &NaccMaterial, f: Mat2) -> (f32, f32) {
+        let (_, sigma, _) = svd2(f);
+        let sv_sq = Vec2::new(sigma.x * sigma.x, sigma.y * sigma.y);
+        let j = sigma.x * sigma.y;
+        let s = mat.mu / j * (sv_sq - Vec2::splat((sv_sq.x + sv_sq.y) * 0.5));
+        (pressure_from_j(mat.kappa, j), s.length())
+    }
+
+    /// Preconsolidation pressure of the (beta = 0) ellipse that passes through
+    /// the stress state `(p, |s|)`: solves `2 |s|^2 + M^2 p (p - p0) = 0`.
+    fn p0_through(mat: &NaccMaterial, p: f32, shear: f32) -> f32 {
+        p + 2.0 * shear * shear / (mat.friction * mat.friction * p)
+    }
+
+    /// Shear plus compression on the wet side of the ellipse: after the soil
+    /// hardens, the stress must sit on the hardened surface. The projection
+    /// keeps tr(B) rather than J, so even a fixed surface is missed slightly;
+    /// hardening must add nothing beyond that.
+    #[test]
+    fn wet_side_shear_lands_on_the_hardened_surface() {
+        for xi in [2.0_f32, 27.8] {
+            let mat = NaccMaterial::new(3000.0, 2000.0, 1.2, 0.0, xi);
+            let mut fixed = mat;
+            fixed.hardening_enabled = false;
+            for (a, b) in [(0.985_f32, 0.975_f32), (0.99, 0.965), (0.995, 0.96)] {
+                let f = Mat2::from_diagonal(Vec2::new(a, b));
+                let (p_tr, _) = p_and_shear(&mat, f);
+                let p0_start = 1.3 * p_tr;
+                let alpha = -((p0_start / mat.kappa - 1.0e-5).asinh()) / xi;
+
+                let (f_after, alpha_after) = mat.project(f, alpha, 0.0);
+                let (p, shear) = p_and_shear(&mat, f_after);
+                let p0 = mat.preconsolidation_pressure(alpha_after);
+                let hardened_miss = (p0 / p0_through(&mat, p, shear) - 1.0).abs();
+
+                let (f_fixed, _) = fixed.project(f, alpha, 0.0);
+                let (pf, sf) = p_and_shear(&mat, f_fixed);
+                let projection_miss = (p0_start / p0_through(&mat, pf, sf) - 1.0).abs();
+
+                assert!(alpha_after < alpha, "the wet side must harden");
+                assert!(
+                    hardened_miss <= projection_miss + 1.0e-4,
+                    "xi={xi} F=diag({a}, {b}): hardened surface missed by {hardened_miss}, \
+                     the projection alone misses by {projection_miss}"
+                );
+            }
+        }
+    }
+
+    /// Preconsolidation is a memory: unloading and reloading back to the
+    /// previous maximum stays elastic, and the soil yields only beyond it.
+    #[test]
+    fn reloading_is_elastic_until_the_previous_maximum() {
+        let mut mat = NaccMaterial::new(3000.0, 2000.0, 1.2, 0.0, 2.0);
+        // A soil already consolidated under 400, so the pressures this test
+        // reads sit far above the floor where a f32 J stops resolving them.
+        mat.initial_preconsolidation = 400.0;
+        let squeeze = Mat2::from_diagonal(Vec2::splat(0.995));
+        let release = Mat2::from_diagonal(Vec2::splat(0.995_f32.recip()));
+        let (mut f, mut alpha) = (Mat2::IDENTITY, 0.0_f32);
+        for _ in 0..40 {
+            (f, alpha) = mat.project(squeeze * f, alpha, 0.0);
+        }
+        let alpha_max_load = alpha;
+        for _ in 0..20 {
+            (f, alpha) = mat.project(release * f, alpha, 0.0);
+        }
+        for _ in 0..20 {
+            (f, alpha) = mat.project(squeeze * f, alpha, 0.0);
+        }
         assert!(
-            peat_p0 < wet_soil_p0,
-            "peat should have built up LESS compression-cap resistance than \
-             wet_soil after identical prior compaction: peat_p0={peat_p0} \
-             wet_soil_p0={wet_soil_p0}"
+            (alpha - alpha_max_load).abs() < 1.0e-6,
+            "unload-reload to the previous maximum must stay elastic: \
+             alpha {alpha_max_load} -> {alpha}"
+        );
+        (f, alpha) = mat.project(squeeze * squeeze * f, alpha, 0.0);
+        let p = pressure_from_j(mat.kappa, f.determinant());
+        let p0 = mat.preconsolidation_pressure(alpha);
+        assert!(
+            alpha < alpha_max_load,
+            "loading past the maximum must yield"
+        );
+        assert!((p0 - p).abs() <= 1.0e-3 * p, "p0={p0} p={p}");
+    }
+
+    /// A softer hardening exponent builds less memory from the same plastic
+    /// compaction: p0 = p_ref exp(-xi alpha) grows with xi at any fixed alpha.
+    #[test]
+    fn a_lower_hardening_exponent_stores_less_preconsolidation() {
+        let soft = NaccMaterial::new(3000.0, 2000.0, 1.2, 0.0, 5.0);
+        let stiff = NaccMaterial::new(3000.0, 2000.0, 1.2, 0.0, 27.8);
+        let alpha = -0.05; // the same prior compaction for both
+        assert!(
+            soft.preconsolidation_pressure(alpha) < stiff.preconsolidation_pressure(alpha),
+            "soft={} stiff={}",
+            soft.preconsolidation_pressure(alpha),
+            stiff.preconsolidation_pressure(alpha)
         );
     }
 }
@@ -911,7 +1176,10 @@ mod from_si_tests {
             },
             friction: 1.0,
             cohesion: 0.0,
-            hardening_factor: 2.0,
+            compression_index: 0.12,
+            swelling_index: 0.023,
+            void_ratio: 1.7,
+            preconsolidation_pa: 0.0,
         };
         let config_a = SimConfig::earth(64, 0.01, 0.1);
         let config_b = SimConfig::earth(64, 0.01, 0.001);
@@ -924,7 +1192,7 @@ mod from_si_tests {
         );
         assert_eq!(mat_a.friction, props.friction);
         assert_eq!(mat_a.cohesion, props.cohesion);
-        assert_eq!(mat_a.hardening_factor, props.hardening_factor);
+        assert_eq!(mat_a.hardening_factor, mat_b.hardening_factor);
     }
 
     /// Real, direct check against the same `scale_lame` + plane-strain
@@ -940,7 +1208,10 @@ mod from_si_tests {
             },
             friction: 1.2,
             cohesion: 0.0,
-            hardening_factor: 3.0,
+            compression_index: 0.12,
+            swelling_index: 0.023,
+            void_ratio: 1.7,
+            preconsolidation_pa: 0.0,
         };
         let config = SimConfig::earth(64, 0.01, 0.05);
         let mat = NaccMaterial::from_physical(&props, &config);

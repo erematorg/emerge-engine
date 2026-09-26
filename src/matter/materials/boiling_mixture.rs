@@ -201,6 +201,7 @@
 use glam::{Mat2, Vec2};
 
 use super::cavitating_eos::CavitatingEosTable;
+use crate::materials::utils::advance_log_volume_ratio;
 use crate::materials::{ConstitutiveModel, MaterialModel, MaterialParams};
 use crate::particle::{Particle, ParticleUpdateCtx, Particles};
 
@@ -447,9 +448,20 @@ impl MaterialModel for BoilingMixtureMaterial {
         ConstitutiveModel::Fluid
     }
 
+    fn gpu_unsupported_reason(&self) -> Option<&'static str> {
+        Some(
+            "BoilingMixtureMaterial has no GPU stress path: it uploads as a plain Tait fluid, so the GPU would run without its liquid-vapour equation of state",
+        )
+    }
+
     // Same real F/V/rho contract as `CavitatingFluidMaterial` -- see this
     // module's own top doc: the fixed liquid reference stays the
     // bookkeeping anchor, `rho_eq(x)` only ever enters the pressure law.
+    /// A scene that spawns this at a density other than the liquid
+    /// reference must set the lattice spacing AND
+    /// `SpawnRegion::initial_deformation_gradient` together -- see
+    /// `cavitating_eos`'s own module doc for the measured cost of
+    /// setting only one of the two.
     fn init_particle(&self, particle: &mut Particle) {
         let j = particle.deformation_gradient.determinant();
         particle.initial_volume = particle.mass / self.rest_density_grid;
@@ -511,7 +523,21 @@ impl MaterialModel for BoilingMixtureMaterial {
     fn update_particle(&self, ctx: &mut ParticleUpdateCtx, dt: f32) {
         let old_j = ctx.deformation_gradient.determinant();
         let div_v = ctx.velocity_gradient.x_axis.x + ctx.velocity_gradient.y_axis.y;
-        let j = (old_j * (dt * div_v).exp()).clamp(self.volume_ratio_min, self.volume_ratio_max);
+        // The carried logarithm is the real state; reading J back from F
+        // and multiplying loses a fraction of every small increment (see
+        // `advance_log_volume_ratio`'s own doc for the measurement).
+        let carried = if *ctx.log_volume_strain != 0.0 || old_j == 1.0 {
+            *ctx.log_volume_strain
+        } else {
+            old_j.max(1.0e-9).ln()
+        };
+        let (log_j, j) = advance_log_volume_ratio(
+            carried,
+            dt * div_v,
+            self.volume_ratio_min,
+            self.volume_ratio_max,
+        );
+        *ctx.log_volume_strain = log_j;
         let s = j.sqrt();
         *ctx.deformation_gradient = Mat2::from_cols(Vec2::new(s, 0.0), Vec2::new(0.0, s));
         let density = (self.rest_density_grid / j)
@@ -609,6 +635,13 @@ mod tests {
         p.deformation_gradient = Mat2::from_diagonal(Vec2::splat(s));
         p.friction_hardening = x;
         p
+    }
+
+    #[test]
+    fn gpu_refuses_the_boiling_mixture() {
+        let material = BoilingMixtureMaterial::from_table(&real_table(), 1.0, 0.0, 0.5, 8.0);
+        let reason = material.gpu_unsupported_reason();
+        assert!(reason.is_some_and(|r| r.starts_with("BoilingMixtureMaterial")));
     }
 
     /// Real, direct anchor: at `x=0`, `J=1` (equilibrium liquid), pressure

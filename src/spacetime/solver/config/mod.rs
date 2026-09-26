@@ -51,7 +51,7 @@ pub struct SimConfig {
     /// is real but LOOSE for the rod's geometrically nonlinear dynamics -- 0.5
     /// diverges for a long/stiff-EI cantilever at N=30/40; 0.4 is the
     /// bisected, long-horizon-verified safe value across that regime and a
-    /// short/soft blade-of-grass regime (see `project_rod_cfl_gershgorin_and_cookbook_2026-07-21` memory).
+    /// short/soft blade-of-grass regime.
     pub rod_cfl_coefficient: f32,
     /// Legacy timestep-granularity hint retained for API compatibility.
     ///
@@ -114,8 +114,7 @@ pub struct SimConfig {
     /// It is not a physics cap: a solver step must advance the full requested
     /// `dt` through CFL-safe substeps or explicitly report/defer the work.
     pub max_substeps_per_step: usize,
-    /// Real preflight/retry for strict WC-MPM fluid materials, CPU-side (root-caused
-    /// 2026-08-08, see project memory's fluid-recovery notes): CFL picks a substep dt from
+    /// Preflight/retry for strict WC-MPM fluid materials, CPU-side: CFL picks a substep dt from
     /// the PREVIOUS substep's state, which cannot perfectly bound an inherently NONLINEAR
     /// Tait-EOS pressure spike (`eos_power` typically 7) that a fast local compression
     /// event -- confirmed specifically at a hard-wall contact -- can produce WITHIN the
@@ -160,9 +159,8 @@ pub struct SimConfig {
     /// material-timestep contribution computed with `material_cfl_coefficient` divided by
     /// this factor.
     ///
-    /// **Real, second use found 2026-08-08 (see `MEMORY.md`'s fluid-recovery notes, Round
-    /// 9): also tightens the gravity-CFL bound (`cfl.rs`) for the SAME near-wall strict-
-    /// fluid particles.** This is the one that actually matters once `SimConfig::
+    /// **Second use: also tightens the gravity-CFL bound (`cfl.rs`) for the same
+    /// near-wall strict-fluid particles.** This is the one that actually matters once `SimConfig::
     /// fluid_pressure_iterations > 0` (`eos_stiffness=0`): the ORIGINAL acoustic-only
     /// tightening above is structurally INERT there (confirmed live, bit-identical
     /// results at scale=5 vs scale=20 vs disabled -- `NewtonianFluidMaterial::
@@ -170,11 +168,11 @@ pub struct SimConfig {
     /// `material_cfl_coefficient` by anything changes nothing). The gravity bound is the
     /// one bound still genuinely ACTIVE and PREDICTIVE for an eos-less fluid at rest, so
     /// tightening THAT one, for near-wall particles specifically, is what actually helps.
-    /// Real, measured result on the single hardest known scene (fluid already touching a
-    /// wall at spawn, spanning nearly the full domain): combined with
-    /// `fluid_pressure_iterations=1`, this is the first configuration tonight that
-    /// completes all 120 frames with zero non-finite state (a real, disclosed, bounded
-    /// slow drift late in the run, not fully eliminated, but never diverging).
+    /// On the wall-contact column scene (fluid already touching a wall at spawn,
+    /// spanning nearly the full domain), combined with `fluid_pressure_iterations=1`,
+    /// it lets all 120 frames complete without non-finite state. That run is not
+    /// physically valid: J sits at the [0.5, 2.0] safety clamp from about frame 20
+    /// (see the pressure projection entry in `KNOWN_LIMITATIONS.md`).
     ///
     /// `1.0` (default) = no scaling on either bound, byte-identical to before this field
     /// existed.
@@ -400,9 +398,8 @@ pub struct SimConfig {
     pub mixture_pressure_iterations: u32,
     /// Number of OUTER correction passes per substep for STRICT (single-
     /// phase, non-mixture) fluid incompressibility pressure projection
-    /// (`Grid::project_fluid_incompressibility`, see its own doc). Real fix
-    /// for the root-caused sustained-wall-contact stability limit (see
-    /// `MEMORY.md`'s fluid-recovery notes, Round 9): a stiff Tait EOS
+    /// (`Grid::project_fluid_incompressibility`, see its own doc). Meant to
+    /// remove the sustained-wall-contact stability limit: a stiff Tait EOS
     /// (`eos_stiffness`) needs a tiny acoustic-CFL-bound timestep to stay
     /// stable, and even the tightest near-wall CFL scale tested was too slow
     /// for sustained contact (a settled puddle against a wall/floor). A real
@@ -448,10 +445,15 @@ pub struct SimConfig {
     /// properly (real per-cell mass, with the free-surface unbounded-alpha
     /// problem solved structurally, e.g. `apic2d`'s own real variational
     /// solid-fraction boundary weighting -- `tmp/apic2d/apic2d/fluidsim.cpp`,
-    /// not yet ported), a genuinely separate, larger undertaking. For less
-    /// extreme scenes (fluid not already touching a wall at spawn), this
-    /// projection is real, verified, and stable -- see the easy-drop-scene
-    /// finding in the same memory notes.
+    /// not yet ported), a genuinely separate, larger undertaking.
+    ///
+    /// Not only the wall case: a falling droplet with no wall anywhere also
+    /// drives J to the clamp, at frame 1 at full gravity and at frame 6-7 at
+    /// 0.003 g. The mechanisms measured so far (fake divergence at empty
+    /// cells, a 1/nodal-mass correction against an average-density solve,
+    /// the 0.2 relaxation masking an unstable operator, and node
+    /// classification by mass thresholds at walls) are listed in the
+    /// pressure projection entry of `KNOWN_LIMITATIONS.md`. Off by default.
     ///
     /// Real, disclosed scope limit: when this is nonzero,
     /// `Simulation::step`'s strict-fluid assertions additionally require

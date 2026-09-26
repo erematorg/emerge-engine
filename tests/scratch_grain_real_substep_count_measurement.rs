@@ -116,7 +116,6 @@ fn make_grains_mode_sim_sized(
         box_size: IVec2::new(terrain_half_width_cells * 2, GRAINS_TERRAIN_HEIGHT_CELLS),
         box_center: terrain_center,
         material_id: 0,
-        precompute_initial_volumes: true,
         position_jitter: 0.3,
         ..SpawnRegion::for_sim(&config)
     };

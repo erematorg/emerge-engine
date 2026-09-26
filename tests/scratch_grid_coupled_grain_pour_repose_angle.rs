@@ -214,7 +214,6 @@ fn pour_grid_coupled_to_repose_angle_seeded(pour: &PourConfig) -> PileShape {
         ),
         box_center: terrain_center,
         material_id: 0,
-        precompute_initial_volumes: true,
         position_jitter: 0.3,
         ..SpawnRegion::for_sim(&config)
     };

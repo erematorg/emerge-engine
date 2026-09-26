@@ -244,22 +244,26 @@ impl MaterialRegistry {
         }
     }
 
-    /// Real, generic per-particle stress magnitude, usable across EVERY
-    /// material this registry holds (no material-specific special case --
-    /// every `MaterialModel` already implements `kirchhoff_stress`, this
-    /// just reduces that real tensor to one scalar via the standard 2D
-    /// plane-stress von Mises equivalent stress: von Mises 1913 ("Mechanik
-    /// der festen Körper im plastisch-deformablen Zustand"), the general
-    /// scalar-equivalent-stress formula also given in Hill 1950 ("The
-    /// Mathematical Theory of Plasticity") -- `sigma_vm = sqrt(sxx^2 -
-    /// sxx*syy + syy^2 + 3*sxy^2)`. NOT the same computation as
-    /// `VonMisesMaterial`'s own internal `dev_norm` (that is a log-strain-
-    /// space yield-surface bookkeeping quantity specific to that one
-    /// material's own return-mapping, not a general Cauchy/Kirchhoff
-    /// stress scalar every material can produce). Intended real use:
-    /// render-side visualization (`ColorMode::ByStress`), where a single,
-    /// universal, physically-real quantity should mean the same thing
-    /// regardless of which material a particle happens to be.
+    /// Per-particle von Mises equivalent stress of the DEVIATORIC part of
+    /// each particle's own `kirchhoff_stress`, for any material this registry
+    /// holds: `sqrt(3 J2)`, with `J2 = s:s / 2` and `s = tau - tr(tau)/2 I`,
+    /// the in-plane deviator split the way the materials here split their
+    /// own stress (trace over two). Pressure does not enter: a body carrying
+    /// its weight at rest reads zero wherever it holds no shear. For
+    /// incompressible plane strain, where the out-of-plane stress is the
+    /// in-plane mean, this is exactly the three-dimensional `sqrt(3 J2)`.
+    ///
+    /// It shows shear, not how close a material is to yielding: each
+    /// material states its yield criterion in its own measure.
+    /// `VonMisesMaterial` yields where `2 mu |dev(eps)|`, eps the Hencky
+    /// strain, reaches its `yield_stress`; at small strain that is the
+    /// Frobenius norm of the deviator, `sqrt(2 J2)`, and this field reads
+    /// `sqrt(3/2) yield_stress` there, while at strains of order one the
+    /// stress reads lower. `BinghamFluidMaterial` yields where `sqrt(J2)`
+    /// reaches `yield_stress`, so it reads `sqrt(3) yield_stress`. A view
+    /// that means "at yield" asks each material for its own criterion
+    /// (`VonMisesMaterial::yield_ratio`), which one display scale cannot
+    /// replace (`tests/scratch_stress_view_before_after.rs`).
     pub fn von_mises_stress_field(&self, particles: &Particles) -> Vec<f32> {
         (0..particles.len())
             .map(|i| {
@@ -367,6 +371,15 @@ impl MaterialRegistry {
         (material_id as usize) < self.materials.len()
     }
 
+    /// First registered material the GPU solver cannot run, with the reason
+    /// it gives (see `MaterialModel::gpu_unsupported_reason`).
+    pub fn first_gpu_unsupported(&self) -> Option<(u32, &'static str)> {
+        self.materials
+            .iter()
+            .enumerate()
+            .find_map(|(id, m)| m.gpu_unsupported_reason().map(|reason| (id as u32, reason)))
+    }
+
     /// Returns true if any registered material requires a CPU plasticity pass each substep.
     /// Used by the GPU solver to skip the download+update loop when all plasticity is on GPU.
     pub fn any_needs_cpu_update(&self) -> bool {
@@ -455,20 +468,17 @@ impl MaterialRegistry {
     }
 }
 
-/// Real, standard 2D plane-stress von Mises equivalent stress -- see
-/// `MaterialRegistry::von_mises_stress_field`'s own doc for the full
-/// citation. Symmetrizes the off-diagonal term first (a real discrete
-/// Kirchhoff stress need not come back perfectly symmetric from every
-/// material's own internal bookkeeping, same real justification this
-/// project already uses for the Bagi/Christoffersen stress-tensor
-/// symmetrization in `spacetime::grains::population`).
+/// `sqrt(3 J2)` of the in-plane deviator, see
+/// `MaterialRegistry::von_mises_stress_field`. It used to be the plane-stress
+/// von Mises of the FULL tensor, `sqrt(sxx^2 - sxx syy + syy^2 + 3 sxy^2)`,
+/// where a pure pressure reads as its own magnitude: on a body at rest the
+/// view painted weight, not shear. Symmetrizes the off-diagonal term first,
+/// since a discrete Kirchhoff stress need not come back exactly symmetric.
 fn von_mises_equivalent_2d(sigma: Mat2) -> f32 {
-    let sxx = sigma.x_axis.x;
-    let syy = sigma.y_axis.y;
+    // s = [[d, sxy], [sxy, -d]] with d = (sxx - syy) / 2, so J2 = d^2 + sxy^2.
+    let d = 0.5 * (sigma.x_axis.x - sigma.y_axis.y);
     let sxy = 0.5 * (sigma.x_axis.y + sigma.y_axis.x);
-    (sxx * sxx - sxx * syy + syy * syy + 3.0 * sxy * sxy)
-        .max(0.0)
-        .sqrt()
+    (3.0 * (d * d + sxy * sxy)).sqrt()
 }
 
 #[cfg(test)]
@@ -476,14 +486,45 @@ mod von_mises_tests {
     use super::*;
     use glam::Vec2;
 
-    /// Real, hand-verified case 1: pure uniaxial stress (only sxx nonzero)
-    /// reduces to EXACTLY sxx itself -- the standard, textbook von Mises
-    /// result for uniaxial loading (e.g. Hill 1950's own worked example).
+    /// The fix itself: a pure pressure holds no shear, so it reads zero.
+    /// Before, the plane-stress formula read it as its own magnitude.
     #[test]
-    fn pure_uniaxial_stress_gives_exactly_itself() {
+    fn pure_pressure_gives_zero() {
+        let sigma = Mat2::from_diagonal(Vec2::splat(-330.0));
+        assert_eq!(von_mises_equivalent_2d(sigma), 0.0);
+    }
+
+    /// In-plane uniaxial stress `sxx`: its in-plane deviator is
+    /// `diag(sxx/2, -sxx/2)`, so `J2 = sxx^2 / 4` and the value is
+    /// `sqrt(3)/2 sxx`. The three-dimensional plane-stress answer, `sxx`,
+    /// assumes a zero out-of-plane stress this two-dimensional deviator
+    /// does not.
+    #[test]
+    fn in_plane_uniaxial_stress_gives_root_3_over_2_of_itself() {
         let sigma = Mat2::from_cols(Vec2::new(7.0, 0.0), Vec2::new(0.0, 0.0));
         let vm = von_mises_equivalent_2d(sigma);
-        assert!((vm - 7.0).abs() < 1.0e-5, "vm={vm}, expected 7.0");
+        let expected = 3.0f32.sqrt() * 0.5 * 7.0;
+        assert!(
+            (vm - expected).abs() < 1.0e-5,
+            "vm={vm}, expected {expected}"
+        );
+    }
+
+    /// The factor the doc states for `VonMisesMaterial` at small strain: at
+    /// its yield the deviator's Frobenius norm equals `yield_stress`, and
+    /// this field reads `sqrt(3/2)` of it. Shear chosen as a pure `sxy`,
+    /// whose Frobenius norm is `sqrt(2) sxy`.
+    #[test]
+    fn at_frobenius_yield_reads_root_3_over_2_of_the_yield() {
+        let yield_stress = 12.0;
+        let sxy = yield_stress / 2.0f32.sqrt();
+        let sigma = Mat2::from_cols(Vec2::new(-40.0, sxy), Vec2::new(sxy, -40.0));
+        let vm = von_mises_equivalent_2d(sigma);
+        let expected = 1.5f32.sqrt() * yield_stress;
+        assert!(
+            (vm - expected).abs() < 1.0e-4,
+            "vm={vm}, expected {expected}"
+        );
     }
 
     /// Real, hand-verified case 2: pure shear (sxx=syy=0, only sxy nonzero)
@@ -503,8 +544,7 @@ mod von_mises_tests {
         );
     }
 
-    /// Zero stress must give exactly zero, not a spurious value from
-    /// floating-point roundoff around the `.max(0.0)` guard.
+    /// Zero stress gives exactly zero.
     #[test]
     fn zero_stress_gives_zero() {
         assert_eq!(von_mises_equivalent_2d(Mat2::ZERO), 0.0);
@@ -526,5 +566,67 @@ mod von_mises_tests {
             (vm - expected).abs() < 1.0e-4,
             "vm={vm}, expected {expected}"
         );
+    }
+}
+
+#[cfg(test)]
+mod gpu_support_tests {
+    use super::*;
+    use crate::materials::{
+        BinghamFluidMaterial, IdealGasMaterial, NaccMaterial, NeoHookeanMaterial,
+        NewtonianFluidMaterial, NoCompressionMaterial,
+    };
+
+    fn gpu_ready_registry() -> MaterialRegistry {
+        let mut registry =
+            MaterialRegistry::with_default(Box::new(NeoHookeanMaterial::new(2000.0, 4000.0)));
+        registry.insert(
+            1,
+            Box::new(NewtonianFluidMaterial::low_viscosity(1.0, 50.0)),
+        );
+        registry.insert(
+            2,
+            Box::new(BinghamFluidMaterial::new(1000.0, 0.5, 5000.0, 7.0, 100.0)),
+        );
+        registry
+    }
+
+    #[test]
+    fn gpu_supported_materials_pass_the_check() {
+        assert_eq!(gpu_ready_registry().first_gpu_unsupported(), None);
+    }
+
+    #[test]
+    fn each_unsupported_material_is_refused_by_name_and_slot() {
+        let mut elastoviscoplastic = BinghamFluidMaterial::new(1000.0, 0.5, 5000.0, 7.0, 100.0);
+        elastoviscoplastic.shear_modulus = 2000.0;
+        let config = crate::SimConfig::earth(64, 0.01, 0.001);
+        let cases: [(Box<dyn MaterialModel>, &str); 4] = [
+            (Box::new(elastoviscoplastic), "BinghamFluidMaterial"),
+            (
+                Box::new(NaccMaterial::new(3000.0, 2000.0, 1.2, 0.0, 2.0)),
+                "NaccMaterial",
+            ),
+            (
+                Box::new(NoCompressionMaterial::new(2000.0, 4000.0)),
+                "NoCompressionMaterial",
+            ),
+            (
+                Box::new(IdealGasMaterial::air(1.2, 293.15, &config)),
+                "IdealGasMaterial",
+            ),
+        ];
+        for (material, name) in cases {
+            let mut registry = gpu_ready_registry();
+            registry.insert(3, material);
+            let (id, reason) = registry
+                .first_gpu_unsupported()
+                .unwrap_or_else(|| panic!("{name} must be refused on the GPU"));
+            assert_eq!(id, 3);
+            assert!(
+                reason.starts_with(name),
+                "reason must name {name}: {reason}"
+            );
+        }
     }
 }

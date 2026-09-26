@@ -69,7 +69,6 @@ fn main() {
             box_size: IVec2::new(14, 52),
             box_center: Vec2::new(20.0, 30.0),
             material_id: MAT_WATER,
-            precompute_initial_volumes: true,
             mass_override: Some(WATER_RHO_GRID * SPACING * SPACING),
             ..SpawnRegion::for_sim(&config)
         },
@@ -227,7 +226,9 @@ fn main() {
         )
         .expect("write header");
         let lit = pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|p| p[0] as u32 + p[1] as u32 + p[2] as u32 > 120)
             .count();
         println!("{mode}: wrote {path}, {lit} pixels above background");

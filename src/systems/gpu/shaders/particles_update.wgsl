@@ -118,7 +118,7 @@ fn has_model(model: u32, m: u32) -> bool {
 // This substep's timestep and velocity cap, decided on the GPU at the end of the previous
 // substep -- see `adaptive_cfl.wgsl`. `substep_dt()`/`vel_limit` are the CPU's
 // frame-start values and are NOT authoritative any more (the GPU may only tighten them).
-@group(2) @binding(37) var<storage, read_write> adaptive_dt: array<atomic<u32>, 4>;
+@group(2) @binding(37) var<storage, read_write> adaptive_dt: array<atomic<u32>, 5>;
 
 // Cached per invocation: this is an atomic storage load, and reading it at every use
 // site cost ~40% of a substep (measured: 0.29 -> 0.41ms per substep on the dam break).
@@ -624,7 +624,7 @@ fn update_particle(p_idx: u32, pp: ptr<function, Particle>) {
     var f_increment = I + dt * p.velocity_gradient;
     if has_model(mat.model, 2u) || has_model(mat.model, 3u) || has_model(mat.model, 4u)
         || has_model(mat.model, 5u) || has_model(mat.model, 6u) || has_model(mat.model, 7u)
-        || has_model(mat.model, 9u) || has_model(mat.model, 11u) {
+        || has_model(mat.model, 8u) || has_model(mat.model, 9u) || has_model(mat.model, 11u) {
         f_increment = deformation_increment_exp(dt * p.velocity_gradient);
     }
     var new_F = f_increment * p.deformation_gradient;
@@ -745,9 +745,23 @@ fn update_particle(p_idx: u32, pp: ptr<function, Particle>) {
         // the GPU fluid impact explosion (and of the per-substep shear damping
         // once added to mask it).
         let div_v = trace2(p.velocity_gradient);
-        var J_fluid = old_J * exp(dt * div_v);
-        if !(J_fluid > 0.0) { J_fluid = 1.0; }
-        J_fluid = clamp(J_fluid, FLUID_J_MIN, fluid_j_max);
+        // Carried in the log, the same as CPU `advance_log_volume_ratio`,
+        // and for the reason measured there: near one, an f32 resolves
+        // about 1.2e-7 while a calm flow's own increment is a thousandth
+        // of that, so multiplying `det(F)` by `exp(dt div v)` every
+        // substep loses a fixed fraction of each increment and the
+        // smallest ones vanish outright. `log_volume_strain` is free for
+        // fluids (it is Drucker-Prager's and NACC's own field), so this
+        // costs no bytes in the 128-byte particle.
+        var carried = p.log_volume_strain;
+        if carried == 0.0 && old_J != 1.0 && old_J > 0.0 {
+            carried = log(old_J);
+        }
+        var log_j = carried + dt * div_v;
+        if !(log_j > -1.0e30 && log_j < 1.0e30) { log_j = 0.0; }
+        log_j = clamp(log_j, log(FLUID_J_MIN), log(fluid_j_max));
+        p.log_volume_strain = log_j;
+        let J_fluid = exp(log_j);
         let sqrtJ = sqrt(J_fluid);
         new_F = mat2x2<f32>(vec2<f32>(sqrtJ, 0.0), vec2<f32>(0.0, sqrtJ));
 
@@ -815,19 +829,17 @@ fn update_particle(p_idx: u32, pp: ptr<function, Particle>) {
     // This mirrors CPU estimate_density_and_volume_impl (density.rs) exactly.
     // p.density and p.volume already hold the correct values -- nothing to recompute here.
 
-    // No velocity damping for elastic/viscoelastic models (0, 2, 3, 9) -- APIC is
-    // energy-conserving and extra damping causes over-settling that leads to floor-compression
-    // instability. Plastic flow (snow, sand, VM, etc.) provides its own dissipation.
-    // For plasticity models we apply a very light damping as a boundary-edge safety margin.
-    // Model 1u (fluid) excluded: explicit viscosity already dissipates; extra damping slows flow.
-    // Light damping for plasticity models -- their explicit dissipation (yield, flow) is enough,
-    // but a small margin prevents edge-particle instability near boundaries.
-    // Elastic (2, 3) and fluid (0, 1) excluded -- APIC is energy-conserving; damping fights that.
-    // Viscoelastic (9) excluded: viscosity stress handles dissipation during deformation.
-    // Velocity damping would bleed into free-fall and make vis fall slower than other materials.
-    if mat.model != 0u && mat.model != 1u && mat.model != 2u && mat.model != 3u && mat.model != 9u {
-        p.v *= 0.999;
-    }
+    // No velocity damping anywhere, for any model. Plastic models used to
+    // get `v *= 0.999` here as a boundary-edge safety margin, which the CPU
+    // never had: `tests/gpu_parity.rs` measured what that cost in a scene
+    // carrying no stress at all, where the two paths can only differ in
+    // their transfer. In free fall the five plastic laws separated from the
+    // elastic ones by two orders of magnitude in velocity (4.1e-3 against
+    // 2e-5) purely because of this line. The comment it replaces said as
+    // much about viscoelastic -- damping "would bleed into free-fall and
+    // make vis fall slower than other materials" -- and then applied it to
+    // the plastic laws anyway. No commit ever introduced it with a
+    // measurement behind it: it survives from before a July file split.
 
     // Position update: x += v · dt  (v written by g2p pass)
     var new_x = p.x + p.v * dt;
