@@ -923,3 +923,371 @@ fn lattice_volume_against_the_hydrostatic_gap() {
         );
     }
 }
+
+/// What the hydrostatic column looks like when it "loses its equilibrium"
+/// at a finer grid, read from text pictures instead of guessed: the column
+/// at 0.5 cm cells for both initial volumes, its top height and mean volume
+/// ratio every 400 frames, and a picture of where the material is.
+///
+/// Found: the lattice-volume column topples. Its width grows from 12 to 19
+/// cells by 0.8 s, it leans by 1 s and lies as a slab 24 cells wide and 7
+/// tall by 2 s. The estimated-volume column rocks (width 11.6 to 14) but
+/// stands. Neither is damped: the fastest particle still moves at about
+/// 0.5 m/s after 2 s. What seeds the asymmetric mode is not established.
+#[test]
+#[ignore = "diagnostic probe kept for reruns, not part of the CI suite"]
+fn the_refined_column_seen() {
+    use emerge::NeoHookeanMaterial;
+    use emerge::diagnostics::{OCCUPANCY_BANDS, scene_map};
+    let spacing: f32 = 0.5;
+    let refine = env("HYDRO_REFINE", 2.0) as i32;
+    let grid: usize = 48 * refine as usize;
+    let dx: f32 = 0.01 / refine as f32;
+    let column: IVec2 = IVec2::new(6 * refine, 12 * refine);
+    for lattice in [false, true] {
+        let config = SimConfig {
+            min_dt: 1.0e-7,
+            max_substeps_per_step: 128 * (refine * refine) as usize * 4,
+            ..SimConfig::earth(grid, dx, 0.0005)
+        };
+        let spawn = SpawnRegion {
+            spacing,
+            box_size: column,
+            box_center: Vec2::new(
+                14.0 * refine as f32,
+                3.0 * refine as f32 + column.y as f32 * 0.5,
+            ),
+            material_id: 0,
+            mass_override: Some(RHO_KG_M3 * (spacing * dx).powi(2)),
+            initial_velocity_scale: 0.0,
+            ..SpawnRegion::for_sim(&config)
+        };
+        let mut sim = Simulation::new(config, spawn)
+            .with_default_material(Box::new(NeoHookeanMaterial::from_young_modulus(2.0e5, 0.3)))
+            .with_boundary(Box::new(SlipBoundary::new(config.boundary_thickness)));
+        let n = sim.particles().len();
+        if lattice {
+            let cell = spacing * spacing;
+            let p = sim.particles_mut();
+            for i in 0..n {
+                p.initial_volume[i] = cell;
+                p.volume[i] = cell;
+                p.density[i] = p.mass[i] / cell;
+            }
+        }
+        println!(
+            "--- {} initial volume, refine {refine}",
+            if lattice { "lattice" } else { "estimated" }
+        );
+        for frame in 0..=4000 {
+            if frame % 400 == 0 {
+                let p = sim.particles();
+                let top = p.x.iter().map(|x| x.y).fold(f32::MIN, f32::max);
+                let lo = p.x.iter().map(|x| x.x).fold(f32::MAX, f32::min);
+                let hi = p.x.iter().map(|x| x.x).fold(f32::MIN, f32::max);
+                let j = (0..n)
+                    .map(|i| f64::from(p.deformation_gradient[i].determinant()))
+                    .sum::<f64>()
+                    / n as f64;
+                let vmax = p.v.iter().map(|v| v.length()).fold(0.0f32, f32::max);
+                println!(
+                    "t={:.2}s top {:.1} cells above spawn floor, width {:.1}, mean J {j:.4}, fastest {:.3} m/s",
+                    frame as f32 * 0.0005,
+                    top - 3.0 * refine as f32 + column.y as f32 * 0.5 - column.y as f32 * 0.5,
+                    hi - lo,
+                    vmax * dx
+                );
+                if frame % 2000 == 0 {
+                    let region = (
+                        Vec2::new(4.0 * refine as f32, 0.0),
+                        Vec2::new(24.0 * refine as f32, 20.0 * refine as f32),
+                    );
+                    for row in scene_map(p, region, 40, 20, |_| 1.0, &OCCUPANCY_BANDS) {
+                        if row.trim().is_empty() {
+                            continue;
+                        }
+                        println!("      |{row}|");
+                    }
+                }
+            }
+            sim.step();
+        }
+    }
+}
+
+/// The column loses its equilibrium by toppling: undamped, it rings from
+/// its stress-free spawn, and on a frictionless floor the ringing can rock
+/// it over (`the_refined_column_seen`). A wide slab cannot topple, so it
+/// gives the convergence table issue #41 asks for. A slab 40 cells wide and
+/// 12 tall at 1 cm (scaled with the refinement), on the same slip floor,
+/// the same material and mass as the column; the vertical stress over its
+/// central third, lower half, time-averaged over the second second,
+/// against `rho g d` with `d` the depth under the slab's own top there. The
+/// top's drift over that second is printed, the check that it is at rest.
+///
+/// Found (positive: the lower half carries more than the weight above it):
+///
+/// ```text
+///   cells    as spawned   lattice    top drift over the second second
+///   1 cm       +4.2 %     +33.1 %    -0.005 / -0.041 cells
+///   0.5 cm     +6.8 %     +27.0 %    +0.022 / -0.589 cells
+///   0.25 cm    +8.8 %     +13.6 %    -1.625 / -0.428 cells
+/// ```
+///
+/// At 1 cm the estimated volume is eight times closer. Refined, the lattice
+/// volume closes in and the estimated one drifts slowly away; neither
+/// converges cleanly, and at 0.25 cm the estimated-volume slab is still
+/// sinking by 1.6 cells over the measured second, so that row is not at
+/// rest. Why it sinks is not established.
+#[test]
+#[ignore = "diagnostic probe kept for reruns, not part of the CI suite"]
+fn the_hydrostatic_slab_for_both_initial_volumes() {
+    use emerge::{MaterialModel, NeoHookeanMaterial};
+    let spacing: f32 = 0.5;
+    println!("  cells    initial volume       measured      rho g d      error     top drift");
+    for refine in [1i32, 2, 4] {
+        let grid: usize = 48 * refine as usize;
+        let dx: f32 = 0.01 / refine as f32;
+        let slab = IVec2::new(40 * refine, 12 * refine);
+        for lattice in [false, true] {
+            let config = SimConfig {
+                min_dt: 1.0e-7,
+                max_substeps_per_step: 128 * (refine * refine) as usize * 4,
+                ..SimConfig::earth(grid, dx, 0.0005)
+            };
+            let material = NeoHookeanMaterial::from_young_modulus(2.0e5, 0.3);
+            let spawn = SpawnRegion {
+                spacing,
+                box_size: slab,
+                box_center: Vec2::new(grid as f32 * 0.5, 3.0 * refine as f32 + slab.y as f32 * 0.5),
+                material_id: 0,
+                mass_override: Some(RHO_KG_M3 * (spacing * dx).powi(2)),
+                initial_velocity_scale: 0.0,
+                ..SpawnRegion::for_sim(&config)
+            };
+            let mut sim = Simulation::new(config, spawn)
+                .with_default_material(Box::new(material))
+                .with_boundary(Box::new(SlipBoundary::new(config.boundary_thickness)));
+            let n = sim.particles().len();
+            if lattice {
+                let cell = spacing * spacing;
+                let p = sim.particles_mut();
+                for i in 0..n {
+                    p.initial_volume[i] = cell;
+                    p.volume[i] = cell;
+                    p.density[i] = p.mass[i] / cell;
+                }
+            }
+            let g = sim.config().gravity.length();
+            let centre = grid as f32 * 0.5;
+            let third = slab.x as f32 / 6.0;
+            let middle_top = |sim: &Simulation| {
+                let p = sim.particles();
+                p.x.iter()
+                    .filter(|x| (x.x - centre).abs() < third)
+                    .map(|x| x.y)
+                    .fold(f32::MIN, f32::max)
+            };
+            for _ in 0..2000 {
+                sim.step();
+            }
+            let top_start = middle_top(&sim);
+            let (mut measured, mut expected, mut samples) = (0.0f64, 0.0f64, 0u32);
+            for _ in 0..2000 {
+                sim.step();
+                let p = sim.particles();
+                let top = middle_top(&sim);
+                let (mut m, mut e, mut k) = (0.0f64, 0.0f64, 0u32);
+                for i in 0..n {
+                    if (p.x[i].x - centre).abs() >= third {
+                        continue;
+                    }
+                    let depth = top - p.x[i].y;
+                    if depth < slab.y as f32 * 0.5 {
+                        continue;
+                    }
+                    let j = p.deformation_gradient[i].determinant().max(1.0e-6);
+                    m += f64::from(material.kirchhoff_stress(p, i).y_axis.y / j);
+                    e += f64::from(-RHO_KG_M3 * g * dx * depth * dx);
+                    k += 1;
+                }
+                if k > 0 {
+                    measured += m / f64::from(k);
+                    expected += e / f64::from(k);
+                    samples += 1;
+                }
+            }
+            let drift = middle_top(&sim) - top_start;
+            let (measured, expected) =
+                (measured / f64::from(samples), expected / f64::from(samples));
+            println!(
+                "  {:>4} cm  {:<18}  {measured:>9.1} Pa  {expected:>9.1} Pa  {:>+7.1} %   {:+.3} cells",
+                dx * 100.0,
+                if lattice {
+                    "lattice spacing^2"
+                } else {
+                    "as spawned"
+                },
+                100.0 * (expected - measured) / expected.abs(),
+                drift
+            );
+        }
+    }
+}
+
+/// Issue #41's reconciliation: the core audit ranked the two initial
+/// volumes the other way (sag of a free column, `self_weight_strain_is_
+/// spacing_independent`: about 0.82 of the analytic for the estimated
+/// volume, 1.03 for the lattice's), while the slab above ranks them by
+/// stress (+4 percent against +33). Two different quantities on two
+/// different scenes. This measures BOTH on BOTH, for both volumes, in
+/// grid units throughout: the sag as that test reads it (height from the
+/// particle centres, time-averaged, over its analytic mean strain), and the
+/// lower half's vertical stress over the weight above it, `rho g d` with
+/// `rho` the lattice density `mass / spacing^2`, which does not depend on
+/// either volume.
+///
+/// Found, 1 cm cells, spacing 0.5:
+///
+/// ```text
+///   scene               volume      sag / analytic   stress / weight
+///   audit column 6x10   estimated       0.913            0.905
+///   audit column 6x10   lattice         1.075            1.118
+///   wide slab 40x12     estimated       1.053            1.044
+///   wide slab 40x12     lattice         1.133            1.332
+/// ```
+///
+/// Within each scene the two quantities rank the volumes the same way; no
+/// quantity inverts the order. What changes sign is the estimated volume's
+/// error between scenes, 9 percent under on the narrow free column and 4 to
+/// 5 over on the slab, while the lattice volume is over on both, 8 to 33
+/// percent. The audit's own 0.82 against 1.03 is not reproduced today
+/// (0.913 against 1.075 here); it predates the spawn contract fix that
+/// changed the estimated volume, which is the likely reason, not checked.
+/// The lattice volume is not the more accurate one on either scene.
+#[test]
+#[ignore = "diagnostic probe kept for reruns, not part of the CI suite"]
+fn the_audit_sag_and_the_slab_stress_on_both_scenes() {
+    use emerge::{MaterialModel, NeoHookeanMaterial};
+    // (label, box, centre, E, nu, boundary cells, frame dt, uniaxial analytic)
+    let scenes = [
+        (
+            "audit column 6x10",
+            IVec2::new(6, 10),
+            Vec2::new(32.0, 8.0),
+            1.0e5f32,
+            0.2f32,
+            3usize,
+            0.005f32,
+            true,
+        ),
+        (
+            "wide slab 40x12",
+            IVec2::new(40, 12),
+            Vec2::new(32.0, 9.0),
+            2.0e5,
+            0.3,
+            2,
+            0.0005,
+            false,
+        ),
+    ];
+    let spacing = 0.5f32;
+    let rho = 1000.0f32;
+    println!(
+        "  scene               initial volume    sag / analytic    lower-half stress / weight"
+    );
+    for (label, size, centre, young, poisson, boundary, dt, uniaxial) in scenes {
+        for lattice in [false, true] {
+            let config = SimConfig {
+                boundary_thickness: boundary,
+                min_dt: 1.0e-7,
+                max_substeps_per_step: 2000,
+                ..SimConfig::earth(64, 0.01, dt)
+            };
+            let spawn = SpawnRegion {
+                spacing,
+                box_size: size,
+                box_center: centre,
+                material_id: 0,
+                initial_velocity_scale: 0.0,
+                ..SpawnRegion::for_sim(&config)
+            };
+            let (lambda, mu) = config.lame_from_si_physical_cfg(young, poisson, rho);
+            let material = NeoHookeanMaterial::new(lambda, mu);
+            let mut sim = Simulation::new(config, spawn)
+                .with_default_material(Box::new(material))
+                .with_boundary(Box::new(SlipBoundary::new(config.boundary_thickness)));
+            let n = sim.particles().len();
+            if lattice {
+                let cell = spacing * spacing;
+                let p = sim.particles_mut();
+                for i in 0..n {
+                    p.initial_volume[i] = cell;
+                    p.volume[i] = cell;
+                    p.density[i] = p.mass[i] / cell;
+                }
+            }
+            let g = sim.config().gravity.length();
+            let rho_grid = sim.particles().mass[0] / (spacing * spacing);
+            // The central third across, so the slab's ends do not enter.
+            let third = size.x as f32 / 6.0;
+            let middle = |x: Vec2| (x.x - centre.x).abs() < third;
+            let height = |s: &Simulation| {
+                let p = s.particles();
+                let top =
+                    p.x.iter()
+                        .filter(|x| middle(**x))
+                        .map(|x| x.y)
+                        .fold(f32::MIN, f32::max);
+                let bottom =
+                    p.x.iter()
+                        .filter(|x| middle(**x))
+                        .map(|x| x.y)
+                        .fold(f32::MAX, f32::min);
+                (top, top - bottom)
+            };
+            let (_, h0) = height(&sim);
+            // The audit's analytic: mean strain of a free column, rho g h / 2E.
+            // A wide slab is held laterally by itself, so its modulus is the
+            // constrained one, lambda + 2 mu.
+            let modulus = if uniaxial {
+                mu * (3.0 * lambda + 2.0 * mu) / (lambda + mu)
+            } else {
+                lambda + 2.0 * mu
+            };
+            let analytic = rho_grid * g * h0 / (2.0 * modulus);
+            let settle = (2.0 / dt).round() as usize;
+            for _ in 0..settle {
+                sim.step();
+            }
+            let (mut sag, mut stress, mut samples) = (0.0f64, 0.0f64, 0u32);
+            for _ in 0..settle {
+                sim.step();
+                let (top, h) = height(&sim);
+                sag += f64::from((h0 - h) / h0);
+                let p = sim.particles();
+                let (mut m, mut e) = (0.0f64, 0.0f64);
+                for i in 0..n {
+                    let depth = top - p.x[i].y;
+                    if !middle(p.x[i]) || depth < size.y as f32 * 0.5 {
+                        continue;
+                    }
+                    let j = p.deformation_gradient[i].determinant().max(1.0e-6);
+                    m += f64::from(-material.kirchhoff_stress(p, i).y_axis.y / j);
+                    e += f64::from(rho_grid * g * depth);
+                }
+                if e > 0.0 {
+                    stress += m / e;
+                }
+                samples += 1;
+            }
+            println!(
+                "  {label:<18}  {:<16}    {:>6.3}            {:>6.3}",
+                if lattice { "lattice" } else { "estimated" },
+                sag / f64::from(samples) / f64::from(analytic),
+                stress / f64::from(samples)
+            );
+        }
+    }
+}
