@@ -7,7 +7,7 @@ use super::directional_grip::DirectionalContactGrip;
 use super::{FxU32BuildHasher, Grid, flat_index};
 
 /// Second velocity field for multi-field frictional contact (Bardenhagen, Guilkey,
-/// Roessig, Brackbill 2001) — see `Particle::contact_group`'s doc for the full
+/// Roessig, Brackbill 2001) -- see `Particle::contact_group`'s doc for the full
 /// rationale. Only allocated at grid nodes touched by at least one particle with
 /// `contact_group != 0` ("grip"); the rest of the grid never sees this at all.
 ///
@@ -18,7 +18,7 @@ use super::{FxU32BuildHasher, Grid, flat_index};
 /// respectively, at nodes where this cell exists.
 ///
 /// `points`: labeled particle positions (`+1.0` grip, `-1.0` rest) whose kernel
-/// touches this node — the "point cloud" the logistic-regression contact normal
+/// touches this node -- the "point cloud" the logistic-regression contact normal
 /// (`fit_contact_normal_lr`) fits a separating plane through. Populated by a
 /// second particle pass (`gather_contact_point_cloud`, gated on contact activity)
 /// after the ordinary P2G scatter has determined which nodes are contact-active.
@@ -36,7 +36,7 @@ pub(super) type ContactCellMap = HashMap<u32, ContactCell, FxU32BuildHasher>;
 impl Grid {
     /// Accumulate mass and momentum for the "grip" contact field (particles with
     /// `contact_group != 0`) during P2G, additively alongside the normal
-    /// `add_mass_momentum` call for the SAME particle — this is a second, separate
+    /// `add_mass_momentum` call for the SAME particle -- this is a second, separate
     /// accumulator, not a replacement. OOB silently ignored.
     pub fn add_grip_mass_momentum(&mut self, cell_pos: IVec2, mass: f32, momentum: Vec2) {
         let Some(idx) = flat_index(cell_pos, self.resolution) else {
@@ -65,7 +65,7 @@ impl Grid {
     /// `cell_pos`'s contact point cloud, for the logistic-regression normal fit
     /// (`fit_contact_normal_lr`). Only pushes into a cell that ALREADY exists in
     /// `contact_cells` (i.e. one at least one grip particle already touched via
-    /// `add_grip_mass_momentum` this substep) — never creates a new entry, so a
+    /// `add_grip_mass_momentum` this substep) -- never creates a new entry, so a
     /// rest particle far from any grip body cannot spuriously grow `contact_dirty`.
     /// Called from a second particle pass (`gather_contact_point_cloud`) run
     /// AFTER the main P2G scatter has fully determined which nodes are
@@ -80,7 +80,7 @@ impl Grid {
         }
     }
 
-    /// Resolved "grip" field velocity at `cell_pos` — valid after `resolve_contact()`.
+    /// Resolved "grip" field velocity at `cell_pos` -- valid after `resolve_contact()`.
     /// Falls back to the ordinary total velocity when no contact was ever registered
     /// at this node (e.g. a grip particle whose kernel briefly touches a cell that no
     /// OTHER grip particle reaches, so there's no real second field to speak of).
@@ -93,9 +93,9 @@ impl Grid {
             .map_or_else(|| self.velocity_at(cell_pos), |c| c.resolved_grip_v)
     }
 
-    /// Resolved "rest" (contact_group == 0) field velocity at `cell_pos` — valid after
+    /// Resolved "rest" (contact_group == 0) field velocity at `cell_pos` -- valid after
     /// `resolve_contact()`. Falls back to the ordinary total velocity when no contact
-    /// was registered at this node, which is the common case away from any grip body —
+    /// was registered at this node, which is the common case away from any grip body --
     /// this is what makes routing G2P through this function safe everywhere, not just
     /// near contact.
     pub fn rest_velocity_at(&self, cell_pos: IVec2) -> Vec2 {
@@ -108,7 +108,7 @@ impl Grid {
     }
 
     /// Grip-field mass at `cell_pos`, 0.0 if OOB or untouched. Used only by
-    /// `grip_mass_gradient_normal` below — a tiny, deliberately local helper, not a
+    /// `grip_mass_gradient_normal` below -- a tiny, deliberately local helper, not a
     /// public query (there's no meaningful "grip mass" outside contact resolution).
     fn grip_mass_at(&self, cell_pos: IVec2) -> f32 {
         flat_index(cell_pos, self.resolution)
@@ -116,7 +116,7 @@ impl Grid {
             .map_or(0.0, |c| c.grip_mass)
     }
 
-    /// Fallback contact normal: Sobel-3x3 gradient of the grip field's own grid mass —
+    /// Fallback contact normal: Sobel-3x3 gradient of the grip field's own grid mass --
     /// the ORIGINAL Bardenhagen 2001 method, kept as a fallback for
     /// `fit_contact_normal_lr`'s "no confident plane" case. Not the primary method
     /// (has known weaknesses near a translating body or a material corner), but
@@ -137,13 +137,13 @@ impl Grid {
     /// Brackbill 2001, "An Improved Contact Algorithm for the Material Point Method").
     ///
     /// - Per-field velocity `v_grip = p_grip/m_grip` (eq. 4); center-of-mass velocity
-    ///   `v_cm` is just this grid's own existing total field (eq. 5-6) — already computed
+    ///   `v_cm` is just this grid's own existing total field (eq. 5-6) -- already computed
     ///   by `update_velocities`, called right before this.
     /// - Surface normal `n`: fitted via logistic regression through a labeled particle
-    ///   point cloud (`fit_contact_normal_lr`), not a grid mass gradient — see that
+    ///   point cloud (`fit_contact_normal_lr`), not a grid mass gradient -- see that
     ///   function's doc.
     /// - Approach test (eq. 8): contact applies only when `(v_grip - v_cm)·n < 0`
-    ///   (bodies approaching); otherwise free separation — the two fields keep their
+    ///   (bodies approaching); otherwise free separation -- the two fields keep their
     ///   own independently-integrated velocities, untouched.
     /// - Correction (eq. 10-13): remove the approaching normal component entirely, and
     ///   reduce the tangential component by up to `friction·|v_n|` (stick if that would
@@ -156,16 +156,11 @@ impl Grid {
     ///   total momentum by construction.
     ///
     /// Scope, disclosed: this is a 2-field (grip vs. rest) implementation, not full
-    /// N-body multi-field contact — see `Particle::contact_group` doc. Also skips the
+    /// N-body multi-field contact -- see `Particle::contact_group` doc. Also skips the
     /// paper's own refinement of releasing contact based on normal TRACTION rather than
-    /// kinematic approach/departure — the paper itself states the simpler kinematic-only
+    /// kinematic approach/departure -- the paper itself states the simpler kinematic-only
     /// criterion used here is exact "in the special case where contacting bodies are
     /// stress free."
-    ///
-    /// `vel_limit`: the SAME CFL speed cap the caller already applies to the total
-    /// field right before this call, applied here too to every velocity this function
-    /// produces or reads raw — without it, a tiny-mass grip node could carry a huge raw
-    /// velocity even when the total field is safe.
     ///
     /// `multi_field_contact_produces_real_coulomb_slip_and_stick`
     /// (`tests/physics_correctness.rs`) verifies both the frictionless-slip and
@@ -175,28 +170,23 @@ impl Grid {
         dt: f32,
         gravity: Vec2,
         friction: f32,
-        vel_limit: f32,
         grid_cell_size: f32,
         directional_grip: Option<&DirectionalContactGrip>,
     ) {
-        // Only a guard against literal division-by-zero, NOT a "low confidence" cutoff —
+        // Only a guard against literal division-by-zero, NOT a "low confidence" cutoff --
         // a larger threshold here would route every node with small-but-nonzero grip_mass
         // through the branch below, which sets both fields to the raw blended
         // `total.momentum`. But any nonzero grip_mass means `total.momentum` (mass-weighted
         // across BOTH bodies) already carries a real contribution from grip, contaminating
-        // what `rest` reads back — worse for thicker bodies (their kernel reaches more
+        // what `rest` reads back -- worse for thicker bodies (their kernel reaches more
         // small-but-nonzero-grip-mass nodes). Everything above this floor falls through to
         // the "no confident normal" branch below instead, which does correct,
         // uncontaminated per-field separation without a Coulomb correction.
         const MIN_MASS_FRACTION: f32 = 1.0e-6;
-        let clamp_speed = |v: Vec2| -> Vec2 {
-            let spd = v.length();
-            if spd > vel_limit {
-                v * (vel_limit / spd)
-            } else {
-                v
-            }
-        };
+        // Frictional dissipation found here is collected and written after the
+        // loop: the loop already borrows `contact_dirty` and `contact_cells`.
+        // Empty whenever nothing rubs, so a contact-free scene allocates nothing.
+        let mut dissipated: Vec<(usize, f32)> = Vec::new();
         for &idx in &self.contact_dirty {
             let node_pos = Vec2::new(
                 (idx as usize / self.resolution) as f32,
@@ -214,7 +204,7 @@ impl Grid {
             let rest_mass = total.mass - grip_mass;
             if grip_mass <= MIN_MASS_FRACTION || rest_mass <= MIN_MASS_FRACTION {
                 // No real second field at this node (e.g. a grip particle's kernel edge
-                // with negligible weight) — both sides just read the ordinary total
+                // with negligible weight) -- both sides just read the ordinary total
                 // field, identical to no contact resolution ever happening here.
                 let cell = self.contact_cells.get_mut(&idx).unwrap();
                 cell.resolved_grip_v = total.momentum;
@@ -222,14 +212,14 @@ impl Grid {
                 continue;
             }
 
-            let v_cm = total.momentum; // already normalized + gravity-applied + clamped
-            let v_grip = clamp_speed(grip_momentum / grip_mass + gravity * dt);
+            let v_cm = total.momentum; // already normalized + gravity-applied
+            let v_grip = grip_momentum / grip_mass + gravity * dt;
 
-            // Contact normal fitted through the actual particle point cloud (Nairn's LR
-            // method) rather than a grid mass gradient. `-` because the raw fit points
+            // Contact normal fitted through the actual particle point cloud (Nairn et
+            // al.'s LR method) rather than a grid mass gradient. `-` because the raw fit points
             // toward increasing grip-label density (grip=+1); negating matches this
             // function's "outward: away from grip" convention. `.filter(is_finite)`:
-            // defense in depth — `fit_contact_normal_lr` guards its own iteration against
+            // defense in depth -- `fit_contact_normal_lr` guards its own iteration against
             // non-finite results internally, but any NaN/inf that slips through is treated
             // as "no confident normal" here rather than propagating into the Coulomb
             // correction and contaminating particle velocities.
@@ -255,21 +245,48 @@ impl Grid {
                 // interface still carry the real contact for the body as a whole).
                 let cell = self.contact_cells.get_mut(&idx).unwrap();
                 cell.resolved_grip_v = v_grip;
-                cell.resolved_rest_v =
-                    clamp_speed((v_cm * total.mass - v_grip * grip_mass) / rest_mass);
+                cell.resolved_rest_v = (v_cm * total.mass - v_grip * grip_mass) / rest_mass;
                 continue;
             };
 
             match directional_grip {
                 Some(grip) => grip.resolve(&mut v_rel, n),
-                None => crate::boundary::apply_coulomb_wall(&mut v_rel, n, friction),
+                // Multi-field contact between two bodies dissipates too, but
+                // it is not routed into the frictional-heating ledger yet:
+                // that ledger is keyed by grid node and this resolves in a
+                // per-contact-pair relative frame. Disclosed gap, not an
+                // oversight -- see `energy::thermodynamics::frictional_heating`.
+                None => {
+                    // Two bodies rubbing dissipate exactly as a body rubbing a
+                    // wall does, so this feeds the same ledger and becomes heat
+                    // through the same path (`energy::thermodynamics::
+                    // frictional_heating`). One conversion is needed first.
+                    //
+                    // `apply_coulomb_wall` reports energy per unit mass of the
+                    // body it moved, and here it moved the RELATIVE velocity of
+                    // two fields -- so its result is per unit REDUCED mass,
+                    // `mu = m_grip * m_rest / m_total`, the standard two-body
+                    // result. The ledger is per unit node mass, hence the second
+                    // division by `m_total`:
+                    //
+                    //   E = returned * mu,  e_node = E / m_total
+                    //                             = returned * m_grip * m_rest / m_total^2
+                    let per_reduced_mass =
+                        crate::boundary::apply_coulomb_wall(&mut v_rel, n, friction);
+                    if per_reduced_mass > 0.0 && total.mass > 0.0 {
+                        let reduced_mass = grip_mass * rest_mass / total.mass;
+                        dissipated
+                            .push((idx as usize, per_reduced_mass * reduced_mass / total.mass));
+                    }
+                }
             }
 
             // Baumgarte stabilization (Baumgarte 1972, "Stabilization of Constraints and
-            // Integration of PDEs of Dynamical Systems"; the same ~0.1-0.3 factor is the
-            // well-known default in e.g. Box2D/Bullet's own velocity-constraint solvers).
+            // Integrals of Motion in Dynamical Systems", CMAME 1:1-16; the same ~0.1-0.3
+            // factor is the well-known default in e.g. Box2D/Bullet's own
+            // velocity-constraint solvers).
             // The kinematic-only approach test above only prevents FURTHER approach once
-            // it fires — it has no mechanism to correct overlap that already exists, which
+            // it fires -- it has no mechanism to correct overlap that already exists, which
             // matches Bardenhagen 2001's own disclosed caveat that this simpler test is
             // exact only "in the special case where contacting bodies are stress free" (a
             // resting body under constant gravity never is). Reuses the SAME particle point
@@ -280,15 +297,11 @@ impl Grid {
             // oscillation.
             //
             // Correction rate/speed must be a dt-INDEPENDENT absolute value, not the
-            // textbook `beta * gap / dt` (which assumes a roughly fixed timestep) — this
-            // engine's adaptive substep dt can shrink to ~1e-6 for a stiff material's CFL
-            // bound, and the raw formula blows up as dt->0. Clamping to `vel_limit` does
-            // NOT fix this: `vel_limit` is itself a CFL bound that scales as 1/dt by design
-            // (`grid_cell_size / sub_dt`), so it grows in lockstep with the blowup it would
-            // need to cap. A small ABSOLUTE correction rate and speed cap keeps the position
-            // fix bounded and gentle at any substep size, correcting large overlaps over
-            // several substeps instead of injecting one huge velocity kick that distorts F
-            // as if it were real physical momentum.
+            // textbook `beta * gap / dt` (which assumes a roughly fixed timestep): the
+            // engine's adaptive substep dt can shrink for stiff solids, and the raw formula
+            // then blows up as dt->0. This is a contact-constraint stabilization for solid
+            // scenes, not a fluid constitutive term; strict WC-MPM liquids reject multi-field
+            // contact before reaching this solver.
             let mut max_grip_proj = f32::NEG_INFINITY;
             let mut min_rest_proj = f32::INFINITY;
             for &(pos, label) in &contact.points {
@@ -302,7 +315,7 @@ impl Grid {
             if max_grip_proj.is_finite() && min_rest_proj.is_finite() {
                 let gap = min_rest_proj - max_grip_proj; // >0 separated, <0 overlapping
                 if gap < 0.0 {
-                    // Neither derived from dt nor from vel_limit -- a fixed, small correction
+                    // Neither derived from dt nor a generic velocity limiter -- a fixed, small correction
                     // rate (fraction of the overlap corrected per unit REAL time) and an
                     // absolute speed ceiling (a small fraction of one grid cell per unit real
                     // time), both independent of how finely the adaptive substep loop divides
@@ -314,7 +327,7 @@ impl Grid {
                     // `v_rel`'s normal component down to the target if it isn't there already.
                     // The LR-fitted `n` wobbles substep to substep, so an unconditional add
                     // would stack a slightly-different-direction impulse every firing with no
-                    // cap on the total applied — an unbounded numerical-heating mechanism (a
+                    // cap on the total applied -- an unbounded numerical-heating mechanism (a
                     // directional random walk in velocity space). A floor is self-limiting:
                     // it never re-applies once the target is already met (same principle as
                     // Box2D/Bullet-style sequential-impulse position bias).
@@ -326,7 +339,7 @@ impl Grid {
                 }
             }
 
-            let v_grip_new = clamp_speed(v_cm + v_rel);
+            let v_grip_new = v_cm + v_rel;
 
             // Exact momentum conservation: whatever the grip field's momentum changed
             // by, the rest field absorbs the opposite delta (eq. 14's identity holds by
@@ -334,11 +347,14 @@ impl Grid {
             // clamped v_grip_new so the conservation identity still holds against what
             // G2P will actually read.
             let total_momentum = v_cm * total.mass;
-            let v_rest_new = clamp_speed((total_momentum - v_grip_new * grip_mass) / rest_mass);
+            let v_rest_new = (total_momentum - v_grip_new * grip_mass) / rest_mass;
 
             let cell = self.contact_cells.get_mut(&idx).unwrap();
             cell.resolved_grip_v = v_grip_new;
             cell.resolved_rest_v = v_rest_new;
+        }
+        for (idx, specific_energy) in dissipated {
+            self.add_friction_heat(idx, specific_energy);
         }
     }
 }

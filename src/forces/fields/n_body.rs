@@ -1,18 +1,18 @@
 //! N-body gravity via Barnes-Hut quadtree.
 //!
-//! For discrete macro-scale sources (stars, planets) use `GravityWellField` — it's O(sources)
+//! For discrete macro-scale sources (stars, planets) use `GravityWellField` -- it's O(sources)
 //! per particle and simpler. Use `NBodyGravityField` when MPM particles themselves gravitate
-//! each other (planetary terrain, accretion disks) — Barnes-Hut reduces this from O(N²) to
+//! each other (planetary terrain, accretion disks) -- Barnes-Hut reduces this from O(N²) to
 //! O(N log N) per substep at the cost of one tree rebuild.
 //!
 //! # Physics
 //! Plummer-softened gravity: **a = G·M·r̂ / (|r|² + ε²)^(3/2)**
 //!
 //! Barnes-Hut approximation: treat a cluster of bodies as a single body at their
-//! center of mass when the cluster is "far enough" away — width/distance < θ (theta).
+//! center of mass when the cluster is "far enough" away -- width/distance < θ (theta).
 //! θ = 0.5 is a common Barnes-Hut trade-off value in practice (e.g. GADGET-2's
 //! default region uses values in this neighborhood, Springel 2005, MNRAS
-//! 364:1105 — not independently confirmed as a specific universal default
+//! 364:1105 -- not independently confirmed as a specific universal default
 //! from that paper itself); lower is more accurate, higher is faster.
 //!
 //! # Reference
@@ -28,7 +28,7 @@ use crate::particle::Particles;
 // These control tree quality vs. build cost. Both are configurable via the
 // builder methods on NBodyGravityField.
 
-/// Default maximum tree depth. 8 levels → 4^8 = 65536 leaf nodes — fine for up to ~100k bodies.
+/// Default maximum tree depth. 8 levels → 4^8 = 65536 leaf nodes -- fine for up to ~100k bodies.
 const DEFAULT_MAX_DEPTH: usize = 8;
 
 /// Default maximum bodies per leaf node before the node is subdivided.
@@ -68,7 +68,7 @@ struct Aabb2 {
 }
 
 impl Aabb2 {
-    fn new(center: Vec2, half_size: Vec2) -> Self {
+    const fn new(center: Vec2, half_size: Vec2) -> Self {
         Self { center, half_size }
     }
 
@@ -106,10 +106,41 @@ impl MassProps {
     }
 }
 
+/// Quadrupole moment tensor (Hernquist 1987; Binney & Tremaine, *Galactic Dynamics*
+/// §2.5) -- a real second-order correction on top of monopole-only Barnes-Hut, not a
+/// heuristic. All bodies/field points live in this engine's z=0 plane, so the true 3D
+/// trace-free quadrupole tensor Q_ij = Σ m_k(3·x_k,i·x_k,j − δ_ij·|x_k|²) reduces to a
+/// symmetric 2×2 (Q_zx=Q_zy=0 exactly when every x_k,z=0, so it exerts zero out-of-plane
+/// force on an in-plane field point -- Q_zz is never needed and isn't stored).
+#[derive(Clone, Debug, Default)]
+struct QuadProps {
+    qxx: f32,
+    qxy: f32,
+    qyy: f32,
+}
+
+impl QuadProps {
+    /// Parallel-axis shift: fold `child` (a node's quadrupole tensor about ITS OWN
+    /// center of mass, or a point mass's trivially-zero self-quadrupole) into `self`
+    /// (about a different origin, `offset` away). Real theorem, not an approximation:
+    /// Q_ij(new origin) = Q_ij(child's own COM) + mass·(3·offset_i·offset_j −
+    /// δ_ij·|offset|²) -- the cross term Σm_k(x_k−child_com) vanishes exactly because
+    /// child_com IS that child's own center of mass (derived directly from the
+    /// definition, not copied from a table -- verified against the parallel-axis
+    /// theorem for moment of inertia, which this specializes to for a spherically
+    /// symmetric child).
+    fn add_shifted(&mut self, child: &QuadProps, mass: f32, offset: Vec2) {
+        self.qxx += child.qxx + mass * (2.0 * offset.x * offset.x - offset.y * offset.y);
+        self.qxy += child.qxy + mass * 3.0 * offset.x * offset.y;
+        self.qyy += child.qyy + mass * (2.0 * offset.y * offset.y - offset.x * offset.x);
+    }
+}
+
 struct Node {
     aabb: Aabb2,
     depth: usize,
     mass: MassProps,
+    quad: QuadProps,
     /// Bodies: (particle_index, position, mass).
     bodies: Vec<(usize, Vec2, f32)>,
     children: [Option<Box<Node>>; 4],
@@ -123,6 +154,7 @@ impl Node {
             aabb,
             depth,
             mass: MassProps::default(),
+            quad: QuadProps::default(),
             bodies: Vec::new(),
             children: [None, None, None, None],
             max_depth,
@@ -130,9 +162,35 @@ impl Node {
         }
     }
 
+    /// Post-order pass computing each node's quadrupole tensor about its OWN final
+    /// center of mass -- must run only after every `insert()` for the tree is done
+    /// (unlike `mass`, which is correct incrementally, `center_of_mass` shifts with
+    /// every insert, so a tensor computed relative to it can't be updated online the
+    /// same way; real Barnes-Hut tree codes compute multipole moments bottom-up in a
+    /// separate pass for exactly this reason).
+    fn compute_quad(&mut self) {
+        let com = self.mass.center_of_mass;
+        let mut q = QuadProps::default();
+        if self.children.iter().all(|c| c.is_none()) {
+            // Leaf: each body is a point mass, zero self-quadrupole about itself.
+            for &(_, pos, mass) in &self.bodies {
+                q.add_shifted(&QuadProps::default(), mass, pos - com);
+            }
+        } else {
+            for child in self.children.iter_mut().flatten() {
+                child.compute_quad();
+                if child.mass.total_mass > 0.0 {
+                    let offset = child.mass.center_of_mass - com;
+                    q.add_shifted(&child.quad, child.mass.total_mass, offset);
+                }
+            }
+        }
+        self.quad = q;
+    }
+
     fn is_far_enough(&self, pos: Vec2, theta: f32, softening: f32) -> bool {
         let dist = (pos - self.aabb.center).length();
-        // Skip Barnes-Hut approximation if we're inside or touching the softening radius —
+        // Skip Barnes-Hut approximation if we're inside or touching the softening radius --
         // at these distances the multipole expansion is inaccurate.
         if dist < softening || self.mass.total_mass <= 0.0 {
             return false;
@@ -177,15 +235,38 @@ impl Node {
 
     fn acceleration_on(&self, idx: usize, pos: Vec2, gp: GravParams) -> Vec2 {
         if self.is_far_enough(pos, gp.theta, gp.softening) {
-            let r_vec = self.mass.center_of_mass - pos;
+            let com = self.mass.center_of_mass;
+            let r_vec = com - pos;
             let r2 = r_vec.length_squared();
             let norm_s = r2 + gp.eps2;
-            let scale = gp.g * self.mass.total_mass / (norm_s * norm_s.sqrt());
-            return if scale.is_finite() {
+            let inv_r3 = 1.0 / (norm_s * norm_s.sqrt());
+            let scale = gp.g * self.mass.total_mass * inv_r3;
+            let mut accel = if scale.is_finite() {
                 r_vec * scale
             } else {
                 Vec2::ZERO
             };
+
+            // Quadrupole correction (Hernquist 1987 multipole expansion of the
+            // gravitational potential, truncated at 2nd order) -- rho = pos - com is
+            // the field point relative to the cluster's own COM, the natural frame
+            // the expansion is derived in (rho = -r_vec; see `QuadProps`'s own doc
+            // for the tensor itself). a_quad = G(Q*rho)/r^5 - (5G/2)(rho.Q.rho)*rho/r^7,
+            // using the SAME softened `norm_s` as the monopole term above so the
+            // correction never diverges as r->0 either.
+            let rho = pos - com;
+            let q_rho = Vec2::new(
+                self.quad.qxx * rho.x + self.quad.qxy * rho.y,
+                self.quad.qxy * rho.x + self.quad.qyy * rho.y,
+            );
+            let s = rho.dot(q_rho);
+            let inv_r5 = inv_r3 / norm_s;
+            let inv_r7 = inv_r5 / norm_s;
+            let quad_accel = gp.g * q_rho * inv_r5 - (2.5 * gp.g * s) * rho * inv_r7;
+            if quad_accel.x.is_finite() && quad_accel.y.is_finite() {
+                accel += quad_accel;
+            }
+            return accel;
         }
 
         if self.children.iter().all(|c| c.is_none()) {
@@ -262,6 +343,7 @@ impl Quadtree {
         for &(idx, pos, mass) in bodies {
             tree.root.insert(idx, pos, mass);
         }
+        tree.root.compute_quad();
         tree
     }
 
@@ -281,7 +363,7 @@ impl Quadtree {
 ///
 /// # When to use
 /// - Particles gravitate each other (accretion, planetary terrain at LP planetary scale).
-/// - Use `GravityWellField` instead for fixed point-mass sources — much cheaper.
+/// - Use `GravityWellField` instead for fixed point-mass sources -- much cheaper.
 ///
 /// # Parameters
 /// - `gravitational_constant`: G in simulation units. Tune to your scale.
@@ -302,7 +384,7 @@ pub struct NBodyGravityField {
     /// Smaller = finer tree (more accuracy, slower build). Default: `DEFAULT_MAX_BODIES_PER_NODE` (4).
     pub max_bodies_per_node: usize,
 
-    // Internal — rebuilt each substep by prepare().
+    // Internal -- rebuilt each substep by prepare().
     tree: Option<Quadtree>,
     /// Snapshot of (particle_index, position, mass) used to build the tree.
     /// Filtered to particles with positive mass only.
@@ -359,7 +441,7 @@ impl Field for NBodyGravityField {
 }
 
 /// Orbital-mechanics helpers for placing bodies in stable orbits under
-/// [`NBodyGravityField`]. All take `g` explicitly — pass the same `gravitational_constant`
+/// [`NBodyGravityField`]. All take `g` explicitly -- pass the same `gravitational_constant`
 /// you gave the field. Units are simulation units (grid cells, cells/s).
 ///
 /// Use these to seed initial velocities so spawned bodies orbit rather than fall in.
@@ -451,5 +533,101 @@ mod orbit_tests {
     fn zero_radius_is_safe() {
         assert_eq!(circular_velocity(1.0, 1.0, 0.0), 0.0);
         assert_eq!(escape_velocity(1.0, 1.0, 0.0), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod quadrupole_tests {
+    use super::*;
+    use crate::particle::Particle;
+
+    fn particle_at(x: Vec2, mass: f32) -> Particle {
+        Particle {
+            x,
+            v: Vec2::ZERO,
+            velocity_gradient: glam::Mat2::ZERO,
+            deformation_gradient: glam::Mat2::IDENTITY,
+            mass,
+            initial_volume: 1.0,
+            volume: 1.0,
+            density: 1.0,
+            material_id: 0,
+            plastic_volume_ratio: 1.0,
+            hardening_scale: 1.0,
+            friction_hardening: 0.0,
+            log_volume_strain: 0.0,
+            temperature: 0.0,
+            scalar_field: 0.0,
+            user_tag: 0,
+            activation: 0.0,
+            activation_dir: Vec2::ZERO,
+            muscle_group_id: 0,
+            contact_group: 0,
+            sleeping: 0,
+            pinned: 0,
+            internal_pressure: 0.0,
+        }
+    }
+
+    /// Real, hand-derived reference check (Hernquist 1987 quadrupole expansion of the
+    /// gravitational potential), not just "the tree runs without panicking". Two equal
+    /// masses at (±1,0) form a real, nonzero quadrupole about their own center of mass
+    /// (a DIPOLE about the true COM is impossible by definition -- Σm(x−com)=0 always --
+    /// so this is the simplest configuration with a genuinely nonzero next-order moment,
+    /// not a degenerate edge case). A third, massless probe far away on the same axis
+    /// queries the pair through Barnes-Hut (theta=1.0 so the pair-node is definitely
+    /// treated as "far enough"; the probe has mass=0 so `prepare()`'s own mass>0 filter
+    /// keeps it out of the tree entirely, avoiding self-interaction edge cases).
+    ///
+    /// Verifies monopole+quadrupole lands within ~1e-6 of the exact two-body direct sum,
+    /// and -- the actual point of adding quadrupole moments at all -- more than 100x
+    /// closer than the monopole-only prediction (same total mass at the exact COM) gets.
+    #[test]
+    fn quadrupole_correction_beats_monopole_only_against_exact_two_body_sum() {
+        let d = 1.0_f32;
+        let mass = 1.0_f32;
+        let r_query = 20.0_f32;
+        let g = 1.0_f32;
+
+        let mut particles = Particles::default();
+        particles.push(particle_at(Vec2::new(d, 0.0), mass));
+        particles.push(particle_at(Vec2::new(-d, 0.0), mass));
+        let query_idx = particles.len();
+        particles.push(particle_at(Vec2::new(r_query, 0.0), 0.0)); // massless probe
+
+        let mut field = NBodyGravityField::new(g, 0.0, 1.0);
+        field.max_bodies_per_node = 2;
+        field.prepare(&particles);
+        let a_actual = field.acceleration(&particles, query_idx);
+
+        // Exact direct pairwise sum (unsoftened, matches softening=0.0 above).
+        let probe_pos = Vec2::new(r_query, 0.0);
+        let mut a_exact = Vec2::ZERO;
+        for &(bx, bmass) in &[(d, mass), (-d, mass)] {
+            let r_vec = Vec2::new(bx, 0.0) - probe_pos;
+            let r2 = r_vec.length_squared();
+            a_exact += r_vec * (g * bmass / (r2 * r2.sqrt()));
+        }
+
+        // Monopole-only reference: same total mass, at the exact COM (origin).
+        let total_mass = 2.0 * mass;
+        let r_vec_mono = Vec2::ZERO - probe_pos;
+        let r2_mono = r_vec_mono.length_squared();
+        let a_mono = r_vec_mono * (g * total_mass / (r2_mono * r2_mono.sqrt()));
+
+        let err_actual = (a_actual - a_exact).length();
+        let err_mono = (a_mono - a_exact).length();
+
+        assert!(
+            err_actual < 1e-6,
+            "monopole+quadrupole should match the exact two-body sum to ~1e-7: \
+             a_actual={a_actual:?} a_exact={a_exact:?} err={err_actual:e}"
+        );
+        assert!(
+            err_actual < err_mono / 100.0,
+            "adding quadrupole moments should cut the error by >100x, not just help a \
+             little: err_actual={err_actual:e} err_mono={err_mono:e} ratio={:.1}",
+            err_mono / err_actual
+        );
     }
 }

@@ -2,18 +2,16 @@
 //! exchange through the shared grid, not parallel plumbing that happens to compile.
 
 extern crate emerge_engine as emerge;
+
+#[path = "common/mod.rs"]
+mod common;
+
 use emerge::rod::{RodMaterial, build_straight_rod};
 use emerge::{NeoHookeanMaterial, SimConfig, Simulation, SpawnRegion};
 use glam::{IVec2, Vec2};
 
 fn zero_gravity_config(grid_res: usize) -> SimConfig {
-    SimConfig {
-        grid_res,
-        dt: 0.02,
-        gravity: Vec2::ZERO,
-        adaptive_timestep: true,
-        ..SimConfig::default()
-    }
+    common::zero_gravity_config(grid_res, 0.02)
 }
 
 /// Total linear momentum: particles + rods summed together.

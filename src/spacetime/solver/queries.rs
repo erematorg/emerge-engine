@@ -2,13 +2,13 @@
 //!
 //! Split out of `solver/mod.rs` -- everything here reads state (or, for the
 //! tag-group setters, writes a small uniform slice of it) rather than
-//! advancing the simulation. Distinct from `solver::query`, which holds the
-//! free `BodyState`-aggregation functions these methods call into.
+//! advancing the simulation. Distinct from `solver::body_state`, which holds
+//! the free `BodyState`-aggregation functions these methods call into.
 
 use glam::Vec2;
 
 use super::Simulation;
-use super::query::{self, BodyState, body_state_of};
+use super::body_state::{self, BodyState, body_state_of};
 use crate::diagnostics::{SimSnapshot, collect_rod_snapshot, collect_snapshot};
 
 impl Simulation {
@@ -116,12 +116,12 @@ impl Simulation {
     }
 
     /// Directly overwrite `v` (not add, unlike `apply_group_impulse`) on every
-    /// particle with `tag` — the real primitive for a KINEMATICALLY-driven body
+    /// particle with `tag` -- the real primitive for a KINEMATICALLY-driven body
     /// (position/velocity set by an external controller, e.g. player input,
     /// rather than by internal elastic/plastic forces). Combined with a real,
     /// large `mass` on that group and a nonzero `contact_group` (Bardenhagen
     /// 2001 multi-field contact), this lets an externally-driven tool genuinely
-    /// PUSH/displace other real matter through real momentum exchange — no
+    /// PUSH/displace other real matter through real momentum exchange -- no
     /// mass is created or destroyed, unlike deleting particles outright.
     /// O(group_size).
     pub fn set_group_velocity(&mut self, tag: u32, velocity: glam::Vec2) {
@@ -132,7 +132,7 @@ impl Simulation {
         }
     }
 
-    /// Set `contact_group` uniformly on all particles with `tag` — opts a
+    /// Set `contact_group` uniformly on all particles with `tag` -- opts a
     /// body into its own real multi-field Coulomb contact (Bardenhagen 2001)
     /// against everything else, instead of MPM's default infinite-friction
     /// stick. O(group_size).
@@ -144,7 +144,7 @@ impl Simulation {
         }
     }
 
-    /// Scale `mass` uniformly on all particles with `tag` — a real, disclosed
+    /// Scale `mass` uniformly on all particles with `tag` -- a real, disclosed
     /// way to make a kinematically-driven body act like a much heavier real
     /// object (e.g. a tool vs. the loose material it displaces) without
     /// changing its own internal material response. O(group_size).
@@ -153,6 +153,19 @@ impl Simulation {
             for &i in indices {
                 self.particles.mass[i] *= multiplier;
             }
+        }
+    }
+
+    /// Lazily rebuilds the spatial hash if `step()` has run since the last
+    /// rebuild (see `spatial_hash`'s own doc on `Simulation`). No-op when
+    /// already fresh -- at most one real rebuild per `step()` call no matter
+    /// how many query methods get called before the next `step()`.
+    fn ensure_spatial_hash_fresh(&self) {
+        if self.spatial_hash_dirty.get() {
+            self.spatial_hash
+                .borrow_mut()
+                .rebuild(&self.particles.x, self.active_count);
+            self.spatial_hash_dirty.set(false);
         }
     }
 
@@ -165,9 +178,11 @@ impl Simulation {
 
     /// Aggregate state for all particles within `radius` grid-cells of `center`.
     pub fn region_state(&self, center: Vec2, radius: f32) -> BodyState {
+        self.ensure_spatial_hash_fresh();
         let r2 = radius * radius;
-        let mut s = query::BodyState::default();
-        for i in self.spatial_hash.query(center, radius) {
+        let mut s = body_state::BodyState::default();
+        let hash = self.spatial_hash.borrow();
+        for i in hash.query(center, radius) {
             if (self.particles.x[i] - center).length_squared() <= r2 {
                 s.accumulate(
                     self.particles.x[i],
@@ -182,23 +197,30 @@ impl Simulation {
         s
     }
 
-    /// Iterate indices of active particles within `radius` grid-cells of `center`.
+    /// Indices of active particles within `radius` grid-cells of `center`.
     ///
-    /// Returns indices only — read particle data via `solver.particles().x[i]` etc.
-    /// O(candidates) via spatial hash, not O(N).
-    pub fn particles_near(&self, center: Vec2, radius: f32) -> impl Iterator<Item = usize> + '_ {
+    /// Returns indices only -- read particle data via `solver.particles().x[i]` etc.
+    /// O(candidates) via spatial hash, not O(N). Collected eagerly into a `Vec`
+    /// (not a lazy iterator, unlike an earlier version of this method) -- the
+    /// lazy spatial-hash rebuild below needs a `Ref` borrow that can't outlive
+    /// this call, so results are gathered up front instead. Negligible extra
+    /// cost relative to the O(candidates) work already being done.
+    pub fn particles_near(&self, center: Vec2, radius: f32) -> Vec<usize> {
+        self.ensure_spatial_hash_fresh();
         let r2 = radius * radius;
-        self.spatial_hash
-            .query(center, radius)
-            .filter(move |&i| (self.particles.x[i] - center).length_squared() <= r2)
+        let hash = self.spatial_hash.borrow();
+        hash.query(center, radius)
+            .filter(|&i| (self.particles.x[i] - center).length_squared() <= r2)
+            .collect()
     }
 
     /// Count active particles of a given material within `radius` of `center`.
     /// O(candidates) via spatial hash, not O(N).
     pub fn count_near(&self, center: Vec2, radius: f32, material_id: u32) -> usize {
+        self.ensure_spatial_hash_fresh();
         let r2 = radius * radius;
-        self.spatial_hash
-            .query(center, radius)
+        let hash = self.spatial_hash.borrow();
+        hash.query(center, radius)
             .filter(|&i| {
                 self.particles.material_id[i] == material_id
                     && (self.particles.x[i] - center).length_squared() <= r2
@@ -229,14 +251,15 @@ impl Simulation {
         if k == 0 || self.active_count == 0 {
             return Vec::new();
         }
+        self.ensure_spatial_hash_fresh();
+        let hash = self.spatial_hash.borrow();
         let domain_diag =
             self.config.grid_res as f32 * self.config.grid_cell_size * std::f32::consts::SQRT_2;
         let mut radius = self.config.grid_cell_size * (k as f32).sqrt().max(1.0);
         let mut candidates: Vec<(usize, f32)>;
         loop {
             let r2 = radius * radius;
-            candidates = self
-                .spatial_hash
+            candidates = hash
                 .query(center, radius)
                 .map(|i| (i, (self.particles.x[i] - center).length_squared()))
                 .filter(|&(_, d2)| d2 <= r2)

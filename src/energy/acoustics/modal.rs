@@ -1,4 +1,4 @@
-//! Modal synthesis — real vibration frequencies and damping derived
+//! Modal synthesis -- real vibration frequencies and damping derived
 //! directly from a rod's own material properties (`ea`, `ei`, mass,
 //! damping), not from a sample-fitting or calibration pipeline.
 //!
@@ -6,15 +6,15 @@
 //! Real procedural sound (no samples, no pre-recorded audio, same "zero
 //! assets" discipline as the rest of emerge/LP) needs per-material
 //! resonant frequencies. The open question blocking this has always been
-//! *where do the parameters come from* — fit against real recorded audio,
+//! *where do the parameters come from* -- fit against real recorded audio,
 //! or derive from physics the engine already knows? For the rod solver
 //! specifically, that question is already answered: `RodMaterial` already
 //! carries real `ea`/`ei` (axial/bending stiffness) and each `RodPoints`
-//! carries real per-point mass — exactly the inputs a beam's own natural
+//! carries real per-point mass -- exactly the inputs a beam's own natural
 //! frequencies are a function of. No new parameters, no calibration step.
 //!
 //! # Real physics: Euler-Bernoulli cantilever bending modes
-//! Fixed-free (pinned root, free tip) boundary conditions — matching how
+//! Fixed-free (pinned root, free tip) boundary conditions -- matching how
 //! every existing rod scene in this engine anchors a rod (grass blade,
 //! branch, root: "pin points 0-1, not just point 0"). The natural
 //! (angular) frequency of bending mode `n` for a uniform beam is:
@@ -25,31 +25,31 @@
 //! (m), and `β_n·L` are the real, tabulated roots of the cantilever's own
 //! characteristic equation `cos(βL)·cosh(βL) = -1` (Blevins, *Formulas for
 //! Natural Frequency and Mode Shape*, 1979, Table 8-1; the same values
-//! appear in Rao, *Mechanical Vibrations*) — independently confirmed via
+//! appear in Rao, *Mechanical Vibrations*) -- independently confirmed via
 //! search, not recalled from memory alone: 1.8751, 4.6941, 7.8548,
 //! 10.9955 for the first four modes; modes beyond that converge to
 //! `(2n-1)·π/2` (Blevins' own asymptotic note).
 //!
-//! # Damping — a disclosed simplification, not measured per-mode data
+//! # Damping -- a disclosed simplification, not measured per-mode data
 //! `RodMaterial::bending_damping` is a single discrete-scale coefficient
-//! (see its own doc comment), not a full two-parameter Rayleigh model —
+//! (see its own doc comment), not a full two-parameter Rayleigh model --
 //! there is no per-mode damping measurement to draw on. This reduces it to
 //! ONE dimensionless ratio: what fraction of critical damping that
 //! coefficient represents at the rod's own reference discrete scale (mean
-//! segment length, mean point mass — reusing `RodMaterial::critical_damping`'s
+//! segment length, mean point mass -- reusing `RodMaterial::critical_damping`'s
 //! own real formula, not a new one), then applies that SAME ratio to every
 //! continuous mode. Assuming a constant modal damping ratio when detailed
 //! per-mode data isn't available is itself standard, real practice
-//! (Blevins 1979 §2) — disclosed here as an approximation, not presented
+//! (Blevins 1979 §2) -- disclosed here as an approximation, not presented
 //! as measured per-mode data.
 //!
 //! # Scope (honest, not silently expanded)
-//! Bending modes only (no axial/longitudinal modes, no torsion — 2D rods
+//! Bending modes only (no axial/longitudinal modes, no torsion -- 2D rods
 //! have no twist DOF at all, matching `spacetime::rod`'s own real
 //! dimensional-fact disclosure). Uniform-beam approximation (constant
-//! `EI`/`μ` along the rod) — a rod with strongly varying per-point mass or
+//! `EI`/`μ` along the rod) -- a rod with strongly varying per-point mass or
 //! `ei` violates this. Frequencies and damping only: no amplitude/excitation
-//! model and no audio-buffer synthesis here — exciting modes (e.g.
+//! model and no audio-buffer synthesis here -- exciting modes (e.g.
 //! proportional to impact force) and running the actual oscillator/DSP
 //! loop is real, separate work, left to the caller (LP), matching the
 //! engine/game split every other emerge system already follows.
@@ -58,7 +58,7 @@ use crate::rod::Rod;
 
 /// A single vibrational mode: real frequency (Hz) and dimensionless
 /// damping ratio (0 = undamped, 1 = critically damped). Minimal, real
-/// data for an oscillator-bank synthesizer — not an audio sample.
+/// data for an oscillator-bank synthesizer -- not an audio sample.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AcousticMode {
     pub frequency_hz: f32,
@@ -70,7 +70,7 @@ pub struct AcousticMode {
 /// Blevins 1979, Table 8-1 / Rao, *Mechanical Vibrations*, Table 8.2.
 const CANTILEVER_BETA_L: [f32; 4] = [1.8751, 4.6941, 7.8548, 10.9955];
 
-/// `β_n·L` for mode index `n` (0-based) — tabulated for the first 4 modes,
+/// `β_n·L` for mode index `n` (0-based) -- tabulated for the first 4 modes,
 /// asymptotic `(2n-1)·π/2` beyond that (Blevins 1979's own noted limit).
 fn beta_l(mode_index: usize) -> f32 {
     CANTILEVER_BETA_L

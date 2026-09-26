@@ -6,6 +6,7 @@
 //! the simulation, as opposed to advancing it (`solver::step`) or reading
 //! aggregate state from it (`solver::queries`).
 
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use glam::Vec2;
@@ -36,25 +37,50 @@ impl Simulation {
             next_tag: 1,
             grid: Grid::new(config.grid_res),
             materials,
+            friction_heat_debt: Vec::new(),
             boundaries: vec![default_boundary],
+            boundaries_are_default: true,
             contact_grip: None,
             force_fields: Vec::new(),
             thermal: None,
             scalar_fields: Vec::new(),
+            pending_diffusion_dt: 0.0,
+            substep_index_in_frame: 0,
+            granular_fluidity: None,
+            granular_fluidity_g: Vec::new(),
+            cosserat: None,
+            cosserat_omega: Vec::new(),
+            cosserat_curvature: Vec::new(),
             frame_index: 0,
+            fluid_sticky_fine_dt: None,
+            pending_divergence_diagnostic: None,
+            boundary_impulse_diagnostic:
+                super::boundary_diagnostics::BoundaryImpulseExperiment::from_env()
+                    .map(super::boundary_diagnostics::BoundaryImpulseDiagnostic::new),
+            last_max_particle_speed: 0.0,
             last_step_dt: config.dt,
             last_substeps: 0,
             last_vel_clamp_count: 0,
             last_j_projection_count: 0,
             last_sim_time_dropped: 0.0,
             last_timing: crate::diagnostics::StepTiming::default(),
+            cached_spatial_sort_order: Vec::new(),
             phase_rules: Vec::new(),
-            spatial_hash: SpatialHash::new(config.grid_cell_size),
+            spatial_hash: RefCell::new(SpatialHash::new(config.grid_cell_size)),
+            spatial_hash_dirty: Cell::new(false),
             scratch_indices: Vec::new(),
             rods: Vec::new(),
+            grain_populations: Vec::new(),
         }
     }
 
+    /// Create a solver with an initial population of particles spawned
+    /// into `spawn`'s region, using `config`'s material at `spawn.
+    /// material_id` (register more materials afterward via
+    /// `with_material`/`with_default_material`). This is the normal entry
+    /// point every shipped example uses; use [`Simulation::empty`] instead
+    /// when the scene should start with zero particles (e.g. spawning
+    /// bodies later via [`Simulation::add_body`]).
     pub fn new(config: SimConfig, spawn: SpawnRegion) -> Self {
         config.validate();
         spawn.validate_for_sim(&config);
@@ -78,7 +104,7 @@ impl Simulation {
             // Initial particles carry user_tag=0; register them so group ops work.
             tag_index.insert(0, (0..active_count).collect());
         }
-        let mut solver = Self {
+        let solver = Self {
             config,
             particles,
             active_count,
@@ -86,25 +112,44 @@ impl Simulation {
             next_tag: 1,
             grid,
             materials,
+            friction_heat_debt: Vec::new(),
             boundaries: vec![default_boundary],
+            boundaries_are_default: true,
             contact_grip: None,
             force_fields: Vec::new(),
             thermal: None,
             scalar_fields: Vec::new(),
+            pending_diffusion_dt: 0.0,
+            substep_index_in_frame: 0,
+            granular_fluidity: None,
+            granular_fluidity_g: Vec::new(),
+            cosserat: None,
+            cosserat_omega: Vec::new(),
+            cosserat_curvature: Vec::new(),
             frame_index: 0,
+            fluid_sticky_fine_dt: None,
+            pending_divergence_diagnostic: None,
+            boundary_impulse_diagnostic:
+                super::boundary_diagnostics::BoundaryImpulseExperiment::from_env()
+                    .map(super::boundary_diagnostics::BoundaryImpulseDiagnostic::new),
+            last_max_particle_speed: 0.0,
             last_step_dt: config.dt,
             last_substeps: 0,
             last_vel_clamp_count: 0,
             last_j_projection_count: 0,
             last_sim_time_dropped: 0.0,
             last_timing: crate::diagnostics::StepTiming::default(),
+            cached_spatial_sort_order: Vec::new(),
             phase_rules: Vec::new(),
-            spatial_hash: SpatialHash::new(config.grid_cell_size),
+            spatial_hash: RefCell::new(SpatialHash::new(config.grid_cell_size)),
+            spatial_hash_dirty: Cell::new(false),
             scratch_indices: Vec::new(),
             rods: Vec::new(),
+            grain_populations: Vec::new(),
         };
         solver
             .spatial_hash
+            .borrow_mut()
             .rebuild(&solver.particles.x, solver.active_count);
         solver
     }
@@ -122,7 +167,7 @@ impl Simulation {
     }
 
     /// Set directional (setae-style) friction for the multi-field contact "grip"
-    /// field — see `DirectionalContactGrip`'s doc. Takes an `Arc` so the same
+    /// field -- see `DirectionalContactGrip`'s doc. Takes an `Arc` so the same
     /// instance can be shared with external code (player/AI input) for live
     /// steering, matching `RatchetFrictionBoundary`'s own established pattern.
     /// Only affects particles with `contact_group != 0`; a scene that never sets
@@ -141,7 +186,7 @@ impl Simulation {
         self
     }
 
-    /// Append a named force field — name can be used later to remove or replace it.
+    /// Append a named force field -- name can be used later to remove or replace it.
     pub fn with_named_force_field(
         mut self,
         name: impl Into<String>,
@@ -160,10 +205,36 @@ impl Simulation {
         self.thermal = Some(thermal);
     }
 
+    /// Attach a Nonlocal Granular Fluidity field (see `energy::
+    /// thermodynamics::granular_fluidity` module doc). `None` (never
+    /// calling this) is the default, zero-cost, byte-identical to every
+    /// existing scene -- same convention `with_thermal` already has.
+    ///
+    /// Its explicit von Neumann stability bound is folded directly into each
+    /// adaptive substep by `choose_substep_dt`. `SimConfig::min_dt` is never
+    /// allowed to raise that upper bound, so attaching this field does not
+    /// retune unrelated solver settings or trade stability for throughput.
+    pub fn with_granular_fluidity(
+        mut self,
+        field: crate::thermodynamics::GranularFluidityField,
+    ) -> Self {
+        self.granular_fluidity = Some(field);
+        self
+    }
+
+    /// Attach a Cosserat micro-rotation field (see `energy::thermodynamics::
+    /// cosserat_field` module doc). `None` (never calling this) is the
+    /// default, zero-cost, byte-identical to every existing scene -- same
+    /// convention `with_granular_fluidity` already has.
+    pub fn with_cosserat_field(mut self, field: crate::thermodynamics::CosseratField) -> Self {
+        self.cosserat = Some(field);
+        self
+    }
+
     /// Mutable access to the attached thermal model's config, if any (`None` when no
     /// `with_thermal`/`set_thermal` was ever called). The real, minimal hook for a
     /// scene/LP-driven day-night or seasonal cycle: mutate `.ambient` each frame from a
-    /// time-varying function (e.g. a sinusoid) BEFORE calling `step()` — `ThermalDiffusion
+    /// time-varying function (e.g. a sinusoid) BEFORE calling `step()` -- `ThermalDiffusion
     /// ::apply` already runs automatically every substep and reads `config.ambient` fresh
     /// each time via the existing Newton-cooling term (`dT/dt = -k_c*(T-ambient)`), so no
     /// new physics is needed, just this accessor to reach the config from outside.
@@ -171,9 +242,15 @@ impl Simulation {
         self.thermal.as_mut().map(|t| &mut t.config)
     }
 
+    /// Read-only access to the attached `GranularFluidityField`, if any --
+    /// same "`None` unless opted in" convention as `thermal_config_mut`.
+    pub const fn granular_fluidity(&self) -> Option<&crate::thermodynamics::GranularFluidityField> {
+        self.granular_fluidity.as_ref()
+    }
+
     /// Register a material and return its typed `MaterialHandle`.
     ///
-    /// Preferred over `with_material(id, mat)` — handle is type-safe, auto-allocates ID.
+    /// Preferred over `with_material(id, mat)` -- handle is type-safe, auto-allocates ID.
     /// ```rust,no_run
     /// # extern crate emerge_engine as emerge;
     /// # use emerge::solver::Simulation;
@@ -189,7 +266,7 @@ impl Simulation {
         MaterialHandle(id)
     }
 
-    /// Builder variant of `register_material` — chains with other `.with_*` calls.
+    /// Builder variant of `register_material` -- chains with other `.with_*` calls.
     /// Note: returns `(Self, MaterialHandle)` so the handle is accessible.
     pub fn with_registered_material(
         mut self,
@@ -212,30 +289,58 @@ impl Simulation {
         self
     }
 
-    pub fn config(&self) -> &SimConfig {
+    pub const fn config(&self) -> &SimConfig {
         &self.config
     }
 
-    pub fn particles(&self) -> &Particles {
+    /// Mutable access to the live config -- lets a caller retune solver
+    /// behavior (gravity, adaptive-timestep knobs, feature opt-ins like
+    /// `implicit_corotated_elastic`) mid-run without reconstructing the
+    /// whole `Simulation` (which would also discard all existing particle/
+    /// grid state).
+    pub const fn config_mut(&mut self) -> &mut SimConfig {
+        &mut self.config
+    }
+
+    pub const fn particles(&self) -> &Particles {
         &self.particles
+    }
+
+    /// Diagnostic-only read access to the gathered Cosserat micro-curvature
+    /// buffer -- lets tests measure whether the coupling is actually
+    /// producing nonzero curvature, instead of only inferring it indirectly.
+    /// Empty when no `CosseratField` is configured for this scene.
+    pub fn cosserat_curvature(&self) -> &[glam::Vec2] {
+        &self.cosserat_curvature
     }
 
     /// Direct read-only access to the background grid -- lets a CPU-simulated scene's
     /// renderer sample the solver's own mass field (e.g. for grid-volume rendering,
     /// mirroring what GPU scenes get via `GpuSimulation::grid_buffer()`) without
     /// duplicating the solver's own P2G-computed density.
-    pub fn grid(&self) -> &Grid {
+    pub const fn grid(&self) -> &Grid {
         &self.grid
+    }
+
+    /// Direct read-only access to the material registry -- real, necessary
+    /// gap closed 2026-09-15: `MaterialRegistry::von_mises_stress_field`
+    /// (the real, generic per-material stress computation `ColorMode::
+    /// ByStress` reads from) takes `&MaterialRegistry`, but no caller
+    /// outside this crate could ever obtain one from a `Simulation` before
+    /// this existed -- the field itself is, and stays, private. A real,
+    /// working feature was otherwise unusable from any example or game
+    /// code, not just unused by convention.
+    pub const fn materials(&self) -> &MaterialRegistry {
+        &self.materials
     }
 
     /// Direct mutable access to all particles.
     ///
-    /// **CFL WARNING:** velocity changes made here bypass the solver's CFL clamp.
-    /// Any velocity written must satisfy `|v| ≤ grid_cell_size / current_sub_dt` or the
-    /// next P2G scatter will inject extreme momentum → J→0 → deformation collapse.
-    /// For gameplay impulses use `apply_impulse` / `apply_radial_impulse` instead.
+    /// **State warning:** velocity changes made here are used exactly. The
+    /// next substep recomputes its CFL bound from the altered state; callers
+    /// must keep values finite and use physically meaningful forcing.
     /// Safe uses: writing non-velocity fields (temperature, activation, user_tag, material_id).
-    pub fn particles_mut(&mut self) -> &mut Particles {
+    pub const fn particles_mut(&mut self) -> &mut Particles {
         &mut self.particles
     }
 
@@ -245,7 +350,7 @@ impl Simulation {
         self.particles.retain(pred);
         let new_len = self.particles.len();
         self.active_count = new_len;
-        // Rebuild tag index from scratch — indices shift after retain.
+        // Rebuild tag index from scratch -- indices shift after retain.
         self.tag_index.clear();
         for i in 0..new_len {
             self.tag_index
@@ -254,18 +359,20 @@ impl Simulation {
                 .insert(i);
         }
         self.spatial_hash
+            .borrow_mut()
             .rebuild(&self.particles.x, self.active_count);
+        self.spatial_hash_dirty.set(false);
     }
 
     /// Splits active particles matching `should_split` into two half-mass/half-volume
     /// children, jittered apart by `jitter` (grid units) so they don't start exactly
-    /// overlapping — an un-jittered split would put both children at the literal same
+    /// overlapping -- an un-jittered split would put both children at the literal same
     /// position, the same lattice-symmetry failure mode ("combed" sand) that spawn
     /// lattices need jitter to avoid. Every other field (velocity, deformation gradient,
     /// material_id, temperature, etc.) is inherited unchanged from the parent; only
     /// mass/volume/position differ, and children always wake up (a freshly-fractured
     /// piece has no reason to start asleep). Sleeping particles are left untouched, never
-    /// split. CPU-only (`Simulation`, not `GpuSimulation`) — splitting requires growing the
+    /// split. CPU-only (`Simulation`, not `GpuSimulation`) -- splitting requires growing the
     /// particle buffer, which the GPU path's fixed-size buffers don't support; not
     /// attempted here, future work if needed.
     ///
@@ -311,7 +418,9 @@ impl Simulation {
                 .insert(i);
         }
         self.spatial_hash
+            .borrow_mut()
             .rebuild(&self.particles.x, self.active_count);
+        self.spatial_hash_dirty.set(false);
     }
 
     pub fn assign_particle_materials_by_position<F>(&mut self, mut material_for: F)
@@ -358,16 +467,36 @@ impl Simulation {
     pub fn set_boundary_condition(&mut self, boundary: Box<dyn BoundaryCondition>) {
         self.boundaries.clear();
         self.boundaries.push(boundary);
+        self.boundaries_are_default = false;
     }
 
     /// Append an additional boundary condition (stacks with existing ones).
+    ///
+    /// The FIRST call clears the auto-inserted default `SlipBoundary` (see
+    /// `empty`/`new`) instead of stacking underneath it -- a real, confirmed
+    /// bug otherwise (2026-08-20): the default's zero-friction no-penetration
+    /// pass runs first every substep and zeroes the into-wall velocity
+    /// component before a user's own boundary (e.g. `FrictionBoundary`) ever
+    /// sees it nonzero, permanently defeating that boundary's own friction
+    /// with no error, no warning -- a scene calling `.with_boundary(real)`
+    /// exactly once, the overwhelming common case (38 of 39 real call sites
+    /// across the whole codebase at the time this was found; the one
+    /// exception, `tests::boundary_count_stress`, only asserts finite/
+    /// contained, not friction magnitude, so is unaffected), almost
+    /// certainly means "this is THE boundary," not "add me to a hidden
+    /// pile." Calls after the first genuinely stack, unchanged.
     pub fn add_boundary_condition(&mut self, boundary: Box<dyn BoundaryCondition>) {
+        if self.boundaries_are_default {
+            self.boundaries.clear();
+            self.boundaries_are_default = false;
+        }
         self.boundaries.push(boundary);
     }
 
     /// Remove all boundary conditions.
     pub fn clear_boundaries(&mut self) {
         self.boundaries.clear();
+        self.boundaries_are_default = false;
     }
 
     /// Append an anonymous force field (auto-named "force_field_N").
@@ -401,17 +530,59 @@ impl Simulation {
         self.force_fields.iter().map(|(n, _)| n.as_str()).collect()
     }
 
-    pub fn gravity(&self) -> Vec2 {
+    pub const fn gravity(&self) -> Vec2 {
         self.config.gravity
     }
 
-    pub fn set_gravity(&mut self, gravity: Vec2) {
+    pub const fn set_gravity(&mut self, gravity: Vec2) {
         self.config.gravity = gravity;
+    }
+
+    /// Live-tunable duration of one `step()` call, in seconds -- same
+    /// precedent as [`Self::set_gravity`].
+    ///
+    /// This is a frame-budget control, not a physics one. Adaptive
+    /// substepping already fixes how much simulated time one CFL-safe
+    /// substep may advance, so halving this halves both the substeps a
+    /// frame costs and the simulated time it shows, at identical
+    /// per-substep fidelity. It buys frame rate and slower motion, not
+    /// accuracy in either direction. Total work for a given simulated
+    /// duration is unchanged.
+    ///
+    /// `dt_seconds` moves with it so the legacy, timestep-dependent SI
+    /// conversions stay self-consistent. A material built through the
+    /// `*_from_si_physical` family is unaffected either way: that family
+    /// deliberately does not read `dt_seconds`. A material built through
+    /// the older `*_from_si` family was scaled once at construction and
+    /// will NOT rescale, so change this before building such a material,
+    /// or rebuild it afterwards.
+    pub const fn set_step_duration(&mut self, dt_seconds: f32) {
+        self.config.dt = dt_seconds;
+        self.config.dt_seconds = dt_seconds;
+    }
+
+    /// Live-tunable Cundall (1982) non-viscous damping coefficient, same
+    /// precedent as `set_gravity` -- lets a caller phase-gate it (e.g. off
+    /// while material is actively falling/impacting, on once it should
+    /// relax toward equilibrium) instead of one constant value for a
+    /// scene's entire run.
+    pub const fn set_cundall_damping(&mut self, damping: f32) {
+        self.config.cundall_damping = damping;
+    }
+
+    /// Live-tunable APIC/FLIP blend, same phase-gating precedent as
+    /// `set_cundall_damping` -- lets a caller run the violent/dynamic part
+    /// of a collapse at the scene's own default blend (real toppling
+    /// energy preserved), then switch to the proven quasi-static holding
+    /// value (0.05) once the material has actually settled, instead of one
+    /// constant blend fighting both phases at once.
+    pub const fn set_apic_blend(&mut self, blend: f32) {
+        self.config.apic_blend = blend;
     }
 
     /// Append a rod, returning its index into `rods()`/`rods_mut()`. A rod's
     /// `points.x` must already be in this simulation's grid-cell coordinate
-    /// space (same convention as `Particle::x`) — build it with
+    /// space (same convention as `Particle::x`) -- build it with
     /// `rod::build_straight_rod(start, end, n, linear_density, config.dx_meters)`
     /// so `start`/`end` (grid-cell units) and the resulting rest lengths
     /// (real meters) both land in the right space for `scatter_rod_to_grid`/
@@ -448,6 +619,35 @@ impl Simulation {
     pub fn rods_mut(&mut self) -> &mut [crate::rod::Rod] {
         &mut self.rods
     }
+
+    /// Adds a discrete-element grain population (`spacetime::grains`),
+    /// returning its index. Mirrors `add_rod` exactly. See `grain_populations`'s
+    /// own doc on `Simulation` for real scope (no automatic oracle yet --
+    /// this is an explicit, caller-decided population, same as a rod).
+    pub fn add_grain_population(
+        &mut self,
+        population: crate::grains::population::GrainPopulation,
+    ) -> usize {
+        self.grain_populations.push(population);
+        self.grain_populations.len() - 1
+    }
+
+    /// Builder variant of `add_grain_population`.
+    pub fn with_grain_population(
+        mut self,
+        population: crate::grains::population::GrainPopulation,
+    ) -> Self {
+        self.add_grain_population(population);
+        self
+    }
+
+    pub fn grain_populations(&self) -> &[crate::grains::population::GrainPopulation] {
+        &self.grain_populations
+    }
+
+    pub fn grain_populations_mut(&mut self) -> &mut [crate::grains::population::GrainPopulation] {
+        &mut self.grain_populations
+    }
 }
 
 #[cfg(test)]
@@ -465,7 +665,7 @@ mod add_rod_buckling_check_tests {
     /// right index, `rods()` reflects it) whether or not the rod happens to
     /// be over its own critical height -- the warning CONTENT itself is
     /// already covered by `rod::root_cause_fixes_tests::
-    /// buckling_warning_matches_tonights_real_finding`.
+    /// buckling_warning_matches_expected_critical_height`.
     fn make_rod(young_modulus: f32, height_m: f32, dx_meters: f32) -> Rod {
         let start = Vec2::new(9.0, 4.0);
         let end = Vec2::new(start.x, start.y + height_m / dx_meters);

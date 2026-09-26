@@ -5,34 +5,35 @@
 use glam::Vec2;
 
 /// Fits the contact-interface separating plane through a labeled particle point cloud
-/// via logistic regression — Nairn, "New Material Point Method Contact Algorithms for
-/// Improved Accuracy" (2020), the LR method, eq. 19-21 + Appendix eq. 53-57.
+/// via logistic regression -- Nairn, Hammerquist & Smith, "New Material Point Method
+/// Contact Algorithms for Improved Accuracy" (CMAME 2020), the LR method, eq. 19-21 +
+/// Appendix eq. 53-57.
 ///
-/// Replaces Bardenhagen's own original normal — the spatial gradient of the grip
-/// field's grid mass — which this paper's own Figure 3C independently identifies as
+/// Replaces Bardenhagen's own original normal -- the spatial gradient of the grip
+/// field's grid mass -- which this paper's own Figure 3C independently identifies as
 /// unreliable near a material edge/corner: a node near a corner of one body sees a
 /// tilted gradient from that body while the other body's gradient stays vertical, and
 /// even averaging the two still leaves a residual tilt. Fitting a plane through actual
 /// particle POSITIONS instead sidesteps grid-discretization artifacts entirely.
 ///
-/// `points`: (position, label) pairs gathered by `gather_contact_point_cloud` — every
+/// `points`: (position, label) pairs gathered by `gather_contact_point_cloud` -- every
 /// particle (both bodies) whose kernel touches this node, label `+1.0` grip / `-1.0`
 /// rest. `node_pos`: this contact node's own grid position, used ONLY to CENTER the
-/// point cloud before fitting (`x_p - node_pos`, not raw absolute grid coordinates) —
+/// point cloud before fitting (`x_p - node_pos`, not raw absolute grid coordinates) --
 /// a numerical-conditioning requirement, not cosmetic: fitting directly against raw
 /// grid coordinates (e.g. X≈32, Y≈10 rather than both near 0) leaves the Newton
 /// iteration ill-conditioned enough to converge to a badly wrong plane at asymmetric
 /// (edge/corner-like) point clouds. Returns `None` if both labels aren't present (no
 /// interface at this node).
 ///
-/// Uses the paper's own recommended numerics, not guessed: uniform weights (`w_p=1` —
+/// Uses the paper's own recommended numerics, not guessed: uniform weights (`w_p=1` --
 /// the paper tried several weighting schemes, none improved on this), penalty
 /// `Γ=1e-7·Δx²·(1,1,0)` (only the plane's normal components are regularized, not its
 /// offset), convergence on normal-direction change `1-n̂'·n̂<1e-5`, capped at 15
 /// iterations (the paper's own cap, "to guard against needless iterations" on slow-
 /// converging point clouds). Starting from `β⁽⁰⁾=0` makes the first NLLS update reduce
 /// exactly to a closed-form linear-regression plane fit (the paper's own appendix
-/// derives this) — so this is one iteration loop, not two separate code paths.
+/// derives this) -- so this is one iteration loop, not two separate code paths.
 pub(super) fn fit_contact_normal_lr(
     points: &[(Vec2, f32)],
     node_pos: Vec2,
@@ -109,7 +110,7 @@ pub(super) fn fit_contact_normal_lr(
         prev_n = Some(n);
     }
 
-    // Sign-consistency check against the ACTUAL labels the plane was fit from — a
+    // Sign-consistency check against the ACTUAL labels the plane was fit from -- a
     // general safeguard, not a hardcoded direction. Newton's method on the
     // logistic-regression objective can converge (by this function's own
     // angle-based criterion) to a plateau whose normal direction is backwards
@@ -135,7 +136,7 @@ pub(super) fn fit_contact_normal_lr(
     })
 }
 
-/// Solves a general 3x3 linear system via Cramer's rule — closed-form is simpler and
+/// Solves a general 3x3 linear system via Cramer's rule -- closed-form is simpler and
 /// faster than a general decomposition for this fixed, tiny size (one call per NLLS
 /// iteration in `fit_contact_normal_lr`). Returns `None` if singular (determinant ~0);
 /// the caller's Tikhonov-style penalty term keeps this from happening in practice.

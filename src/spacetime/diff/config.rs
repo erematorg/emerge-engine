@@ -8,12 +8,32 @@ use super::body_plan::BodyPlan;
 // ── Config / controller / state ───────────────────────────────────────────────
 
 pub struct DiffConfig {
+    /// Uniform per-particle mass for this mini-sim -- a free constant, same
+    /// disclosed-simplification convention as `stress_coeff` below (this
+    /// whole module trades real, SI-calibrated physics for a small,
+    /// stylized, backprop-friendly training environment, per
+    /// `spacetime::diff`'s own module doc). 1.0 keeps every derived
+    /// quantity in the same simple unit scale the rest of this
+    /// free-parameter config already uses.
     pub mass: f32,
     /// P2G stress premultiplier: `-V0 * KERNEL_D_INVERSE * dt` in the real
     /// solver; a free constant here.
     pub stress_coeff: f32,
+    /// Fixed substep size for this mini-sim's own explicit integration --
+    /// NOT CFL-derived (unlike the real solver's adaptive substep logic,
+    /// `spacetime::solver::cfl`): this differentiable stepper trades real
+    /// adaptive stability for a constant, backprop-friendly step count per
+    /// rollout. 0.01 is an empirically-stable free choice across
+    /// `BodyPlan`'s creature scales, not derived from a stability bound.
     pub dt: f32,
     pub kernel_d_inverse: f32,
+    /// Same ROLE as `SimConfig::apic_blend` (PIC/FLIP interpolation), but a
+    /// FREE constant here, not a derived one: `SimConfig::apic_blend`'s own
+    /// doc grounds its value in a strict WC-MPM continuity-equation
+    /// requirement for real fluid materials -- this mini-sim's own material
+    /// model has no such continuity constraint, so there is nothing to
+    /// derive it from. `1.0` (pure APIC, no FLIP blending) matches this
+    /// whole struct's disclosed "stylized training environment" status.
     pub apic_blend: f32,
     /// Downward gravitational acceleration (grid units / s^2).
     pub gravity: f32,
@@ -210,7 +230,7 @@ pub struct FeedbackController {
 }
 
 impl FeedbackController {
-    pub fn feature_len(n_groups: usize) -> usize {
+    pub const fn feature_len(n_groups: usize) -> usize {
         n_groups * 4
     }
 

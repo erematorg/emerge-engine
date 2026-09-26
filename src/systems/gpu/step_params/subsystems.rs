@@ -5,25 +5,25 @@
 //! subsystem existed. Split out of `step_params.rs`, see that module's own doc
 //! comment for the full file map.
 
-/// Grid-based Fourier heat diffusion — GPU mirror of `ThermalDiffusion`/`ThermalConfig`
+/// Grid-based Fourier heat diffusion -- GPU mirror of `ThermalDiffusion`/`ThermalConfig`
 /// (`src/energy/thermodynamics/diffusion.rs`). Implements the same real PDE:
 /// `∂T/∂t = α·∇²T` (Fourier's law) plus Newton cooling `dT/dt = −k_c·(T−ambient)`.
-/// `dt` itself is NOT stored here — the thermal pass reads `step_params.dt` (group 0)
+/// `dt` itself is NOT stored here -- the thermal pass reads `step_params.dt` (group 0)
 /// directly, since substep `dt` is already the single source of truth uploaded there
 /// every substep; duplicating it here would risk the two going out of sync.
 /// `enabled == 0` skips all 4 thermal passes entirely (see `contact_active`'s identical
-/// gate-when-unused pattern) — every scene that never attaches thermal pays nothing.
+/// gate-when-unused pattern) -- every scene that never attaches thermal pays nothing.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuThermalParams {
-    /// Thermal diffusivity α = k / (c_p · dx²), grid-units²/s — see
+    /// Thermal diffusivity α = k / (c_p · dx²), grid-units²/s -- see
     /// `ThermalConfig::alpha_grid`'s own doc for the real derivation/units.
     pub alpha: f32,
-    /// Ambient/boundary temperature — empty cells and Newton cooling both relax toward this.
+    /// Ambient/boundary temperature -- empty cells and Newton cooling both relax toward this.
     pub ambient: f32,
     /// Newton cooling rate k_c, 1/s. 0.0 = no cooling (adiabatic walls).
     pub cooling_rate: f32,
-    /// 0 = no thermal system attached (default, every existing scene) — skips all 4
+    /// 0 = no thermal system attached (default, every existing scene) -- skips all 4
     /// thermal passes. 1 = attached and active.
     pub enabled: u32,
 }
@@ -41,12 +41,12 @@ impl GpuThermalParams {
 
 const _: () = assert!(core::mem::size_of::<GpuThermalParams>() == 16);
 
-/// Generic reaction-diffusion resource field — GPU mirror of `ScalarDiffusionField`
+/// Generic reaction-diffusion resource field -- GPU mirror of `ScalarDiffusionField`
 /// (`src/energy/thermodynamics/scalar_field.rs`), specialized to the one source term
 /// its own CPU test module uses: logistic growth (Verhulst 1838, `dφ/dt = r·φ·(1−φ/K)`).
 /// Same PDE shape as `GpuThermalParams` (scatter -> normalize -> Laplacian+reaction ->
 /// gather), but its own separate group/buffers and carrier field (`particle.scalar_field`,
-/// not `particle.temperature`) — composes freely with `GpuThermalParams` in the same
+/// not `particle.temperature`) -- composes freely with `GpuThermalParams` in the same
 /// scene since the two no longer share a carrier field.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -136,6 +136,25 @@ impl GpuMaterialMassParams {
             _pad: [0; 3],
         }
     }
+}
+
+/// GPU mirror of `fluid_pressure.wgsl`'s own `FluidPressureParams` struct --
+/// field order and types must match exactly (WGSL uniform buffers use the
+/// same std140-style layout rules bytemuck's `Pod` derive already assumes
+/// elsewhere in this file). Real GPU port of the CPU-proven Chorin-style
+/// incompressibility pressure projection, see that shader's own module doc.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuFluidPressureParams {
+    /// Real reference fluid cell mass (`rest_density * spacing^2`, this
+    /// material's own grid units) -- Rust already knows this exactly from
+    /// the material/spawn setup, avoiding a GPU-side reduction pass purely
+    /// to recover what the CPU equivalent (`pressure.rs`'s own `mass_avg`)
+    /// computes analytically. Used only for the free-surface classification
+    /// threshold (`reference_cell_mass * 0.3`, matching CPU's own
+    /// `mass_avg * 0.3` convention).
+    pub reference_cell_mass: f32,
+    pub _pad: [f32; 3],
 }
 
 const _: () = assert!(core::mem::size_of::<GpuMaterialMassParams>() == 16);

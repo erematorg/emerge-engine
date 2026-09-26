@@ -9,7 +9,7 @@ use glam::{Mat2, Vec2};
 /// 3. σᵢ = √λᵢ; U columns = F·vᵢ / σᵢ (fallback to complement for σᵢ ≈ 0)
 /// 4. If F is inverted, encode the reflection in signed σ₂ so U and V stay proper rotations
 ///
-/// No external library or Jacobi iteration needed — fully closed-form.
+/// No external library or Jacobi iteration needed -- fully closed-form.
 /// Reference: standard 2×2 symmetric eigendecomposition; McAdams et al. 2011 §2.
 pub(crate) fn svd2(f: Mat2) -> (Mat2, Vec2, Mat2) {
     // F column-major: x_axis = (f00, f10), y_axis = (f01, f11)
@@ -18,7 +18,7 @@ pub(crate) fn svd2(f: Mat2) -> (Mat2, Vec2, Mat2) {
     let f01 = f.y_axis.x;
     let f11 = f.y_axis.y;
 
-    // C = FᵀF — symmetric 2×2: [[c00, c01],[c01, c11]]
+    // C = FᵀF -- symmetric 2×2: [[c00, c01],[c01, c11]]
     let c00 = f00 * f00 + f10 * f10;
     let c01 = f00 * f01 + f10 * f11;
     let c11 = f01 * f01 + f11 * f11;

@@ -5,7 +5,7 @@ use crate::diagnostics::rules::{StabilityThresholds, evaluate_stability};
 use crate::diagnostics::snapshot::SimSnapshot;
 use crate::particle::{Particle, Particles};
 
-/// Per-material aggregate statistics — one entry per unique `material_id`.
+/// Per-material aggregate statistics -- one entry per unique `material_id`.
 ///
 /// Computed in a single pass over the particle slice.
 /// Cheap enough to call every frame; only allocates one BTreeMap entry per material.
@@ -14,7 +14,7 @@ pub struct MaterialStats {
     pub material_id: u32,
     pub count: usize,
     pub centroid: Vec2,
-    /// Bounding-box min/max position — the same "is it scattering or
+    /// Bounding-box min/max position -- the same "is it scattering or
     /// growing" signal ad hoc example telemetry (e.g. basic_creature.rs) used
     /// to hand-compute per frame; now available to any caller for free.
     pub extent_min: Vec2,
@@ -23,7 +23,7 @@ pub struct MaterialStats {
     pub mean_speed: f32,
     /// Speed of fastest particle.
     pub max_speed: f32,
-    /// [min, max] of det(F) — J < 1 = compressed, J > 1 = expanded.
+    /// [min, max] of det(F) -- J < 1 = compressed, J > 1 = expanded.
     pub j_range: [f32; 2],
     /// Mean plastic volume ratio Jp = det(Fₚ). 1.0 = no plastic deformation.
     /// Drops below 1.0 when material compresses plastically (snow after impact).
@@ -36,7 +36,7 @@ pub struct MaterialStats {
     /// Max activation. Useful to confirm the oscillator is reaching full contraction.
     pub max_activation: f32,
     /// Mean damage (friction_hardening for Rankine; q accumulator for sand/VonMises).
-    /// Meaning depends on material — use as a relative indicator.
+    /// Meaning depends on material -- use as a relative indicator.
     pub mean_damage: f32,
     /// Mean temperature.
     pub mean_temperature: f32,
@@ -71,7 +71,7 @@ impl MaterialStats {
             self.j_range[0],
             self.j_range[1],
         );
-        // Plastic state — only when deformed.
+        // Plastic state -- only when deformed.
         if (self.avg_plastic_volume_ratio - 1.0).abs() > 1e-4 {
             s.push_str(&format!("  Jp={:.3}", self.avg_plastic_volume_ratio));
         }
@@ -79,18 +79,18 @@ impl MaterialStats {
             s.push_str(&format!("  h={:.3}", self.avg_hardening_scale));
         }
         // friction_hardening: DP q, VonMises κ, Rankine damage, SandMuI µ(I).
-        // Only print when non-zero — name it generically as "q" (internal state).
+        // Only print when non-zero -- name it generically as "q" (internal state).
         if self.mean_damage.abs() > 1e-4 {
             s.push_str(&format!("  q={:.3}", self.mean_damage));
         }
-        // Activation — only for creature materials.
+        // Activation -- only for creature materials.
         if self.max_activation > 1e-4 {
             s.push_str(&format!(
                 "  act={:.2}/{:.2}",
                 self.mean_activation, self.max_activation
             ));
         }
-        // Temperature — only when non-zero.
+        // Temperature -- only when non-zero.
         if self.mean_temperature.abs() > 1e-4 {
             s.push_str(&format!("  T={:.2}", self.mean_temperature));
         }
@@ -101,7 +101,7 @@ impl MaterialStats {
 /// Compute per-material stats in a single particle pass.
 ///
 /// Returns one `MaterialStats` per unique `material_id`, sorted by id.
-/// Only allocates a BTreeMap entry per material — O(n·log(m)) where m = number of materials.
+/// Only allocates a BTreeMap entry per material -- O(n·log(m)) where m = number of materials.
 pub fn per_material_stats(particles: &Particles) -> Vec<MaterialStats> {
     per_material_stats_iter(particles.iter())
 }
@@ -216,34 +216,9 @@ fn per_material_stats_iter(iter: impl Iterator<Item = Particle>) -> Vec<Material
         .collect()
 }
 
-/// Print a clean per-frame summary: header + one line per material.
-///
-/// Pass `labels` to annotate material IDs with names (e.g. `&[(0, "snow"), (1, "sand")]`).
-/// Only prints if `frame % interval == 0` — set `interval = 1` to print every frame.
-pub fn log_frame(
-    frame: u64,
-    dt: f32,
-    particles: &Particles,
-    labels: &[(u32, &str)],
-    interval: u64,
-) {
-    if interval > 0 && !frame.is_multiple_of(interval) {
-        return;
-    }
-    let stats = per_material_stats(particles);
-    println!("── frame {}  dt={:.4}  n={} ──", frame, dt, particles.len());
-    for s in &stats {
-        let label = labels
-            .iter()
-            .find(|(id, _)| *id == s.material_id)
-            .map(|(_, l)| *l);
-        println!("  {}", s.format(label));
-    }
-}
-
 /// Print per-frame summary + global health status (CFL, mass/momentum conservation, NaN checks).
 ///
-/// Header shows CFL and health — if unhealthy, the violated checks are listed.
+/// Header shows CFL and health -- if unhealthy, the violated checks are listed.
 /// Per-material lines follow (same format as `log_frame`).
 ///
 /// Use `solver.diagnostics_snapshot()` to obtain the snapshot.
@@ -321,7 +296,7 @@ pub fn log_frame_full(
 
 /// GPU-compatible per-frame log. Takes a `&[Particle]` slice (CPU mirror from GpuSimulation).
 ///
-/// No CFL or health check — those require grid data unavailable on the GPU path.
+/// No CFL or health check -- those require grid data unavailable on the GPU path.
 /// Shows global J range computed from the particle mirror (1-frame lag vs GPU state).
 /// Format: `── frame N  dt=D  n=N  J=[min,max]  [GPU] ──` followed by per-material lines.
 /// Only prints if `frame % interval == 0`.

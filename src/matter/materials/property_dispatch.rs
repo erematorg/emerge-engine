@@ -2,13 +2,15 @@
 //! `props.particle_mass(spacing, &config)` for each of the 7 property
 //! families (`Elastic`, `Elastoplastic`, `Viscoelastic`, `Pressurized`,
 //! `NoCompression`, `FluidGranular`, `Fluid`, defined in `physical_props.rs`)
-//! — dispatching each preset to its concrete `MaterialModel` constructor.
-//! Split out of `mod.rs` (2026-07-22) purely for LOC — no behavior change.
+//! -- dispatching each preset to its concrete `MaterialModel` constructor.
+//! Split out of `mod.rs` purely for LOC -- no behavior change.
 
-use super::physical_props::{BinghamProps, DuctileProps, GranularProps, NewtonianFluid, SnowProps};
+use super::physical_props::{
+    BinghamProps, DuctileProps, GranularProps, NaccProps, NewtonianFluid, SnowProps,
+};
 use super::{
     BinghamFluidMaterial, BrittleProps, DruckerPragerMaterial, Elastic, Elastoplastic, Fluid,
-    FluidGranular, FromSI, GranularFluidMaterial, MaterialModel, MuIRheologyMaterial,
+    FluidGranular, FromSI, GranularFluidMaterial, MaterialModel, MuIRheologyMaterial, NaccMaterial,
     NeoHookeanMaterial, NewtonianFluidMaterial, NoCompression, NoCompressionMaterial, ParticleMass,
     PlasticityModel, Pressurized, RankineMaterial, StomakhinMaterial, Viscoelastic,
     ViscoelasticMaterial, VonMisesMaterial, WithPreStress,
@@ -21,29 +23,20 @@ impl Elastic {
         Box::new(NeoHookeanMaterial::from_physical(self, config))
     }
 
-    /// Particle mass (real SI kilograms -- `rho_kg_m3 * (spacing*dx_meters)^2`, an areal
-    /// mass for this 2D solver) for a `SpawnRegion` spawning this material at `spacing`.
-    /// Pass to `SpawnRegion { mass_override: Some(props.particle_mass(spacing, &config)),
-    /// .. }` — without this, every material in a multi-material scene gets the same
-    /// inertia regardless of `rho_kg_m3` (only `SimConfig::particle_mass`, one global
-    /// value, is used).
+    /// Particle mass in real SI kilograms -- `rho_kg_m3 * (spacing*dx_meters)^2`,
+    /// an areal mass for this 2D solver.
     ///
-    /// INVESTIGATED 2026-07-07: briefly "fixed" by adding a `1/dt_seconds^2` factor here,
-    /// then REVERTED -- that was the wrong side of the bug. Confirmed by reading
-    /// `transfer.rs::scatter_particles_to_grid`: gravity's momentum contribution
-    /// (`mass_i * v_i`) and the grid mass accumulator both scale with `mass_i`, but the
-    /// STRESS-based momentum contribution does not depend on particle mass at all (pure
-    /// `stress * geometry`). Both terms get divided by the SAME grid-node mass during
-    /// grid update, so inflating `mass_i` by `1/dt_seconds^2` (often a huge factor, e.g.
-    /// 10000x at dt=0.01) dilutes the EOS's restoring force relative to gravity by that
-    /// same factor -- confirmed empirically: a water column settled into a stable
-    /// equilibrium requiring ~1000x more compression than real hydrostatic physics
-    /// needs, not a numerics/CFL issue (resolution-independent, reproduced identically
-    /// via both a dropped column and a gentle layer-by-layer pour). The REAL bug was in
-    /// `FromSI<NewtonianFluid>`'s (and Bingham/GranularFluid's) `rest_density` conversion
-    /// -- see their fix docs. This formula was correct all along for every material
-    /// (elastic/plastic solids never referenced `rest_density`, so force-balance was
-    /// never in question for them; fluids needed the OTHER side of the ratio fixed).
+    /// Do NOT assign this to `SpawnRegion::mass_override`: that field is in GRID
+    /// units, and the two differ by `rho * dx_meters^2`. Use
+    /// `SpawnRegion::mass_from(&props, &config)`, which applies the conversion.
+    /// A multi-material scene needs it so regions differ in inertia and not only
+    /// in stiffness; a single-material scene does not, since
+    /// `SimConfig::grid_density` already puts it at grid density 1.
+    ///
+    /// Do not add a `1/dt_seconds^2` factor here to fix fluid force balance --
+    /// this formula is correct as-is for every material. The scaling that
+    /// matters for fluids lives in `FromSI<NewtonianFluid>` (and
+    /// Bingham/GranularFluid)'s `rest_density` conversion; see their docs.
     pub fn particle_mass(&self, spacing: f32, config: &crate::SimConfig) -> f32 {
         self.rho_kg_m3 * (spacing * config.dx_meters).powi(2)
     }
@@ -56,6 +49,8 @@ impl Elastoplastic {
     /// - `GranularRateDependent` → `MuIRheologyMaterial`
     /// - `Ductile`               → `VonMisesMaterial`
     /// - `Brittle`               → `RankineMaterial`
+    /// - `CamClay`               → `NaccMaterial` (CPU-only, see that
+    ///   material's own doc -- GPU construction rejects it)
     pub fn material(&self, config: &crate::SimConfig) -> Box<dyn MaterialModel> {
         use PlasticityModel::*;
         match self.model {
@@ -105,10 +100,23 @@ impl Elastoplastic {
                 },
                 config,
             )),
+            CamClay {
+                friction,
+                cohesion,
+                hardening_factor,
+            } => Box::new(NaccMaterial::from_physical(
+                &NaccProps {
+                    elastic: self.elastic,
+                    friction,
+                    cohesion,
+                    hardening_factor,
+                },
+                config,
+            )),
         }
     }
 
-    /// See `Elastic::particle_mass` — density lives in `self.elastic.rho_kg_m3`.
+    /// See `Elastic::particle_mass` -- density lives in `self.elastic.rho_kg_m3`.
     pub fn particle_mass(&self, spacing: f32, config: &crate::SimConfig) -> f32 {
         self.elastic.particle_mass(spacing, config)
     }
@@ -119,7 +127,7 @@ impl Viscoelastic {
         Box::new(ViscoelasticMaterial::from_physical(self, config))
     }
 
-    /// See `Elastic::particle_mass` — density lives in `self.elastic.rho_kg_m3`.
+    /// See `Elastic::particle_mass` -- density lives in `self.elastic.rho_kg_m3`.
     pub fn particle_mass(&self, spacing: f32, config: &crate::SimConfig) -> f32 {
         self.elastic.particle_mass(spacing, config)
     }
@@ -137,7 +145,7 @@ impl Pressurized {
         Box::new(WithPreStress::new(base, pressure_grid))
     }
 
-    /// See `Elastic::particle_mass` — density lives in `self.elastic.rho_kg_m3`.
+    /// See `Elastic::particle_mass` -- density lives in `self.elastic.rho_kg_m3`.
     pub fn particle_mass(&self, spacing: f32, config: &crate::SimConfig) -> f32 {
         self.elastic.particle_mass(spacing, config)
     }
@@ -148,22 +156,38 @@ impl NoCompression {
         Box::new(NoCompressionMaterial::from_physical(&self.elastic, config))
     }
 
-    /// See `Elastic::particle_mass` — density lives in `self.elastic.rho_kg_m3`.
+    /// See `Elastic::particle_mass` -- density lives in `self.elastic.rho_kg_m3`.
     pub fn particle_mass(&self, spacing: f32, config: &crate::SimConfig) -> f32 {
         self.elastic.particle_mass(spacing, config)
     }
 }
 
 impl FluidGranular {
-    /// Dispatches to `GranularFluidMaterial` — Tait EOS pressure + corotated deviatoric + SVD plasticity.
+    /// Dispatches to `GranularFluidMaterial` -- Tait EOS pressure + corotated deviatoric + SVD plasticity.
     pub fn material(&self, config: &crate::SimConfig) -> Box<dyn MaterialModel> {
-        use super::physical_props::{scale_lame, scale_stress};
+        use super::physical_props::scale_lame;
         // Tait EOS polytropic exponent -- Cole 1948, "Underwater Explosions"; standard
         // in SPH/MPM weakly-compressible fluid solvers (Monaghan 1994).
         const GAMMA: f32 = 7.0;
         let (lambda, mu) = scale_lame(self.e_pa, self.nu, self.rho_kg_m3, config);
-        let eos = scale_stress(self.bulk_modulus_pa / GAMMA, self.rho_kg_m3, config);
-        // See `NewtonianFluidMaterial::from_physical`'s fix doc (2026-07-07) -- rest_density
+        // Real fix 2026-08-11: this EOS/bulk-pressure term is the SAME
+        // density-ratio Tait pressure `NewtonianFluidMaterial`/
+        // `BinghamFluidMaterial` use (`p = k*((rho/rho0)^gamma - 1)`, see
+        // `GranularFluidMaterial::kirchhoff_stress`) -- their own
+        // `from_physical` doc says applying `scale_stress`'s legacy
+        // dt^2/(rho*dx^2) conversion here "would double-scale it". This
+        // used to call `scale_stress(self.bulk_modulus_pa / GAMMA, ...)`,
+        // the exact same abandoned path the WCSPH diagnostic test was
+        // caught using (see that test's own doc) -- real, live bug, not
+        // just a test issue: it made every `FluidGranular`-dispatched mud/
+        // wet-terrain material's bulk pressure orders of magnitude too
+        // soft to resist compression. `lambda`/`mu` above stay on
+        // `scale_lame` correctly -- that term is added to the SAME
+        // F-based corotated elastic stress space every other solid
+        // material uses, a genuinely different (and correctly scaled)
+        // pipeline from the density-ratio EOS pressure below.
+        let eos = self.bulk_modulus_pa / GAMMA;
+        // See `NewtonianFluidMaterial::from_physical`'s doc -- rest_density
         // must match `particles.density[i]`'s real units, not an extra `/dt_seconds^2`.
         let rho_grid = self.rho_kg_m3 * config.dx_meters * config.dx_meters;
         Box::new(GranularFluidMaterial {
@@ -178,6 +202,16 @@ impl FluidGranular {
             min_plastic_jacobian: 0.2,
             max_plastic_jacobian: 3.0,
             pressure_floor: 0.0,
+            // Same real, disclosed damping convention as `GranularFluidMaterial::
+            // saturated_loam` (see that field's own doc on the struct) --
+            // `FluidGranular` itself doesn't yet expose a distinct viscosity
+            // input, so this generic SI-driven dispatch path uses the same
+            // 0.3*mu default rather than silently shipping zero damping here too.
+            dynamic_viscosity: 0.3 * mu,
+            // Real correction -- see `GranularFluidMaterial::saturated_loam`'s
+            // own note: scales with THIS scene's own real (SI-derived)
+            // eos_stiffness, not mu.
+            bulk_viscosity: 0.5 * eos,
         })
     }
 
@@ -206,6 +240,11 @@ impl Fluid {
                     eta_pa_s: self.eta_pa_s,
                     bulk_modulus_pa: self.bulk_modulus_pa,
                     yield_stress_pa: tau0,
+                    // `Fluid` describes a liquid, and a liquid has no
+                    // storage modulus. Reaching the elastoviscoplastic
+                    // branch is a deliberate act via `BinghamProps`, not
+                    // something the liquid route turns on behind the caller.
+                    shear_modulus_pa: 0.0,
                 },
                 config,
             )),
@@ -213,6 +252,24 @@ impl Fluid {
     }
 
     /// See `Elastic::particle_mass`.
+    pub fn particle_mass(&self, spacing: f32, config: &crate::SimConfig) -> f32 {
+        self.rho_kg_m3 * (spacing * config.dx_meters).powi(2)
+    }
+}
+
+impl GranularProps {
+    /// See `Elastic::particle_mass`. Delegates to the shared elastic
+    /// density -- `DruckerPragerMaterial`/`MuIRheologyMaterial` add no
+    /// separate mass concept of their own on top of it.
+    pub fn particle_mass(&self, spacing: f32, config: &crate::SimConfig) -> f32 {
+        self.elastic.particle_mass(spacing, config)
+    }
+}
+
+impl BinghamProps {
+    /// See `Elastic::particle_mass`. Present for the same reason as every
+    /// other family's: a caller building this material directly (rather
+    /// than through `Fluid::material`) still needs its real particle mass.
     pub fn particle_mass(&self, spacing: f32, config: &crate::SimConfig) -> f32 {
         self.rho_kg_m3 * (spacing * config.dx_meters).powi(2)
     }
@@ -243,6 +300,8 @@ forward_particle_mass!(
     NoCompression,
     FluidGranular,
     Fluid,
+    BinghamProps,
+    GranularProps,
 );
 
 #[cfg(test)]
@@ -254,7 +313,16 @@ mod particle_mass_tests {
         SimConfig::earth(64, 0.01, 0.05)
     }
 
-    /// mass_from(&props) == props.particle_mass(spacing) called directly — no duplication risk.
+    /// mass_from(&props) == props.particle_mass(spacing) converted through the
+    /// same SI-kg -> grid-unit factor `mass_from` itself applies -- no
+    /// duplication risk between the two `particle_mass` call sites.
+    ///
+    /// Real fix, 2026-08-27: `expected` used to compare directly against
+    /// `particle_mass`'s raw SI-kg return, which stopped matching once
+    /// `mass_from` (src/spacetime/solver/config/spawn.rs) started converting
+    /// that SI mass into grid units as part of the grid-density root fix
+    /// (85ee103) -- a units mismatch in the TEST, not an engine bug (same
+    /// family as the 6 tests already recalibrated for that fix in 9ad1dbd).
     #[test]
     fn mass_from_matches_direct_call() {
         let config = earth_config();
@@ -267,7 +335,9 @@ mod particle_mass_tests {
         let region = SpawnRegion::for_sim(&config)
             .spacing(spacing)
             .mass_from(&props, &config);
-        let expected = props.particle_mass(spacing, &config);
+        let si_kg = props.particle_mass(spacing, &config);
+        let to_grid = 1.0 / (config.reference_density_kg_m3 * config.dx_meters * config.dx_meters);
+        let expected = si_kg * to_grid;
         assert!(
             (region.mass_override.unwrap() - expected).abs() < 1e-9,
             "mass_from result {:.6e} != direct call {:.6e}",
@@ -315,5 +385,67 @@ mod particle_mass_tests {
         assert!((from_ep - expected_elastic).abs() < 1e-9);
         assert!((from_ve - expected_elastic).abs() < 1e-9);
         assert!((from_fluid - expected_elastic).abs() < 1e-9);
+    }
+
+    /// `PlasticityModel::CamClay` dispatch (wired 2026-09-08, closing the gap
+    /// `NaccProps`'s own doc used to disclose) must produce the exact same
+    /// `NaccMaterial` as calling `NaccMaterial::from_physical` directly --
+    /// no double conversion, no dropped fields, same pattern this file's own
+    /// `Brittle`/`Ductile`/`Granular` arms already prove out.
+    #[test]
+    fn camclay_dispatch_matches_direct_nacc_from_physical() {
+        use crate::materials::NaccMaterial;
+
+        let config = earth_config();
+        let elastic = Elastic {
+            e_pa: 2.0e6,
+            nu: 0.3,
+            rho_kg_m3: 1800.0,
+        };
+        let (friction, cohesion, hardening_factor) = (1.2, 0.1, 2.0);
+
+        let via_dispatch = Elastoplastic {
+            elastic,
+            model: PlasticityModel::CamClay {
+                friction,
+                cohesion,
+                hardening_factor,
+            },
+        }
+        .material(&config);
+
+        let direct = NaccMaterial::from_physical(
+            &NaccProps {
+                elastic,
+                friction,
+                cohesion,
+                hardening_factor,
+            },
+            &config,
+        );
+
+        // `.material()` returns `Box<dyn MaterialModel>`; `MaterialModel:
+        // Debug` is a supertrait bound, so comparing the trait objects'
+        // Debug output directly (not just a `MaterialParams` projection)
+        // catches any field the dispatch path might drop or double-convert.
+        assert_eq!(
+            format!("{via_dispatch:?}"),
+            format!("{direct:?}"),
+            "CamClay dispatch produced a different NaccMaterial than the direct FromSI path"
+        );
+
+        // particle_mass for Elastoplastic must still route through the same
+        // elastic density, unaffected by which PlasticityModel variant is chosen.
+        let spacing = 0.5_f32;
+        let expected_mass = elastic.particle_mass(spacing, &config);
+        let ep = Elastoplastic {
+            elastic,
+            model: PlasticityModel::CamClay {
+                friction,
+                cohesion,
+                hardening_factor,
+            },
+        };
+        assert!((ep.particle_mass(spacing, &config) - expected_mass).abs() < 1e-9);
     }
 }

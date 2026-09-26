@@ -25,7 +25,7 @@ mod activation_tests {
     }
 
     /// Directional materials (everything except Viscoelastic): active stress follows the fiber
-    /// direction exactly — `activation * coeff` along the fiber axis, zero perpendicular to it.
+    /// direction exactly -- `activation * coeff` along the fiber axis, zero perpendicular to it.
     #[test]
     fn directional_active_stress_follows_fiber_axis() {
         let mut mat = NeoHookeanMaterial::new(100.0, 200.0);
@@ -48,7 +48,7 @@ mod activation_tests {
     }
 
     /// Viscoelastic uses an isotropic active term (matches its Kelvin-Voigt formulation and the
-    /// GPU shader's `model == 9u` special case) — equal on both diagonal axes, regardless of
+    /// GPU shader's `model == 9u` special case) -- equal on both diagonal axes, regardless of
     /// `activation_dir`.
     #[test]
     fn viscoelastic_active_stress_is_isotropic() {
@@ -73,7 +73,7 @@ mod activation_tests {
 
     /// Regression: `ViscoelasticMaterial::kirchhoff_stress` used to add its own isotropic active
     /// term directly AND report a non-zero `activation_scale()`, so the shared P2G path
-    /// (`combined_kirchhoff_stress`) added a second active term on top — silently doubling muscle
+    /// (`combined_kirchhoff_stress`) added a second active term on top -- silently doubling muscle
     /// stress for any Viscoelastic creature body. Pin the total to exactly one contribution.
     #[test]
     fn viscoelastic_active_stress_is_not_double_counted() {
@@ -98,7 +98,7 @@ mod activation_tests {
         let mut mat = NeoHookeanMaterial::new(100.0, 200.0);
         mat.active_stress_coeff = 10.0;
         let mut p = particle_at_rest();
-        p.activation = 0.0; // off — must be a true no-op regardless of coeff
+        p.activation = 0.0; // off -- must be a true no-op regardless of coeff
         p.activation_dir = Vec2::X;
 
         let soa = Particles::from(vec![p]);
@@ -112,7 +112,7 @@ mod activation_tests {
 
 /// Real, checkable validation of the internal pre-stress mechanism added for
 /// turgor-pressure-style support (see `Particle::internal_pressure` and
-/// `MaterialModel::pressure_scale` docs) — not a "looks nicer" check, a direct
+/// `MaterialModel::pressure_scale` docs) -- not a "looks nicer" check, a direct
 /// verification of the `-P*I` formula `combined_kirchhoff_stress` adds.
 #[cfg(test)]
 mod pre_stress_tests {
@@ -131,7 +131,7 @@ mod pre_stress_tests {
         p
     }
 
-    /// `NeoHookeanMaterial` opts into pre-stress (`pressure_scale() == 1.0`) — an
+    /// `NeoHookeanMaterial` opts into pre-stress (`pressure_scale() == 1.0`) -- an
     /// undeformed particle's stress should be exactly `-P*I`, matching the real
     /// "prestressed structure" formula (isotropic hydrostatic pressure term).
     #[test]
@@ -161,7 +161,7 @@ mod pre_stress_tests {
     fn zero_internal_pressure_leaves_stress_unchanged() {
         let mat = NeoHookeanMaterial::new(100.0, 200.0);
         let mut p = particle_at_rest();
-        p.internal_pressure = 0.0; // off — must be a true no-op
+        p.internal_pressure = 0.0; // off -- must be a true no-op
 
         let soa = Particles::from(vec![p]);
         let tau = combined_kirchhoff_stress(&mat, &soa, 0);
@@ -172,7 +172,7 @@ mod pre_stress_tests {
     }
 
     /// A material that does NOT override `pressure_scale()` (default 0.0) must ignore
-    /// `internal_pressure` entirely — real opt-in behavior, not a silent global effect.
+    /// `internal_pressure` entirely -- real opt-in behavior, not a silent global effect.
     /// `DruckerPragerMaterial` (sand) is a real material that never opts in.
     #[test]
     fn material_without_pressure_scale_ignores_internal_pressure() {
@@ -183,7 +183,7 @@ mod pre_stress_tests {
             "test assumption: DruckerPragerMaterial does not opt into pre-stress"
         );
         let mut p = particle_at_rest();
-        p.internal_pressure = 999.0; // deliberately large — should have zero effect
+        p.internal_pressure = 999.0; // deliberately large -- should have zero effect
 
         let soa = Particles::from(vec![p]);
         let tau = combined_kirchhoff_stress(&mat, &soa, 0);
@@ -193,7 +193,7 @@ mod pre_stress_tests {
         );
     }
 
-    /// Pre-stress and activation are independent additive terms — both should apply
+    /// Pre-stress and activation are independent additive terms -- both should apply
     /// simultaneously without either one suppressing the other (real composability,
     /// not an accidental either/or).
     #[test]

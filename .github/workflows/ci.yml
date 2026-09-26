@@ -30,37 +30,93 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
+  # Split by test target instead of one sequential run of all 24 test
+  # binaries. Previously a single job ran `cargo test` then
+  # `cargo test --all-features` back to back, i.e. every binary twice, in
+  # series -- measured at ~2h50m and FAILING on both platforms (run
+  # 32179465407, 2026-08-18). The suite genuinely is slow: several
+  # long-horizon stability tests run 60s+ each in debug on purpose (they are
+  # real correctness checks, not benchmarks). The fix is to stop running
+  # them end to end -- these shards run concurrently, so wall-clock is
+  # bounded by the SLOWEST shard rather than their sum.
+  #
+  # `--no-fail-fast` so one slow shard failing still reports the others.
   test:
-    name: test (${{ matrix.os }})
+    name: test ${{ matrix.shard }} (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    # Several long-horizon stability tests in physics_correctness.rs run 60s+
-    # each in debug mode (real correctness checks, not perf benchmarks -- see
-    # their own doc comments); GitHub's default job timeout was cutting the
-    # combined no-features + all-features run short. 60 min gives real headroom
-    # without masking a genuine hang (a real hang would still exceed this).
-    timeout-minutes: 60
+    timeout-minutes: 45
     strategy:
+      # Report every shard's real result rather than cancelling siblings on
+      # the first failure -- with physics suites, knowing WHICH ones broke is
+      # most of the diagnosis.
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
+        shard:
+          # The two known-heaviest suites get their own shard each: measured
+          # locally at ~20 min (lib) and 13+ min (grains_grid_coupling), with
+          # accuracy longer still.
+          - lib
+          - accuracy
+          - physics
+          - grains
+          - rods
+          - rest
+        include:
+          - shard: lib
+            args: "--lib"
+          - shard: accuracy
+            args: "--test accuracy"
+          - shard: physics
+            args: "--test physics_correctness --test solver --test implicit_corotated_substep"
+          - shard: grains
+            args: "--test grains_grid_coupling --test grains_repose_angle"
+          - shard: rods
+            args: >-
+              --test rod_gravitropism --test rod_gravitropism_whole_organ
+              --test rod_grid_coupling --test rod_growth
+              --test rod_network_branching --test rod_network_rigid_joints
+              --test rod_phototropism --test rod_plasticity_integration
+              --test rod_sleep_wake --test rod_soil_anchorage
+          - shard: rest
+            args: >-
+              --test autonomous_locomotion --test diagnostics
+              --test extensibility --test gpu --test orbital_mechanics
+              --test particle_neighbor_momentum_transfer
+              --test perf_particle_scaling --test self_gravitating_body
+              --test stress
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: test (no features — CPU-only path)
-        run: cargo test
-      # gpu/render tests need a Vulkan adapter. ubuntu-latest has no GPU and no software
-      # Vulkan driver by default — without lavapipe, every GPU test panics on
-      # request_adapter().expect(...). windows-latest gets D3D12 WARP from the OS itself,
-      # no extra install needed.
+      # gpu/render tests need a Vulkan adapter. ubuntu-latest has no GPU and no
+      # software Vulkan driver by default -- without lavapipe, every GPU test
+      # panics on request_adapter().expect(...). windows-latest gets D3D12 WARP
+      # from the OS itself, no extra install needed.
       - name: install software Vulkan driver (lavapipe)
         if: matrix.os == 'ubuntu-latest'
         run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
-      # -j 2: cargo test --all-features builds every integration test binary against
-      # gpu+render+experimental at once; full parallelism can exhaust available memory
-      # and crash the linker (STATUS_STACK_BUFFER_OVERRUN, confirmed reproducible and
-      # confirmed fixed by capping parallelism -- not a code bug, see CONTRIBUTING.md).
-      - name: test (all features)
-        run: cargo test --all-features -j 2
+      # -j 2: building every integration test binary against
+      # gpu+render+experimental at full parallelism can exhaust available
+      # memory and crash the linker (STATUS_STACK_BUFFER_OVERRUN, confirmed
+      # reproducible and confirmed fixed by capping parallelism -- not a code
+      # bug, see CONTRIBUTING.md).
+      - name: test (${{ matrix.shard }}, all features)
+        run: cargo test --all-features -j 2 --no-fail-fast ${{ matrix.args }}
+
+  # The no-features (CPU-only) path still needs real coverage, but running the
+  # WHOLE suite twice was half the original cost. The default-feature build is
+  # about proving the CPU-only path compiles and its core physics runs -- the
+  # exhaustive per-suite coverage above already runs with all features on.
+  test-no-features:
+    name: test (no features, CPU-only path)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --lib --test solver --test diagnostics --test extensibility
 
   publish-dry-run:
     name: publish dry-run

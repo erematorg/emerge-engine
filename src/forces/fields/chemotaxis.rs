@@ -50,7 +50,7 @@ use crate::thermodynamics::ScalarDiffusionField;
 /// Call `sync_from(&scalar_field)` once per substep (after `scalar_field.apply()`)
 /// to update the internal snapshot, then register with the solver as a `Field`.
 pub struct ChemotaxisField {
-    /// Grid resolution — must match the ScalarDiffusionField and MPM solver.
+    /// Grid resolution -- must match the ScalarDiffusionField and MPM solver.
     grid_res: usize,
     /// Snapshot of φ on the grid. Layout: phi[x*grid_res+y].
     phi: Vec<f32>,
@@ -66,7 +66,7 @@ impl ChemotaxisField {
     /// Create a new chemotaxis field.
     ///
     /// - `grid_res`: must match `ScalarDiffusionField` and `Simulation` grid resolution.
-    /// - `sensitivity`: χ — positive for attraction, negative for repulsion.
+    /// - `sensitivity`: χ -- positive for attraction, negative for repulsion.
     pub fn new(grid_res: usize, sensitivity: f32) -> Self {
         Self {
             grid_res,
@@ -77,7 +77,7 @@ impl ChemotaxisField {
     }
 
     /// Restrict force to a single material.  `None` (default) = all particles.
-    pub fn with_material_filter(mut self, id: u32) -> Self {
+    pub const fn with_material_filter(mut self, id: u32) -> Self {
         self.material_filter = Some(id);
         self
     }

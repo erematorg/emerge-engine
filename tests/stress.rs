@@ -1,4 +1,4 @@
-//! Stress tests — correctness under load, not just speed.
+//! Stress tests -- correctness under load, not just speed.
 //!
 //! Each test pushes one core-system axis (phase rules, boundaries, diagnostics plugins,
 //! materials, force fields) to a higher count than any other test exercises, and asserts
@@ -49,7 +49,7 @@ fn assert_all_finite_and_stable(sim: &Simulation, label: &str) {
 // threshold against a distinct target material) and steps long enough for rules whose
 // threshold is below the actual particle temperature to fire. Asserts every particle stays
 // finite/stable AND that at least one rule actually transitioned particles (rules aren't dead
-// code — the per-substep evaluation in `add_phase_rule` is genuinely exercised).
+// code -- the per-substep evaluation in `add_phase_rule` is genuinely exercised).
 
 #[test]
 fn phase_rule_count_stress() {
@@ -72,7 +72,7 @@ fn phase_rule_count_stress() {
 
         for i in 0..n_rules {
             let threshold = 100.0 + i as f32 * 10.0; // all thresholds < 500.0 -> all fire
-            let target_material = (i % 3 + 1) as u32; // cycle 1,2,3 — never 0 (the source id)
+            let target_material = (i % 3 + 1) as u32; // cycle 1,2,3 -- never 0 (the source id)
             sim.add_phase_rule(move |p| {
                 if p.material_id == 0 && p.temperature > threshold {
                     Some(target_material)
@@ -91,7 +91,7 @@ fn phase_rule_count_stress() {
             let transitioned = sim.particles().iter().any(|p| p.material_id != 0);
             assert!(
                 transitioned,
-                "phase_rule_count_stress n={n_rules}: no particle transitioned — rules not firing"
+                "phase_rule_count_stress n={n_rules}: no particle transitioned -- rules not firing"
             );
         }
     }
@@ -101,7 +101,7 @@ fn phase_rule_count_stress() {
 //
 // Stacks Slip + Friction + Heightmap boundaries simultaneously (each contributes its own
 // apply_to_grid_velocity / clamp_particle_position pass). Asserts particles stay inside the
-// domain and finite under three active boundary implementations at once — a case no other
+// domain and finite under three active boundary implementations at once -- a case no other
 // test exercises (existing tests use exactly one boundary).
 
 #[test]
@@ -242,7 +242,7 @@ fn force_field_count_stress() {
     sim.step_n(30);
     assert_all_finite_and_stable(&sim, "force_field_count_stress");
 
-    // All 16 fields confine to the same radius+margin — particles should not have escaped
+    // All 16 fields confine to the same radius+margin -- particles should not have escaped
     // far beyond it despite 16x the confinement evaluations per substep.
     let max_allowed = RADIUS * 1.5;
     for (i, p) in sim.particles().iter().enumerate() {
@@ -256,7 +256,7 @@ fn force_field_count_stress() {
 
 // ── sand_count_stress (granular plasticity under multi-material load) ───────────────────────
 //
-// Sand (Drucker-Prager) mixed with elastic NeoHookean across several materials simultaneously —
+// Sand (Drucker-Prager) mixed with elastic NeoHookean across several materials simultaneously --
 // checks that yield-surface return-mapping (the most numerically active plasticity path)
 // stays stable when sharing a step with other constitutive models, not just in isolation.
 

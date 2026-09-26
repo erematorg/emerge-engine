@@ -13,10 +13,10 @@ pub struct StabilityThresholds {
     pub max_out_of_bounds_particles: usize,
     pub max_invalid_physical_particle_values: usize,
     pub max_non_finite_values: usize,
-    /// Max simulation time (seconds) that may be dropped per frame before flagging.
-    /// Nonzero drop means the substep budget was exhausted — sim runs in slow motion.
+    /// Legacy compatibility threshold for former dropped simulation time.
+    /// Current solvers advance the requested time, so the measured field is zero.
     pub max_sim_time_dropped: f32,
-    /// Max velocity clamps per frame. Each clamp = G2P produced over-CFL velocity.
+    /// Legacy compatibility threshold for removed G2P velocity clipping.
     pub max_vel_clamp_count: usize,
     /// Max J projections per frame. Each projection = explicit integration diverged.
     pub max_j_projection_count: usize,
@@ -76,16 +76,17 @@ pub struct StabilityStatus {
     pub out_of_bounds_violation: bool,
     pub invalid_physical_state_violation: bool,
     pub non_finite_violation: bool,
-    /// Substep budget was exhausted — sim dropped time, may be running in slow motion.
+    /// Legacy compatibility signal for dropped-time detection (always false in
+    /// the current full-time substep path).
     pub sim_time_dropped_violation: bool,
-    /// G2P produced over-CFL velocities that were clamped — integration under stress.
+    /// Legacy compatibility signal for removed G2P velocity clipping.
     pub vel_clamp_violation: bool,
-    /// J went negative and was projected back — explicit integration diverged.
+    /// J went negative and was projected back -- explicit integration diverged.
     pub j_projection_violation: bool,
 }
 
 impl StabilityStatus {
-    pub fn healthy(self) -> bool {
+    pub const fn healthy(self) -> bool {
         !self.particle_count_violation
             && !self.inactive_grid_violation
             && !self.cell_concentration_violation
@@ -145,7 +146,7 @@ impl StabilityStatus {
         labels
     }
 
-    pub fn issue_mask(self) -> u16 {
+    pub const fn issue_mask(self) -> u16 {
         let mut mask = 0u16;
         if self.particle_count_violation {
             mask |= 1 << 0;

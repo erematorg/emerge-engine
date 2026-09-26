@@ -11,14 +11,17 @@
 pub use crate::{
     AabbConfinementField,
     ActivationStatsPlugin,
-    // Materials — all twelve (*Material types only)
+    // Materials -- all seventeen (*Material types only)
     BinghamFluidMaterial,
+    BinghamProps,
     // Queries + density field export
     BodyState,
+    BoilingMixtureMaterial,
     // Boundary conditions
     BoundaryCondition,
     BrittleProps,
     BuoyancyField,
+    CavitatingFluidMaterial,
     ChemotaxisField,
     CorotatedMaterial,
     CoulombField,
@@ -43,13 +46,19 @@ pub use crate::{
     FrictionBoundary,
     FromSI,
     GranularFluidMaterial,
+    GranularProps,
     GravityWellField,
     // Directional/phase-gated grip boundaries (shipped with the ratchet
-    // locomotion work) -- were missing from the prelude despite its own doc
-    // claiming full boundary-condition coverage; fixed 2026-07-08.
+    // locomotion work).
     GripFrictionBoundary,
     HeightmapBoundary,
 
+    IdealGasMaterial,
+    IsothermalCavitatingFluidMaterial,
+    // Real, kinematically-driven moving obstacle -- see its own doc for
+    // the "no rigid bodies" scope-compliant design and the real two-way
+    // momentum-exchange mechanism.
+    KinematicCircleBoundary,
     // Creature locomotion controller
     Lnn,
     MaterialCountPlugin,
@@ -70,7 +79,6 @@ pub use crate::{
     Particles,
 
     PlasticityModel,
-    PredictiveBoundary,
     Pressurized,
     RadialConfinementField,
     RankineMaterial,
@@ -101,6 +109,7 @@ pub use crate::{
     ViscoelasticMaterial,
     VonMisesMaterial,
     WithLatentHeat,
+    WithLatentHeatTable,
     WithPreStress,
     // Particle construction helpers
     build_particles,
@@ -110,8 +119,12 @@ pub use crate::{
     gravity_to_grid,
 
     lame_from_si,
+    // Real, dt-independent SI->grid conversion -- prefer this over
+    // `lame_from_si` for any new scene (see its own doc for the measured
+    // dt^2 bug in the older sibling above, kept only for scenes already
+    // tuned against it).
+    lame_from_si_physical,
     lame_from_young,
-    log_frame,
     log_frame_full,
     log_frame_gpu,
     per_material_stats,
@@ -119,5 +132,5 @@ pub use crate::{
     rankine_damage_estimate,
 };
 
-// Math types — re-exported so consumers don't need a separate glam dependency.
+// Math types -- re-exported so consumers don't need a separate glam dependency.
 pub use glam::{IVec2, Mat2, Vec2};

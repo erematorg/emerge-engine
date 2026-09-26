@@ -23,7 +23,7 @@ impl KLDivergence {
             if p > 0.0 && q > 0.0 {
                 kl += p * (p / q).log2();
             } else if p > 0.0 {
-                // P has support where Q does not — infinite divergence by definition
+                // P has support where Q does not -- infinite divergence by definition
                 return f64::INFINITY;
             }
             // p == 0 contributes 0 regardless of q  (0 · log(0/q) := 0)

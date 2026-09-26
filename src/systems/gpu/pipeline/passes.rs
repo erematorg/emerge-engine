@@ -10,7 +10,7 @@
 //! (built in `SimPipelines::new` from the four bind-group layouts) plus
 //! whichever WGSL `override` constants its shaders need, and returns a tuple
 //! of the pipelines it built, in the same order `SimPipelines::new` destructures
-//! them — mirrors `systems::render::pipelines`' `(Pipeline, BindGroupLayout)`
+//! them -- mirrors `systems::render::pipelines`' `(Pipeline, BindGroupLayout)`
 //! tuple style, just wider tuples since one pipeline_layout is shared by many
 //! more passes here.
 use super::super::step_params::MAX_MATERIALS;
@@ -19,7 +19,7 @@ use super::shaders;
 /// Replaces `{{MAX_MATERIALS}}` with the Rust-side value.
 /// Needed because naga requires array-size constants to be CREATION_RESOLVED (known at
 /// shader-module creation time), so WGSL `override` constants cannot be used there.
-/// MAX_FORCE_FIELDS is a loop bound only — it uses `override` and is handled via constants.
+/// MAX_FORCE_FIELDS is a loop bound only -- it uses `override` and is handled via constants.
 fn patch_shader(source: &str) -> String {
     source.replace("{{MAX_MATERIALS}}", &MAX_MATERIALS.to_string())
 }
@@ -27,9 +27,9 @@ fn patch_shader(source: &str) -> String {
 /// `skip_workgroup_zero_init`: opt-IN per pipeline, NOT a global default. WebGPU mandates
 /// zeroing `var<workgroup>` memory before use, as a safety net against reading stale data from
 /// a prior dispatch. Pass `true` ONLY if every `var<workgroup>` declared in this specific
-/// shader is provably written by every thread before any read (barrier-guarded) — skipping the
+/// shader is provably written by every thread before any read (barrier-guarded) -- skipping the
 /// zero-init then costs nothing in correctness and saves real time (measured: ~10-18% on the
-/// one pipeline that currently qualifies, particle_sort_scan). This is NOT compiler-checked —
+/// one pipeline that currently qualifies, particle_sort_scan). This is NOT compiler-checked --
 /// if a future edit to that shader (or a copy-pasted call site for a new shader) adds a
 /// `var<workgroup>` without re-verifying the write-before-read invariant, this flag must be
 /// re-audited or set back to `false`. Default to `false` for any new pipeline.
@@ -61,11 +61,11 @@ fn make_pipeline(
 
 /// Once per frame, in order (block-level counting sort, see particle_sort.wgsl): clear
 /// histogram -> count per-block -> compact (active-block list, GPU sparse grid Phase 1)
-/// -> scan (exclusive prefix sum) -> scatter into sorted_particle_ids. `active_block_swap`
-/// lives in the same shader module but is actually dispatched FIRST each substep, before
-/// clear/count/compact — see `active_block_swap_main`'s doc in particle_sort.wgsl. All six
-/// need `block_consts` (`NUM_BLOCKS_PER_DIM`) supplied, even entry points that don't read it
-/// — NUM_BLOCKS_PER_DIM is an `override` at the particle_sort.wgsl MODULE level.
+/// -> scan (exclusive prefix sum) -> scatter into sorted_particle_ids.
+/// `active_block_swap_and_clear` lives in the same shader module but is dispatched FIRST
+/// each substep, before count/compact -- see the swap pass's doc in particle_sort.wgsl. All
+/// six need `block_consts` (`NUM_BLOCKS_PER_DIM`) supplied, even entry points that don't read it
+/// -- NUM_BLOCKS_PER_DIM is an `override` at the particle_sort.wgsl MODULE level.
 pub(super) fn build_sort_pipelines(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
@@ -74,7 +74,8 @@ pub(super) fn build_sort_pipelines(
     wgpu::ComputePipeline, // particle_sort_clear
     wgpu::ComputePipeline, // particle_sort_count
     wgpu::ComputePipeline, // particle_sort_compact
-    wgpu::ComputePipeline, // active_block_swap
+    wgpu::ComputePipeline, // active_block_swap_and_clear
+    wgpu::ComputePipeline, // contact_counts_clear
     wgpu::ComputePipeline, // particle_sort_scan
     wgpu::ComputePipeline, // particle_sort_scatter
 ) {
@@ -96,7 +97,7 @@ pub(super) fn build_sort_pipelines(
         block_consts,
         false,
     );
-    // GPU sparse grid Phase 1 — reads the raw histogram before scan overwrites it into a
+    // GPU sparse grid Phase 1 -- reads the raw histogram before scan overwrites it into a
     // scatter cursor, so must run between count and scan, never reordered.
     let particle_sort_compact = make_pipeline(
         device,
@@ -108,20 +109,29 @@ pub(super) fn build_sort_pipelines(
         false,
     );
     // Dispatched FIRST each substep, before clear/count/compact in the per-substep
-    // sequence (not the once-per-frame sort sequence) — see active_block_swap_main's doc
+    // sequence (not the once-per-frame sort sequence) -- see active_block_swap_and_clear_main's doc
     // comment in particle_sort.wgsl for why.
-    let active_block_swap = make_pipeline(
+    let active_block_swap_and_clear = make_pipeline(
         device,
         layout,
         shaders::PARTICLE_SORT,
-        "active_block_swap_main",
-        "active_block_swap",
+        "active_block_swap_and_clear_main",
+        "active_block_swap_and_clear",
         block_consts,
         false,
     );
-    // particle_sort_scan is the ONLY pipeline with var<workgroup> memory (scan_temp) —
+    // particle_sort_scan is the ONLY pipeline with var<workgroup> memory (scan_temp) --
     // see the skip_workgroup_zero_init doc on make_pipeline for the safety argument.
     // Every other pipeline keeps the WebGPU-mandated zero-init (false here = default ON).
+    let contact_counts_clear = make_pipeline(
+        device,
+        layout,
+        shaders::PARTICLE_SORT,
+        "contact_counts_clear_main",
+        "contact_counts_clear",
+        block_consts,
+        false,
+    );
     let particle_sort_scan = make_pipeline(
         device,
         layout,
@@ -145,7 +155,8 @@ pub(super) fn build_sort_pipelines(
         particle_sort_clear,
         particle_sort_count,
         particle_sort_compact,
-        active_block_swap,
+        active_block_swap_and_clear,
+        contact_counts_clear,
         particle_sort_scan,
         particle_sort_scatter,
     )
@@ -156,12 +167,12 @@ pub(super) fn build_sort_pipelines(
 /// (needed by `gather_contact_points_main`'s contact_block_index call) -- both entry
 /// points compiled from that module need it supplied, even though p2g_main itself
 /// doesn't reference it. grid_update needs BOTH the force-field loop bound AND the
-/// block-dispatch constant (Phase 2 — see grid_update.wgsl doc comment), passed in via
+/// block-dispatch constant (Phase 2 -- see grid_update.wgsl doc comment), passed in via
 /// `grid_update_consts`.
 pub(super) fn build_p2g_and_grid_pipelines(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
-    block_consts: &[(&str, f64)],
+    grid_clear_consts: &[(&str, f64)],
     contact_block_consts: &[(&str, f64)],
     grid_update_consts: &[(&str, f64)],
 ) -> (
@@ -170,7 +181,7 @@ pub(super) fn build_p2g_and_grid_pipelines(
     wgpu::ComputePipeline, // gather_contact_points
     wgpu::ComputePipeline, // grid_update
 ) {
-    // MAX_MATERIALS: array-size constant — must be injected via string template
+    // MAX_MATERIALS: array-size constant -- must be injected via string template
     // (naga requires CREATION_RESOLVED; WGSL `override` doesn't apply to array sizes).
     let p2g_src = patch_shader(shaders::P2G);
 
@@ -180,7 +191,7 @@ pub(super) fn build_p2g_and_grid_pipelines(
         shaders::GRID_CLEAR,
         "grid_clear_main",
         "grid_clear",
-        block_consts,
+        grid_clear_consts,
         false,
     );
     let p2g = make_pipeline(
@@ -190,9 +201,11 @@ pub(super) fn build_p2g_and_grid_pipelines(
         "p2g_main",
         "p2g",
         contact_block_consts,
-        false,
+        // p2g_main writes every word of its workgroup tile (and the tile origin) before a
+        // barrier, ahead of any read -- see its own "no early return" setup block.
+        true,
     );
-    // Multi-field contact (GPU port, first slice) — populates `contact_points` from
+    // Multi-field contact (GPU port, first slice) -- populates `contact_points` from
     // each particle's 9-node stencil, gated on grip mass already being nonzero at that
     // node (written by `p2g` immediately before this runs). See `p2g.wgsl`'s
     // `gather_contact_points_main` doc for the full rationale.
@@ -218,41 +231,78 @@ pub(super) fn build_p2g_and_grid_pipelines(
     (grid_clear, p2g, gather_contact_points, grid_update)
 }
 
-/// g2p -> particles_update -> force_fields, the second half of the per-substep MPM
-/// sequence.
-pub(super) fn build_g2p_and_update_pipelines(
+/// The fused per-particle substep tail `g2p_update` (G2P gather -> F update/plasticity/
+/// position -> force fields, one dispatch), specialized to the material models in
+/// `models_present` (`MaterialRegistry::model_mask`; `u32::MAX` = generic).
+pub(super) fn build_g2p_update_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
     ff_consts: &[(&str, f64)],
-) -> (
-    wgpu::ComputePipeline, // g2p
-    wgpu::ComputePipeline, // particles_update
-    wgpu::ComputePipeline, // force_fields
-) {
-    // MAX_MATERIALS: array-size constant, same rationale as p2g_src above.
-    let particles_update_src = patch_shader(shaders::PARTICLES_UPDATE);
-
-    let g2p = make_pipeline(device, layout, shaders::G2P, "g2p_main", "g2p", &[], false);
-    let particles_update = make_pipeline(
+    models_present: u32,
+) -> wgpu::ComputePipeline {
+    // MAX_MATERIALS: array-size constant, same rationale as p2g_src above. The gather and
+    // force-field functions are shared WGSL snippets appended to their host module (WGSL
+    // has no includes; module-scope declarations are order-independent).
+    let g2p_update_src = patch_shader(&format!(
+        "{}
+{}
+{}",
+        shaders::PARTICLES_UPDATE,
+        shaders::G2P_GATHER_INC,
+        shaders::FORCE_FIELDS_APPLY_INC
+    ));
+    let mut consts = ff_consts.to_vec();
+    consts.push(("MODELS_PRESENT", f64::from(models_present)));
+    make_pipeline(
         device,
         layout,
-        &particles_update_src,
-        "particles_update_main",
-        "particles_update",
+        &g2p_update_src,
+        "g2p_update_main",
+        "g2p_update",
+        &consts,
+        false,
+    )
+}
+
+/// The GPU's own per-substep CFL: turns the minimum bound the particles folded into
+/// `adaptive_dt[2]` this substep into the next substep's timestep. See adaptive_cfl.wgsl.
+pub(super) fn build_cfl_commit_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+) -> wgpu::ComputePipeline {
+    make_pipeline(
+        device,
+        layout,
+        shaders::ADAPTIVE_CFL,
+        "cfl_commit_main",
+        "cfl_commit",
         &[],
         false,
+    )
+}
+
+/// Standalone force fields + sleep/wake, used only after the ASFLIP fused G2P (which
+/// replaces `g2p_update`'s gather+update but not its force-field stage).
+pub(super) fn build_force_fields_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    ff_consts: &[(&str, f64)],
+) -> wgpu::ComputePipeline {
+    let force_fields_src = format!(
+        "{}
+{}",
+        shaders::FORCE_FIELDS,
+        shaders::FORCE_FIELDS_APPLY_INC
     );
-    let force_fields = make_pipeline(
+    make_pipeline(
         device,
         layout,
-        shaders::FORCE_FIELDS,
+        &force_fields_src,
         "force_fields_main",
         "force_fields",
         ff_consts,
         false,
-    );
-
-    (g2p, particles_update, force_fields)
+    )
 }
 
 /// ASFLIP (GPU port, Fei et al. 2021) -- replaces g2p+particles_update for a substep,
@@ -275,7 +325,7 @@ pub(super) fn build_asflip_pipeline(
     )
 }
 
-/// Impulse pass — a dedicated single-pipeline layout (particles + impulse_params only,
+/// Impulse pass -- a dedicated single-pipeline layout (particles + impulse_params only,
 /// built in `layouts::build_impulse_bind_group_layout`), separate from the main
 /// 4-group `pipeline_layout` shared by every other pass in this file.
 pub(super) fn build_impulse_pipeline(
@@ -448,5 +498,65 @@ pub(super) fn build_resource_pipelines(
         resource_p2g,
         resource_normalize_laplacian,
         resource_g2p,
+    )
+}
+
+/// Real GPU port of the CPU-proven Chorin-style fluid incompressibility
+/// pressure projection -- see `fluid_pressure.wgsl`'s own module doc for the
+/// full real algorithm, citations, and why Jacobi (not CPU's exact DCT
+/// solve) is the right GPU technique. 4 pipelines: divergence+classification
+/// setup, the two alternating Jacobi sweep directions, and the final
+/// per-cell-mass momentum correction.
+pub(super) fn build_fluid_pressure_pipelines(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+) -> (
+    wgpu::ComputePipeline, // fluid_pressure_setup
+    wgpu::ComputePipeline, // fluid_pressure_jacobi_a_to_b
+    wgpu::ComputePipeline, // fluid_pressure_jacobi_b_to_a
+    wgpu::ComputePipeline, // fluid_pressure_correct
+) {
+    let fluid_pressure_setup = make_pipeline(
+        device,
+        layout,
+        shaders::FLUID_PRESSURE,
+        "fluid_pressure_setup_main",
+        "fluid_pressure_setup",
+        &[],
+        false,
+    );
+    let fluid_pressure_jacobi_a_to_b = make_pipeline(
+        device,
+        layout,
+        shaders::FLUID_PRESSURE,
+        "fluid_pressure_jacobi_a_to_b_main",
+        "fluid_pressure_jacobi_a_to_b",
+        &[],
+        false,
+    );
+    let fluid_pressure_jacobi_b_to_a = make_pipeline(
+        device,
+        layout,
+        shaders::FLUID_PRESSURE,
+        "fluid_pressure_jacobi_b_to_a_main",
+        "fluid_pressure_jacobi_b_to_a",
+        &[],
+        false,
+    );
+    let fluid_pressure_correct = make_pipeline(
+        device,
+        layout,
+        shaders::FLUID_PRESSURE,
+        "fluid_pressure_correct_main",
+        "fluid_pressure_correct",
+        &[],
+        false,
+    );
+
+    (
+        fluid_pressure_setup,
+        fluid_pressure_jacobi_a_to_b,
+        fluid_pressure_jacobi_b_to_a,
+        fluid_pressure_correct,
     )
 }

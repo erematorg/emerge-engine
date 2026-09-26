@@ -1,4 +1,4 @@
-//! Standalone rod time integration — no grid, no `Simulation` (Phase 0/1).
+//! Standalone rod time integration -- no grid, no `Simulation` (Phase 0/1).
 //! Phase 2's grid-coupled path reuses `forces::compute_internal_forces`
 //! directly (see `coupling.rs`) rather than this integrator.
 
@@ -7,7 +7,7 @@ use glam::Vec2;
 use super::{RodMaterial, RodPoints, RodRestState, compute_internal_forces};
 
 /// One explicit (symplectic Euler) rod substep. Pinned points held at
-/// `v=0`/position fixed — identical semantics to `Particle::pinned`'s own
+/// `v=0`/position fixed -- identical semantics to `Particle::pinned`'s own
 /// G2P handling (forces v=0 instead of gathering, position left completely
 /// untouched, mass/forces still computed normally so the anchor is real).
 pub fn step_rod(
@@ -63,20 +63,20 @@ pub fn step_rod(
 
 /// CFL-safe `dt` bound for the rod's own explicit integrator, covering BOTH
 /// stiffness (axial + bending natural frequencies, `dt < 2/omega`) AND
-/// damping (axial + bending dashpots, `dt < 2*m/c` — its own, independent
-/// explicit-Euler stability limit) — the rod's own direct analog of
+/// damping (axial + bending dashpots, `dt < 2*m/c` -- its own, independent
+/// explicit-Euler stability limit) -- the rod's own direct analog of
 /// `materials::utils::elastic_wave_dt` PLUS `ViscoelasticMaterial::
 /// timestep_bound`'s separate `viscous_dt` term. No `dx_meters` parameter
-/// needed — `mass`/`rest_edge_length` are already real SI (kg/meters), so
+/// needed -- `mass`/`rest_edge_length` are already real SI (kg/meters), so
 /// every bound here comes out in real seconds directly.
 ///
 /// Computed per-point rather than per-edge/vertex: an interior point is
 /// coupled to 2 axial edges AND up to 3 overlapping bending vertices
 /// simultaneously, so this sums every stiffness/damping term touching each
-/// point — a real Gershgorin circle row-sum bound (for `x''=-M^-1 K x`, the
+/// point -- a real Gershgorin circle row-sum bound (for `x''=-M^-1 K x`, the
 /// spectral radius of `M^-1 K` is bounded by `max_i(sum_j |K_ij|)/m_i`, the
 /// standard way to localize eigenvalues without a full eigendecomposition)
-/// — then takes the min across points. Endpoints see fewer coupled terms
+/// -- then takes the min across points. Endpoints see fewer coupled terms
 /// and correctly get a larger safe dt than an interior point.
 /// Point `i`'s own `(omega_sq, damping_rate)` Gershgorin row-sum, shared by
 /// `rod_cfl_dt` and `apply_mass_scaling_for_target_dt` so both work from the

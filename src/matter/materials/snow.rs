@@ -2,9 +2,9 @@ use glam::{Mat2, Vec2};
 
 use crate::materials::physical_props::{FromSI, SnowProps, scale_lame};
 use crate::materials::svd::svd2;
-use crate::materials::utils::{MIN_J, elastic_wave_dt, lame_from_young};
+use crate::materials::utils::{MIN_J, deformation_increment_exp, elastic_wave_dt, lame_from_young};
 use crate::materials::{ConstitutiveModel, MaterialModel, MaterialParams, polar_decomposition_2d};
-use crate::particle::{Particle, Particles};
+use crate::particle::{Particle, ParticleUpdateCtx, Particles};
 
 /// Snow constitutive model: corotated elasticity + SVD-based plasticity.
 ///
@@ -31,13 +31,17 @@ pub struct StomakhinMaterial {
     pub max_plastic_jacobian: f32,
     /// Cohesion pressure: τ += −c · max(1−Jp, 0) · I.
     /// Creates attractive stress in plastically compacted snow (Jp < 1).
-    /// 0.0 = no cohesion (Stomakhin 2013 default — powder, loose snow).
+    /// 0.0 = no cohesion (Stomakhin 2013 default -- powder, loose snow).
     /// ~500–2000 for packed/wet snow that sticks after impact.
     pub cohesion_coeff: f32,
 }
 
 impl StomakhinMaterial {
-    pub fn new(
+    /// Construct directly from grid-native Lame parameters and Stomakhin
+    /// 2013's own plasticity thresholds -- NOT SI Pascals (see
+    /// [`Self::from_young_modulus`] for the common gotcha and the real SI
+    /// conversion path).
+    pub const fn new(
         lambda: f32,
         mu: f32,
         hardening_exponent: f32,
@@ -58,13 +62,22 @@ impl StomakhinMaterial {
         }
     }
 
-    pub fn with_cohesion(mut self, coeff: f32) -> Self {
+    pub const fn with_cohesion(mut self, coeff: f32) -> Self {
         self.cohesion_coeff = coeff;
         self
     }
 
     /// Stomakhin 2013 canonical plasticity: ξ=10, θ_c=0.025, θ_s=0.0075.
-    /// Canonical: E = 1.4e5, ν = 0.2 — matches MPM2D reference and sparkl snow demos.
+    /// Canonical: E = 1.4e5, ν = 0.2 -- matches MPM2D reference and sparkl snow demos.
+    /// **Grid units, NOT real Pascals** (real disclosure added 2026-09-05,
+    /// same finding as `NeoHookeanMaterial::from_young_modulus`'s own doc):
+    /// calls [`lame_from_young`] directly, never touches `dx_meters`/
+    /// density. For a real, correctly SI-to-grid-converted material, build
+    /// an [`Elastoplastic`](crate::materials::Elastoplastic) with
+    /// `model: PlasticityModel::Snow` and call its `.material(&config)`
+    /// (real dispatch, see that method's own doc) -- `Self::from_physical`
+    /// exists but its `SnowProps` input type is crate-internal, not
+    /// constructible from outside.
     pub fn from_young_modulus(young_modulus: f32, poisson_ratio: f32) -> Self {
         let (lambda, mu) = lame_from_young(young_modulus, poisson_ratio);
         Self::new(lambda, mu, 10.0, 0.025, 0.0075, 0.6, 20.0)
@@ -138,9 +151,13 @@ impl MaterialModel for StomakhinMaterial {
         particles.initial_volume[i]
     }
 
-    fn update_particle(&self, particles: &mut Particles, i: usize, dt: f32) {
-        let f_trial = (Mat2::IDENTITY + dt * particles.velocity_gradient[i])
-            * particles.deformation_gradient[i];
+    fn update_particle(&self, ctx: &mut ParticleUpdateCtx, dt: f32) {
+        // Integrate Fdot = C F with the exact constant-C increment. Forward
+        // Euler introduces an O(dt^2) determinant ratchet under alternating
+        // rates/rotation; for snow that numerical volume error can be mistaken
+        // for real SVD-clamp plasticity and permanently alter Jp/hardening.
+        let f_trial =
+            deformation_increment_exp(dt * *ctx.velocity_gradient) * *ctx.deformation_gradient;
 
         let (u, sigma, vt) = svd2(f_trial);
 
@@ -153,25 +170,23 @@ impl MaterialModel for StomakhinMaterial {
                 .clamp(1.0 - self.compression_limit, 1.0 + self.stretch_limit),
         );
 
-        let jp_new =
-            particles.plastic_volume_ratio[i] * (sigma.x * sigma.y) / (sigma_c.x * sigma_c.y);
+        let jp_new = *ctx.plastic_volume_ratio * (sigma.x * sigma.y) / (sigma_c.x * sigma_c.y);
         // Known: Jp drifts slowly over thousands of substeps due to cumulative SVD rounding.
         // Clamp prevents blow-up but doesn't eliminate drift. Acceptable for LP timescales.
-        particles.plastic_volume_ratio[i] =
+        *ctx.plastic_volume_ratio =
             jp_new.clamp(self.min_plastic_jacobian, self.max_plastic_jacobian);
 
         // h clamped [0.1, 7.0]: upper bound is CFL-driven (h=7 → E_eff=35k → ~20 substeps).
-        particles.hardening_scale[i] = (self.hardening_exponent
-            * (1.0 - particles.plastic_volume_ratio[i]))
+        *ctx.hardening_scale = (self.hardening_exponent * (1.0 - *ctx.plastic_volume_ratio))
             .exp()
             .clamp(0.1, 7.0);
 
-        particles.deformation_gradient[i] = u * Mat2::from_diagonal(sigma_c) * vt;
+        *ctx.deformation_gradient = u * Mat2::from_diagonal(sigma_c) * vt;
 
-        let j = particles.deformation_gradient[i].determinant().max(MIN_J);
-        let v = (particles.initial_volume[i] * j).max(1.0e-6);
-        particles.volume[i] = v;
-        particles.density[i] = particles.mass[i] / v;
+        let j = ctx.deformation_gradient.determinant().max(MIN_J);
+        let v = (ctx.initial_volume * j).max(1.0e-6);
+        *ctx.volume = v;
+        *ctx.density = ctx.mass / v;
     }
 
     fn params(&self) -> MaterialParams {
@@ -197,7 +212,7 @@ impl MaterialModel for StomakhinMaterial {
         material_cfl: f32,
         _viscous_cfl: f32,
     ) -> f32 {
-        // h grows when snow compresses — accounts for stiffening in CFL bound
+        // h grows when snow compresses -- accounts for stiffening in CFL bound
         elastic_wave_dt(
             self.lambda,
             self.mu,
@@ -213,6 +228,21 @@ impl MaterialModel for StomakhinMaterial {
 #[cfg(test)]
 mod analytical_validation_tests {
     use super::*;
+
+    fn run_rate_step(
+        mat: &StomakhinMaterial,
+        particles: &mut Particles,
+        velocity_gradient: Mat2,
+        dt: f32,
+    ) {
+        let mut ctx = particles.update_ctx(0);
+        *ctx.velocity_gradient = velocity_gradient;
+        mat.update_particle(&mut ctx, dt);
+    }
+
+    fn matrix_error(a: Mat2, b: Mat2) -> f32 {
+        (a.x_axis - b.x_axis).length() + (a.y_axis - b.y_axis).length()
+    }
 
     fn particle_with(f: Mat2, hardening_scale: f32, plastic_volume_ratio: f32) -> Particles {
         let mut p = Particle::zeroed();
@@ -271,7 +301,7 @@ mod analytical_validation_tests {
         let sigma_x = 1.0 - 0.99 * mat.compression_limit; // just inside the floor
         let f = Mat2::from_diagonal(Vec2::new(sigma_x, 1.0));
         let mut particles = particle_with(f, 1.0, 1.0);
-        mat.update_particle(&mut particles, 0, 1.0);
+        mat.update_particle(&mut particles.update_ctx(0), 1.0);
         let f_after = particles.deformation_gradient[0];
         assert!(
             (f_after.x_axis.x - sigma_x).abs() < 1.0e-5,
@@ -291,7 +321,7 @@ mod analytical_validation_tests {
         let sigma_x = 1.0 - 1.5 * mat.compression_limit; // comfortably beyond the floor
         let f = Mat2::from_diagonal(Vec2::new(sigma_x, 1.0));
         let mut particles = particle_with(f, 1.0, 1.0);
-        mat.update_particle(&mut particles, 0, 1.0);
+        mat.update_particle(&mut particles.update_ctx(0), 1.0);
         let f_after = particles.deformation_gradient[0];
 
         let expected_clamped = 1.0 - mat.compression_limit;
@@ -312,6 +342,114 @@ mod analytical_validation_tests {
              {expected_jp}, got {}",
             particles.plastic_volume_ratio[0]
         );
+    }
+
+    /// A rigid spin has zero strain and must neither trigger the SVD clamp nor
+    /// fabricate permanent compaction/hardening. This exercises the complete
+    /// snow update, rather than only the shared matrix-exponential helper.
+    #[test]
+    fn rigid_rotation_preserves_volume_and_does_not_harden_snow() {
+        let mat = StomakhinMaterial::from_young_modulus(1.4e5, 0.2);
+        let mut particles = particle_with(Mat2::IDENTITY, 1.0, 1.0);
+        let omega = 3.7;
+        let dt = 0.1;
+        let spin = Mat2::from_cols(Vec2::new(0.0, omega), Vec2::new(-omega, 0.0));
+
+        run_rate_step(&mat, &mut particles, spin, dt);
+
+        let expected = Mat2::from_angle(omega * dt);
+        assert!(
+            matrix_error(particles.deformation_gradient[0], expected) < 2.0e-6,
+            "snow rigid spin must remain a rotation: expected={expected:?}, got={:?}",
+            particles.deformation_gradient[0]
+        );
+        assert!((particles.deformation_gradient[0].determinant() - 1.0).abs() < 1.0e-6);
+        assert_eq!(particles.plastic_volume_ratio[0], 1.0);
+        assert_eq!(particles.hardening_scale[0], 1.0);
+    }
+
+    /// Equal and opposite sub-clamp rates are exactly reversible under the
+    /// exponential kinematic update. Since neither trial state reaches a snow
+    /// plastic bound, Jp and h must remain unchanged rather than accumulate.
+    #[test]
+    fn opposite_subclamp_rates_are_reversible_without_false_plasticity() {
+        let mat = StomakhinMaterial::from_young_modulus(1.4e5, 0.2);
+        let mut particles = particle_with(Mat2::IDENTITY, 1.0, 1.0);
+        let rate = Mat2::from_diagonal(Vec2::new(-0.1, 0.05));
+        let dt = 0.1;
+
+        run_rate_step(&mat, &mut particles, rate, dt);
+        assert_eq!(particles.plastic_volume_ratio[0], 1.0);
+        assert_eq!(particles.hardening_scale[0], 1.0);
+        run_rate_step(&mat, &mut particles, -rate, dt);
+
+        assert!(
+            matrix_error(particles.deformation_gradient[0], Mat2::IDENTITY) < 2.0e-6,
+            "sub-clamp rate reversal must recover identity, got {:?}",
+            particles.deformation_gradient[0]
+        );
+        assert_eq!(particles.plastic_volume_ratio[0], 1.0);
+        assert_eq!(particles.hardening_scale[0], 1.0);
+    }
+
+    /// Constructs trial stretches through nonzero C, on either side of the
+    /// compression limit. This pins the important migration invariant: using
+    /// exp(dt*C) must not move a marginal elastic case onto the plastic branch,
+    /// while a genuinely over-limit trial must still clamp and update Jp.
+    #[test]
+    fn exponential_trial_respects_both_sides_of_compression_limit() {
+        let mat = StomakhinMaterial::from_young_modulus(1.4e5, 0.2);
+        let dt = 0.1;
+        let floor = 1.0 - mat.compression_limit;
+
+        let inside_sigma = floor + 1.0e-4;
+        let mut inside = particle_with(Mat2::IDENTITY, 1.0, 1.0);
+        let inside_rate = Mat2::from_diagonal(Vec2::new(inside_sigma.ln() / dt, 0.0));
+        run_rate_step(&mat, &mut inside, inside_rate, dt);
+        assert!((inside.deformation_gradient[0].x_axis.x - inside_sigma).abs() < 2.0e-6);
+        assert_eq!(inside.plastic_volume_ratio[0], 1.0);
+        assert_eq!(inside.hardening_scale[0], 1.0);
+
+        let outside_sigma = floor - 1.0e-4;
+        let mut outside = particle_with(Mat2::IDENTITY, 1.0, 1.0);
+        let outside_rate = Mat2::from_diagonal(Vec2::new(outside_sigma.ln() / dt, 0.0));
+        run_rate_step(&mat, &mut outside, outside_rate, dt);
+        assert!((outside.deformation_gradient[0].x_axis.x - floor).abs() < 2.0e-6);
+        let expected_jp = outside_sigma / floor;
+        assert!((outside.plastic_volume_ratio[0] - expected_jp).abs() < 2.0e-6);
+        let expected_h = (mat.hardening_exponent * (1.0 - expected_jp)).exp();
+        assert!((outside.hardening_scale[0] - expected_h).abs() < 2.0e-6);
+    }
+
+    /// Plastic compaction is permanent, whereas an elastic unload must not
+    /// further alter Jp. A second compression only adds hardening once the
+    /// clamped elastic stretch is reached again.
+    #[test]
+    fn compression_unload_recompression_accumulates_only_when_clamp_binds() {
+        let mat = StomakhinMaterial::from_young_modulus(1.4e5, 0.2);
+        let mut particles = particle_with(Mat2::IDENTITY, 1.0, 1.0);
+        let dt = 0.1;
+        let compression = Mat2::from_diagonal(Vec2::new(-0.5, 0.0));
+
+        run_rate_step(&mat, &mut particles, compression, dt);
+        let jp_after_first = particles.plastic_volume_ratio[0];
+        let h_after_first = particles.hardening_scale[0];
+        assert!(jp_after_first < 1.0 && h_after_first > 1.0);
+
+        // Small elastic unload: the singular value moves away from the lower
+        // clamp but remains below the stretch bound.
+        let unload = Mat2::from_diagonal(Vec2::new(0.1, 0.0));
+        run_rate_step(&mat, &mut particles, unload, dt);
+        assert!((particles.plastic_volume_ratio[0] - jp_after_first).abs() < 2.0e-6);
+        assert!((particles.hardening_scale[0] - h_after_first).abs() < 2.0e-6);
+
+        run_rate_step(&mat, &mut particles, compression, dt);
+        let jp_after_second = particles.plastic_volume_ratio[0];
+        let h_after_second = particles.hardening_scale[0];
+        assert!(jp_after_second < jp_after_first);
+        assert!(h_after_second > h_after_first);
+        let expected_h = (mat.hardening_exponent * (1.0 - jp_after_second)).exp();
+        assert!((h_after_second - expected_h).abs() < 2.0e-6);
     }
 
     /// **Cohesion must match its own documented formula exactly** -- pins the
@@ -359,6 +497,65 @@ mod analytical_validation_tests {
             delta_uncompacted.x_axis.x.abs() < 1.0e-5 && delta_uncompacted.y_axis.y.abs() < 1.0e-5,
             "Jp=1.0 (never compacted) must produce zero cohesion contribution, got \
              {delta_uncompacted:?}"
+        );
+    }
+
+    /// **Real, dynamic compaction-hardening test** -- the category-defining
+    /// snow behavior ("compressed snow is stiffer," this file's own module
+    /// doc, Stomakhin 2013 §4.2) had zero test driving it through real
+    /// `update_particle` substeps before this; every existing test above
+    /// hand-sets `hardening_scale`/`plastic_volume_ratio` directly rather
+    /// than letting them accumulate from real sustained compression. Real,
+    /// dynamic mirror of `VonMises`'s permanent-set test and `Rankine`'s
+    /// softening test (2026-08-04) -- snow's own real contrast is
+    /// HARDENING, the opposite sign of Rankine's softening.
+    #[test]
+    fn repeated_compaction_genuinely_stiffens_snow_real_hardening_dynamics() {
+        // Real Stomakhin 2013 canonical params (xi=10, theta_c=0.025).
+        let mat = StomakhinMaterial::from_young_modulus(1.4e5, 0.2);
+
+        // Drive ONE particle through repeated compressive substeps via the
+        // real `update_particle` path (Jp/hardening_scale accumulate
+        // naturally, not hand-set) -- a sustained uniaxial compression rate,
+        // the same real mechanism a footstep/snowball packing would apply.
+        let mut particles = particle_with(Mat2::IDENTITY, 1.0, 1.0);
+        let dt = 0.01;
+        {
+            let mut ctx = particles.update_ctx(0);
+            *ctx.velocity_gradient = Mat2::from_diagonal(Vec2::new(-0.5, -0.5));
+            for _ in 0..20 {
+                mat.update_particle(&mut ctx, dt);
+            }
+        }
+
+        let jp_after = particles.plastic_volume_ratio[0];
+        let h_after = particles.hardening_scale[0];
+        assert!(
+            jp_after < 1.0,
+            "sustained real compression must genuinely compact the material (Jp<1), got {jp_after}"
+        );
+        assert!(
+            h_after > 1.0,
+            "genuinely compacted snow must be stiffer (hardening_scale>1), got {h_after}"
+        );
+
+        // Real stress-stiffening proof: apply the exact same current
+        // deformation to a compacted particle vs a fresh (h=1, Jp=1)
+        // particle AT THE SAME F -- compacted must produce a LARGER stress
+        // for the identical deformation, the real "packed snow resists
+        // further compression more" signature, not just an unused number.
+        let f_current = particles.deformation_gradient[0];
+        let compacted = particle_with(f_current, h_after, jp_after);
+        let fresh = particle_with(f_current, 1.0, 1.0);
+        let tau_compacted = mat.kirchhoff_stress(&compacted, 0);
+        let tau_fresh = mat.kirchhoff_stress(&fresh, 0);
+        let mag = |t: Mat2| (t.x_axis.length_squared() + t.y_axis.length_squared()).sqrt();
+        assert!(
+            mag(tau_compacted) > mag(tau_fresh),
+            "compacted snow must show a stiffer (larger-magnitude) stress response to the \
+             identical deformation than fresh snow: compacted={:.3}, fresh={:.3}",
+            mag(tau_compacted),
+            mag(tau_fresh)
         );
     }
 }

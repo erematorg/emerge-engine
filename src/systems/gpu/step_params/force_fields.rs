@@ -5,7 +5,7 @@
 /// Must match `MAX_FORCE_FIELDS` in `force_fields.wgsl`.
 pub const MAX_FORCE_FIELDS: usize = 16;
 
-/// Field-type discriminants — match `FIELD_*` constants in `force_fields.wgsl`.
+/// Field-type discriminants -- match `FIELD_*` constants in `force_fields.wgsl`.
 pub mod field_type {
     pub const DISABLED: u32 = 0;
     pub const GRAVITY_WELL: u32 = 1;
@@ -18,7 +18,7 @@ pub mod field_type {
     pub const SPATIAL_DRAG_CYLINDER: u32 = 8;
 }
 
-/// One GPU force-field entry — 48 bytes, 16-byte aligned.
+/// One GPU force-field entry -- 48 bytes, 16-byte aligned.
 /// Matches `struct FieldEntry` in `force_fields.wgsl` exactly (size-asserted).
 /// Use the named constructors instead of filling `params` manually.
 #[repr(C)]
@@ -144,7 +144,7 @@ impl GpuFieldEntry {
 
     /// Spatially-constant electric field: a = q · E / m.
     ///
-    /// - `field`: E-field vector (simulation units — force per unit charge)
+    /// - `field`: E-field vector (simulation units -- force per unit charge)
     /// - `charge`: per-particle charge for `material_id` (same units as the Coulomb constant)
     /// - `material_id`: only particles of this material are affected
     pub fn uniform_electric(field: glam::Vec2, charge: f32, material_id: u32) -> Self {
@@ -164,7 +164,7 @@ impl GpuFieldEntry {
     ///
     /// - `gravity`: must match `SimConfig::gravity` (solver gravity, including sign)
     /// - `fluid_density_grid`: surrounding fluid's rest_density in grid units
-    ///   (`ρ_SI · dx_m²` — same value as `NewtonianFluidMaterial::rest_density`, no
+    ///   (`ρ_SI · dx_m²` -- same value as `NewtonianFluidMaterial::rest_density`, no
     ///   extra `/dt_s²` factor)
     /// - `material_id`: only particles of this material receive the buoyancy force
     ///
@@ -176,7 +176,7 @@ impl GpuFieldEntry {
         p[0] = gravity.x;
         p[1] = gravity.y;
         p[2] = fluid_density_grid;
-        p[3] = 1.0e-4; // min_density floor — mirrors BuoyancyField::new default
+        p[3] = 1.0e-4; // min_density floor -- mirrors BuoyancyField::new default
         Self {
             field_type: field_type::BUOYANCY,
             material_mask: 1 << material_id,
@@ -185,7 +185,7 @@ impl GpuFieldEntry {
         }
     }
 
-    /// Linear drag toward a target/ambient flow velocity: a = k·(v_target − v_particle) —
+    /// Linear drag toward a target/ambient flow velocity: a = k·(v_target − v_particle) --
     /// see `LinearDragField`'s (CPU) doc comment for the real physics (Stokes drag /
     /// Rayleigh friction) this mirrors exactly. River current, wind-blown sand, any scene
     /// needing sustained directional flow instead of gravity settling into a static
@@ -194,7 +194,7 @@ impl GpuFieldEntry {
     /// - `target_velocity`: the ambient flow velocity particles relax toward
     /// - `drag_coefficient`: relaxation rate k (1/time); decay timescale is 1/k
     /// - `material_mask`: general bitmask (`1 << material_id`, OR together for several,
-    ///   or `Self::ALL_MATERIALS`) — NOT a single `material_id` like most other
+    ///   or `Self::ALL_MATERIALS`) -- NOT a single `material_id` like most other
     ///   constructors here, matching `LinearDragField`'s own CPU-side parameter exactly
     ///   for real CPU/GPU parity.
     pub fn linear_drag(
@@ -217,10 +217,10 @@ impl GpuFieldEntry {
     /// Spatially-varying wind/current drag: same `a = k·(target(x) − v)` mechanism as
     /// `linear_drag`, but `target` is sampled from the real, exact closed-form solution
     /// for 2D potential flow around a circular cylinder (uniform stream + doublet
-    /// superposition — see CPU's `SpatialDragField`/its test module doc for the derivation
+    /// superposition -- see CPU's `SpatialDragField`/its test module doc for the derivation
     /// and citations). WGSL has no function pointers, so unlike CPU's generic
     /// `target_velocity_fn: fn(Vec2) -> Vec2`, this GPU port bakes this ONE specific
-    /// analytic formula into its own field-type case in `force_fields.wgsl` — the real,
+    /// analytic formula into its own field-type case in `force_fields.wgsl` -- the real,
     /// disclosed trade-off of porting a fn-pointer-based mechanism to a shader.
     ///
     /// - `cylinder_center`: the flow singularity's position, in grid coordinates
@@ -249,7 +249,7 @@ impl GpuFieldEntry {
     }
 }
 
-/// Uniform buffer containing all active GPU force-field entries — 784 bytes.
+/// Uniform buffer containing all active GPU force-field entries -- 784 bytes.
 /// Matches `struct FieldsParams` in `force_fields.wgsl` exactly (size-asserted).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]

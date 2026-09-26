@@ -1,13 +1,13 @@
-// Grid clear — zero cells before each P2G pass.
+// Grid clear -- zero cells before each P2G pass.
 //
 // GPU sparse grid Phase 1 (see mpm_technique_survey memory note): dispatch one workgroup per
-// POTENTIAL active-block slot (NUM_BLOCKS, fixed worst-case size — no indirect dispatch yet,
+// POTENTIAL active-block slot (NUM_BLOCKS, fixed worst-case size -- no indirect dispatch yet,
 // that's Phase 3), with an early-return guard for slots beyond how many blocks are actually
 // active this frame. The few workgroups that proceed clear only their own block's real cell
-// range, not the whole grid_res² grid — this is where the actual win comes from. P2G,
+// range, not the whole grid_res² grid -- this is where the actual win comes from. P2G,
 // grid_update, and G2P are untouched by this phase; they still index the (still dense) grid
 // buffer exactly as before. Only which cells get zeroed changes, never the value written once
-// a cell is touched — same physics, less wasted work.
+// a cell is touched -- same physics, less wasted work.
 //
 // Must run before P2G every substep so the atomic scatter starts from zero.
 //
@@ -24,33 +24,51 @@ struct StepParams {
     particle_count:     u32,
     dt:                 f32,
     kernel_d_inverse:          f32,
-    gravity:            vec2<f32>, // angled gravity — offset 16, 8-byte aligned ✓
+    gravity:            vec2<f32>, // angled gravity -- offset 16, 8-byte aligned ✓
     boundary_thickness: u32,
     vel_limit:          f32,
     sleep_threshold:    f32,
     _pad0:              u32,
     _pad1:              u32,
-    _pad2:              u32, // 48 bytes — 16-byte aligned for uniform binding ✓
+    contact_active:              u32, // 48 bytes -- 16-byte aligned for uniform binding ✓
 }
 
-// override, not a hardcoded literal — must match particle_sort.wgsl's NUM_BLOCKS_PER_DIM
+// override, not a hardcoded literal -- must match particle_sort.wgsl's NUM_BLOCKS_PER_DIM
 // exactly, single Rust-side source of truth (src/gpu/mod.rs step_params module).
 override NUM_BLOCKS_PER_DIM: u32;
-const NUM_BLOCKS: u32 = 256u; // NUM_BLOCKS_PER_DIM² — array sizes can't be override-derived
-// Thread-grid covering one block, per workgroup — see the grid-stride loop below for why a
+const NUM_BLOCKS: u32 = 256u; // NUM_BLOCKS_PER_DIM² -- array sizes can't be override-derived
+// Thread-grid covering one block, per workgroup -- see the grid-stride loop below for why a
 // fixed-size workgroup still correctly covers a block whose real cell range is larger.
-const BLOCK_THREADS_PER_DIM: u32 = 16u;
+// Threads per workgroup side -- set at pipeline creation to min(16, cells per block
+// side): at grid_res=64 a block is 4x4 cells, and a 16x16 workgroup left 240 of its
+// 256 threads idle on every one of up to 512 dispatched workgroups. The grid-stride
+// loops below still cover blocks larger than this.
+override BLOCK_THREADS_PER_DIM: u32 = 16u;
 
 @group(0) @binding(1)  var<storage, read_write> grid:                    array<Cell>;
 @group(0) @binding(3)  var<uniform>             step_params:             StepParams;
+
+// This substep's timestep, decided on the GPU (see adaptive_cfl.wgsl). Zero means this
+// encoded substep is spare capacity and must do nothing.
+@group(2) @binding(37) var<storage, read_write> adaptive_dt: array<atomic<u32>, 4>;
+
+var<private> substep_dt_cache: f32 = -1.0;
+
+fn substep_dt() -> f32 {
+    if substep_dt_cache < 0.0 {
+        substep_dt_cache = bitcast<f32>(atomicLoad(&adaptive_dt[0]));
+    }
+    return substep_dt_cache;
+}
+
 @group(0) @binding(8)  var<storage, read_write> active_block_ids:        array<u32, NUM_BLOCKS>;
 @group(0) @binding(9)  var<storage, read_write> active_block_count:      atomic<u32>;
 @group(0) @binding(10) var<storage, read_write> active_block_ids_prev:   array<u32, NUM_BLOCKS>;
 @group(0) @binding(11) var<storage, read_write> active_block_count_prev: u32;
-// Multi-field contact (GPU port, first slice) — same dense grid_res² cell range as
+// Multi-field contact (GPU port, first slice) -- same dense grid_res² cell range as
 // `grid` above, zeroed alongside it every substep. See buffers.rs doc for the full
 // rationale. `contact_point_counts` (bucketed per coarse BLOCK, not per cell) is
-// cleared separately by particle_sort_clear_main (particle_sort.wgsl) instead — its
+// cleared separately by particle_sort_clear_main (particle_sort.wgsl) instead -- its
 // 256-entry size doesn't match this pass's per-CELL iteration.
 @group(1) @binding(12) var<storage, read_write> grip_grid:               array<Cell>;
 
@@ -67,18 +85,23 @@ const MAX_RENDER_MATERIAL_SLOTS: u32 = 16u;
 @group(1) @binding(30) var<storage, read_write> material_mass:        array<f32>;
 @group(1) @binding(31) var<uniform>              material_mass_params: MaterialMassParams;
 
-// Dispatch: (2 * NUM_BLOCKS, 1, 1) workgroups, every frame, fixed — worst case (every block
+// Dispatch: (2 * NUM_BLOCKS, 1, 1) workgroups, every frame, fixed -- worst case (every block
 // active, in both lists) never overflows. workgroup_id.x is a SLOT, not a block ID. Slots
 // 0..NUM_BLOCKS index THIS substep's active_block_ids; slots NUM_BLOCKS..2*NUM_BLOCKS index
-// active_block_ids_prev (LAST substep's list, offset by NUM_BLOCKS) — the one-substep grace
+// active_block_ids_prev (LAST substep's list, offset by NUM_BLOCKS) -- the one-substep grace
 // period that guarantees a block which just stopped being active still gets cleared one more
-// time. See active_block_swap_main in particle_sort.wgsl for why this exists. Most slots
+// time. See active_block_swap_and_clear_main in particle_sort.wgsl for why this exists. Most slots
 // beyond their list's real count do nothing at all.
 @compute @workgroup_size(BLOCK_THREADS_PER_DIM, BLOCK_THREADS_PER_DIM, 1)
 fn grid_clear_main(
     @builtin(workgroup_id) wg_id: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
+    // Spare encoded substeps (the frame's time is already advanced, see adaptive_cfl.wgsl)
+    // must leave the grid ALONE: p2g no longer scatters into it, so clearing here would
+    // hand the renderer -- and anything else reading `grid_buffer()` after the frame, like
+    // ColorMode::GridVolume -- an all-zero grid.
+    if substep_dt() <= 0.0 { return; }
     var block: u32;
     if wg_id.x < NUM_BLOCKS {
         if wg_id.x >= atomicLoad(&active_block_count) { return; }
@@ -96,7 +119,7 @@ fn grid_clear_main(
     let x_start = block_x * block_size;
     let y_start = block_y * block_size;
     // Last block per row/column covers a smaller residual range when grid_res doesn't divide
-    // evenly by NUM_BLOCKS_PER_DIM — clamp so no cell index ever reaches grid_res.
+    // evenly by NUM_BLOCKS_PER_DIM -- clamp so no cell index ever reaches grid_res.
     let x_end = min(x_start + block_size, res);
     let y_end = min(y_start + block_size, res);
 
@@ -114,9 +137,15 @@ fn grid_clear_main(
             grid[idx].momentum = vec2<f32>(0.0, 0.0);
             grid[idx].mass     = 0.0;
             grid[idx]._pad     = 0.0;
-            grip_grid[idx].momentum = vec2<f32>(0.0, 0.0);
-            grip_grid[idx].mass     = 0.0;
-            grip_grid[idx]._pad     = 0.0;
+            // The grip grid (multi-field contact) is only scattered into, decoded and
+            // read while some particle has contact_group != 0 (`contact_active`); outside
+            // that it is left untouched, and the active blocks get cleared here again
+            // before any scatter the substep contact turns back on.
+            if step_params.contact_active != 0u {
+                grip_grid[idx].momentum = vec2<f32>(0.0, 0.0);
+                grip_grid[idx].mass     = 0.0;
+                grip_grid[idx]._pad     = 0.0;
+            }
             if material_mass_params.enabled != 0u {
                 let mm_base = idx * MAX_RENDER_MATERIAL_SLOTS;
                 for (var s: u32 = 0u; s < MAX_RENDER_MATERIAL_SLOTS; s++) {

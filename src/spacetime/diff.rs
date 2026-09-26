@@ -23,20 +23,34 @@
 //!   code runs on an already-zeroed velocity, so the canonical walker
 //!   actually trains against a *sticky* floor (grid cells at floor level
 //!   moving downward get zeroed) -- which is exactly what this module
-//!   implements, with the branch decision recorded forward and replayed as a
-//!   fixed linear map backward (same "detach the branch" treatment as the
-//!   kernel-weight kink documented throughout `spacetime::transfer`).
+//!   implements, with the branch decision (stick vs. not) recorded forward
+//!   and replayed as a fixed linear map backward -- a genuinely universal
+//!   non-differentiability (a hard `if`), the same treatment any
+//!   differentiable contact simulator has to make somewhere.
 //! - **Actuator groups**: particles share muscle groups (legs), not one
 //!   trainable scalar per particle.
 //!
 //! Every backward formula is either one of the individually finite-difference-
 //! verified adjoints from `spacetime::transfer`/`grid`, or is derived and
-//! FD-verified in this module's own tests. The one deliberate scope limit,
-//! same as everywhere else in the chain: kernel weights use each step's REAL
-//! recorded positions as fixed reference points (the position-dependence of
-//! *which cells* a particle touches is not differentiated -- the standard
-//! detached treatment; ChainQueen's own backward pass makes the same choice
-//! per-step-linearization-wise for branch decisions).
+//! FD-verified in this module's own tests. One deliberate scope limit, UNIQUE
+//! to this module (not shared with the real runtime chain): `spacetime::
+//! transfer::p2g_position_vjp` differentiates the full kernel-weight-value
+//! dependence on position (`axis_weights_derivative`, matches finite
+//! difference exactly -- verified by reading that function directly), but
+//! THIS module's own simpler backward re-derivation does not -- it evaluates
+//! each step's weights at the recorded forward position and does not backprop
+//! through them. Real, disclosed limitation, not a shared community
+//! convention: a prior version of this doc claimed ChainQueen/DiffTaichi made
+//! the same simplification; direct inspection of both (`tmp/ChainQueen/src/
+//! backward.cu`'s `G2P_backward`, which explicitly computes and sums `dw()`
+//! terms into the position gradient, and `tmp/difftaichi/examples/
+//! diffmpm.py`'s autodiff-generated backward, which has no `stop_grad` on
+//! `p2g`/`g2p` and therefore differentiates through the weight automatically)
+//! showed that claim was false -- both canonical implementations DO
+//! differentiate through the weight. This module's omission is a bespoke
+//! shortcut for a small, short-horizon offline training tool (see the
+//! `controller_gradient_matches_finite_difference_smooth_regime` test's
+//! measured ~5-7% gap this causes), not precedent-backed.
 //!
 //! Scale/units note: this is a *training tool*, not the runtime solver. It
 //! runs a small body (tens of particles) for a short horizon (~100 substeps)

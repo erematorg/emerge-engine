@@ -12,7 +12,7 @@
 //! compiling against a trait proves the interface exists; the counters prove
 //! the substep loop actually calls it.
 //!
-//! Seams covered (the extension table in ARCHITECTURE.md §7):
+//! Seams covered (see README.md's extension seams table):
 //! - `MaterialModel`      (custom constitutive response)
 //! - `Field`              (custom external body force)
 //! - `BoundaryCondition`  (custom grid boundary)
@@ -195,7 +195,16 @@ struct ExternalWalls {
 }
 
 impl BoundaryCondition for ExternalWalls {
-    fn apply_to_grid_velocity(&self, cell_index: usize, grid_res: usize, velocity: &mut Vec2) {
+    /// Returns 0: these walls are frictionless, so they dissipate nothing.
+    /// A third-party boundary that DID rub would report the specific energy
+    /// here and the engine would turn it into heat -- see
+    /// `energy::thermodynamics::frictional_heating`.
+    fn apply_to_grid_velocity(
+        &self,
+        cell_index: usize,
+        grid_res: usize,
+        velocity: &mut Vec2,
+    ) -> f32 {
         self.grid_calls.fetch_add(1, Ordering::Relaxed);
         let t = self.thickness;
         let x = cell_index / grid_res;
@@ -207,6 +216,7 @@ impl BoundaryCondition for ExternalWalls {
         if (y < t && velocity.y < 0.0) || (y > hi && velocity.y > 0.0) {
             velocity.y = 0.0;
         }
+        0.0
     }
 
     fn clamp_particle_position(&self, position: Vec2, grid_res: usize) -> Vec2 {

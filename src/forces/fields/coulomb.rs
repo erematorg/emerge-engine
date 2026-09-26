@@ -21,16 +21,16 @@ use std::collections::HashMap;
 
 use glam::Vec2;
 
+use super::cutoff::smooth_cutoff;
 use crate::fields::{FADE_ONSET_RATIO, Field};
 use crate::particle::Particles;
-use crate::solver::cutoff::smooth_cutoff;
 
 /// Electrostatic acceleration from external point charges, affecting particles by material.
 pub struct CoulombField {
     /// External charged point sources: `(position in grid coords, charge in sim units)`.
     ///
     /// Positive charge is proton-like. Negative is electron-like.
-    /// These are macro-scale emitters/electrodes — not individual MPM particles.
+    /// These are macro-scale emitters/electrodes -- not individual MPM particles.
     pub sources: Vec<(Vec2, f32)>,
 
     /// Per-material charge value. `material_id → charge`.
@@ -53,7 +53,7 @@ pub struct CoulombField {
 
     /// Cutoff radius in grid coordinates.
     ///
-    /// Default: `f32::INFINITY` (IRL — Coulomb force has infinite range).
+    /// Default: `f32::INFINITY` (IRL -- Coulomb force has infinite range).
     /// Set to a finite value as a performance approximation for large particle counts.
     pub cutoff: f32,
 
@@ -63,8 +63,8 @@ pub struct CoulombField {
 }
 
 impl CoulombField {
-    /// Full-range Coulomb field — IRL default, no distance cutoff.
-    pub fn new(
+    /// Full-range Coulomb field -- IRL default, no distance cutoff.
+    pub const fn new(
         sources: Vec<(Vec2, f32)>,
         material_charges: HashMap<u32, f32>,
         coulomb_constant: f32,

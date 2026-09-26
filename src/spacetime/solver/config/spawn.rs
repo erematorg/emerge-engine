@@ -21,12 +21,12 @@ pub enum SpawnShape {
     Box,
     /// Fill a disk of `radius` grid-cells centered on `box_center`.
     ///
-    /// Set `box_size` large enough to contain the disk — a square of side
+    /// Set `box_size` large enough to contain the disk -- a square of side
     /// `2 * radius` is exactly right, e.g. `IVec2::splat((2.0 * radius) as i32 + 1)`.
     Disk { radius: f32 },
 }
 
-/// Initial particle layout — consumed once at spawn, not needed afterward.
+/// Initial particle layout -- consumed once at spawn, not needed afterward.
 ///
 /// Build via fluent methods on `SpawnRegion::for_sim`:
 /// ```rust,no_run
@@ -58,17 +58,24 @@ pub struct SpawnRegion {
     pub rng_seed: u32,
     /// Material for all particles in this region (default 0).
     pub material_id: u32,
-    /// Per-region particle mass override (grid units). `None` (default) falls back to
-    /// `SimConfig::particle_mass` — the single global value used when every material in a
-    /// scene has the same real density. Set this explicitly when spawning multiple materials
-    /// with different `rho_kg_m3` in the same simulation: `SimConfig::particle_mass` is one
-    /// value shared by the whole `Simulation`, so without a per-region override every
-    /// material's particles get identical mass regardless of their specified density —
-    /// stiffness differs correctly (via Lamé/EOS conversion) but inertia does not.
-    /// Compute as `rho_kg_m3 * (spacing * dx_meters).powi(2)` for a 2D areal-density particle.
-    /// `.mass_from(&props, &config)` computes and sets this from a physical-property struct
-    /// using this region's own `spacing` — prefer it over `.mass()` to avoid passing spacing
-    /// twice (a real duplication risk).
+    /// Per-region particle mass override (GRID units). `None` (default) derives
+    /// it as `SimConfig::grid_density * spacing^2`, which is correct for any
+    /// single-material scene and adapts automatically when the region is
+    /// refined.
+    ///
+    /// Set it only to give one region a real density CONTRAST against another:
+    /// `(rho_kg_m3 / config.reference_density_kg_m3) * spacing^2`, with every
+    /// material's stress converted using that same `reference_density_kg_m3`.
+    /// Without it, mixed-density regions differ correctly in stiffness (via the
+    /// Lamé/EOS conversion) but not in inertia.
+    ///
+    /// Note the units: this is NOT the SI kilogram mass
+    /// `rho_kg_m3 * (spacing * dx_meters)^2` that `ParticleMass::particle_mass`
+    /// returns. The two differ by exactly `rho * dx_meters^2` -- the same
+    /// factor `lame_from_si_physical` divides stress by -- so passing an SI
+    /// mass in here directly is a unit mismatch. `.mass_from(&props, &config)`
+    /// applies that conversion for you and uses this region's own `spacing`;
+    /// prefer it over `.mass()`.
     pub mass_override: Option<f32>,
 }
 
@@ -104,13 +111,13 @@ impl SpawnRegion {
     // ── Fluent builder methods ─────────────────────────────────────────────────
 
     /// Set the center of the spawn region in grid coordinates.
-    pub fn at(mut self, center: Vec2) -> Self {
+    pub const fn at(mut self, center: Vec2) -> Self {
         self.box_center = center;
         self
     }
 
     /// Set the bounding box size in grid cells (used for box shape and disk bounding box).
-    pub fn box_of(mut self, size: IVec2) -> Self {
+    pub const fn box_of(mut self, size: IVec2) -> Self {
         self.box_size = size;
         self
     }
@@ -127,31 +134,40 @@ impl SpawnRegion {
     }
 
     /// Particle lattice spacing in grid cells.
-    pub fn spacing(mut self, s: f32) -> Self {
+    pub const fn spacing(mut self, s: f32) -> Self {
         self.spacing = s;
         self
     }
 
     /// Material ID for all particles in this region.
-    pub fn material(mut self, id: u32) -> Self {
+    pub const fn material(mut self, id: u32) -> Self {
         self.material_id = id;
         self
     }
 
-    /// Per-region particle mass override (grid units), for scenes mixing materials with
-    /// different real densities. See the field doc on `mass_override` for the SI formula.
-    pub fn mass(mut self, particle_mass: f32) -> Self {
-        self.mass_override = Some(particle_mass);
+    /// Per-region particle mass override, in GRID units, for scenes mixing
+    /// materials with different real densities. See the field doc on
+    /// `mass_override` -- an SI kilogram mass passed here is a unit mismatch.
+    pub const fn mass(mut self, grid_mass: f32) -> Self {
+        self.mass_override = Some(grid_mass);
         self
     }
 
-    /// Like `.mass()`, but computes the value from a physical-property struct and
+    /// Like `.mass()`, but derives the value from a physical-property struct and
     /// THIS region's own `spacing` (already set via `.spacing()` or the `spacing`
-    /// field) — avoids passing spacing twice (a real duplication risk; see
-    /// `mass_override`'s field doc; LP hit a related sync bug from this exact
-    /// pattern, fixed 2026-06-22).
+    /// field) -- avoids passing spacing twice, a real duplication risk (see
+    /// `mass_override`'s field doc; LP hit a sync bug from this exact pattern).
+    ///
+    /// `ParticleMass::particle_mass` reports real SI kilograms, so this divides
+    /// by `reference_density_kg_m3 * dx_meters^2` to land in the grid units the
+    /// solver actually integrates -- the same conversion
+    /// `lame_from_si_physical` applies to stress. What survives the division is
+    /// the density RATIO: a region of water at `spacing` gets exactly
+    /// `spacing^2`, and denser materials get proportionally more.
     pub fn mass_from(mut self, props: &impl crate::ParticleMass, config: &SimConfig) -> Self {
-        self.mass_override = Some(props.particle_mass(self.spacing, config));
+        let si_kg = props.particle_mass(self.spacing, config);
+        let to_grid = 1.0 / (config.reference_density_kg_m3 * config.dx_meters * config.dx_meters);
+        self.mass_override = Some(si_kg * to_grid);
         self
     }
 
@@ -159,13 +175,13 @@ impl SpawnRegion {
     ///
     /// Use for elastic solids and dense granular materials where incorrect initial density
     /// would cause a pressure spike on the first substep. Costs one extra P2G pass at spawn.
-    pub fn precompute_volumes(mut self) -> Self {
+    pub const fn precompute_volumes(mut self) -> Self {
         self.precompute_initial_volumes = true;
         self
     }
 
     /// Initial speed randomization magnitude (0 = all particles at rest).
-    pub fn velocity_scale(mut self, scale: f32) -> Self {
+    pub const fn velocity_scale(mut self, scale: f32) -> Self {
         self.initial_velocity_scale = scale;
         self
     }
@@ -174,13 +190,13 @@ impl SpawnRegion {
     ///
     /// 0.0 = perfect lattice (default). 0.2 is a good default for granular materials
     /// (sand, snow) to break lattice symmetry and prevent artificially regular piles.
-    pub fn jitter(mut self, scale: f32) -> Self {
+    pub const fn jitter(mut self, scale: f32) -> Self {
         self.position_jitter = scale;
         self
     }
 
     /// Seed for jitter and initial velocity RNG.
-    pub fn rng_seed(mut self, seed: u32) -> Self {
+    pub const fn rng_seed(mut self, seed: u32) -> Self {
         self.rng_seed = seed;
         self
     }
@@ -191,11 +207,9 @@ impl SpawnRegion {
     /// a creature's current location) where going out of bounds is a normal,
     /// expected outcome to skip gracefully -- not a programmer error to crash
     /// on. `validate_for_sim` stays a hard assert for the scripted/startup
-    /// spawn path, where an out-of-bounds region really is a real bug worth
+    /// spawn path, where an out-of-bounds region is a programmer error worth
     /// catching loudly; this is the same check, exposed so interactive
-    /// callers aren't forced to hand-derive the margin math themselves (that
-    /// duplication is exactly how a real off-by-one crash slipped into
-    /// `material_sandbox_gpu`'s paint tool).
+    /// callers aren't forced to hand-derive the margin math themselves.
     pub fn fits_in_sim(&self, solver: &SimConfig) -> bool {
         if self.spacing <= 0.0 || self.box_size.x <= 0 || self.box_size.y <= 0 {
             return false;

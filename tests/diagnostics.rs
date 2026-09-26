@@ -1,3 +1,7 @@
+//! `DiagnosticsRegistry`/`evaluate_stability`/`collect_snapshot` suite --
+//! health-check violation detection (empty snapshots, concentrated
+//! particles, mixed-material blending) and basic snapshot correctness.
+
 extern crate emerge_engine as emerge;
 
 use emerge::SimConfig;

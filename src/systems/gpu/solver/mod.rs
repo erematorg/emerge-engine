@@ -22,9 +22,9 @@ use super::step_params::{
     GpuMaterialMassParams, GpuResourceParams, GpuThermalParams, MAX_MATERIALS,
 };
 
-/// Workgroup sizes — must match `@workgroup_size(...)` in the WGSL shaders.
+/// Workgroup sizes -- must match `@workgroup_size(...)` in the WGSL shaders.
 /// grid_clear and grid_update are dispatched by active-block slot (`2 * NUM_BLOCKS`
-/// workgroups, see grid_clear.wgsl/grid_update.wgsl), not grid resolution — no WG_GRID
+/// workgroups, see grid_clear.wgsl/grid_update.wgsl), not grid resolution -- no WG_GRID
 /// constant needed for either any more.
 const WG_PARTICLES: u32 = 64; // p2g and g2p: 64-wide 1D workgroups
 
@@ -33,12 +33,13 @@ type ReadbackResult = std::sync::Arc<std::sync::Mutex<Option<Result<(), wgpu::Bu
 
 /// GPU-backed MLS-MPM solver.
 ///
-/// Pass sequence:
-///   Once per frame: particle_sort (identity permutation → sorted_particle_ids)
-///   Per substep:    grid_clear → p2g → grid_update → g2p → particles_update → force_fields
+/// Pass sequence (see `encode_substep.rs` for the authoritative dispatch list --
+/// several passes below are conditional, e.g. contact/mixture/thermal/resource):
+///   Once per frame: particle_sort_clear → count → scan → scatter
+///   Per substep:    active_block_refresh → grid_clear → p2g → grid_update → g2p → particles_update
 ///
 /// Particles live in VRAM between frames; the CPU only touches them at spawn and for
-/// plasticity readback (currently: none — all plasticity runs in particles_update.wgsl).
+/// plasticity readback (currently: none -- all plasticity runs in particles_update.wgsl).
 pub struct GpuSimulation {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
@@ -50,17 +51,34 @@ pub struct GpuSimulation {
     /// Access via `particles()` / `particles_mut()`. Do not replace the Vec directly.
     particles: Vec<Particle>,
     particle_count: usize,
+    /// How many particles the per-particle GPU buffers (`buffers.particles`,
+    /// `sorted_particle_ids`, `readback_staging`) actually have room for --
+    /// always `>= particle_count`. `spawn_region` (spawn.rs) grows this with
+    /// Vec-style amortized doubling on the rare call that exceeds it, so the
+    /// common case (repeated small spawns under existing headroom) is a
+    /// sub-range `write_buffer` instead of a full realloc + reupload + bind
+    /// group rebuild every time. `remove_particles` (spawn.rs) resets this
+    /// back down to its own new exact-fit size when it reallocates smaller --
+    /// must stay in sync with the real buffer size everywhere buffers are
+    /// reallocated, or the fast path in `spawn_region` would write past the
+    /// buffer's actual end.
+    particle_capacity: usize,
     last_sub_dt: f32,
     last_substeps: usize,
+    /// One-frame-lagged max particle speed -- mirrors CPU's own
+    /// `Simulation::last_max_particle_speed` exactly (same convention, same
+    /// consumer: `SimConfig::fluid_near_wall_compression_mach_margin`'s
+    /// predictive near-wall CFL tightening, see `step_frame`'s own scan).
+    last_max_particle_speed: f32,
     frame_index: u64,
     /// `frame_index` at the most recent `spawn_region` call (0 = only the initial
     /// construction batch exists). Tracked so `step_frame`'s sleep-warmup window
     /// (`SLEEP_WARMUP_FRAMES`) can re-arm on every spawn, not just once at
-    /// construction — otherwise a particle spawned live long after frame 10 gets
+    /// construction -- otherwise a particle spawned live long after frame 10 gets
     /// `sleep_threshold` applied on its very first substep at v=0, freezing it
     /// asleep before gravity ever touches it.
     last_spawn_frame: u64,
-    /// GPU force-field entries — uploaded to the force_fields_params uniform each substep.
+    /// GPU force-field entries -- uploaded to the force_fields_params uniform each substep.
     force_field_entries: Vec<GpuFieldEntry>,
     /// Frame counter used to stride CPU readbacks when all materials are GPU-resident.
     readback_frame: usize,
@@ -68,7 +86,7 @@ pub struct GpuSimulation {
     /// 1 = every frame (default, always accurate). 2+ = skip frames, reducing GPU stall cost.
     /// One-frame lag on sprite positions is invisible at 60fps.
     pub readback_stride: usize,
-    /// Particle positions/materials changed — sort + upload required before next GPU pass.
+    /// Particle positions/materials changed -- sort + upload required before next GPU pass.
     /// Set by spawn, phase_transition, mark_particles_dirty().
     layout_dirty: bool,
     /// Pending impulses to apply on GPU at the start of the next step_frame.
@@ -76,16 +94,16 @@ pub struct GpuSimulation {
     /// avoiding the stale-CPU-mirror artifacts from the old upload approach.
     pending_impulses: Vec<GpuImpulseEntry>,
     /// Pending force-sleep/force-wake-by-tag for the next step_frame, applied once in
-    /// force_fields.wgsl then cleared. Minimal hook for LP's future chunk system — see
+    /// force_fields.wgsl then cleared. Minimal hook for LP's future chunk system -- see
     /// `sleep_tag`/`wake_tag` doc comments and the `GpuSleepWakeParams` layout.
     pending_sleep_tags: Vec<u32>,
     pending_wake_tags: Vec<u32>,
-    /// Pending async readback — Some while GPU → staging copy + mapping is in flight.
+    /// Pending async readback -- Some while GPU → staging copy + mapping is in flight.
     /// Checked each step_frame; on completion, CPU particles are updated without blocking.
     /// Arc<Mutex<...>> so the wgpu callback (any thread) can signal the main thread.
     pending_readback: Option<ReadbackResult>,
     /// Count of async readback failures (`map_async` completing with `Err`) ever
-    /// recovered from — should be 0 in ordinary operation; nonzero signals something
+    /// recovered from -- should be 0 in ordinary operation; nonzero signals something
     /// is stressing the GPU backend (rare on fast hardware, more likely on
     /// slow/software backends). See `GpuBuffers::abandon_readback`'s doc.
     pub readback_error_count: u64,
@@ -95,32 +113,35 @@ pub struct GpuSimulation {
     /// `step_frame`/the blocking sync methods check this and become safe no-ops
     /// once set, rather than crashing. Always populated for `new()` instances;
     /// `with_device()` instances need one call to `enable_device_lost_detection()`
-    /// first (see that method's doc for why it isn't automatic there — a wgpu
+    /// first (see that method's doc for why it isn't automatic there -- a wgpu
     /// device can only have one lost-callback, so auto-registering on a
     /// possibly-shared device risks silently overwriting a caller's own).
     /// Callers should poll `device_lost_reason()` if they care why the sim went
-    /// quiet — this is deliberately observable, not silently swallowed.
+    /// quiet -- this is deliberately observable, not silently swallowed.
     device_lost: std::sync::Arc<std::sync::Mutex<Option<String>>>,
-    /// Per-pass GPU timestamp profiling — see `enable_profiling()`. None unless explicitly
+    /// Per-pass GPU timestamp profiling -- see `enable_profiling()`. None unless explicitly
     /// turned on; zero cost to every other code path when not in use.
     profiling: Option<GpuProfiling>,
+    /// Whether `profile_stamp` records the substep currently being encoded -- only the
+    /// frame's last one, so the per-stage timestamps are one coherent substep.
+    profile_this_substep: std::cell::Cell<bool>,
     /// One bind group per `step_params_pool` slot, built once and reused by every
     /// `step_frame()` call instead of being recreated per-substep-per-frame. At high
     /// substep counts, recreating thousands of bind groups every frame exhausts the
     /// GPU's descriptor allocator. The buffers a bind group points at
     /// (`step_params_pool[i]`) never change identity after construction, only their
-    /// contents (rewritten every frame via `upload_step_params_at`) — so the bind group
+    /// contents (rewritten every frame via `upload_step_params_at`) -- so the bind group
     /// itself can be built once and only needs rebuilding when `spawn_region`
     /// reallocates `buffers.particles` (see `rebuild_bind_group_pool`).
     bind_group_pool: Vec<wgpu::BindGroup>,
-    /// Group 1 (contact subsystem) bind group — built exactly once, see
+    /// Group 1 (contact subsystem) bind group -- built exactly once, see
     /// `SimPipelines::make_contact_bind_group`'s doc for why it never needs rebuilding
     /// the way `bind_group_pool` does.
     contact_bind_group: wgpu::BindGroup,
-    /// Group 2 (thermal subsystem) bind group — same "built once" shape as
+    /// Group 2 (thermal subsystem) bind group -- same "built once" shape as
     /// `contact_bind_group`, see `SimPipelines::make_thermal_bind_group`'s doc.
     thermal_bind_group: wgpu::BindGroup,
-    /// Live day-night/ambient thermal diffusion state — `enabled: 0` (default) skips
+    /// Live day-night/ambient thermal diffusion state -- `enabled: 0` (default) skips
     /// all 4 thermal passes entirely, every existing scene pays nothing. Set via
     /// `attach_thermal_gpu`/`set_thermal_ambient`.
     thermal_params: GpuThermalParams,
@@ -131,21 +152,21 @@ pub struct GpuSimulation {
     /// un-folded back out. `None` until `attach_thermal_gpu` is called, matching CPU's
     /// `self.thermal.is_none()` gate (no thermal model configured = no debit applied).
     thermal_heat_capacity: Option<f32>,
-    /// Group 3 (resource regrowth subsystem) bind group — built exactly once, see
+    /// Group 3 (resource regrowth subsystem) bind group -- built exactly once, see
     /// `SimPipelines::make_resource_bind_group`'s doc.
     resource_bind_group: wgpu::BindGroup,
-    /// Live resource-regrowth state — `enabled: 0` (default) skips all 4 resource
+    /// Live resource-regrowth state -- `enabled: 0` (default) skips all 4 resource
     /// passes entirely. Set via `attach_resource_field_gpu`.
     resource_params: GpuResourceParams,
-    /// Live ASFLIP state — `enabled: 0` (default) makes `step_frame` dispatch the
+    /// Live ASFLIP state -- `enabled: 0` (default) makes `step_frame` dispatch the
     /// ordinary split g2p/particles_update pair unchanged; `enabled: 1` dispatches
     /// `g2p_asflip_fused` instead (see `SubstepGates::asflip_active`, `encode_substep.rs`).
-    /// Shares `resource_bind_group` (group 3) — see `SimPipelines::new`'s module doc
+    /// Shares `resource_bind_group` (group 3) -- see `SimPipelines::new`'s module doc
     /// comment on why. Set via `attach_asflip_gpu`.
     asflip_params: GpuAsflipParams,
     /// Live `ColorMode::GridVolume` material-mass state -- `enabled: 0` (default)
     /// skips the extra P2G scatter and grid_clear zeroing entirely. Shares
-    /// `contact_bind_group` (group 1) — see `SimPipelines::make_contact_bind_group`'s
+    /// `contact_bind_group` (group 1) -- see `SimPipelines::make_contact_bind_group`'s
     /// doc for why. Set via `attach_grid_material_render_gpu`.
     material_mass_params: GpuMaterialMassParams,
     /// Spatial acceleration for `particles_near`/`count_near`/`group_centroid` --
@@ -156,9 +177,9 @@ pub struct GpuSimulation {
     /// `RefCell` + `spatial_hash_dirty` defer the actual rebuild to the first query
     /// call after new data lands, instead of paying it unconditionally on every
     /// readback -- see `ensure_spatial_hash_fresh` in `queries.rs`. Matches the
-    /// discipline the CPU `Simulation` follows for the same queries (`ARCHITECTURE.md`
-    /// §4: hash rebuilt once per external `step()`, since LP queries happen between
-    /// frames, never mid-substep). Zero staleness change: a query after a dirty
+    /// discipline the CPU `Simulation` follows for the same queries: hash rebuilt
+    /// once per external `step()`, since LP queries happen between frames, never
+    /// mid-substep. Zero staleness change: a query after a dirty
     /// readback still sees the exact same freshly-landed positions, just computed on
     /// demand.
     spatial_hash: std::cell::RefCell<crate::solver::spatial_hash::SpatialHash>,
@@ -168,23 +189,23 @@ pub struct GpuSimulation {
     /// it fresh immediately (e.g. right after `spawn_region` returns a usable range).
     spatial_hash_dirty: std::cell::Cell<bool>,
     /// CPU-side wall-clock breakdown of the last `step_frame()` call (cfl_scan_ns,
-    /// encode_ns, submit_ns, readback_ns, total_ns) — `Instant::now()` calls are
+    /// encode_ns, submit_ns, readback_ns, total_ns) -- `Instant::now()` calls are
     /// themselves nanosecond-cost, so these are always recorded, not gated behind
     /// `enable_profiling()`. Read via `last_cpu_timings_ns()`. `total_ns` minus the sum of
     /// the other four reveals any unbracketed cost.
     last_cpu_timings: (f32, f32, f32, f32, f32),
-    /// Live directional grip friction state — GPU counterpart to
+    /// Live directional grip friction state -- GPU counterpart to
     /// `DirectionalContactGrip`. Uploaded fresh every `step_frame` (see `step.rs`), so
     /// unlike `contact_bind_group` there's no buffer to rebuild here, just a plain
     /// field updated via `set_grip_direction`/`set_grip_friction`. Starts symmetric
-    /// (no directional bias) — real Coulomb friction at `config.contact_friction`,
+    /// (no directional bias) -- real Coulomb friction at `config.contact_friction`,
     /// identical to every scene before this field existed until a caller opts in.
     grip_params: GpuDirectionalGripParams,
 }
 
 /// One [begin, end] timestamp pair per labeled compute pass in `encode_substep`, written
 /// every substep (later substeps overwrite earlier ones within the same `step_frame()`
-/// call — fine for finding the dominant cost, since substeps cost about the same each
+/// call -- fine for finding the dominant cost, since substeps cost about the same each
 /// time; not meant to capture per-substep variance).
 const PROFILE_PASS_LABELS: &[&str] = &[
     "active_block_refresh (sort)",
@@ -193,9 +214,8 @@ const PROFILE_PASS_LABELS: &[&str] = &[
     "gather_contact_points",
     "grid_update",
     "resolve_contact",
-    "g2p",
-    "particles_update",
-    "force_fields",
+    "g2p_update (gather+update+forces) / g2p_asflip_fused",
+    "force_fields (ASFLIP only) / cfl_commit",
 ];
 
 struct GpuProfiling {
@@ -229,7 +249,7 @@ impl GpuSimulation {
         particles: Vec<Particle>,
         registry: MaterialRegistry,
     ) -> Self {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let instance = super::create_wgpu_instance();
 
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -242,14 +262,15 @@ impl GpuSimulation {
 
         // Request the adapter's actual limits, not wgpu's conservative defaults (128MiB
         // storage binding). Hardware commonly supports far more (e.g. 2047MiB on desktop
-        // GPUs) — capping at the default artificially shrinks the single-buffer particle/grid
+        // GPUs) -- capping at the default artificially shrinks the single-buffer particle/grid
         // ceiling well below what the device can actually do.
         //
         // TIMESTAMP_QUERY requested opportunistically (only if the adapter actually supports
-        // it) so `enable_profiling()` can work later without requiring it everywhere —
+        // it) so `enable_profiling()` can work later without requiring it everywhere --
         // hardware/backends that lack it fall back to empty, identical to before this line
         // existed.
-        let features = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
+        let features = adapter.features()
+            & (wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES);
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("emerge_gpu"),
@@ -272,7 +293,7 @@ impl GpuSimulation {
     }
 
     /// Build a `GpuSimulation` on an existing device/queue so its GPU buffers can be
-    /// shared with a renderer or surface on the same device — required for the
+    /// shared with a renderer or surface on the same device -- required for the
     /// zero-readback [`crate::render::Renderer::render_gpu`] path. `new()` creates its
     /// own headless device instead, which is correct for compute-only or CPU-readback
     /// workflows but cannot share GPU buffers with another device.
@@ -283,6 +304,66 @@ impl GpuSimulation {
         particles: Vec<Particle>,
         registry: MaterialRegistry,
     ) -> Self {
+        // Real regression guard (corrected -- a first version of this check
+        // read `MaterialParams::model` from `all_params()` and looked for
+        // `10`, which is UNREACHABLE: `NaccMaterial::params()` deliberately
+        // emits `ConstitutiveModel::NeoHookean as u32` (2), not its own
+        // `constitutive_model()` value (10) -- see that method's own
+        // comment ("GPU uses NeoHookean stress... Plasticity runs CPU-only
+        // via needs_cpu_update=true"). So a real NaccMaterial's GPU stress
+        // is NOT zero -- it silently runs `case 2u`'s NeoHookean law
+        // (`kappa*ln(J)`) instead of NACC's own real volumetric law
+        // (`kappa/2*(J^2-1)`, see `nacc.rs::kirchhoff_stress`), which is
+        // the actual, original finding here (external review). Its
+        // `needs_cpu_update` fallback (issue #5) DOES correctly re-project
+        // `deformation_gradient` onto the real Cam-Clay yield surface every
+        // frame, but the STRESS feeding that substep's P2G grid transfer is
+        // still NeoHookean's, not NACC's. Must check the real trait method
+        // (`constitutive_model()`, via `constitutive_model_of`), not the
+        // GPU-upload params -- those are exactly the two things this bug
+        // conflates. See `ConstitutiveModel::Nacc`'s own doc for the full
+        // finding. Fail loudly here instead of silently running the wrong
+        // constitutive law -- use `GranularFluidMaterial` instead, already
+        // fully GPU-native.
+        for id in 0..registry.len() as u32 {
+            if registry.constitutive_model_of(id) == crate::materials::ConstitutiveModel::Nacc {
+                panic!(
+                    "NaccMaterial (material_id {id}) has no real GPU stress path -- its \
+                     params() deliberately uploads as NeoHookean (model 2), so p2g.wgsl \
+                     silently runs NeoHookean's kappa*ln(J) volumetric law instead of \
+                     NACC's own kappa/2*(J^2-1) (see ConstitutiveModel::Nacc's own doc). \
+                     Its CPU plasticity fallback (issue #5) keeps F on the right yield \
+                     surface, but the stress driving grid momentum transfer is still \
+                     wrong. Use GranularFluidMaterial instead for a GPU-native \
+                     granular-fluid scene."
+                );
+            }
+        }
+
+        // Real fix, issue #29: `NoCompressionMaterial` has no `p2g.wgsl`/
+        // `particles_update.wgsl` case at all (unlike NACC above, no
+        // compensating CPU fallback exists either) -- an unrecognised
+        // `mat.model` falls through to `default: { return mat2x2<f32>(); }`,
+        // exact zero stress every substep. A cable/membrane/tendon would
+        // silently free-fall with no tension resistance, contradicting the
+        // material's entire purpose. Fail loudly here instead, same pattern
+        // as NACC's own guard -- no real GPU stress path exists yet for
+        // this model, see issue #29 for the WGSL-port option, not pursued
+        // here.
+        for id in 0..registry.len() as u32 {
+            if registry.constitutive_model_of(id)
+                == crate::materials::ConstitutiveModel::NoCompression
+            {
+                panic!(
+                    "NoCompressionMaterial (material_id {id}) has no GPU stress path at all -- \
+                     p2g.wgsl/particles_update.wgsl have no case for this model and there is no \
+                     CPU fallback, so it would silently run with exact zero stress (see \
+                     ConstitutiveModel::NoCompression's own doc). Use this material on the CPU \
+                     Simulation backend instead until issue #29's real WGSL port lands."
+                );
+            }
+        }
+
         let material_params = registry.all_params();
 
         // Run init_particle before uploading. Mirrors Simulation::spawn_region().
@@ -305,7 +386,8 @@ impl GpuSimulation {
         buffers.upload_particles(&queue, &initialized);
         buffers.upload_materials(&queue, &material_params);
 
-        let pipelines = SimPipelines::new(&device);
+        let mut pipelines = SimPipelines::new(&device, config.grid_res);
+        pipelines.specialize_g2p_update(&device, registry.model_mask());
         // A zero-sized particle buffer (no initial particles -- e.g. LP constructs
         // empty, then adds terrain/water/creature via spawn_region) fails bind group
         // creation outright ("binding size is zero"). spawn_region already rebuilds
@@ -342,8 +424,10 @@ impl GpuSimulation {
             registry,
             particles: initialized,
             particle_count,
+            particle_capacity: particle_count,
             last_sub_dt: config.dt,
             last_substeps: 0,
+            last_max_particle_speed: 0.0,
             frame_index: 0,
             last_spawn_frame: 0,
             force_field_entries: Vec::new(),
@@ -357,6 +441,7 @@ impl GpuSimulation {
             readback_error_count: 0,
             device_lost: std::sync::Arc::new(std::sync::Mutex::new(None)),
             profiling: None,
+            profile_this_substep: std::cell::Cell::new(true),
             last_cpu_timings: (0.0, 0.0, 0.0, 0.0, 0.0),
             bind_group_pool,
             contact_bind_group,

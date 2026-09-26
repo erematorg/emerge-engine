@@ -1,10 +1,10 @@
-//! Plugin system for diagnostics — drop-in stat collectors.
+//! Plugin system for diagnostics -- drop-in stat collectors.
 //!
 //! Implement [`DiagnosticsPlugin`] and register with [`DiagnosticsRegistry`].
 //! Each plugin collects key/value pairs once per frame.
 //! The registry aggregates all plugins into a [`DiagnosticsFrame`].
 //!
-//! # Quick start — closure plugin
+//! # Quick start -- closure plugin
 //! ```rust,no_run
 //! # extern crate emerge_engine as emerge;
 //! # use emerge::{DiagnosticsRegistry, DiagnosticsFrame};
@@ -43,7 +43,7 @@ use crate::particle::Particle;
 /// Collect is `&mut self` so plugins can maintain state (rolling histories,
 /// accumulators, per-step diffs) without external wrappers.
 ///
-/// Keys should be short `snake_case`. Collisions are allowed — last writer wins.
+/// Keys should be short `snake_case`. Collisions are allowed -- last writer wins.
 pub trait DiagnosticsPlugin: Send + Sync {
     /// Short identifier for this plugin. Used only for documentation.
     fn name(&self) -> &'static str;
@@ -157,7 +157,7 @@ pub struct DiagnosticsFrame {
 impl DiagnosticsFrame {
     /// Get a stat by key. `None` if not present this frame.
     pub fn get(&self, key: &str) -> Option<f32> {
-        // Last writer wins — iterate in reverse to find the most recent.
+        // Last writer wins -- iterate in reverse to find the most recent.
         self.stats.iter().rfind(|(k, _)| k == key).map(|(_, v)| *v)
     }
 
@@ -171,7 +171,7 @@ impl DiagnosticsFrame {
         self.stats.iter().map(|(k, v)| (k.as_str(), *v))
     }
 
-    /// Merge another frame into this one (appends — duplicate keys allowed).
+    /// Merge another frame into this one (appends -- duplicate keys allowed).
     pub fn merge(&mut self, other: DiagnosticsFrame) {
         self.stats.extend(other.stats);
     }
@@ -205,8 +205,8 @@ impl fmt::Display for DiagnosticsFrame {
 
 /// Per-particle activation summary: `act_mean`, `act_frac`.
 ///
-/// - `act_mean` — mean activation across all particles.
-/// - `act_frac` — fraction of particles with activation > 0.01 (active).
+/// - `act_mean` -- mean activation across all particles.
+/// - `act_frac` -- fraction of particles with activation > 0.01 (active).
 pub struct ActivationStatsPlugin;
 
 impl DiagnosticsPlugin for ActivationStatsPlugin {

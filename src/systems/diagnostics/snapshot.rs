@@ -63,28 +63,29 @@ pub struct SimSnapshot {
     pub active_count: usize,
     /// Sleeping particles (excluded from this step's physics).
     pub sleeping_count: usize,
-    /// Particles whose velocity was clamped to the CFL limit during G2P this step.
-    /// Nonzero = CFL was violated; substep budget or material stiffness needs attention.
+    /// Legacy compatibility counter for former G2P velocity clipping.
+    /// The solver no longer clips velocity, so this remains zero; CFL is met
+    /// by substepping or an inadmissible state is reported.
     pub vel_clamp_count: usize,
     /// Particles whose deformation state was projected back to admissible this step.
     /// Nonzero = explicit integration diverged; check dt, material params, or stiffness.
     pub j_projection_count: usize,
-    /// Simulation time (seconds) dropped due to `max_substeps_per_step` cap this step.
-    /// Nonzero = simulation running slower than real-time; reduce stiffness or raise cap.
+    /// Legacy compatibility field for former max-substep time loss.
+    /// A solver step now advances the full requested time, so this is zero.
     pub sim_time_dropped: f32,
     /// Wall-clock time breakdown for the last `step()` call. All values in microseconds.
-    /// Accumulated across all substeps — divide by `substeps_last_step` for per-substep cost.
+    /// Accumulated across all substeps -- divide by `substeps_last_step` for per-substep cost.
     pub timing: StepTiming,
     /// Total kinetic energy (sum of `0.5 * mass * |v|^2`) across all particles.
     /// Real, generic sanity signal for ANY scene: should decay toward a steady value
     /// under damping (viscous/plastic materials) or oscillate boundedly for a purely
-    /// elastic one — unbounded growth with no external force driving it is a real bug,
+    /// elastic one -- unbounded growth with no external force driving it is a real bug,
     /// not just "high energy."
     pub total_kinetic_energy: f32,
     /// Max speed among particles with `Particle::pinned != 0`. Should read exactly 0.0
-    /// for any scene using pinned/Dirichlet anchors — G2P forces `v=0` on pinned
+    /// for any scene using pinned/Dirichlet anchors -- G2P forces `v=0` on pinned
     /// particles every substep (see `transfer.rs`). Nonzero here means the pinning
-    /// mechanism itself is broken (a real engine bug), not a scene-tuning issue —
+    /// mechanism itself is broken (a real engine bug), not a scene-tuning issue --
     /// added specifically so this class of bug is directly observable instead of
     /// inferred indirectly from a body slowly drifting.
     pub max_pinned_particle_speed: f32,
@@ -132,23 +133,35 @@ impl SimSnapshot {
 }
 
 /// Wall-clock timing breakdown for one `step()` call (sum of all substeps).
-/// Measured with `std::time::Instant` — zero external dependencies.
+/// Measured with `std::time::Instant` -- zero external dependencies.
 /// Read via `solver.diagnostics_snapshot().timing`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StepTiming {
     /// P2G scatter: particle → grid momentum/stress accumulation.
     pub p2g_us: u64,
     /// Grid update: momentum normalization + gravity + boundary application.
+    /// Includes `pressure_us` below (a real cost, not double-counted against
+    /// `total_us`) -- `pressure_us` exists purely to break out how much of
+    /// this bucket is the fluid pressure-projection loop specifically, since
+    /// that loop was folded in here silently before 2026-08-09.
     pub grid_update_us: u64,
+    /// The `SimConfig::fluid_pressure_iterations` corrector loop
+    /// (`Grid::project_fluid_incompressibility` + its own re-applied
+    /// boundary pass) -- a SUBSET of `grid_update_us`, not additive to it.
+    /// Zero for any scene that doesn't enable pressure projection. Split out
+    /// 2026-08-09 because the prior "63% of frame time is grid_update_us"
+    /// profiling number couldn't distinguish the pressure solve from
+    /// gravity/boundary/contact/mixture/Cundall -- see MEMORY.md.
+    pub pressure_us: u64,
     /// G2P gather: grid → particle velocity/position + plasticity update.
     pub g2p_us: u64,
     /// Force fields (NBody, gravity wells, Coulomb). Zero if no fields registered.
     pub fields_us: u64,
     /// Thermal + scalar diffusion. Zero if neither is active.
     pub thermal_us: u64,
-    /// CFL timestep selection (choose_substep_dt) — iterates all particles once per substep.
+    /// CFL timestep selection (choose_substep_dt) -- iterates all particles once per substep.
     pub cfl_us: u64,
-    /// Spatial hash rebuild (O(N) per substep) — powers particles_near / count_near queries.
+    /// Spatial hash rebuild (O(N) per substep) -- powers particles_near / count_near queries.
     pub spatial_hash_us: u64,
     /// Phase rule evaluation + sleep scoring (O(N) per substep).
     pub phase_sleep_us: u64,
@@ -156,6 +169,15 @@ pub struct StepTiming {
     pub project_us: u64,
     /// Density recompute via P2G volume estimation (only when fluid materials present).
     pub density_us: u64,
+    /// `do_substep_with_retry`'s own `self.particles.clone()` snapshot -- taken
+    /// unconditionally once per attempt (up to `FLUID_STEP_RETRY_LIMIT+1`, worst
+    /// case 17x) whenever `SimConfig::fluid_step_retry_enabled` is on, regardless
+    /// of whether that attempt actually needed a retry. A full SoA deep-copy at
+    /// full particle count, added 2026-08-09 alongside the retry/backstop fixes --
+    /// not visible in any other bucket before this field existed (fell into the
+    /// unaccounted `total_us` - sum(other fields) residual). Zero when retry is
+    /// disabled (the default) or no material owns deformation/volume state.
+    pub retry_snapshot_us: u64,
     /// Total wall time for the step (includes overhead not captured in individual phases).
     pub total_us: u64,
 }

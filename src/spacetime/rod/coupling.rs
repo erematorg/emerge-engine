@@ -1,12 +1,12 @@
 //! Rod <-> shared MPM grid coupling (Phase 2). Mirrors
 //! `spacetime::transfer::p2g`/`g2p`'s own scatter/gather exactly, so a rod
 //! and ordinary MPM particles exchange momentum through the identical
-//! mechanism — see `mod.rs`'s own doc for why `Grid` being fully
+//! mechanism -- see `mod.rs`'s own doc for why `Grid` being fully
 //! source-agnostic makes this a real, not aspirational, integration.
 //!
 //! Wired into `Simulation::do_substep` (`solver/step.rs`): scatter after
 //! particle P2G, gather after particle G2P, forces after particle force
-//! fields — see that file's own comments at each call site for the exact
+//! fields -- see that file's own comments at each call site for the exact
 //! ordering and why it matters (gravity/wake propagation for free).
 
 use glam::Vec2;
@@ -16,12 +16,12 @@ use crate::grid::kernel::quadratic_weights;
 
 use super::{RodMaterial, RodPoints, RodRestState, compute_internal_forces};
 
-/// Kernel support radius for `quadratic_weights` is 1.5 grid cells — two
+/// Kernel support radius for `quadratic_weights` is 1.5 grid cells -- two
 /// scatter locations spaced up to this far apart still have overlapping
 /// stencils, so nothing between them is left uncovered. This is also the
 /// trigger threshold for `coverage_samples` below: an edge shorter than
 /// this needs no sub-sampling at all, so an already-dense rod (e.g. the
-/// blade-of-grass demos) gets zero extra scatter calls — real, not just
+/// blade-of-grass demos) gets zero extra scatter calls -- real, not just
 /// nominal, zero cost when unneeded.
 const COVERAGE_SPACING: f32 = 1.5;
 
@@ -38,10 +38,10 @@ fn extra_samples_toward(rod: &RodPoints, i: usize, neighbor: usize) -> usize {
     }
 }
 
-/// One quadratic-B-spline scatter at `pos` — the same inner loop
+/// One quadratic-B-spline scatter at `pos` -- the same inner loop
 /// `scatter_rod_to_grid` used to run directly; factored out so it can be
 /// called once per coverage sample instead of once per point. Additive
-/// second scatter into the grip field when `contact_group != 0` — real
+/// second scatter into the grip field when `contact_group != 0` -- real
 /// multi-field frictional contact (Bardenhagen 2001 + Nairn, Hammerquist,
 /// Smith 2020), identical mechanism and identical zero-cost-when-unused
 /// property as `transfer::p2g`'s own particle scatter (see
@@ -65,27 +65,27 @@ fn scatter_point(grid: &mut Grid, pos: Vec2, mass: f32, momentum: Vec2, contact_
 
 /// Rod -> grid scatter. From the grid's point of view a rod point is just
 /// another mass+momentum source (`Cell { momentum, mass }`, keyed by flat
-/// cell index only — `Grid` has no idea this isn't an MPM particle). No
+/// cell index only -- `Grid` has no idea this isn't an MPM particle). No
 /// stress-as-impulse term here (a rod's internal force is a per-point
-/// Newtons force, not a stress tensor) — mirrors only the mass/velocity part
+/// Newtons force, not a stress tensor) -- mirrors only the mass/velocity part
 /// of `scatter_particles_to_grid`, not its stress term.
 ///
 /// **Coverage gap fix** (real, citable technique, not invented): a rod
 /// whose points are spaced farther apart than the kernel's support radius
-/// leaves a genuine hole in its grid presence between them — a small MPM
+/// leaves a genuine hole in its grid presence between them -- a small MPM
 /// particle (rain) can pass straight through without ever registering
 /// contact, since nothing was deposited into the cells in between. Guo,
 /// Han, Fu, Gast, Tamstorf, Teran, "A Material Point Method for Thin Shells
 /// with Frictional Contact" (SIGGRAPH 2018) hit the identical problem for a
 /// coarse shell control mesh and solve it with extra quadrature points that
 /// couple to the grid WITHOUT becoming new dynamical DOFs. Same idea here:
-/// each point's own (UNCHANGED total) mass is redistributed — never
-/// added — across extra sample locations placed toward each neighbor, up
+/// each point's own (UNCHANGED total) mass is redistributed -- never
+/// added -- across extra sample locations placed toward each neighbor, up
 /// to that edge's midpoint. Sample weights always sum to exactly 1.0, so
 /// total scattered mass and momentum are provably identical to the
 /// single-point scatter; only *where* it lands is denser. Every sample uses
 /// the point's own velocity (not an inter-point interpolation), trading a
-/// minor physical simplification for EXACT — not merely small — mass and
+/// minor physical simplification for EXACT -- not merely small -- mass and
 /// momentum conservation. Verified against the real, reproduced bug this
 /// fixes in `tests/rod_grid_coupling.rs::coverage_gap_fix_catches_particle_
 /// falling_through_sparse_rod_midpoint`.
@@ -133,10 +133,10 @@ pub fn scatter_rod_to_grid(rod: &RodPoints, grid: &mut Grid) {
     }
 }
 
-/// Grid -> rod gather. Pure PIC (no APIC/`C`-matrix — a rod point has no
+/// Grid -> rod gather. Pure PIC (no APIC/`C`-matrix -- a rod point has no
 /// deformation gradient; its own "F" is already fully tracked via edge
 /// lengths + curvature). Disclosed as slightly more dissipative than the
-/// APIC particles sharing its grid — doesn't affect momentum conservation
+/// APIC particles sharing its grid -- doesn't affect momentum conservation
 /// (exact through the grid either way), just settles marginally faster.
 /// Pinned points held at `v=0`/position untouched, mirroring G2P's own
 /// pinned branch exactly (`transfer::g2p`'s `v_position`/`new_pos` logic) --
@@ -232,11 +232,11 @@ pub(crate) fn push_acceleration(
 }
 
 /// Applies the rod's own internal (stretch+bend+damping) forces plus wind
-/// drag directly to `rod.v` — called AFTER `gather_grid_to_rod`, mirroring
+/// drag directly to `rod.v` -- called AFTER `gather_grid_to_rod`, mirroring
 /// where MPM's own force fields run (after G2P, before the next P2G).
 /// Deliberately does NOT re-apply gravity: the grid-update step already
 /// applied gravity to every cell the rod scattered into (step 8 in the
-/// substep order — see `mod.rs`'s own doc), so the rod already received
+/// substep order -- see `mod.rs`'s own doc), so the rod already received
 /// gravity through the shared mechanism ordinary particles use.
 ///
 /// Bundles this function's own scalar/optional parameters -- the real fix

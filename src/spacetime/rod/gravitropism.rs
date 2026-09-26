@@ -1,4 +1,4 @@
-//! Real gravitropism — curvature relaxation toward a per-organ gravitropic
+//! Real gravitropism -- curvature relaxation toward a per-organ gravitropic
 //! set-point angle (GSA), with proprioceptive (self-straightening) damping.
 //! Dynamics FORM: Porat, Rivière, Meroz 2024, "A quantitative model for
 //! spatio-temporal dynamics of root gravitropism," Journal of Experimental
@@ -21,10 +21,10 @@
 //! Real, cited equation FORM (a genuine damped-relaxation law: curvature
 //! grows to reduce the local angular deviation from the organ's OWN target
 //! angle, damped by a real proprioceptive self-straightening term that
-//! prevents runaway curling) — not invented. The rate constants below
+//! prevents runaway curling) -- not invented. The rate constants below
 //! (`sensitivity`, `straightening`) are disclosed as illustrative, chosen
 //! for a visibly real, stable response, NOT yet calibrated to either paper's
-//! own fitted parameters — a real, open follow-up, not hidden. Applied to
+//! own fitted parameters -- a real, open follow-up, not hidden. Applied to
 //! THIS engine's own dimensionless discrete-curvature convention (see
 //! `forces::discrete_curvature`'s own doc), not either paper's literal
 //! 1/length units.
@@ -37,13 +37,13 @@
 //! `dC(s,t)/dt = -beta*sin(A(s,t)) - gamma*C(s,t)`. Two real, distinct,
 //! cited regimes this engine now supports, chosen per-organ via
 //! `GravitropismMode`:
-//! - `TipOnly` (default): only the bending vertex nearest the tip evolves —
+//! - `TipOnly` (default): only the bending vertex nearest the tip evolves --
 //!   correct for an actively ELONGATING organ's growth zone (Porat 2024's
 //!   own scope; real roots only actively bend within that zone, mature
 //!   tissue further back does not keep re-curving). Exactly the original,
 //!   pre-2026-07-27 behavior.
 //! - `WholeOrgan`: every interior bending vertex evolves independently,
-//!   each sensing its OWN local edge direction — correct for a MATURE,
+//!   each sensing its OWN local edge direction -- correct for a MATURE,
 //!   non-elongating organ's whole-body posture control (Bastien 2013's own
 //!   scope). One shared `sensitivity`/`straightening` pair applied at every
 //!   vertex is a faithful match to Bastien's own base model (constant beta,
@@ -51,7 +51,7 @@
 //!   Needed because nudging only the tip vertex cannot undo a shape already
 //!   stored across every OTHER vertex of a mature organ (confirmed
 //!   2026-07-27: a buckled blade of grass recovered only ~10% of its offset
-//!   under `TipOnly` before plateauing — the other ~17 vertices' own
+//!   under `TipOnly` before plateauing -- the other ~17 vertices' own
 //!   rest_curvature never moved).
 //!
 //! # Phototropism reuses the SAME core, a different sensed signal
@@ -71,15 +71,15 @@ use super::RodPoints;
 use super::growth::{GrowthResistance, sample_mass_density};
 use crate::grid::Grid;
 
-/// Which vertices `apply_gravitropism` actually evolves — see the module
+/// Which vertices `apply_gravitropism` actually evolves -- see the module
 /// doc's own "`GravitropismMode`" section for the real, cited distinction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GravitropismMode {
-    /// Growth-zone-localized (Porat, Rivière, Meroz 2024) — an actively
+    /// Growth-zone-localized (Porat, Rivière, Meroz 2024) -- an actively
     /// elongating organ (a root). Default: exactly the original behavior.
     #[default]
     TipOnly,
-    /// Whole-organ posture control (Bastien, Bohr, Moulia, Douady 2013) — a
+    /// Whole-organ posture control (Bastien, Bohr, Moulia, Douady 2013) -- a
     /// mature, non-elongating organ that needs to recover its whole shape,
     /// not just reorient its growing tip.
     WholeOrgan,
@@ -100,7 +100,7 @@ pub struct Gravitropism {
     /// plagiotropic organ actively holding that non-vertical angle. Default
     /// (via `new()`) is 0.0, matching the prior root-only behavior exactly.
     pub target_angle_rad: f32,
-    /// Which vertices evolve — see `GravitropismMode`'s own doc. Default
+    /// Which vertices evolve -- see `GravitropismMode`'s own doc. Default
     /// `TipOnly`, matching the prior (pre-2026-07-27) behavior exactly.
     pub mode: GravitropismMode,
     /// Real turgor-vs-soil-resistance gate, reusing `GrowthResistance`
@@ -126,19 +126,19 @@ impl Gravitropism {
         }
     }
 
-    pub fn with_resistance(mut self, resistance: GrowthResistance) -> Self {
+    pub const fn with_resistance(mut self, resistance: GrowthResistance) -> Self {
         self.resistance = Some(resistance);
         self
     }
 
     /// Set this organ's `target_angle_rad` -- see that field's own doc.
-    pub fn with_gsa(mut self, target_angle_rad: f32) -> Self {
+    pub const fn with_gsa(mut self, target_angle_rad: f32) -> Self {
         self.target_angle_rad = target_angle_rad;
         self
     }
 
     /// Choose which vertices evolve -- see `GravitropismMode`'s own doc.
-    pub fn with_mode(mut self, mode: GravitropismMode) -> Self {
+    pub const fn with_mode(mut self, mode: GravitropismMode) -> Self {
         self.mode = mode;
         self
     }
@@ -183,20 +183,20 @@ impl Phototropism {
         }
     }
 
-    pub fn with_resistance(mut self, resistance: GrowthResistance) -> Self {
+    pub const fn with_resistance(mut self, resistance: GrowthResistance) -> Self {
         self.resistance = Some(resistance);
         self
     }
 
     /// Set this organ's own target angle from the sensed light direction --
     /// see `target_angle_rad`'s own doc.
-    pub fn with_target_angle(mut self, target_angle_rad: f32) -> Self {
+    pub const fn with_target_angle(mut self, target_angle_rad: f32) -> Self {
         self.target_angle_rad = target_angle_rad;
         self
     }
 
     /// Choose which vertices evolve -- see `GravitropismMode`'s own doc.
-    pub fn with_mode(mut self, mode: GravitropismMode) -> Self {
+    pub const fn with_mode(mut self, mode: GravitropismMode) -> Self {
         self.mode = mode;
         self
     }
@@ -232,7 +232,7 @@ fn target_direction(gravity_dir: Vec2, target_angle_rad: f32) -> Vec2 {
 /// Which `rest_curvature` indices `mode` governs, for a rod of `n` points
 /// (`rest_curvature` has `n-2` entries). Matches `forces.rs`'s own vertex
 /// convention: vertex `j` sits between points `j`, `j+1`, `j+2`.
-fn vertex_range(mode: GravitropismMode, n: usize) -> std::ops::Range<usize> {
+const fn vertex_range(mode: GravitropismMode, n: usize) -> std::ops::Range<usize> {
     match mode {
         GravitropismMode::TipOnly => (n - 3)..(n - 2),
         GravitropismMode::WholeOrgan => 0..(n - 2),
@@ -406,7 +406,7 @@ fn tropism_still_correcting(
 /// Without the `resistance` gate, a rod embedded in soil evolves
 /// `rest_curvature` toward its own target-angle alignment regardless of
 /// whether it can actually rotate that far, which can drive unbounded
-/// velocity growth — the same class of failure `growth.rs`'s own
+/// velocity growth -- the same class of failure `growth.rs`'s own
 /// `GrowthResistance` was built to prevent for elongation, extended here to
 /// curvature (see `Gravitropism::resistance`'s own doc).
 ///

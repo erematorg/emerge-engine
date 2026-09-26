@@ -1,3 +1,12 @@
+//! Blocking `impl GpuSimulation` readback wrappers -- distinct from
+//! `systems::gpu::buffers::readback`, which owns the low-level `GpuBuffers`
+//! download primitives these methods call into. Mostly test/diagnostic
+//! accessors (each documents itself as such); `download_particles_blocking`
+//! and `material_mass_blocking` are real production accessors, not
+//! test-only scaffolding -- kept in this file rather than split further
+//! because every method here shares the same "blocking, off the per-frame
+//! path" shape regardless of caller.
+
 use super::GpuSimulation;
 use crate::systems::gpu::step_params::{
     ContactDebugParams, MAX_CONTACT_POINTS_PER_BLOCK, MAX_RENDER_MATERIAL_SLOTS, NUM_BLOCKS,
@@ -19,7 +28,7 @@ impl GpuSimulation {
     }
 
     /// Verification-only accessor: read back `sorted_particle_ids` as a `Vec<u32>`.
-    /// Used by tests to confirm the particle_sort pipeline produces a valid permutation —
+    /// Used by tests to confirm the particle_sort pipeline produces a valid permutation --
     /// not part of the render/game-loop API.
     pub fn sorted_particle_ids_blocking(&self) -> Vec<u32> {
         self.buffers.readback_u32_blocking(
@@ -30,7 +39,7 @@ impl GpuSimulation {
         )
     }
 
-    /// Test/diagnostic readback for the GPU sparse grid Phase 1 active-block list — the
+    /// Test/diagnostic readback for the GPU sparse grid Phase 1 active-block list -- the
     /// first `active_block_count_blocking()` entries are valid; the rest are stale/unused.
     pub fn active_block_ids_blocking(&self) -> Vec<u32> {
         self.buffers.readback_u32_blocking(
@@ -52,7 +61,7 @@ impl GpuSimulation {
         )[0]
     }
 
-    /// Test/diagnostic readback of the dense grid buffer — 4 f32 per cell (momentum.x,
+    /// Test/diagnostic readback of the dense grid buffer -- 4 f32 per cell (momentum.x,
     /// momentum.y, mass, _pad), same field order as the WGSL `Cell` struct, flat-indexed
     /// `(y * grid_res + x) * 4`. Lets tests verify grid_clear actually zeroed cells far from
     /// any particle (the failure mode a block-boundary mapping bug would produce: stale,
@@ -68,7 +77,7 @@ impl GpuSimulation {
     }
 
     /// Test/diagnostic readback of the multi-field contact "grip" accumulator (GPU port,
-    /// first slice) — same 4-f32-per-cell layout as `grid_cells_blocking`. Lets tests
+    /// first slice) -- same 4-f32-per-cell layout as `grid_cells_blocking`. Lets tests
     /// verify grip mass/momentum scatter matches CPU's `Grid::add_grip_mass_momentum`.
     pub fn grip_grid_cells_blocking(&self) -> Vec<f32> {
         let cell_floats = self.config.grid_res * self.config.grid_res * 4;
@@ -80,11 +89,11 @@ impl GpuSimulation {
         )
     }
 
-    /// Test/diagnostic readback of the per-block contact point-cloud counts (GPU port) —
+    /// Test/diagnostic readback of the per-block contact point-cloud counts (GPU port) --
     /// `NUM_CONTACT_BLOCKS` (4096) `u32` entries, one per dedicated contact-point spatial
     /// block (see `MAX_CONTACT_POINTS_PER_BLOCK`'s doc in `step_params/spatial_blocks.rs`).
     /// A count can exceed `MAX_CONTACT_POINTS_PER_BLOCK` on overflow (a real, observable signal, not
-    /// silently capped) — callers must clamp before indexing `contact_points_blocking`.
+    /// silently capped) -- callers must clamp before indexing `contact_points_blocking`.
     pub fn contact_point_counts_blocking(&self) -> Vec<u32> {
         self.buffers.readback_u32_blocking(
             &self.device,
@@ -95,11 +104,11 @@ impl GpuSimulation {
     }
 
     /// Test/diagnostic readback of `ColorMode::GridVolume`'s per-cell per-material mass
-    /// accumulator — `grid_res² × MAX_RENDER_MATERIAL_SLOTS` `f32` entries, flat-indexed
+    /// accumulator -- `grid_res² × MAX_RENDER_MATERIAL_SLOTS` `f32` entries, flat-indexed
     /// `(y * grid_res + x) * MAX_RENDER_MATERIAL_SLOTS + slot`. Only meaningful after
     /// `attach_grid_material_render_gpu()` has been called (reads a tiny placeholder
     /// buffer otherwise, since the real buffer hasn't grown yet). Real accessor, not
-    /// test-only scaffolding — the same buffer `grid_volume.wgsl`'s `dominant_material`
+    /// test-only scaffolding -- the same buffer `grid_volume.wgsl`'s `dominant_material`
     /// reads at render time.
     pub fn material_mass_blocking(&self) -> Vec<f32> {
         let grid_res = self.config.grid_res;
@@ -112,7 +121,7 @@ impl GpuSimulation {
         )
     }
 
-    /// Test/diagnostic readback of the full contact point-cloud buffer (GPU port) —
+    /// Test/diagnostic readback of the full contact point-cloud buffer (GPU port) --
     /// `NUM_CONTACT_BLOCKS * MAX_CONTACT_POINTS_PER_BLOCK` `vec4<f32>` entries
     /// (position.x, position.y, label, unused), flat-indexed
     /// `block * MAX_CONTACT_POINTS_PER_BLOCK + slot`. Only the first
@@ -128,17 +137,17 @@ impl GpuSimulation {
         )
     }
 
-    /// Debug/test-only: runs `resolve_contact.wgsl`'s `debug_fit_normal_main` — the SAME
+    /// Debug/test-only: runs `resolve_contact.wgsl`'s `debug_fit_normal_main` -- the SAME
     /// neighbor-expanded, distance-filtered `gather_local_points` the real per-substep
-    /// `resolve_cell` uses — centered on `node_pos`. Returns `(normal, valid)` — `valid`
+    /// `resolve_cell` uses -- centered on `node_pos`. Returns `(normal, valid)` -- `valid`
     /// is `false` if the fit found no confident answer (mirrors CPU's
     /// `fit_contact_normal_lr`'s `Option<Vec2>`). Verifies the Newton-Raphson LR fit's
     /// WGSL port against a known reference case, the same way CPU's own
     /// `fit_contact_normal_lr_tests` module unit-tests the fit separately from the full
-    /// `resolve_contact` integration. Blocking — test/diagnostic use only.
+    /// `resolve_contact` integration. Blocking -- test/diagnostic use only.
     ///
     /// CHANGED 2026-07-18 (GPU sparse-contact perf pass): `target_block`/`point_count`
-    /// are vestigial — the shader no longer reads one un-expanded block's raw points (an
+    /// are vestigial -- the shader no longer reads one un-expanded block's raw points (an
     /// assumption that only held by coincidence at the old coarse partition's
     /// block_size=4, false in general and definitely false against the new, finer,
     /// dedicated contact partition). Kept as parameters only because removing them would
@@ -184,7 +193,7 @@ impl GpuSimulation {
         (glam::Vec2::new(out[0], out[1]), out[2] > 0.0)
     }
 
-    /// Test/diagnostic readback of the resolved "grip" field velocity per node —
+    /// Test/diagnostic readback of the resolved "grip" field velocity per node --
     /// `grid_res² × vec2<f32>`, written by `resolve_contact_main`. See
     /// `GpuBuffers::resolved_grip_v`'s own doc.
     pub fn resolved_grip_v_blocking(&self) -> Vec<f32> {
@@ -197,7 +206,7 @@ impl GpuSimulation {
         )
     }
 
-    /// Test/diagnostic readback of the resolved "rest" field velocity per node — same
+    /// Test/diagnostic readback of the resolved "rest" field velocity per node -- same
     /// layout as `resolved_grip_v_blocking`.
     pub fn resolved_rest_v_blocking(&self) -> Vec<f32> {
         let floats = self.config.grid_res * self.config.grid_res * 2;

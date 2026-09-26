@@ -14,7 +14,7 @@ use crate::solver::config::{SimConfig, SpawnRegion};
 use glam::{IVec2, Vec2};
 
 fn gpu_available() -> bool {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    let instance = crate::systems::gpu::create_wgpu_instance();
     pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::None,
         compatible_surface: None,
@@ -24,7 +24,7 @@ fn gpu_available() -> bool {
 }
 
 /// Real, white-box verification of the device-lost guard added for emerge
-/// issue #10 (see project memory gpu_readback_error_path_bug_issue10 — the
+/// issue #10 (see project memory gpu_readback_error_path_bug_issue10 -- the
 /// root cause, a genuine `Out of Memory` device loss under sustained
 /// slow-backend load, was confirmed with hard evidence via a real
 /// `device_lost_callback` firing; forcing that same OOM condition again just
@@ -192,7 +192,7 @@ fn with_device_instances_need_explicit_opt_in_for_device_lost_detection() {
     if !gpu_available() {
         return;
     }
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    let instance = crate::systems::gpu::create_wgpu_instance();
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         compatible_surface: None,

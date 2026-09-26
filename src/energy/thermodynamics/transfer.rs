@@ -1,4 +1,4 @@
-//! Scalar heat-transfer and entropy primitives — pure IRL physics, SI units.
+//! Scalar heat-transfer and entropy primitives -- pure IRL physics, SI units.
 //!
 //! These are library functions (like `materials::lame_from_young`): closed-form
 //! laws a consumer calls when it needs a heat flux, a diffusivity, or an entropy
@@ -7,10 +7,10 @@
 //!
 //! All inputs/outputs are SI. The caller converts to/from simulation units.
 
-/// Stefan–Boltzmann constant σ — W/(m²·K⁴).
+/// Stefan–Boltzmann constant σ -- W/(m²·K⁴).
 pub const STEFAN_BOLTZMANN: f32 = 5.670_374_4e-8;
 
-/// Thermal diffusivity α = k / (ρ·c_p) — m²/s.
+/// Thermal diffusivity α = k / (ρ·c_p) -- m²/s.
 ///
 /// Governs how fast temperature equalises: ∂T/∂t = α·∇²T (Fourier).
 /// Feeds the CFL bound for explicit diffusion: dt ≤ C·dx²/α.
@@ -23,7 +23,7 @@ pub fn thermal_diffusivity(
     conductivity_w_m_k / (density_kg_m3 * specific_heat_j_kg_k).max(f32::EPSILON)
 }
 
-/// Fourier conduction heat flux q = k·A·ΔT/d — Watts.
+/// Fourier conduction heat flux q = k·A·ΔT/d -- Watts.
 ///
 /// `temp_diff` K, `area` m², `distance` m, `conductivity` W/(m·K).
 /// Positive when heat flows from hot to cold (ΔT > 0).
@@ -37,7 +37,7 @@ pub fn heat_conduction(
     conductivity_w_m_k * area_m2 * temp_diff_k / distance_m.max(f32::EPSILON)
 }
 
-/// Stefan–Boltzmann radiative exchange q = σ·ε·A·F·(T_hot⁴ − T_cold⁴) — Watts.
+/// Stefan–Boltzmann radiative exchange q = σ·ε·A·F·(T_hot⁴ − T_cold⁴) -- Watts.
 ///
 /// Radiation needs no medium (unlike conduction), so it is the heat-transfer mode
 /// that crosses vacuum. `emissivity` ε ∈ `[0,1]`, `view_factor` F ∈ `[0,1]` (geometry).
@@ -57,7 +57,7 @@ pub fn heat_radiation(
         * (hot_temp_k.powi(4) - cold_temp_k.powi(4))
 }
 
-/// Reversible entropy change ΔS = Q/T — J/K.
+/// Reversible entropy change ΔS = Q/T -- J/K.
 ///
 /// Entropy transferred when heat `Q` (J) crosses a boundary at temperature `T` (K).
 #[inline]
@@ -69,7 +69,7 @@ pub fn entropy_change_heat_transfer(heat_j: f32, temperature_k: f32) -> f32 {
     }
 }
 
-/// Net entropy produced when heat `Q` flows from a hot source to a cold sink — J/K.
+/// Net entropy produced when heat `Q` flows from a hot source to a cold sink -- J/K.
 ///
 /// ΔS = Q·(1/T_cold − 1/T_hot) ≥ 0 for T_hot ≥ T_cold > 0 (2nd law).
 #[inline]
@@ -87,17 +87,17 @@ pub fn second_law_holds(total_entropy_change: f32) -> bool {
     total_entropy_change >= 0.0
 }
 
-/// Saturating uptake/consumption rate — one rectangular-hyperbola equation shared
+/// Saturating uptake/consumption rate -- one rectangular-hyperbola equation shared
 /// across three disciplines under three names: the Holling Type II functional response
 /// (predation, Holling 1959), Michaelis-Menten kinetics (enzyme reaction rate, 1913),
-/// and the Monod equation (microbial growth rate, 1949) — all `rate = max_rate ·
+/// and the Monod equation (microbial growth rate, 1949) -- all `rate = max_rate ·
 /// density / (half_saturation + density)`, confirmed identical in form, not three
 /// separate laws.
 ///
 /// Replaces any "consume everything within radius X" rule: rate is continuous in local
 /// density, saturating toward `max_rate` as `density → ∞` (a real consumer has a finite
 /// maximum processing rate no matter how much is available) and linear (∝ density) for
-/// `density ≪ half_saturation` (scarce regime) — the two asymptotic checks any real
+/// `density ≪ half_saturation` (scarce regime) -- the two asymptotic checks any real
 /// closed-form test should verify, not just "doesn't explode."
 ///
 /// `half_saturation` is the density at which `rate` reaches exactly half of `max_rate`.

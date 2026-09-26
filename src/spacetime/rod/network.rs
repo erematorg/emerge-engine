@@ -1,28 +1,27 @@
-//! Real branching rod topology — a genuine graph, not two `Rod`s synchronized
+//! Real branching rod topology -- a genuine graph, not two `Rod`s synchronized
 //! after the fact.
 //! A branch's root point literally IS a point in the SAME array as its
-//! parent — one array, one source of truth, no post-hoc synchronization.
+//! parent -- one array, one source of truth, no post-hoc synchronization.
 //!
 //! Reuses `forces::discrete_curvature`/`discrete_curvature_gradient`
-//! completely unchanged — those functions are already point-based (three
+//! completely unchanged -- those functions are already point-based (three
 //! raw `Vec2`s), not index-based, so the real curvature math from Bergou et
 //! al. 2008 needs no modification at all to work at a branch vertex; only
 //! the TOPOLOGY (which points form which edges/bending triples) needed to
 //! generalize from "always i-1,i,i+1" (implicit, linear-chain `RodPoints`)
 //! to an explicit list.
 //!
-//! Scope, disclosed: binary branching only — a point may have at most 3
+//! Scope, disclosed: binary branching only -- a point may have at most 3
 //! incident edges (one "parent" side, two "child" sides), giving exactly 2
 //! meaningful bending vertices at a branch point. Real botanical branching
 //! is overwhelmingly bifurcation; true simultaneous trifurcation would need
 //! a further real extension, not attempted here.
 //!
-//! Per-edge/per-bending-vertex stiffness (`ea`/`ei`) is stored explicitly,
-//! not one shared `RodMaterial` — a real trunk and its fine branches
-//! genuinely differ in stiffness, unlike a single unbranched rod where one
-//! material was always a reasonable assumption. Damping stays network-wide
-//! for now (disclosed simplification — real stiffness variation across a
-//! plant is dramatic, damping ratio variation far less so).
+//! Per-edge/per-bending-vertex stiffness and damping (`ea`/`ei`,
+//! `axial_damping`/`bending_damping`) are stored explicitly, not one shared
+//! `RodMaterial` -- a real trunk and its fine branches genuinely differ in
+//! their mechanical response, unlike a single unbranched rod where one
+//! material was always a reasonable assumption.
 
 use glam::Vec2;
 
@@ -34,6 +33,7 @@ pub struct NetworkEdge {
     pub b: usize,
     pub rest_length_m: f32,
     pub ea: f32,
+    pub axial_damping: f32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -43,6 +43,7 @@ pub struct NetworkBendingVertex {
     pub p2: usize,
     pub rest_curvature: f32,
     pub ei: f32,
+    pub bending_damping: f32,
     pub voronoi_length_m: f32,
 }
 
@@ -55,21 +56,23 @@ pub struct RodNetwork {
     pub position_compensation: Vec<Vec2>,
     pub edges: Vec<NetworkEdge>,
     pub bending: Vec<NetworkBendingVertex>,
+    /// Default copied into new edges by network constructors.
     pub axial_damping: f32,
+    /// Default copied into new bending vertices by network constructors.
     pub bending_damping: f32,
 }
 
 impl RodNetwork {
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.x.len()
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.x.is_empty()
     }
 }
 
-/// Grouped parameters for `build_y_branch` — one struct instead of an
+/// Grouped parameters for `build_y_branch` -- one struct instead of an
 /// 11-argument function signature.
 #[derive(Debug, Clone, Copy)]
 pub struct YBranchSpec {
@@ -88,7 +91,7 @@ pub struct YBranchSpec {
 
 /// Builds a simple Y-branch: a straight trunk from `trunk_start` to
 /// `junction`, with a straight branch continuing from `junction` to
-/// `branch_end` — the smallest real, testable branching topology. The
+/// `branch_end` -- the smallest real, testable branching topology. The
 /// junction point is shared: it is NOT duplicated, it is literally point
 /// index `n_trunk - 1`, referenced by both the trunk's last edge and the
 /// branch's first edge.
@@ -138,6 +141,7 @@ pub fn build_y_branch(spec: YBranchSpec) -> RodNetwork {
             b: i + 1,
             rest_length_m: trunk_seg_m,
             ea,
+            axial_damping,
         });
     }
     for i in 0..n_trunk_points.saturating_sub(2) {
@@ -148,6 +152,7 @@ pub fn build_y_branch(spec: YBranchSpec) -> RodNetwork {
             p2: i + 2,
             rest_curvature: 0.0,
             ei,
+            bending_damping,
             voronoi_length_m: voronoi,
         });
     }
@@ -179,6 +184,7 @@ pub fn build_y_branch(spec: YBranchSpec) -> RodNetwork {
             b: w[1],
             rest_length_m: branch_seg_m,
             ea,
+            axial_damping,
         });
     }
     for w in branch_indices.windows(3) {
@@ -188,6 +194,7 @@ pub fn build_y_branch(spec: YBranchSpec) -> RodNetwork {
             p2: w[2],
             rest_curvature: 0.0,
             ei,
+            bending_damping,
             voronoi_length_m: branch_seg_m,
         });
     }
@@ -215,6 +222,7 @@ pub fn build_y_branch(spec: YBranchSpec) -> RodNetwork {
             p2: branch_indices[1],
             rest_curvature: discrete_curvature(p0, p1, p2),
             ei,
+            bending_damping,
             voronoi_length_m: 0.5 * (trunk_seg_m + branch_seg_m),
         });
     }
@@ -236,7 +244,7 @@ pub fn build_y_branch(spec: YBranchSpec) -> RodNetwork {
 /// Real per-point internal force (Newtons), generalizing
 /// `forces::compute_internal_forces` from implicit linear-chain adjacency
 /// to an explicit edge/bending topology. Same stretch + bending + damping
-/// physics, same underlying curvature math — only the iteration is
+/// physics, same underlying curvature math -- only the iteration is
 /// different (over explicit lists instead of an index range).
 pub fn compute_network_internal_forces(net: &RodNetwork, dx_meters: f32) -> Vec<Vec2> {
     let n = net.len();
@@ -254,7 +262,7 @@ pub fn compute_network_internal_forces(net: &RodNetwork, dx_meters: f32) -> Vec<
         let f_stretch = edge.ea * (l - l0) / l0;
         let rel_v = (net.v[edge.b] - net.v[edge.a]) * dx_meters;
         let strain_rate = rel_v.dot(dir);
-        let f_damp = net.axial_damping * strain_rate;
+        let f_damp = edge.axial_damping * strain_rate;
 
         let f = (f_stretch + f_damp) * dir;
         force[edge.a] += f;
@@ -276,7 +284,7 @@ pub fn compute_network_internal_forces(net: &RodNetwork, dx_meters: f32) -> Vec<
         let kappa_dot = grad[0].dot(net.v[bv.p0] * dx_meters)
             + grad[1].dot(net.v[bv.p1] * dx_meters)
             + grad[2].dot(net.v[bv.p2] * dx_meters);
-        let damp_coeff = net.bending_damping * kappa_dot;
+        let damp_coeff = bv.bending_damping * kappa_dot;
 
         let total_coeff = coeff + damp_coeff;
         force[bv.p0] -= total_coeff * grad[0];
@@ -289,7 +297,7 @@ pub fn compute_network_internal_forces(net: &RodNetwork, dx_meters: f32) -> Vec<
 
 /// Real Gershgorin CFL bound, generalizing `integrator::rod_cfl_dt` from
 /// implicit `i-1/i/i+1` neighbor lookups to an explicit edges/bending pass
-/// — same principle (sum every stiffness/damping term touching each point),
+/// -- same principle (sum every stiffness/damping term touching each point),
 /// single accumulation pass instead of a per-point neighbor scan since the
 /// topology is no longer a fixed linear pattern.
 pub fn network_cfl_dt(net: &RodNetwork, safety: f32) -> f32 {
@@ -303,8 +311,8 @@ pub fn network_cfl_dt(net: &RodNetwork, safety: f32) -> f32 {
         let l0 = edge.rest_length_m.max(1.0e-9);
         omega_sq[edge.a] += edge.ea / (m_a * l0);
         omega_sq[edge.b] += edge.ea / (m_b * l0);
-        damping_rate[edge.a] += net.axial_damping;
-        damping_rate[edge.b] += net.axial_damping;
+        damping_rate[edge.a] += edge.axial_damping;
+        damping_rate[edge.b] += edge.axial_damping;
     }
     for bv in &net.bending {
         let voronoi_length = bv.voronoi_length_m.max(1.0e-9);
@@ -313,8 +321,8 @@ pub fn network_cfl_dt(net: &RodNetwork, safety: f32) -> f32 {
             if bv.ei > 0.0 {
                 omega_sq[p] += bv.ei / (m * voronoi_length.powi(3));
             }
-            if net.bending_damping > 0.0 {
-                damping_rate[p] += net.bending_damping / voronoi_length.powi(2);
+            if bv.bending_damping > 0.0 {
+                damping_rate[p] += bv.bending_damping / voronoi_length.powi(2);
             }
         }
     }
@@ -332,7 +340,7 @@ pub fn network_cfl_dt(net: &RodNetwork, safety: f32) -> f32 {
     min_dt
 }
 
-/// Standalone explicit (symplectic Euler) network step — no grid, mirrors
+/// Standalone explicit (symplectic Euler) network step -- no grid, mirrors
 /// `integrator::step_rod`'s own Phase 0/1 role for the linear rod. No
 /// built-in CFL enforcement, matching `step_rod`'s own contract: the caller
 /// must pick a stable `dt`, typically via `network_cfl_dt`.
@@ -355,5 +363,85 @@ pub fn step_network(net: &mut RodNetwork, gravity: Vec2, dx_meters: f32, dt: f32
             continue;
         }
         net.x[i] += net.v[i] * dt;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_network() -> RodNetwork {
+        build_y_branch(YBranchSpec {
+            trunk_start: Vec2::new(0.0, 0.0),
+            junction: Vec2::new(0.0, 2.0),
+            branch_end: Vec2::new(2.0, 3.0),
+            n_trunk_points: 3,
+            n_branch_points: 3,
+            linear_density_kg_per_m: 1.0,
+            dx_meters: 1.0,
+            ea: 0.0,
+            ei: 0.0,
+            axial_damping: 2.0,
+            bending_damping: 3.0,
+        })
+    }
+
+    #[test]
+    fn constructor_copies_network_damping_defaults_to_each_branch_element() {
+        let net = test_network();
+        assert!(net.edges.iter().all(|edge| edge.axial_damping == 2.0));
+        assert!(
+            net.bending
+                .iter()
+                .all(|vertex| vertex.bending_damping == 3.0)
+        );
+    }
+
+    #[test]
+    fn internal_forces_use_per_element_damping_not_network_defaults() {
+        let mut net = test_network();
+        net.axial_damping = 1000.0;
+        net.bending_damping = 1000.0;
+        for edge in &mut net.edges {
+            edge.axial_damping = 0.0;
+        }
+        for vertex in &mut net.bending {
+            vertex.bending_damping = 0.0;
+        }
+        assert!(
+            network_cfl_dt(&net, 0.5).is_infinite(),
+            "CFL damping bound must also ignore network-wide construction defaults"
+        );
+
+        let edge = net.edges[0];
+        let edge_dir = (net.x[edge.b] - net.x[edge.a]).normalize();
+        net.v[edge.b] = edge_dir;
+        assert!(
+            compute_network_internal_forces(&net, 1.0)
+                .iter()
+                .all(|force| force.length() < 1.0e-6),
+            "network-wide defaults must not leak into existing edges or vertices"
+        );
+
+        net.edges[0].axial_damping = 4.0;
+        assert!(network_cfl_dt(&net, 0.5).is_finite());
+        let axial_forces = compute_network_internal_forces(&net, 1.0);
+        assert!(
+            axial_forces[edge.a].length() > 1.0,
+            "the edited edge's own axial damping must contribute force"
+        );
+
+        net.v.fill(Vec2::ZERO);
+        net.edges[0].axial_damping = 0.0;
+        let vertex = net.bending[0];
+        let grad =
+            discrete_curvature_gradient(net.x[vertex.p0], net.x[vertex.p1], net.x[vertex.p2]);
+        net.v[vertex.p0] = grad[0];
+        net.bending[0].bending_damping = 5.0;
+        let bending_forces = compute_network_internal_forces(&net, 1.0);
+        assert!(
+            bending_forces.iter().any(|force| force.length() > 1.0e-3),
+            "the edited bending vertex's own damping must contribute force"
+        );
     }
 }

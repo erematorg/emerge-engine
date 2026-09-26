@@ -1,6 +1,7 @@
 # Rust build artifacts
 /target/
 **/target/
+/target-*/
 Cargo.lock
 
 # IDE and editor settings

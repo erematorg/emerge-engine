@@ -3,36 +3,37 @@
 //! Implements ∂φ/∂t = D·∇²φ − λ·φ + S  (diffusion + first-order decay + sources)
 //! where φ is any per-particle scalar, read/written via function pointers.
 //!
-//! # Algorithm (per substep) — identical to ThermalDiffusion
-//! 1. **Source** — optional: inject S(p)·dt into each particle before scattering
-//! 2. **P2G** — scatter mass-weighted φ to the grid
-//! 3. **Normalize** — grid_φ = Σ(w·m·φ) / Σ(w·m); empty cells = ambient
-//! 4. **Laplacian FD** — explicit Euler: φ_new = φ + dt·D·∇²φ
-//! 5. **Decay** — φ_new *= exp(−λ·dt)  (or equivalently φ_new += −λ·φ·dt for small λ·dt)
-//! 6. **G2P** — gather Δφ back to particles
+//! # Algorithm (per substep) -- identical to ThermalDiffusion
+//! 1. **Source** -- optional: inject S(p)·dt into each particle before scattering
+//! 2. **P2G** -- scatter mass-weighted φ to the grid
+//! 3. **Normalize** -- grid_φ = Σ(w·m·φ) / Σ(w·m); empty cells = ambient
+//! 4. **Laplacian FD** -- explicit Euler: φ_new = φ + dt·D·∇²φ
+//! 5. **Decay** -- φ_new *= exp(−λ·dt)  (or equivalently φ_new += −λ·φ·dt for small λ·dt)
+//! 6. **G2P** -- gather Δφ back to particles
 //!
 //! # Use cases
-//! - **Heat** — same as `ThermalDiffusion`, D = k/(ρ·cₚ·dx²)
-//! - **Chemical / pheromone** — high decay_rate (seconds to minutes half-life)
-//! - **Nutrient / oxygen** — low decay_rate, sourced by terrain particles
-//! - **Signal / pressure wave** — high diffusivity, zero decay
+//! - **Heat** -- same as `ThermalDiffusion`, D = k/(ρ·cₚ·dx²)
+//! - **Chemical / pheromone** -- high decay_rate (seconds to minutes half-life)
+//! - **Nutrient / oxygen** -- low decay_rate, sourced by terrain particles
+//! - **Signal / pressure wave** -- high diffusivity, zero decay
 //!
 //! # Fn pointer API
 //! `get` and `set` are plain function pointers (not closures) so the field
 //! is `Send + Sync` and can be stored without lifetime annotation.
-//! `set` receives the **delta** (Δφ), not the new absolute value — this
+//! `set` receives the **delta** (Δφ), not the new absolute value -- this
 //! preserves per-particle state not captured by the grid (sparse regions, edges).
 
 use glam::IVec2;
 
 use crate::{
     grid::kernel::quadratic_weights,
+    materials::{MaterialModel, registry::MaterialRegistry},
     particle::{Particle, Particles},
 };
 
 /// A diffusing, decaying scalar field grid-coupled to MPM particles.
 ///
-/// # Example — pheromone field
+/// # Example -- pheromone field
 /// ```rust,no_run
 /// # extern crate emerge_engine as emerge;
 /// # use emerge::{ScalarDiffusionConfig, ScalarDiffusionField};
@@ -49,6 +50,12 @@ use crate::{
 ///     64,
 /// );
 /// ```
+/// Signature for `ScalarDiffusionField::source` -- factored into its own
+/// alias (clippy's own complexity threshold, not just cosmetic) once the
+/// resolved-material parameter joined the particle/phi pair. See `source`'s
+/// own doc for what each argument is for.
+pub type ScalarFieldSource = fn(&Particle, f32, &dyn MaterialModel) -> f32;
+
 pub struct ScalarDiffusionField {
     pub config: ScalarDiffusionConfig,
     /// Read the scalar value φ from a particle.
@@ -56,16 +63,48 @@ pub struct ScalarDiffusionField {
     /// Apply a delta Δφ to a particle (called during G2P).
     pub set: fn(&mut Particle, f32),
     /// Optional per-particle source term in φ/s.
-    /// Each substep: φ_particle += source(p, φ) · dt before P2G.
+    /// Each substep: φ_particle += source(p, φ, material) · dt before P2G.
     ///
-    /// Second argument is the current φ value of the particle — enables
+    /// Second argument is the current φ value of the particle -- enables
     /// nonlinear (reaction-diffusion) sources, e.g. Gray-Scott: `−u·v²`.
+    /// Third argument is this particle's own resolved material -- lets a
+    /// source classify by REAL PHYSICAL CONDITIONS (e.g.
+    /// `material.owns_deformation_volume_state()` for "behaves like a
+    /// strict fluid") instead of checking `material_id` against a specific,
+    /// named identity. A material becomes a source because it genuinely
+    /// satisfies real conditions, not because the engine was told in
+    /// advance what it is -- the same property-driven principle every
+    /// material's own construction already follows (`ElasticProps`,
+    /// `FluidProps`, etc. -- see `matter::materials::physical_props`).
     /// Use for fire emitting heat, creatures emitting pheromone, Turing patterns, etc.
-    pub source: Option<fn(&Particle, f32) -> f32>,
+    pub source: Option<ScalarFieldSource>,
+
+    /// PIC/FLIP-style transfer blend, real and established (Zhu & Bridson
+    /// 2005; standard in production fluid solvers, commonly ~0.95 FLIP/0.05
+    /// PIC -- see Bridson, *Fluid Simulation for Computer Graphics*, already
+    /// cited elsewhere in this engine; this engine's own `apic_blend`
+    /// applies the identical idea to velocity transfer already).
+    ///
+    /// `1.0` (default) = pure delta transfer ("FLIP-like"): a particle's own
+    /// stored value plus the grid-computed change, preserving per-particle
+    /// heterogeneity -- exactly this field's original, only behavior, so
+    /// every existing heat/pheromone/nutrient scene is byte-identical.
+    /// `0.0` = pure absolute transfer ("PIC-like"): a particle simply takes
+    /// the local grid average, discarding its own prior value -- damped,
+    /// stable, no nullspace noise.
+    ///
+    /// Real motivating case: a passive reader (e.g. sand) co-located with an
+    /// aggressive, persistent source (e.g. water) can accumulate the SAME
+    /// grid-computed delta the source itself gets every substep, with
+    /// nothing of its own to counterbalance it -- the exact nullspace-noise
+    /// failure FLIP is documented to have. A lower blend trades some of the
+    /// "preserve my own value" property for the stability a passive
+    /// participant actually needs.
+    pub blend: f32,
 
     grid_res: usize,
-    grid_mass: Vec<f32>, // Σ(w · mass)          — cleared each step
-    grid_norm: Vec<f32>, // φ_grid (pre-Laplacian) — needed for G2P delta
+    grid_mass: Vec<f32>, // Σ(w · mass)          -- cleared each step
+    grid_norm: Vec<f32>, // φ_grid (pre-Laplacian) -- needed for G2P delta
     grid_work: Vec<f32>, // dual-use: P2G scatter buffer, then Laplacian output
                          // Note: grid_work is reused between P2G and Laplacian to avoid a 4th allocation.
                          // P2G phase:       grid_work = Σ(w · mass · φ)
@@ -116,6 +155,7 @@ impl ScalarDiffusionField {
             get,
             set,
             source: None,
+            blend: 1.0,
             grid_res,
             grid_mass: vec![0.0; n],
             grid_norm: vec![0.0; n],
@@ -144,23 +184,24 @@ impl ScalarDiffusionField {
     }
 
     /// Grid resolution this field was created with.
-    pub fn grid_res(&self) -> usize {
+    pub const fn grid_res(&self) -> usize {
         self.grid_res
     }
 
     /// Apply one substep of diffusion to the particle set.
     ///
     /// Call once per MPM substep, after force fields.
-    pub fn apply(&mut self, particles: &mut Particles, sub_dt: f32) {
+    pub fn apply(&mut self, particles: &mut Particles, sub_dt: f32, materials: &MaterialRegistry) {
         let n = self.grid_res * self.grid_res;
         let res = self.grid_res as i32;
 
-        // --- Source injection: φ += S(p)·dt before scattering ---
+        // --- Source injection: φ += S(p, φ, material)·dt before scattering ---
         if let Some(src) = self.source {
             for pi in 0..particles.len() {
                 let mut p = particles.get(pi);
                 let phi = (self.get)(&p);
-                let inject = src(&p, phi) * sub_dt;
+                let material = materials.get(p.material_id);
+                let inject = src(&p, phi, material) * sub_dt;
                 (self.set)(&mut p, inject);
                 particles.set(pi, p);
             }
@@ -212,7 +253,7 @@ impl ScalarDiffusionField {
             d_dt,
             self.config.ambient,
         );
-        // Decay pulls toward zero (not ambient — a real, deliberate
+        // Decay pulls toward zero (not ambient -- a real, deliberate
         // difference from ThermalDiffusion's Newton cooling, see module doc).
         let decay_factor = 1.0 - self.config.decay_rate * sub_dt;
         if decay_factor != 1.0 {
@@ -221,13 +262,13 @@ impl ScalarDiffusionField {
             }
         }
 
-        // --- G2P: gather Δφ = (φ_new − φ_old) back to particles ---
-        // Scatter delta, not absolute — preserves per-particle state in sparse/edge regions.
+        // --- G2P: gather back to particles, PIC/FLIP-blended (see `blend`'s own doc) ---
         // grid_work = φ_new, grid_norm = φ_old.
         for pi in 0..particles.len() {
             let p_ref = particles.get(pi);
             let w = quadratic_weights(p_ref.x);
-            let mut delta = 0.0f32;
+            let mut new_local = 0.0f32; // interpolated φ_new at this particle's position
+            let mut old_local = 0.0f32; // interpolated φ_old at this particle's position
             let mut w_sum = 0.0f32;
 
             for gx in 0i32..3 {
@@ -238,16 +279,119 @@ impl ScalarDiffusionField {
                         continue;
                     }
                     let idx = (cell.x * res + cell.y) as usize;
-                    delta += weight * (self.grid_work[idx] - self.grid_norm[idx]);
+                    new_local += weight * self.grid_work[idx];
+                    old_local += weight * self.grid_norm[idx];
                     w_sum += weight;
                 }
             }
 
             if w_sum > 1e-10 {
                 let mut p = particles.get(pi);
-                (self.set)(&mut p, delta / w_sum);
+                let new_local = new_local / w_sum;
+                let old_local = old_local / w_sum;
+                // FLIP-like: preserve the particle's own prior value, apply only
+                // the grid-computed change. PIC-like: replace with the local
+                // grid average outright, discarding the particle's own value.
+                let flip_delta = new_local - old_local;
+                let pic_delta = new_local - (self.get)(&p);
+                let blended = self.blend * flip_delta + (1.0 - self.blend) * pic_delta;
+                (self.set)(&mut p, blended);
                 particles.set(pi, p);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod pic_flip_blend_tests {
+    use super::*;
+    use crate::materials::registry::MaterialRegistry;
+    use crate::materials::{DruckerPragerMaterial, NewtonianFluidMaterial};
+    use glam::Vec2;
+
+    /// Real regression test for `blend` itself, at the hardest case on
+    /// purpose: sand and water EXACTLY co-located (every pair sharing one
+    /// position), not just spatially nearby -- the worst-case scenario for
+    /// FLIP's nullspace-noise failure (see `blend`'s own doc), since a
+    /// passive reader here gets the identical grid delta the source itself
+    /// gets, every substep, with nothing of its own to counterbalance it.
+    /// At a real PIC-leaning blend, the passive material must still pick up
+    /// genuine positive saturation instead of drifting negative.
+    #[test]
+    fn low_blend_gives_stable_positive_transfer_even_at_exact_colocation() {
+        let mut registry = MaterialRegistry::with_default(Box::new(
+            DruckerPragerMaterial::cohesionless(1.0e5, 0.2),
+        ));
+        registry.insert(
+            1,
+            Box::new(NewtonianFluidMaterial::low_viscosity(4.0, 10.0)),
+        );
+
+        // Real spatial spread (a small block, not a singular point) -- two
+        // particles sharing one exact position is a degenerate edge case
+        // (no meaningful gradient for the Laplacian to act on), not a
+        // realistic test of spatial diffusion between two bodies.
+        let mut raw = Vec::new();
+        for bx in 0..4 {
+            for by in 0..4 {
+                raw.push(Particle {
+                    x: Vec2::new(6.0 + bx as f32, 6.0 + by as f32),
+                    mass: 1.0,
+                    initial_volume: 1.0,
+                    volume: 1.0,
+                    density: 1.0,
+                    material_id: 0,
+                    ..Particle::zeroed()
+                });
+                raw.push(Particle {
+                    x: Vec2::new(6.0 + bx as f32, 6.0 + by as f32),
+                    mass: 1.0,
+                    initial_volume: 1.0,
+                    volume: 1.0,
+                    density: 1.0,
+                    material_id: 1,
+                    ..Particle::zeroed()
+                });
+            }
+        }
+        let mut particles = Particles::from(raw);
+
+        let mut field = ScalarDiffusionField::new(
+            ScalarDiffusionConfig {
+                diffusivity: 0.5,
+                decay_rate: 0.0,
+                ambient: 0.0,
+            },
+            |p| p.scalar_field,
+            |p, delta| p.scalar_field += delta,
+            16,
+        );
+        fn src(_p: &Particle, phi: f32, material: &dyn MaterialModel) -> f32 {
+            if material.owns_deformation_volume_state() && phi < 1.0 {
+                4.0
+            } else {
+                0.0
+            }
+        }
+        field.source = Some(src);
+        field.blend = 0.3;
+
+        for _ in 0..10 {
+            field.apply(&mut particles, 0.1, &registry);
+        }
+
+        let sand_sum: f32 = (0..particles.len())
+            .filter(|&i| particles.material_id[i] == 0)
+            .map(|i| particles.scalar_field[i])
+            .sum();
+        let water_sum: f32 = (0..particles.len())
+            .filter(|&i| particles.material_id[i] == 1)
+            .map(|i| particles.scalar_field[i])
+            .sum();
+        println!("DIAG: sand_sum={sand_sum} water_sum={water_sum}");
+        assert!(
+            sand_sum > 0.0,
+            "direct apply() must transfer real, positive phi to co-located non-fluid particles"
+        );
     }
 }

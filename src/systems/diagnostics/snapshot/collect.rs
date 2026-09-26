@@ -13,7 +13,7 @@ use crate::{grid::Grid, particle::Particles};
 
 use super::SimSnapshot;
 
-/// Particle-only snapshot — no grid required. Used by `GpuSimulation::diagnostics_snapshot`.
+/// Particle-only snapshot -- no grid required. Used by `GpuSimulation::diagnostics_snapshot`.
 /// Grid-side fields (mass error, momentum error, grid speed, active cells) are left at zero.
 pub fn collect_snapshot_particles_only(
     frame_index: u64,

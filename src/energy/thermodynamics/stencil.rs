@@ -1,16 +1,16 @@
 //! Shared 5-point explicit-Euler Laplacian diffusion stencil.
 //!
 //! The one piece of math genuinely identical between [`super::diffusion`]
-//! and [`super::scalar_field`] — both scatter a particle scalar to the grid,
+//! and [`super::scalar_field`] -- both scatter a particle scalar to the grid,
 //! run this stencil, then gather the delta back. What differs between them
 //! (direct-field access vs. runtime fn-pointer access, decay-to-zero vs.
-//! Newton-cooling-to-ambient) is real, not accidental duplication — see
+//! Newton-cooling-to-ambient) is real, not accidental duplication -- see
 //! each module's own docs. Only the stencil itself was hand-copied.
 
 /// Applies one explicit-Euler diffusion step: `grid_out[c] = grid_in[c] +
 /// diffusivity_dt * laplacian(grid_in, c)`.
 ///
-/// Off-grid neighbors (domain edges) are treated as `ambient` — a Dirichlet
+/// Off-grid neighbors (domain edges) are treated as `ambient` -- a Dirichlet
 /// boundary condition. Column-major layout: `idx = x * grid_res + y`,
 /// matching the mechanics grid.
 pub(crate) fn laplacian_step(

@@ -1,4 +1,4 @@
-// Instanced particle render — 2D.
+// Instanced particle render -- 2D.
 // Vertex: deforms unit quad by F, projects via orthographic camera.
 // Fragment: optional disc clip with soft edge.
 

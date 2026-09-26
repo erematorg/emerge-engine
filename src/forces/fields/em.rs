@@ -37,7 +37,7 @@ pub struct UniformElectricField {
 }
 
 impl UniformElectricField {
-    pub fn new(field: Vec2, material_charges: HashMap<u32, f32>) -> Self {
+    pub const fn new(field: Vec2, material_charges: HashMap<u32, f32>) -> Self {
         Self {
             field,
             material_charges,

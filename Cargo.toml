@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2024"
 authors = ["Eremat"]
 license = "MIT OR Apache-2.0"
-description = "Real-time MLS-MPM continuum physics engine — fluids, granular, elastic solids, active matter."
+description = "Real-time MLS-MPM continuum physics engine -- fluids, granular, elastic solids, active matter."
 repository = "https://github.com/erematorg/emerge-engine"
 readme = "README.md"
 keywords = ["physics", "mpm", "simulation", "game", "continuum"]
@@ -19,18 +19,26 @@ exclude = ["LP_MPM_SPEC.md"]
 glam = { version = "0.30", features = ["bytemuck"] }
 bytemuck = { version = "1", features = ["derive"] }
 rayon = "1"
-wgpu = { version = "27", optional = true }
+# Arbitrary-length real FFT for `grid::dct`'s DCT-II/III -- the fluid
+# pressure-projection solve's Poisson operator diagonalizes exactly in this
+# basis, and the active-region bounding box (its own transform size) is not
+# a power of two, so a general-N FFT is required. A well-established, widely
+# used pure-Rust crate (Bluestein/mixed-radix internally), not a hand-rolled
+# arbitrary-N FFT written under time pressure -- see `grid::dct`'s own doc.
+rustfft = "6"
+wgpu = { version = "27", optional = true, features = ["static-dxc"] }
 
 [features]
 default = []
-# GPU compute: 11-pass wgpu pipeline (5 sort/active-block passes once per frame,
-# 6 per substep -- see ARCHITECTURE.md §5). Plasticity runs on GPU for every
-# material except NACC, which is CPU-only (issue #5).
+# GPU compute: wgpu pipeline, sparse active-block dispatch on grid_clear/
+# grid_update, run every substep.
+# Plasticity runs on GPU for every material except NACC, which is CPU-only
+# (issue #5).
 gpu = ["dep:wgpu"]
 # Standalone debug renderer: instanced particle draw via wgpu. Requires gpu.
 render = ["gpu"]
 # Experimental physics modules: acoustics, EM, information theory.
-# Not part of the guaranteed public API — no concrete LP use yet.
+# Not part of the guaranteed public API -- no concrete LP use yet.
 experimental = []
 
 [dev-dependencies]
@@ -46,6 +54,9 @@ name = "scaling"
 harness = false
 
 [profile.dev]
+# Measured 2026-08-25: raising this to 3 moved a real demo frame from 19.8ms
+# to 19.5ms of solve -- 1.5%, for +1m31s of compile. The solver is not
+# codegen-bound at this particle count, so 1 stays.
 opt-level = 1
 debug = 1
 
@@ -56,143 +67,382 @@ opt-level = 3  # Full optimization for dependencies
 lto = "thin"
 codegen-units = 1
 
+# Release-speed code without release-speed BUILD cost, for the development
+# loop and for CI. `codegen-units = 1` serialises code generation onto one
+# thread and thin LTO adds a whole-program pass; both earn their keep in a
+# shipped binary and cost minutes in a loop where the run is seconds.
+#
+# Same opt-level, so measurements taken under it are representative. Use
+# `--release` for numbers that go in a report.
+[profile.quick]
+inherits = "release"
+lto = false
+codegen-units = 16
+
 [[example]]
 name = "headless"
+path = "examples/cpu/headless.rs"
+
+[[example]]
+name = "fluid_thin_layer_diag"
+path = "examples/cpu/fluid_thin_layer_diag.rs"
+
+[[example]]
+name = "fluid_thin_layer_diag_gpu"
+path = "examples/gpu/fluid_thin_layer_diag_gpu.rs"
+required-features = ["gpu"]
+
+[[example]]
+name = "cfl_staleness_experiment_gpu"
+path = "examples/gpu/cfl_staleness_experiment_gpu.rs"
+required-features = ["gpu"]
+
+[[example]]
+name = "regional_substep_feasibility_check"
+path = "examples/gpu/regional_substep_feasibility_check.rs"
+required-features = ["gpu"]
+
+[[example]]
+name = "render_modes_snapshot"
+path = "examples/gpu/render_modes_snapshot.rs"
+required-features = ["render"]
+
+[[example]]
+name = "fragmentation_check_gpu"
+path = "examples/gpu/fragmentation_check_gpu.rs"
+required-features = ["gpu"]
+
+[[example]]
+name = "cpu_gpu_single_step_kernel_diff"
+path = "examples/gpu/cpu_gpu_single_step_kernel_diff.rs"
+required-features = ["gpu"]
+
+[[example]]
+name = "fragmentation_check_cpu"
+path = "examples/cpu/fragmentation_check_cpu.rs"
+
+[[example]]
+name = "cfl_refresh_rate_check_gpu"
+path = "examples/gpu/cfl_refresh_rate_check_gpu.rs"
+required-features = ["gpu"]
+
+[[example]]
+name = "fluid_pressure_projection_gpu_check"
+path = "examples/gpu/fluid_pressure_projection_gpu_check.rs"
+required-features = ["gpu"]
+
+[[example]]
+name = "fluid_pressure_projection_parity_check"
+path = "examples/cpu/fluid_pressure_projection_parity_check.rs"
+
+[[example]]
+name = "fluid_pressure_projection_droplet_landing_check"
+path = "examples/cpu/fluid_pressure_projection_droplet_landing_check.rs"
+
+[[example]]
+name = "atomic_scatter_contention_test"
+path = "examples/gpu/atomic_scatter_contention_test.rs"
+required-features = ["gpu"]
+
+[[example]]
+name = "cpu_gpu_lockstep_divergence_finder"
+path = "examples/gpu/cpu_gpu_lockstep_divergence_finder.rs"
+required-features = ["gpu"]
 
 # --- GPU examples: current focus ---
 [[example]]
 name = "basic_jellies_gpu"
-required-features = ["render"]
-
-[[example]]
-name = "basic_sand_gpu"
+path = "examples/gpu/basic_jellies_gpu.rs"
 required-features = ["render"]
 
 [[example]]
 name = "basic_snow_gpu"
+path = "examples/gpu/basic_snow_gpu.rs"
 required-features = ["render"]
 
 [[example]]
 name = "basic_fluids_gpu"
+path = "examples/gpu/basic_fluids_gpu.rs"
 required-features = ["render"]
 
 [[example]]
 name = "basic_showcase_gpu"
+path = "examples/gpu/basic_showcase_gpu.rs"
 required-features = ["render"]
 
 [[example]]
 name = "material_sandbox_gpu"
+path = "examples/gpu/material_sandbox_gpu.rs"
 required-features = ["render"]
 
 [[example]]
 name = "render_physics"
+path = "examples/gpu/render_physics.rs"
 required-features = ["render"]
 
 # --- CPU examples: deferred. Reference / fallback only. ---
 [[example]]
 name = "basic_showcase"
+path = "examples/cpu/basic_showcase.rs"
 required-features = ["render"]
 
 [[example]]
 name = "basic_fluids"
+path = "examples/cpu/basic_fluids.rs"
 required-features = ["render"]
 
 [[example]]
-name = "mixture_sand_water"
+name = "basic_gas"
+path = "examples/cpu/basic_gas.rs"
+required-features = ["render"]
+
+[[example]]
+name = "basic_orbital"
+path = "examples/cpu/basic_orbital.rs"
+required-features = ["render"]
+
+[[example]]
+name = "basic_solar_system"
+path = "examples/cpu/basic_solar_system.rs"
 required-features = ["render"]
 
 [[example]]
 name = "basic_plant"
+path = "examples/cpu/basic_plant.rs"
 required-features = ["render"]
 
 [[example]]
 name = "basic_jellies"
+path = "examples/cpu/basic_jellies.rs"
 required-features = ["render"]
 
 [[example]]
 name = "basic_snow"
+path = "examples/cpu/basic_snow.rs"
 required-features = ["render"]
 
 [[example]]
 name = "basic_sand"
+path = "examples/cpu/basic_sand.rs"
+required-features = ["render"]
+
+[[example]]
+name = "basic_membrane"
+path = "examples/cpu/basic_membrane.rs"
+required-features = ["render"]
+
+[[example]]
+name = "bingham_cost_probe"
+path = "examples/cpu/bingham_cost_probe.rs"
+
+[[example]]
+name = "mui_cost_probe"
+path = "examples/cpu/mui_cost_probe.rs"
+
+[[example]]
+name = "basic_mui_rheology"
+path = "examples/cpu/basic_mui_rheology.rs"
+required-features = ["render"]
+
+[[example]]
+name = "corotated_cost_probe"
+path = "examples/cpu/corotated_cost_probe.rs"
+
+[[example]]
+name = "basic_corotated"
+path = "examples/cpu/basic_corotated.rs"
+required-features = ["render"]
+
+[[example]]
+name = "viscoelastic_cost_probe"
+path = "examples/cpu/viscoelastic_cost_probe.rs"
+
+[[example]]
+name = "basic_viscoelastic"
+path = "examples/cpu/basic_viscoelastic.rs"
+required-features = ["render"]
+
+[[example]]
+name = "basic_bingham"
+path = "examples/cpu/basic_bingham.rs"
+required-features = ["render"]
+
+[[example]]
+name = "basic_vonmises"
+path = "examples/cpu/basic_vonmises.rs"
 required-features = ["render"]
 
 [[example]]
 name = "basic_creature"
+path = "examples/cpu/basic_creature.rs"
 required-features = ["render"]
 
 [[example]]
 name = "stress_realtime_scaling"
+path = "examples/gpu/stress_realtime_scaling.rs"
 required-features = ["render"]
 
 [[example]]
 name = "stress_cfl_scan_50k"
+path = "examples/gpu/stress_cfl_scan_50k.rs"
 required-features = ["render"]
 
 [[example]]
 name = "channel_flow"
+path = "examples/cpu/channel_flow.rs"
+required-features = ["render"]
+
+[[example]]
+name = "kinematic_obstacle_in_water"
+path = "examples/cpu/kinematic_obstacle_in_water.rs"
 required-features = ["render"]
 
 [[example]]
 name = "day_night_thermal_gpu"
+path = "examples/gpu/day_night_thermal_gpu.rs"
 required-features = ["render"]
 
 [[example]]
 name = "fire_spread"
+path = "examples/cpu/fire_spread.rs"
 required-features = ["render"]
 
 [[example]]
 name = "grass_field"
+path = "examples/cpu/grass_field.rs"
 required-features = ["render"]
 
 [[example]]
 name = "resource_regrowth_gpu"
+path = "examples/gpu/resource_regrowth_gpu.rs"
 required-features = ["render"]
 
 [[example]]
-name = "rod_blade_of_grass_gui"
+name = "rod_blade_and_root"
+path = "examples/cpu/rod_blade_and_root.rs"
 required-features = ["render"]
 
 [[example]]
 name = "slip_hopper"
+path = "examples/cpu/slip_hopper.rs"
 required-features = ["render"]
 
 [[example]]
 name = "snake_on_terrain"
+path = "examples/cpu/snake_on_terrain.rs"
 required-features = ["render"]
 
 [[example]]
 name = "snake_on_terrain_gpu"
+path = "examples/gpu/snake_on_terrain_gpu.rs"
 required-features = ["render"]
 
 [[example]]
 name = "trophic_predation_demo"
+path = "examples/cpu/trophic_predation_demo.rs"
 required-features = ["render"]
 
 [[example]]
 name = "wind_around_obstacle_gpu"
+path = "examples/gpu/wind_around_obstacle_gpu.rs"
 required-features = ["render"]
 
 [[example]]
-name = "basic_fluids_gui"
+name = "fluid_pressure_projection"
+path = "examples/cpu/fluid_pressure_projection.rs"
 required-features = ["render"]
 
 [[example]]
 name = "basic_sand_grid_gpu"
+path = "examples/gpu/basic_sand_grid_gpu.rs"
 required-features = ["render"]
 
 [[example]]
-name = "basic_sand_gui"
+name = "basic_granular_fluid"
+path = "examples/cpu/basic_granular_fluid.rs"
 required-features = ["render"]
 
 [[example]]
-name = "basic_snow_gui"
+name = "sand_compaction"
+path = "examples/cpu/sand_compaction.rs"
 required-features = ["render"]
 
 [[example]]
-name = "sand_compaction_gui"
+name = "sand_water_saturation"
+path = "examples/cpu/sand_water_saturation.rs"
 required-features = ["render"]
 
 [[example]]
-name = "fire_spread_gui"
+name = "sand_ngf_collapse"
+path = "examples/cpu/sand_ngf_collapse.rs"
 required-features = ["render"]
+
+[[example]]
+name = "sand_repose_angle"
+path = "examples/cpu/sand_repose_angle.rs"
+required-features = ["render"]
+
+[[example]]
+name = "grain_rolling_closeup"
+path = "examples/cpu/grain_rolling_closeup.rs"
+required-features = ["render"]
+
+[[example]]
+name = "grain_newtons_cradle"
+path = "examples/cpu/grain_newtons_cradle.rs"
+required-features = ["render"]
+
+[[example]]
+name = "sand_collapse_settle_demo"
+path = "examples/cpu/sand_collapse_settle_demo.rs"
+required-features = ["render"]
+
+[[example]]
+name = "permafrost"
+path = "examples/cpu/permafrost.rs"
+required-features = ["render"]
+
+[[example]]
+name = "soil_horizons"
+path = "examples/cpu/soil_horizons.rs"
+required-features = ["render"]
+
+[[example]]
+name = "rock_fracture"
+path = "examples/cpu/rock_fracture.rs"
+required-features = ["render"]
+
+# --- Headless (no window, no render feature needed) ---
+[[example]]
+name = "diff_neohookean_toy"
+path = "examples/cpu/diff_neohookean_toy.rs"
+
+[[example]]
+name = "latent_heat"
+path = "examples/cpu/latent_heat.rs"
+
+[[example]]
+name = "phase_states_headless"
+path = "examples/cpu/phase_states_headless.rs"
+
+[[example]]
+name = "phase_states_gui"
+path = "examples/cpu/phase_states_gui.rs"
+required-features = ["render", "experimental"]
+
+[[example]]
+name = "basic_energy"
+path = "examples/cpu/basic_energy.rs"
+required-features = ["render", "experimental"]
+
+[[example]]
+name = "rod_blade_of_grass"
+path = "examples/cpu/rod_blade_of_grass.rs"
+
+[[example]]
+name = "rod_y_branch"
+path = "examples/cpu/rod_y_branch.rs"
+
+[[example]]
+name = "validate_materials"
+path = "examples/cpu/validate_materials.rs"

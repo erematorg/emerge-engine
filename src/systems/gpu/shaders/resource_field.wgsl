@@ -1,4 +1,4 @@
-// Resource regrowth — GPU port of ScalarDiffusionField's real logistic-growth source
+// Resource regrowth -- GPU port of ScalarDiffusionField's real logistic-growth source
 // (src/energy/thermodynamics/scalar_field.rs). Same real PDE shape as thermal.wgsl
 // (scatter -> normalize -> Laplacian+reaction -> gather), but the reaction term is
 // logistic growth (Verhulst 1838, dφ/dt = r·φ·(1−φ/K)) instead of Newton cooling.
@@ -10,10 +10,10 @@
 // 4 passes, same reasoning as thermal.wgsl for why they're separate dispatches (the
 // Laplacian pass needs every cell's normalized φ settled first, a genuine global
 // barrier):
-//   1. resource_clear_main               — zero resource_mass + resource_work
-//   2. resource_p2g_main                 — scatter mass-weighted φ (particle.scalar_field)
-//   3. resource_normalize_laplacian_main — normalize, 5-point Laplacian, logistic growth
-//   4. resource_g2p_main                 — gather Δφ back to particles
+//   1. resource_clear_main               -- zero resource_mass + resource_work
+//   2. resource_p2g_main                 -- scatter mass-weighted φ (particle.scalar_field)
+//   3. resource_normalize_laplacian_main -- normalize, 5-point Laplacian, logistic growth
+//   4. resource_g2p_main                 -- gather Δφ back to particles
 
 struct Particle {
     x:                    vec2<f32>,
@@ -50,9 +50,9 @@ struct StepParams {
     boundary_thickness: u32,
     vel_limit:          f32,
     sleep_threshold:    f32,
-    _pad0:              u32,
-    _pad1:              u32,
-    _pad2:              u32,
+    contact_friction:              f32,
+    grid_cell_size:              f32,
+    contact_active:              u32,
 }
 
 struct ResourceParams {
@@ -72,6 +72,27 @@ const RESOURCE_ATOMIC_SCALE: f32 = 100000.0;
 
 @group(0) @binding(0) var<storage, read_write> particles:   array<Particle>;
 @group(0) @binding(3) var<uniform>             step_params: StepParams;
+
+// This substep's timestep and velocity cap, decided on the GPU at the end of the previous
+// substep -- see `adaptive_cfl.wgsl`. `substep_dt()`/`vel_limit` are the CPU's
+// frame-start values and are NOT authoritative any more (the GPU may only tighten them).
+@group(2) @binding(37) var<storage, read_write> adaptive_dt: array<atomic<u32>, 4>;
+
+// Cached per invocation: this is an atomic storage load, and reading it at every use
+// site cost ~40% of a substep (measured: 0.29 -> 0.41ms per substep on the dam break).
+var<private> substep_dt_cache: f32 = -1.0;
+
+fn substep_dt() -> f32 {
+    if substep_dt_cache < 0.0 {
+        substep_dt_cache = bitcast<f32>(atomicLoad(&adaptive_dt[0]));
+    }
+    return substep_dt_cache;
+}
+
+fn substep_vel_limit(dt: f32) -> f32 {
+    return step_params.grid_cell_size / max(dt, 1.0e-12);
+}
+
 
 @group(3) @binding(24) var<uniform>             resource_params:  ResourceParams;
 @group(3) @binding(25) var<storage, read_write> resource_mass:    array<atomic<i32>>;
@@ -159,12 +180,12 @@ fn resource_normalize_laplacian_main(@builtin(global_invocation_id) gid: vec3<u3
     let p_ym = select(ambient, resource_phi_old[u32(cy - 1) * res + u32(cx)], cy > 0);
     let p_yp = select(ambient, resource_phi_old[u32(cy + 1) * res + u32(cx)], cy + 1 < i32(res));
     let laplacian = p_xm + p_xp + p_ym + p_yp - 4.0 * phi_old_i;
-    var phi_new = phi_old_i + resource_params.diffusivity * step_params.dt * laplacian;
+    var phi_new = phi_old_i + resource_params.diffusivity * substep_dt() * laplacian;
 
     // Real logistic growth: dφ/dt = r·φ·(1−φ/K) (Verhulst 1838).
     let k = max(resource_params.resource_k, 1e-6);
     let growth = resource_params.resource_r * phi_new * (1.0 - phi_new / k);
-    phi_new += growth * step_params.dt;
+    phi_new += growth * substep_dt();
 
     atomicStore(&resource_work[i], i32(round(phi_new * RESOURCE_ATOMIC_SCALE)));
 }

@@ -13,14 +13,14 @@
 
 use glam::Vec2;
 
+use super::cutoff::smooth_cutoff;
 use crate::fields::{FADE_ONSET_RATIO, Field};
 use crate::particle::Particles;
-use crate::solver::cutoff::smooth_cutoff;
 
 /// Gravitational acceleration from one or more point-mass sources.
 ///
 /// Intended for macro-scale bodies (celestial bodies, large terrain features) that
-/// exert gravity on MPM continuum matter. Does **not** model particle-particle N-body —
+/// exert gravity on MPM continuum matter. Does **not** model particle-particle N-body --
 /// for that, use `NBodyGravityField`.
 pub struct GravityWellField {
     /// Point mass sources: `(position in grid coords, mass in simulation units)`.
@@ -28,7 +28,7 @@ pub struct GravityWellField {
 
     /// Gravitational constant G in simulation units.
     ///
-    /// There is no universal default — tune to your scale.
+    /// There is no universal default -- tune to your scale.
     /// Small grid-scale scenes: ~0.1 simulation units.
     /// For SI: G = 6.674×10⁻¹¹ N·m²/kg² (only meaningful if grid_cell_size is set to SI).
     pub gravitational_constant: f32,
@@ -41,18 +41,22 @@ pub struct GravityWellField {
 
     /// Cutoff radius in grid coordinates. Gravity is zero beyond this distance.
     ///
-    /// Default: `f32::INFINITY` (IRL — no cutoff).
+    /// Default: `f32::INFINITY` (IRL -- no cutoff).
     /// Set to a finite value as a performance approximation for large particle counts.
     pub cutoff: f32,
 
-    /// Force-switch onset — smooth fade starts at this radius (must be ≤ cutoff).
+    /// Force-switch onset -- smooth fade starts at this radius (must be ≤ cutoff).
     /// Only meaningful when cutoff is finite.
     pub switch_on: f32,
 }
 
 impl GravityWellField {
-    /// Full-range gravity — IRL default, no distance cutoff.
-    pub fn new(sources: Vec<(Vec2, f32)>, gravitational_constant: f32, softening: f32) -> Self {
+    /// Full-range gravity -- IRL default, no distance cutoff.
+    pub const fn new(
+        sources: Vec<(Vec2, f32)>,
+        gravitational_constant: f32,
+        softening: f32,
+    ) -> Self {
         Self {
             sources,
             gravitational_constant,
@@ -62,7 +66,7 @@ impl GravityWellField {
         }
     }
 
-    /// Single stationary point mass — IRL default, no cutoff.
+    /// Single stationary point mass -- IRL default, no cutoff.
     pub fn point(position: Vec2, mass: f32, gravitational_constant: f32, softening: f32) -> Self {
         Self::new(vec![(position, mass)], gravitational_constant, softening)
     }

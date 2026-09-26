@@ -28,9 +28,9 @@ fn tip_segment_growth_matches_logistic_curve() {
     // Empty grid -- ungated growth (no `resistance` configured) never reads
     // it, this is just satisfying the real signature.
     let grid = Grid::new(16);
-    let growth = Growth::new(rate, k);
+    let mut growth = Growth::new(rate, k);
     for _ in 0..n_steps {
-        apply_growth(&mut rod, &growth, &grid, dt);
+        apply_growth(&mut rod, &mut growth, &grid, Vec2::Y, 1.0, dt);
     }
 
     let l_final = rod.rest_edge_length[0];
@@ -55,7 +55,7 @@ fn growth_pulls_actual_rod_tip_further_away_through_real_elastic_dynamics() {
     let mut baseline = grown.clone();
 
     let material = RodMaterial::from_young_modulus_rectangular(1.0e6, 0.02, 0.01, 50.0, 5.0);
-    let growth = Growth::new(2.0, 1.0); // fast growth rate for a short test
+    let mut growth = Growth::new(2.0, 1.0); // fast growth rate for a short test
 
     // Real CFL-safe dt for THIS material/geometry, recomputed each step as
     // rest_edge_length grows -- step_rod is a standalone integrator with no
@@ -67,7 +67,7 @@ fn growth_pulls_actual_rod_tip_further_away_through_real_elastic_dynamics() {
     let mut elapsed = 0.0_f32;
     while elapsed < 3.0 {
         let dt = rod_cfl_dt(&grown, &material, 0.4).min(0.001);
-        apply_growth(&mut grown, &growth, &grid, dt);
+        apply_growth(&mut grown, &mut growth, &grid, Vec2::Y, 1.0, dt);
         step_rod(&mut grown, &material, Vec2::ZERO, Vec2::ZERO, 0.0, 1.0, dt);
         step_rod(
             &mut baseline,
@@ -81,7 +81,13 @@ fn growth_pulls_actual_rod_tip_further_away_through_real_elastic_dynamics() {
         elapsed += dt;
     }
 
-    let grown_length = (grown.x[1] - grown.x[0]).length();
+    // Real, disclosed 2026-07-29 update: fast+sustained growth like this now
+    // genuinely matures the tip edge and triggers point insertion (see
+    // `growth.rs`'s own "cell division" doc) -- `grown` may end up with MORE
+    // points than it started with, so measure the actual tip (`.last()`),
+    // not a hardcoded index 1, to keep testing the real intent (does growth
+    // measurably stretch the rod) regardless of how many points exist now.
+    let grown_length = (*grown.x.last().unwrap() - grown.x[0]).length();
     let baseline_length = (baseline.x[1] - baseline.x[0]).length();
 
     assert!(

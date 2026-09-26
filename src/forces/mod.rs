@@ -1,8 +1,8 @@
 //! Forces domain: what acts on matter.
 //!
-//! `fields` — the `Field` trait + force-field impls (gravity, Coulomb, EM,
-//! confinement, buoyancy, chemotaxis). `boundary` — the `BoundaryCondition`
-//! trait + wall/friction/terrain impls. `electromagnetics` [experimental] —
+//! `fields` -- the `Field` trait + force-field impls (gravity, Coulomb, EM,
+//! confinement, buoyancy, chemotaxis). `boundary` -- the `BoundaryCondition`
+//! trait + wall/friction/terrain impls. `electromagnetics` [experimental] --
 //! point-charge/current field-query math (E/B at a point); the wave/optical
 //! half lives in `energy::electromagnetics` instead. Core gravity and EM
 //! force-application all belong here, in Forces.
