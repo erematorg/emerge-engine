@@ -1,5 +1,8 @@
 extern crate emerge_engine as emerge;
 
+#[path = "../gui_common/scripted.rs"]
+mod scripted;
+
 use egui_wgpu::ScreenDescriptor;
 use emerge::Particle;
 /// `basic_fluids.rs` (Newtonian water dam-break) with a real,
@@ -26,6 +29,15 @@ use emerge::Particle;
 /// parameter.
 ///
 ///   cargo run --example basic_fluids --features render
+///
+/// `EMERGE_SCRIPT_LOG=<file>` runs a scripted hand instead of the mouse and
+/// logs every step (`gui_common/scripted.rs`): the dam breaks for four
+/// seconds, then the strongest push into the pile, on the front, and a
+/// pull. Measured that way at this demo's gravity, the water's fastest
+/// particle reaches 15.9 cells/s on its own and 25.7 under the hand, four
+/// and six and a half times the 3.95 cells/s its stiffness is sized for;
+/// at real gravity (`EMERGE_SCRIPT_GRAVITY=1`) the water is crushed to half
+/// its volume (J at its 0.5 floor) and lies two rows deep.
 use emerge::materials::MaterialModel;
 use emerge::render::{ColorMode, GridVolumeSource, Renderer, SurfaceReconstructionSource};
 use emerge::thermodynamics::{ThermalConfig, ThermalDiffusion};
@@ -83,6 +95,8 @@ const DT: f32 = 0.1;
 // `DT=0.1`: the same A/B measured 49.8--60.0 FPS, with finite particles and
 // bounded water J, for the initial un-interacted scene.
 const PLAYBACK_STEP_RATE_HZ: f32 = 30.0;
+/// The push slider's top, which a scripted run presses at.
+const PUSH_STRENGTH_MAX: f32 = 20.0;
 // Real, measured 45fps-debug-minimum fix (2026-08-09) -- see `make_sim`'s own
 // doc for the full derivation. Promoted to a top-level const (was local to
 // `make_sim`) so `State::new`/`resize`'s own `set_camera` calls can size
@@ -390,6 +404,10 @@ struct State {
     gravity_fraction: f32,
     cold: bool,
     frame: u64,
+    /// `EMERGE_SCRIPT_LOG`: a scripted run, read from its log (see
+    /// `gui_common/scripted.rs`), and where its hand is this frame.
+    script: Option<scripted::Script>,
+    scripted_at: Option<Vec2>,
     fps_timer: std::time::Instant,
     fps_frames: u64,
     last_fps: f32,
@@ -499,6 +517,33 @@ impl State {
         surface.configure(&device, &sc);
         let sim = make_sim();
         let real_gravity = sim.config().gravity;
+        // A scripted run (see `gui_common/scripted.rs`): the dam breaks for
+        // four seconds, then the hand pushes into the pile, pushes on the
+        // spreading front and pulls, two seconds each with two to recover.
+        let script = scripted::Script::from_env(
+            vec![
+                scripted::Press {
+                    at: Vec2::new(20.0, 10.0),
+                    from: 40,
+                    to: 60,
+                    pull: false,
+                },
+                scripted::Press {
+                    at: Vec2::new(40.0, 8.0),
+                    from: 80,
+                    to: 100,
+                    pull: false,
+                },
+                scripted::Press {
+                    at: Vec2::new(30.0, 8.0),
+                    from: 120,
+                    to: 140,
+                    pull: true,
+                },
+            ],
+            160,
+            (Vec2::ZERO, Vec2::splat(GRID as f32)),
+        );
         let prev_x = sim.particles().x.clone();
         let mut renderer = Renderer::new(&device, sim.particles().len(), fmt);
         renderer.set_camera(
@@ -652,9 +697,11 @@ impl State {
             real_gravity,
             // 0.01, matching the already-validated sand/snow checkpoint at this
             // same grid scale -- not re-guessed live.
-            gravity_fraction: 0.003,
+            gravity_fraction: script.as_ref().map_or(0.003, |s| s.gravity(0.003)),
             cold: false,
             frame: 0,
+            script,
+            scripted_at: None,
             fps_timer: std::time::Instant::now(),
             fps_frames: 0,
             last_fps: 0.0,
@@ -778,6 +825,9 @@ impl State {
     }
 
     fn cursor_grid(&self) -> Vec2 {
+        if let Some(at) = self.scripted_at {
+            return at;
+        }
         let (gx, gy) = self.renderer.screen_to_grid(
             self.cursor_pos[0],
             self.cursor_pos[1],
@@ -870,7 +920,10 @@ impl State {
     /// never more than `max_frame_delta` allows.
     fn step_physics(&mut self, cursor: Vec2, dig_dir: Option<Vec2>) {
         let now = std::time::Instant::now();
-        let frame_delta = (now - self.last_instant).as_secs_f32();
+        let frame_delta = match &self.script {
+            Some(script) => script.frame_seconds(),
+            None => (now - self.last_instant).as_secs_f32(),
+        };
         self.last_instant = now;
         let steps = self.stepper.steps_for_frame(frame_delta);
         // Snapshot the pre-step positions ONCE per batch (not zero -- most
@@ -945,6 +998,21 @@ impl State {
                     t.total_us,
                     t.total_us.saturating_sub(accounted),
                 );
+            }
+            if let Some(script) = &mut self.script {
+                let done = script.record(
+                    self.frame,
+                    DT,
+                    &self.sim,
+                    &[(MAT_WATER, "water"), (MAT_ICE, "ice")],
+                    &[
+                        ("gravity", self.gravity_fraction),
+                        ("push", self.push_strength),
+                    ],
+                );
+                if done {
+                    std::process::exit(0);
+                }
             }
             self.frame += 1;
             self.log_early_frame_diagnostics();
@@ -1079,6 +1147,15 @@ impl State {
     }
 
     fn update_and_render(&mut self, window: &Window) {
+        if let Some(script) = &self.script {
+            // The hand holds the cursor and the button; the push itself is
+            // this demo's own, at its strongest setting.
+            let hand = script.hand(self.frame);
+            self.lmb = hand.is_some_and(|(_, pull)| !pull);
+            self.rmb = hand.is_some_and(|(_, pull)| pull);
+            self.scripted_at = hand.map(|(at, _)| at);
+            self.push_strength = PUSH_STRENGTH_MAX;
+        }
         self.apply_gravity_and_thermal();
         let (cursor, dig_dir) = self.apply_interaction_forces();
         self.step_physics(cursor, dig_dir);
@@ -1140,7 +1217,10 @@ impl State {
                     ui.add(egui::Slider::new(&mut gravity_fraction, 0.0..=2.0));
                     ui.separator();
                     ui.label("Push/pull strength:");
-                    ui.add(egui::Slider::new(&mut push_strength, 0.0..=20.0));
+                    ui.add(egui::Slider::new(
+                        &mut push_strength,
+                        0.0..=PUSH_STRENGTH_MAX,
+                    ));
                     ui.checkbox(&mut digging, "Digging/stirring active (or press D)");
                     ui.add(egui::Slider::new(&mut dig_strength, 0.0..=40.0).text("Dig strength"));
                     ui.separator();
