@@ -534,3 +534,70 @@ fn the_bottom_layer_volume_on_each_floor() {
         }
     }
 }
+
+/// The demo's peak collapse speed read 0.787 m/s on the earlier scene
+/// (64-cell tank, slip floor, columns touching) and 0.662 m/s on today's
+/// (160-cell tank, gripping floor, columns apart). Is it the floor? The
+/// 2 Pa column alone, on each floor: the fastest particle over the whole
+/// run, in m/s.
+#[test]
+#[ignore = "diagnostic probe kept for reruns, not part of the CI suite"]
+fn the_peak_speed_on_each_floor() {
+    let seconds = env("SLUMP_SECONDS", 2.0);
+    let dt = env("SLUMP_DT", 0.001);
+    let tau0 = env("SLUMP_TAU", 2.0);
+    for (label, mu) in [("slip", None), ("friction 1", Some(1.0f32))] {
+        let config = SimConfig {
+            min_dt: 1.0e-5,
+            max_substeps_per_step: 256,
+            ..SimConfig::earth(GRID, DX_M, dt)
+        };
+        let props = BinghamProps {
+            rho_kg_m3: RHO_KG_M3,
+            eta_pa_s: ETA_PA_S,
+            bulk_modulus_pa: bulk_modulus_pa(),
+            yield_stress_pa: tau0,
+            shear_modulus_pa: tau0 / YIELD_STRAIN,
+            cavitation_pressure_pa: BinghamProps::air_entrained_cavitation_pressure(),
+        };
+        let spawn = SpawnRegion {
+            spacing: 0.5,
+            box_size: COLUMN_CELLS,
+            box_center: Vec2::new(
+                GRID as f32 * 0.5 + 0.25,
+                FLOOR_CELLS + COLUMN_CELLS.y as f32 * 0.5,
+            ),
+            material_id: 0,
+            initial_velocity_scale: 0.0,
+            ..SpawnRegion::for_sim(&config)
+        }
+        .mass_from(&props, &config);
+        let wall: Box<dyn BoundaryCondition> = match mu {
+            None => Box::new(SlipBoundary::new(config.boundary_thickness)),
+            Some(m) => Box::new(FrictionBoundary::new(config.boundary_thickness, m)),
+        };
+        let mut sim = Simulation::new(config, spawn)
+            .with_default_material(Box::new(BinghamFluidMaterial::from_physical(
+                &props, &config,
+            )))
+            .with_boundary(wall);
+        let (mut peak, mut at) = (0.0f32, 0usize);
+        for frame in 1..=(seconds / dt).round() as usize {
+            sim.step();
+            let fastest = sim
+                .particles()
+                .v
+                .iter()
+                .map(|v| v.length())
+                .fold(0.0f32, f32::max);
+            if fastest > peak {
+                (peak, at) = (fastest, frame);
+            }
+        }
+        println!(
+            "{tau0} Pa column alone, {label:<10}: peak {:.3} m/s at {:.3} s",
+            peak * DX_M,
+            at as f32 * dt
+        );
+    }
+}
