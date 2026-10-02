@@ -1,11 +1,11 @@
-//! Physical property families — the entry point for all material construction.
+//! Physical property families -- the entry point for all material construction.
 //!
 //! Five families cover all continuum matter:
-//! - [`Elastic`]        — pure elastic solid (NeoHookean / Corotated)
-//! - [`Elastoplastic`]  — elastic + plastic yield (snow, granular, ductile, brittle)
-//! - [`Viscoelastic`]   — elastic + viscous damping (Kelvin-Voigt)
-//! - [`Fluid`]          — viscous fluid (Newtonian if no yield, Bingham if yield set)
-//! - [`FluidGranular`]  — fluid-granular blend (EOS pressure + corotated deviatoric + SVD plasticity = mud)
+//! - [`Elastic`]        -- pure elastic solid (NeoHookean / Corotated)
+//! - [`Elastoplastic`]  -- elastic + plastic yield (snow, granular, ductile, brittle)
+//! - [`Viscoelastic`]   -- elastic + viscous damping (Kelvin-Voigt)
+//! - [`Fluid`]          -- viscous fluid (Newtonian if no yield, Bingham if yield set)
+//! - [`FluidGranular`]  -- fluid-granular blend (EOS pressure + corotated deviatoric + SVD plasticity = mud)
 //!
 //! # Usage
 //! ```rust,no_run
@@ -71,7 +71,7 @@ pub struct Elastoplastic {
 pub enum PlasticityModel {
     /// Volumetric snow plasticity (Stomakhin 2013).
     /// Hardening ξ=10, critical compression θ_c=0.025, critical stretch θ_s=0.0075.
-    /// No extra parameters — determined by MPM snow physics.
+    /// No extra parameters -- determined by MPM snow physics.
     Snow,
 
     /// Drucker-Prager cohesionless granular (rate-independent).
@@ -84,7 +84,7 @@ pub enum PlasticityModel {
     },
 
     /// µ(I)-rheology rate-dependent granular flow (Cicoira et al. DPMui, see
-    /// `MuIRheologyMaterial`'s own doc for the full, corrected citation).
+    /// `MuIRheologyMaterial`'s doc for the full, corrected citation).
     /// Better for dense granular at high shear rates. CPU + GPU.
     /// → `MuIRheologyMaterial`
     GranularRateDependent {
@@ -97,7 +97,9 @@ pub enum PlasticityModel {
     /// J2 ductile plastic flow (von Mises), linear isotropic hardening.
     /// → `VonMisesMaterial`
     Ductile {
-        /// Yield stress `[Pa]`. Flow begins above this deviatoric stress.
+        /// Uniaxial yield stress `[Pa]`, the value tables give. Converted to
+        /// the Frobenius measure `VonMisesMaterial` tests, see its
+        /// `from_physical`.
         yield_stress_pa: f32,
     },
 
@@ -109,6 +111,26 @@ pub enum PlasticityModel {
         tensile_strength_pa: f32,
         /// Exponential softening rate. Higher = faster strength loss post-fracture.
         softening_rate: f32,
+    },
+
+    /// Non-Associated Cam-Clay: elliptical yield surface with a compression
+    /// cap (preconsolidation), for wet soil/clay/soft tissue (Klar et al.
+    /// 2016; see `NaccMaterial`'s doc for the full citation and natural
+    /// phenomena). CPU-only (GPU construction rejects it -- see
+    /// `GpuSimulation`'s own NACC guard).
+    /// → `NaccMaterial`
+    CamClay {
+        /// Friction slope M (tan-like, not a raw angle). Typical 0.8-1.8 --
+        /// see `NaccMaterial::friction`'s doc for the exact relation.
+        friction: f32,
+        /// Cohesion β. 0.0 = no tensile strength (standard soil).
+        cohesion: f32,
+        /// Compression index λ of the soil's oedometer curve.
+        compression_index: f32,
+        /// Swelling index κ of the same curve.
+        swelling_index: f32,
+        /// Void ratio e at the reference state.
+        void_ratio: f32,
     },
 }
 
@@ -124,26 +146,26 @@ pub struct Viscoelastic {
     pub eta_pa_s: f32,
 }
 
-/// Elastic solid under real internal pre-stress pressure — a "prestressed structure"
+/// Elastic solid under real internal pre-stress pressure -- a "prestressed structure"
 /// (Kirchhoff stress gets an added isotropic `-P·I` term; see `Particle::internal_pressure`
 /// doc for the full mechanism). Real motivating case: turgor pressure, the internal
 /// hydrostatic pressure that does real structural work in plant cells, genuinely
-/// distinct from cell-wall elastic stiffness (Niklas 1992's "hydro-skeleton" theory) —
+/// distinct from cell-wall elastic stiffness (Niklas 1992's "hydro-skeleton" theory) --
 /// but generic, not plant-specific: any internally-pressurized body.
 ///
 /// → `NeoHookeanMaterial` wrapped in `WithPreStress`
 #[derive(Debug, Clone, Copy)]
 pub struct Pressurized {
     pub elastic: Elastic,
-    /// Internal pre-stress pressure `[Pa]`. Real, measured range for healthy plant
-    /// cells: 0.2–2.0 MPa (root cells ~0.6 MPa, leaf epidermal cells 1.5–2.0 MPa —
+    /// Internal pre-stress pressure `[Pa]`. Measured range for healthy plant
+    /// cells: 0.2–2.0 MPa (root cells ~0.6 MPa, leaf epidermal cells 1.5–2.0 MPa --
     /// Niklas 1992; Wikipedia "Turgor pressure", sourced from real measurements).
     pub internal_pressure_pa: f32,
 }
 
-/// Tension-only (no-compression) elastic solid — real, established continuum theory
-/// for cables, membranes, tendons, spider silk (see `NoCompressionMaterial`'s own doc
-/// for the full citation). Fully reversible, distinct from `Elastoplastic` — this is
+/// Tension-only (no-compression) elastic solid -- established continuum theory
+/// for cables, membranes, tendons, spider silk (see `NoCompressionMaterial`'s doc
+/// for the full citation). Fully reversible, distinct from `Elastoplastic` -- this is
 /// an asymmetric nonlinear ELASTIC law (goes slack under compression, regains full
 /// stiffness under tension with no memory), not an irreversible yield criterion.
 ///
@@ -163,9 +185,9 @@ pub struct NoCompression {
 pub struct FluidGranular {
     /// Rest density `[kg/m³]`
     pub rho_kg_m3: f32,
-    /// Bulk modulus K `[Pa]` — EOS stiffness. Controls compressibility.
+    /// Bulk modulus K `[Pa]` -- EOS stiffness. Controls compressibility.
     pub bulk_modulus_pa: f32,
-    /// Young's modulus E `[Pa]` — elastic shear stiffness. Controls shape-restoring force.
+    /// Young's modulus E `[Pa]` -- elastic shear stiffness. Controls shape-restoring force.
     pub e_pa: f32,
     /// Poisson's ratio ν
     pub nu: f32,
@@ -179,31 +201,27 @@ pub struct FluidGranular {
 }
 
 impl FluidGranular {
-    // REAL API FIX (2026-07-19): these three presets used to share their exact
-    // names (`saturated_loam`/`consolidated_clay`/`cytoplasmic`) with
-    // `GranularFluidMaterial`'s own, DIFFERENT presets in `granular_fluid.rs`
-    // (zero-arg fixed-SI-literature-value here vs. parameterized
-    // `(young_modulus, poisson_ratio)` there) -- a real ambiguity risk, not
-    // just a style nit. Suffixed `_preset` to mark these as the fixed-value
-    // convenience layer; `GranularFluidMaterial`'s parameterized versions
-    // (same names, no suffix) are the unambiguous, SI-consistent primary entry
-    // point -- use those directly unless you specifically want this property
-    // family's fixed literature-style defaults.
+    // Suffixed `_preset` to disambiguate from `GranularFluidMaterial`'s own,
+    // differently-parameterized presets of the same name
+    // (`saturated_loam`/`consolidated_clay`/`cytoplasmic`) in
+    // `granular_fluid.rs` (zero-arg fixed-SI-literature-value here vs.
+    // parameterized `(young_modulus, poisson_ratio)` there). Prefer the
+    // unsuffixed, parameterized versions unless you specifically want this
+    // property family's fixed literature-style defaults.
 
-    /// Saturated loam — yields easily, flows slowly under sustained load.
+    /// Saturated loam -- yields easily, flows slowly under sustained load.
     ///
-    /// HONEST DISCLOSURE (audit 2026-07-17, same finding as `GranularFluidMaterial`'s
-    /// own presets in `granular_fluid.rs`): `scale_lame`/`scale_stress` below DO
-    /// perform a real, dimensionally-consistent SI-to-grid-unit conversion (same
-    /// pattern already verified for `NewtonianFluidMaterial`), so the MECHANISM here is
-    /// sound. But these specific SI values (`rho_kg_m3`, `bulk_modulus_pa`, `e_pa`,
-    /// `compression_limit` etc.) are not tied to any specific real measurement/paper —
-    /// `rho_kg_m3=1800`/`e_pa=5e3` are plausible ballpark figures for real wet loam, not
-    /// verified against one. Presenting them in real SI units carries a stronger
-    /// implicit "this is measured" claim than a dimensionless test parameter would, so
-    /// this needs the same honest flag: real conversion math, unverified specific
-    /// numbers, not yet a literature-sourced material.
-    pub fn saturated_loam_preset() -> Self {
+    /// `rho_kg_m3 = 1800` lies at the dense end of published ranges for
+    /// compacted or saturated loam-family soils: dry bulk density 1150-1820
+    /// kg/m3 (Xu et al., triaxial compression on sandy loam), saturated
+    /// remolded loess tested at 1500-1700 kg/m3 dry basis (PMC9282495); soil
+    /// density depends on composition and moisture, so no single value is
+    /// "the" loam. `e_pa`/`bulk_modulus_pa`/`nu` are engineering defaults in a
+    /// plausible range, not tied to one measurement (Young's modulus varies
+    /// strongly with moisture and density in the same literature).
+    /// Sources: [Effects of Bulk Density and Moisture Content on Selected Mechanical Properties of Sandy Loam Soil](https://www.sciencedirect.com/science/article/abs/pii/S1537511002901030),
+    /// [Experimental study on shear strength of saturated remolded loess](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC9282495/).
+    pub const fn saturated_loam_preset() -> Self {
         Self {
             rho_kg_m3: 1800.0,
             bulk_modulus_pa: 2.0e5,
@@ -215,11 +233,20 @@ impl FluidGranular {
         }
     }
 
-    /// Consolidated clay — stiffer shear, slow plastic creep.
+    /// Consolidated clay -- stiffer shear, slow plastic creep.
     ///
-    /// Same honest disclosure as `saturated_loam` above: real conversion mechanism,
-    /// unverified specific SI values.
-    pub fn consolidated_clay_preset() -> Self {
+    /// `rho_kg_m3 = 2000` is above loose clay but right for the stiff
+    /// overconsolidated clay the name implies: Rouainia et al. describe London
+    /// Clay as "very stiff and heavily overconsolidated" with a bulk unit
+    /// weight of 20 kN/m3 at Denmark Place (~2040 kg/m3), and the British
+    /// Geological Survey compiles London Clay bulk densities of 1.83-2.35
+    /// Mg/m3. `e_pa`/`bulk_modulus_pa`/`nu` are not tied to a measurement, as in
+    /// `saturated_loam`.
+    /// Sources: Rouainia et al., "A pressuremeter-based evaluation of structure
+    /// in London Clay using a kinematic hardening constitutive model", Acta
+    /// Geotechnica 15 (2020), doi:10.1007/s11440-020-00940-w; British Geological
+    /// Survey, "Geology of London", Table 23d.
+    pub const fn consolidated_clay_preset() -> Self {
         Self {
             rho_kg_m3: 2000.0,
             bulk_modulus_pa: 8.0e5,
@@ -231,13 +258,17 @@ impl FluidGranular {
         }
     }
 
-    /// Cytoplasmic matrix — very soft elastic, near-fluid, large yield surface.
+    /// Cytoplasmic matrix -- very soft elastic, near-fluid, large yield surface.
     ///
-    /// Same honest disclosure as `saturated_loam` above: real conversion mechanism,
-    /// unverified specific SI values (though `e_pa=500` is at least in the right real
-    /// ballpark per AFM cytoplasm-stiffness literature -- not yet tied to a specific
-    /// paper).
-    pub fn cytoplasmic_preset() -> Self {
+    /// AFM cell mechanics reports cell moduli from ~100 Pa to 100 kPa, the
+    /// ~100 Pa end for the actin cortex at small deformation (PMC5377332, "On
+    /// the determination of elastic moduli of cells by AFM based
+    /// indentation"); `e_pa = 500` sits toward the soft end, cytoplasm rather
+    /// than cortex. `rho_kg_m3 = 1050` is close to water, as cytoplasm is.
+    /// `bulk_modulus_pa`/`nu`/plasticity parameters are not tied to a
+    /// measurement.
+    /// Source: [On the determination of elastic moduli of cells by AFM based indentation](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC5377332/).
+    pub const fn cytoplasmic_preset() -> Self {
         Self {
             rho_kg_m3: 1050.0,
             bulk_modulus_pa: 2.0e4,
@@ -260,7 +291,7 @@ pub struct Fluid {
     /// Dynamic (shear) viscosity η `[Pa·s]`
     pub eta_pa_s: f32,
     /// Bulk modulus K `[Pa]`. Sets EOS stiffness (compressibility).
-    /// Real water K ≈ 2.2 GPa. Use K = ρ·c_ref²/γ with c_ref = 10·v_max for weakly-compressible.
+    /// Water's K ≈ 2.2 GPa. Use K = ρ·c_ref²/γ with c_ref = 10·v_max for weakly-compressible.
     pub bulk_modulus_pa: f32,
     /// `None` = Newtonian. `Some(τ₀)` = Bingham: plug flow below τ₀ `[Pa]`.
     pub yield_stress_pa: Option<f32>,
@@ -280,27 +311,42 @@ pub trait FromSI<P> {
 }
 
 /// Particle mass (grid units) for a `SpawnRegion` spawning this material at a
-/// given spacing — `rho_kg_m3 * (spacing * dx_meters)^2` for a 2D areal-density
+/// given spacing -- `rho_kg_m3 * (spacing * dx_meters)^2` for a 2D areal-density
 /// particle. Implemented identically by every physical-property family so
 /// `SpawnRegion::mass_from` can stay generic over which material is being spawned.
 pub trait ParticleMass {
     fn particle_mass(&self, spacing: f32, config: &SimConfig) -> f32;
 }
 
-// ── Internal bridging structs (pub(super) — not part of LP API) ──────────────
+// ── Internal bridging structs (pub(super) -- not part of LP API) ──────────────
 //
 // These carry the exact parameters that each material impl's `from_physical` needs.
-// They are constructed inside `.material()` dispatch — callers never see them.
+// They are constructed inside `.material()` dispatch -- callers never see them.
 
+/// Real-unit properties for `DruckerPragerMaterial`/`MuIRheologyMaterial`.
+///
+/// `pub` for the same reason as `BrittleProps`/`BinghamProps`: the dispatch
+/// enum (`Elastoplastic::material`) returns a type-erased `Box<dyn
+/// MaterialModel>`, so a caller that needs the concrete type back --
+/// `MuIRheologyMaterial`'s own `inertial_q` has no dispatch field yet, see
+/// that struct's doc -- has to build it directly.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct GranularProps {
+pub struct GranularProps {
     pub elastic: Elastic,
     pub friction_angle_deg: f32,
     pub dilatancy_angle_deg: f32,
 }
 
+/// Real-unit properties for `VonMisesMaterial`: elastic constants and the
+/// uniaxial yield stress tables give (converted in `from_physical`).
+///
+/// `pub` for the same reason as `BrittleProps`/`BinghamProps`: the dispatch
+/// route returns a `Box<dyn MaterialModel>`, and a scene that reads each
+/// particle against its own yield surface (`VonMisesMaterial::yield_ratio`)
+/// needs the concrete material: `VonMisesMaterial::from_physical(&props,
+/// &config)`.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct DuctileProps {
+pub struct DuctileProps {
     pub elastic: Elastic,
     pub yield_stress_pa: f32,
 }
@@ -323,6 +369,36 @@ pub(super) struct SnowProps {
     pub elastic: Elastic,
 }
 
+/// SI properties for `NaccMaterial` (Non-Associated Cam-Clay). `pub` because
+/// callers of `Elastoplastic::material` build it for
+/// `PlasticityModel::CamClay`, like `BrittleProps`/`GranularProps`/
+/// `DuctileProps`.
+#[derive(Debug, Clone, Copy)]
+pub struct NaccProps {
+    pub elastic: Elastic,
+    /// Friction slope M -- see `NaccMaterial::friction`'s doc for the
+    /// real friction-angle relation. NOT an SI quantity, passed through
+    /// unconverted (matches `NaccMaterial::from_young_modulus`'s own
+    /// convention).
+    pub friction: f32,
+    /// Cohesion β (0.0 = no tensile strength). NOT an SI quantity, passed
+    /// through unconverted.
+    pub cohesion: f32,
+    /// Compression index λ of the soil's own oedometer curve (slope of the
+    /// normal compression line in e against ln p'). Dimensionless.
+    pub compression_index: f32,
+    /// Swelling index κ of the same curve (unload-reload slope), usually a
+    /// third to a fifth of the compression index. Dimensionless.
+    pub swelling_index: f32,
+    /// Void ratio e at the reference state, so the hardening exponent is
+    /// `(1 + e) / (compression_index - swelling_index)`.
+    pub void_ratio: f32,
+    /// Preconsolidation pressure in Pa, the largest mean effective stress
+    /// the soil has carried before (oedometer test, Casagrande 1936). 0.0 =
+    /// a soil that has never been loaded.
+    pub preconsolidation_pa: f32,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(super) struct NewtonianFluid {
     pub rho_kg_m3: f32,
@@ -330,32 +406,152 @@ pub(super) struct NewtonianFluid {
     pub bulk_modulus_pa: f32,
 }
 
+/// Real-unit properties for `BinghamFluidMaterial`.
+///
+/// `pub` for the same reason as `BrittleProps`: `Fluid::material` returns a
+/// `Box<dyn MaterialModel>`, so a caller that needs to set a field the SI
+/// family does not carry (`optics`, `specific_heat_j_kg_k`, surface
+/// tension) has no way to reach the concrete material through that route.
+/// Building it directly -- `BinghamFluidMaterial::from_physical(&props,
+/// &config)` -- keeps every rheological parameter in real pascals and still
+/// hands back the concrete type.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct BinghamProps {
+pub struct BinghamProps {
     pub rho_kg_m3: f32,
     pub eta_pa_s: f32,
     pub bulk_modulus_pa: f32,
     pub yield_stress_pa: f32,
+    /// Storage modulus G' `[Pa]` below the yield point. `0.0` keeps the
+    /// classical purely-viscous Bingham fluid, which cannot hold a shape at
+    /// rest; a positive value selects the elastoviscoplastic form that can.
+    /// See `BinghamFluidMaterial::shear_modulus`.
+    pub shear_modulus_pa: f32,
+    /// Gauge pressure `[Pa]` at which this fluid cavitates and stops
+    /// carrying tension. Negative. The Tait law this material uses is a
+    /// gauge law, zero at rest density, so a particle above rest volume
+    /// asks for a negative pressure; this is how far down that request is
+    /// honoured before the fluid is taken to have opened a cavity instead.
+    ///
+    /// It is a coefficient of THIS fluid, not a number borrowed from a pure
+    /// liquid: `BinghamProps::cavitation_pressure_from_nucleus` builds it
+    /// from two independent published figures rather than stating it. One of
+    /// those, the nucleus radius, is a class boundary rather than a
+    /// measurement, and that is said where it is defined.
+    ///
+    /// Leaving it at 0.0 is a real physical statement and not a neutral
+    /// default. It says the fluid carries no tension at all, so expansion
+    /// meets no restoring force while compression meets the full one, and
+    /// any symmetric noise in the divergence ratchets volume upward. That
+    /// was measured: every expanded particle in every slab of
+    /// `tests/probes/thin_layer_volume_drift.rs` had its pressure deleted.
+    pub cavitation_pressure_pa: f32,
 }
 
-// ── Scaling helpers (pub(super) — used by material impls) ─────────────────────
+impl BinghamProps {
+    /// Surface tension `[N/m]` measured ON yield-stress fluids, not assumed
+    /// from the liquid they are built in: Mohammadigoushki and Shoele,
+    /// "Cavitation Rheology of Model Yield Stress Fluids Based on Carbopol",
+    /// Langmuir 39(22), 7672-7683, 2023 (arXiv 2304.03187) measure
+    /// 70 +/- 3 mN/m by needle-induced cavitation across Carbopol gels, and
+    /// find it
+    /// INDEPENDENT of the rheology over yield stresses of 0.5 to 120 Pa.
+    /// That independence is why one value can serve a whole family of
+    /// yield-stress fluids, and why a demo may share it across columns that
+    /// differ only in yield stress.
+    pub const YIELD_STRESS_FLUID_SURFACE_TENSION_N_M: f32 = 0.070;
 
-/// Scale SI stress (Pa) to grid units: `p_grid = p_SI · dt² / (ρ · dx²)`.
+    /// Radius `[m]` of the largest gas nucleus an ordinarily mixed paste
+    /// carries. The Federal Highway Administration's petrographic manual
+    /// (FHWA-HRT-04-150, "Petrographic Methods of Examining Hardened
+    /// Concrete", July 2006, chapter 6) describes entrained voids as
+    /// "spherical voids larger than the capillaries, but less than 1 mm on
+    /// the lapped surface", anything above 1 mm being classed as entrapped
+    /// instead.
+    ///
+    /// Read that for what it is: 1 mm is the boundary of a CLASS in a
+    /// petrographic manual for HARDENED concrete, not the largest bubble
+    /// anyone measured in a fresh paste. Entrapped voids above 1 mm exist
+    /// too and would set a shallower threshold still. So the radius here is
+    /// a declared modelling choice standing on a published class boundary,
+    /// not a measurement, and it is the least defensible number in this
+    /// file.
+    ///
+    /// What makes it usable anyway is that it barely matters:
+    /// `tests/probes/thin_layer_volume_drift.rs` sweeps this floor and
+    /// finds the slab behaves much the same anywhere from -280 to -2800 Pa,
+    /// a factor of ten.
+    pub const ENTRAINED_AIR_NUCLEUS_RADIUS_M: f32 = 500.0e-6;
+
+    /// Cavitation pressure `[Pa gauge, negative]` from the nucleus term of
+    /// the needle-induced-cavitation relation `P_c = 5E/6 + 2*gamma/R`
+    /// (Mohammadigoushki and Shoele, above, their Eq. 3): a cavity of
+    /// radius `R` runs away once the pressure difference across its own
+    /// surface tension is exceeded.
+    ///
+    /// One extrapolation, stated rather than hidden. That paper measures a
+    /// cavity INJECTED at a needle tip, so its `R` is the needle's own
+    /// inner radius, swept from 76 to 850 micrometres. Applying the same
+    /// relation to a gas nucleus already sitting in the fluid is the same
+    /// Laplace physics with a different cavity, and it is not what the
+    /// experiment tested. The radius used here does at least sit inside the
+    /// window they measured over.
+    ///
+    /// The elastic term `5E/6` is deliberately NOT included. It would make
+    /// the floor depend on the fluid's own stiffness, so two fluids that
+    /// differ only in yield stress would no longer share a value, and it
+    /// deepens the floor, which is the permissive direction. Leaving it out
+    /// keeps the shallower, more conservative threshold and keeps the
+    /// coefficient a property of the nucleus rather than of the rheology.
+    /// Adding it back is the natural refinement, and it is measurable.
+    ///
+    /// This relation also reproduces the figure the Newtonian twin already
+    /// ships: `NewtonianFluidMaterial::from_physical` uses -100,000 Pa for
+    /// practical dissolved-gas cavitation, and `2*gamma/R` returns that at
+    /// a nucleus radius of 1.4 micrometres. The two are the same
+    /// physics at two nucleus sizes, not two conventions: a clean liquid
+    /// carries only sub-micron nuclei, an ordinarily mixed paste carries
+    /// bubbles two hundred times larger, and cavitates that much sooner.
+    pub fn cavitation_pressure_from_nucleus(
+        surface_tension_n_m: f32,
+        nucleus_radius_m: f32,
+    ) -> f32 {
+        -2.0 * surface_tension_n_m / nucleus_radius_m.max(f32::MIN_POSITIVE)
+    }
+
+    /// The cavitation pressure of an ordinarily mixed, air-entrained paste,
+    /// from this type's own two constants. About -280 Pa. Half derived and
+    /// half declared: the surface tension is measured on this fluid family,
+    /// the nucleus radius is a class boundary read off a petrographic
+    /// manual. See `ENTRAINED_AIR_NUCLEUS_RADIUS_M`.
+    pub fn air_entrained_cavitation_pressure() -> f32 {
+        Self::cavitation_pressure_from_nucleus(
+            Self::YIELD_STRESS_FLUID_SURFACE_TENSION_N_M,
+            Self::ENTRAINED_AIR_NUCLEUS_RADIUS_M,
+        )
+    }
+}
+
+// ── Scaling helpers (pub(super) -- used by material impls) ─────────────────────
+//
+// All three divide by `rho dx^2` (see `SimConfig::stress_from_si`), so they
+// move together and never mix with raw grid-unit Lamé parameters.
+
+/// Scale SI stress (Pa) to grid units: `p_grid = p_SI / (ρ · dx²)`.
 #[inline]
 pub(super) fn scale_stress(pa: f32, rho: f32, config: &SimConfig) -> f32 {
     config.stress_from_si(pa, rho)
 }
 
-/// Scale SI viscosity (Pa·s) to grid units: `η_grid = η_SI · ρ · dx² / dt³`.
+/// Scale SI viscosity (Pa·s) to grid units: `η_grid = η_SI / (ρ · dx²)`.
 #[inline]
 pub(super) fn scale_visc(eta: f32, rho: f32, config: &SimConfig) -> f32 {
     config.visc_from_si(eta, rho)
 }
 
-/// Scale SI Young's modulus to grid Lamé parameters.
+/// Scale SI Young's modulus to grid Lamé parameters: `λ_SI / (ρ · dx²)`.
 #[inline]
 pub(super) fn scale_lame(e_pa: f32, nu: f32, rho: f32, config: &SimConfig) -> (f32, f32) {
-    config.lame_from_si_cfg(e_pa, nu, rho)
+    config.lame_from_si(e_pa, nu, rho)
 }
 
 // ── Reference SI values used in unit tests below ─────────────────────────────
@@ -363,14 +559,14 @@ pub(super) fn scale_lame(e_pa: f32, nu: f32, rho: f32, config: &SimConfig) -> (f
 mod _ref {
     use super::*;
 
-    // Elastic — E [Pa], ν, ρ [kg/m³]
+    // Elastic -- E [Pa], ν, ρ [kg/m³]
     pub const SOFT_ELASTIC: Elastic = Elastic {
         e_pa: 500.0,
         nu: 0.45,
         rho_kg_m3: 1000.0,
     };
 
-    // Viscoelastic — η [Pa·s]
+    // Viscoelastic -- η [Pa·s]
     pub const SOFT_VISCOELASTIC: Viscoelastic = Viscoelastic {
         elastic: Elastic {
             e_pa: 50_000.0,
@@ -380,7 +576,7 @@ mod _ref {
         eta_pa_s: 10.0,
     };
 
-    // Granular — φ=35°
+    // Granular -- φ=35°
     pub const COHESIONLESS_GRANULAR: Elastoplastic = Elastoplastic {
         elastic: Elastic {
             e_pa: 50.0e6,
@@ -403,7 +599,7 @@ mod _ref {
         model: super::PlasticityModel::Snow,
     };
 
-    // Ductile — σ_Y=30 kPa
+    // Ductile -- σ_Y=30 kPa
     pub const SOFT_DUCTILE: Elastoplastic = Elastoplastic {
         elastic: Elastic {
             e_pa: 1.0e6,
@@ -415,7 +611,7 @@ mod _ref {
         },
     };
 
-    // Brittle — σ_t=10 MPa
+    // Brittle -- σ_t=10 MPa
     pub const STIFF_BRITTLE: Elastoplastic = Elastoplastic {
         elastic: Elastic {
             e_pa: 70.0e9,
@@ -428,7 +624,7 @@ mod _ref {
         },
     };
 
-    // Fluid — Newtonian (no yield)
+    // Fluid -- Newtonian (no yield)
     pub const LOW_VISCOSITY_FLUID: Fluid = Fluid {
         rho_kg_m3: 1000.0,
         eta_pa_s: 0.001,
@@ -436,7 +632,7 @@ mod _ref {
         yield_stress_pa: None,
     };
 
-    // Fluid — Bingham (yield=100 Pa)
+    // Fluid -- Bingham (yield=100 Pa)
     pub const VISCOPLASTIC_FLUID: Fluid = Fluid {
         rho_kg_m3: 1500.0,
         eta_pa_s: 0.5,
@@ -444,20 +640,46 @@ mod _ref {
         yield_stress_pa: Some(100.0),
     };
 
-    /// Verify all reference presets construct successfully — catches API breakage.
+    /// Every reference preset builds, and a particle of it at rest
+    /// (F = I, spawned through `init_particle`) carries no stress.
     #[test]
-    fn all_presets_build() {
+    fn all_presets_build_stress_free_at_rest() {
+        use crate::matter::particle::{Particle, Particles};
         use crate::solver::config::SimConfig;
-        use glam::Vec2;
-        let config = SimConfig::standard(64, 0.05, Vec2::NEG_Y * 0.3);
-        let _ = SOFT_ELASTIC.material(&config);
-        let _ = SOFT_VISCOELASTIC.material(&config);
-        let _ = COHESIONLESS_GRANULAR.material(&config);
-        let _ = LOW_DENSITY_GRANULAR.material(&config);
-        let _ = SOFT_DUCTILE.material(&config);
-        let _ = STIFF_BRITTLE.material(&config);
-        let _ = LOW_VISCOSITY_FLUID.material(&config);
-        let _ = VISCOPLASTIC_FLUID.material(&config);
-        let _ = FluidGranular::saturated_loam_preset().material(&config);
+        let config = SimConfig::earth(64, 0.01, 1.0 / 60.0);
+        let materials = [
+            ("soft elastic", SOFT_ELASTIC.material(&config)),
+            ("soft viscoelastic", SOFT_VISCOELASTIC.material(&config)),
+            (
+                "cohesionless granular",
+                COHESIONLESS_GRANULAR.material(&config),
+            ),
+            (
+                "low density granular",
+                LOW_DENSITY_GRANULAR.material(&config),
+            ),
+            ("soft ductile", SOFT_DUCTILE.material(&config)),
+            ("stiff brittle", STIFF_BRITTLE.material(&config)),
+            ("low viscosity fluid", LOW_VISCOSITY_FLUID.material(&config)),
+            ("viscoplastic fluid", VISCOPLASTIC_FLUID.material(&config)),
+            (
+                "saturated loam",
+                FluidGranular::saturated_loam_preset().material(&config),
+            ),
+        ];
+        for (name, material) in &materials {
+            let mut p = Particle::zeroed();
+            p.mass = 0.25;
+            p.initial_volume = 0.25;
+            p.volume = 0.25;
+            p.density = 1.0;
+            material.init_particle(&mut p);
+            let tau = material.kirchhoff_stress(&Particles::from(vec![p]), 0);
+            println!("{name}: tau at rest {tau:?}");
+            assert!(
+                tau.to_cols_array().iter().all(|t| t.abs() <= 1.0e-6),
+                "{name}: stress at rest {tau:?}"
+            );
+        }
     }
 }

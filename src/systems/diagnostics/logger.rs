@@ -5,10 +5,14 @@ use std::path::Path;
 use crate::diagnostics::per_material::MaterialStats;
 use crate::diagnostics::snapshot::SimSnapshot;
 
-/// NDJSON frame logger — one JSON object per line, one file per run.
+/// NDJSON frame logger -- one JSON object per line, one file per run.
 ///
-/// Each `log()` call appends one line. The file is flushed immediately so
-/// `tail -f run.ndjson | jq` gives live output during a simulation.
+/// Each `log()` call appends one line. The OS write is flushed every
+/// `FLUSH_EVERY` calls (see that const), not every call, so `tail -f
+/// run.ndjson | jq` still shows live output during a simulation without a
+/// disk sync every frame. `BufWriter` flushes on drop, so a normal exit
+/// loses nothing; a hard crash can lose up to `FLUSH_EVERY-1` frames of log
+/// data, acceptable for a diagnostics log.
 ///
 /// # Usage
 /// ```ignore
@@ -23,7 +27,16 @@ use crate::diagnostics::snapshot::SimSnapshot;
 /// ```
 pub struct FrameLogger {
     writer: BufWriter<File>,
+    calls_since_flush: usize,
 }
+
+/// Flushing on every call was an fps bottleneck independent of particle
+/// count: `basic_plant.rs` (37 particles) measured 22-24 fps, since
+/// `Write::flush` on a `File` forces an OS write-through (often several ms on
+/// Windows, filesystem/AV filters included). 30 calls (~0.5 s at 60 fps, ~1 s
+/// at 30 fps) keeps `tail -f` live for a human and cuts the per-frame syscall
+/// cost ~30x.
+const FLUSH_EVERY: usize = 30;
 
 impl FrameLogger {
     /// Open (or create) an NDJSON log file. Truncates on open.
@@ -35,13 +48,14 @@ impl FrameLogger {
             .open(path)?;
         Ok(Self {
             writer: BufWriter::new(file),
+            calls_since_flush: 0,
         })
     }
 
     /// Append one frame line. Labels map material_id → name (same as `log_frame_full`).
     ///
     /// `extra` is an optional list of app-defined scalar fields (e.g. a demo's
-    /// live steer input or wave speed) merged into the top-level JSON object —
+    /// live steer input or wave speed) merged into the top-level JSON object --
     /// context the engine has no name for, but that matters when replaying a
     /// run's telemetry (why did the body do that at frame N?).
     pub fn log(
@@ -74,11 +88,10 @@ impl FrameLogger {
             health,
         );
 
-        // Real, generic sanity check: any pinned/Dirichlet-anchored particle should
-        // read exactly v=0 (see `SimSnapshot::max_pinned_particle_speed`'s own doc) —
-        // only emitted when the scene actually uses `Particle::pinned` (nonzero here
-        // means either real motion at an anchor -- a genuine engine bug -- or, more
-        // often, that no particle is pinned at all, in which case this stays absent).
+        // A pinned (Dirichlet-anchored) particle should read exactly v=0 (see
+        // `SimSnapshot::max_pinned_particle_speed`). Emitted only when the
+        // scene pins particles; a nonzero value means motion at an anchor, an
+        // engine bug.
         if snap.max_pinned_particle_speed > 0.0 {
             line.push_str(&format!(
                 ",\"pinned_v\":{:.6}",
@@ -86,10 +99,7 @@ impl FrameLogger {
             ));
         }
 
-        // Optional warn fields — only when non-zero.
-        if snap.vel_clamp_count > 0 {
-            line.push_str(&format!(",\"vel_clamp\":{}", snap.vel_clamp_count));
-        }
+        // Optional warn fields -- only when non-zero.
         if snap.j_projection_count > 0 {
             line.push_str(&format!(",\"j_proj\":{}", snap.j_projection_count));
         }
@@ -171,7 +181,48 @@ impl FrameLogger {
         }
         line.push_str("]}");
 
+        self.write_line(&line);
+    }
+
+    /// Append one text picture from [`crate::diagnostics::scene_map`] as
+    /// its own line, `{"frame":N,"map":"<name>","rows":[...]}`, top row
+    /// first, so the log shows where things are as well as how much. Read
+    /// one back with
+    /// `jq -r 'select(.map=="<name>" and .frame==N) | .rows[]' run.ndjson`.
+    pub fn log_map(&mut self, frame: u64, name: &str, rows: &[String]) {
+        let escape = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+        let mut line = format!(
+            "{{\"frame\":{frame},\"map\":\"{}\",\"rows\":[",
+            escape(name)
+        );
+        for (i, row) in rows.iter().enumerate() {
+            if i > 0 {
+                line.push(',');
+            }
+            line.push('"');
+            line.push_str(&escape(row));
+            line.push('"');
+        }
+        line.push_str("]}");
+        self.write_line(&line);
+    }
+
+    fn write_line(&mut self, line: &str) {
         let _ = writeln!(self.writer, "{}", line);
+        self.calls_since_flush += 1;
+        if self.calls_since_flush >= FLUSH_EVERY {
+            let _ = self.writer.flush();
+            self.calls_since_flush = 0;
+        }
+    }
+}
+
+impl Drop for FrameLogger {
+    /// Final flush on drop. `BufWriter` already flushes on its own `Drop`;
+    /// doing it here (swallowing errors like `log`'s periodic flush) makes
+    /// "a normal exit never loses buffered data" a property of `FrameLogger`
+    /// itself rather than of what it wraps.
+    fn drop(&mut self) {
         let _ = self.writer.flush();
     }
 }

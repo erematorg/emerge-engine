@@ -31,19 +31,18 @@ impl GpuSimulation {
 
     /// Force every particle with `user_tag == tag` asleep, regardless of velocity,
     /// applied at the start of the next `step_frame()`. P2G still scatters for them
-    /// (see `gpu_sleep_wake_phase1` memory note — sleeping particles must keep
-    /// providing structural support); only their own gather/integration/force-field
-    /// work is skipped.
+    /// (sleeping particles keep providing structural support); only their own
+    /// gather/integration/force-field work is skipped.
     ///
-    /// Minimal hook, not a chunk system: this just lets a caller (e.g. LP's future
-    /// chunk loader, once it exists) force-sleep a tagged group by distance instead
-    /// of waiting for velocity to drop. Mirrors the CPU `Simulation::sleep_tag` API.
+    /// A minimal hook, not a chunk system: it lets a caller (e.g. a chunk loader)
+    /// force-sleep a tagged group by distance instead of waiting for velocity to
+    /// drop. Mirrors the CPU `Simulation::sleep_tag` API.
     pub fn sleep_tag(&mut self, tag: u32) {
         if self.pending_sleep_tags.len() < MAX_SLEEP_WAKE_TAGS {
             self.pending_sleep_tags.push(tag);
         } else {
             eprintln!(
-                "emerge: GPU sleep-tag queue full ({MAX_SLEEP_WAKE_TAGS}/frame max) — tag dropped"
+                "emerge: GPU sleep-tag queue full ({MAX_SLEEP_WAKE_TAGS}/frame max) -- tag dropped"
             );
         }
     }
@@ -55,12 +54,12 @@ impl GpuSimulation {
             self.pending_wake_tags.push(tag);
         } else {
             eprintln!(
-                "emerge: GPU wake-tag queue full ({MAX_SLEEP_WAKE_TAGS}/frame max) — tag dropped"
+                "emerge: GPU wake-tag queue full ({MAX_SLEEP_WAKE_TAGS}/frame max) -- tag dropped"
             );
         }
     }
 
-    /// Mark CPU particles as layout-changed (positions/materials) — triggers sort + upload.
+    /// Mark CPU particles as layout-changed (positions/materials) -- triggers sort + upload.
     pub fn mark_particles_dirty(&mut self) {
         self.layout_dirty = true;
     }
@@ -78,18 +77,18 @@ impl GpuSimulation {
         &mut self.registry
     }
 
-    /// The wgpu Device — share with the LP render system to read the particle buffer directly.
+    /// The wgpu Device -- share with the LP render system to read the particle buffer directly.
     pub fn device(&self) -> &Arc<wgpu::Device> {
         &self.device
     }
 
-    /// The wgpu Queue — share with the LP render system for command submission.
+    /// The wgpu Queue -- share with the LP render system for command submission.
     pub fn queue(&self) -> &Arc<wgpu::Queue> {
         &self.queue
     }
 
-    /// The GPU particle storage buffer — bind this in LP's custom render shader.
-    /// Layout: `array<Particle>`, each Particle is 112 bytes, repr(C).
+    /// The GPU particle storage buffer -- bind this in LP's custom render shader.
+    /// Layout: `array<Particle>`, each Particle is 128 bytes, repr(C).
     /// Stays in VRAM between frames; read-only from the render side.
     pub fn particle_buffer(&self) -> &wgpu::Buffer {
         &self.buffers.particles
@@ -105,6 +104,51 @@ impl GpuSimulation {
     /// **CFL WARNING:** velocity changes bypass the solver's CFL clamp.
     /// For gameplay impulses use `apply_impulse` / `apply_radial_impulse` instead.
     /// After modifying, call `mark_particles_dirty()` so the GPU sees the changes.
+    /// Puts every particle into hydrostatic equilibrium under the current
+    /// gravity, so a body spawned "at rest" starts at rest.
+    ///
+    /// The GPU mirror of `Simulation::settle_hydrostatic`; both call the
+    /// same `hydrostatic_state`, so equilibrium means the same thing on
+    /// either path. See that method for why a pool spawned at uniform
+    /// density is not at rest.
+    ///
+    /// Call it after spawning and before the first step. Marks the particle
+    /// buffer dirty so the corrected state reaches the GPU.
+    pub fn settle_hydrostatic(&mut self) {
+        let gravity_magnitude = self.config.gravity.length();
+        if gravity_magnitude <= 0.0 {
+            return;
+        }
+        let mut surface: std::collections::HashMap<(u32, i32), f32> =
+            std::collections::HashMap::new();
+        for p in &self.particles {
+            let top = surface
+                .entry((p.material_id, p.x.x.floor() as i32))
+                .or_insert(f32::NEG_INFINITY);
+            *top = top.max(p.x.y);
+        }
+        for i in 0..self.particles.len() {
+            let p = self.particles[i];
+            let Some(&top) = surface.get(&(p.material_id, p.x.x.floor() as i32)) else {
+                continue;
+            };
+            let Some(state) = crate::spacetime::solver::hydrostatic_state(
+                self.registry.get(p.material_id),
+                gravity_magnitude,
+                top - p.x.y,
+                p.initial_volume,
+                p.mass,
+            ) else {
+                continue;
+            };
+            let p = &mut self.particles[i];
+            p.deformation_gradient = state.deformation_gradient;
+            p.volume = state.volume;
+            p.density = state.density;
+        }
+        self.mark_particles_dirty();
+    }
+
     pub fn particles_mut(&mut self) -> &mut Vec<Particle> {
         &mut self.particles
     }
@@ -149,7 +193,7 @@ impl GpuSimulation {
 
     /// Register a material, auto-assigning the next available ID.
     ///
-    /// Mirrors `Simulation::register_material` — use this instead of `set_material`
+    /// Mirrors `Simulation::register_material` -- use this instead of `set_material`
     /// when you don't want to track IDs manually. Returns a typed handle.
     ///
     /// LP pattern: call at world-init time to build a material palette, then
@@ -179,9 +223,30 @@ impl GpuSimulation {
         self.last_sub_dt
     }
 
-    /// Number of substeps run during the most recent `step_frame` call.
+    /// Substeps the GPU actually ran, for the most recent frame whose stats have been
+    /// read back: the previous frame, or the last one after `sync_frame_stats`.
     pub fn last_substeps(&self) -> usize {
         self.last_substeps
+    }
+
+    /// Mean duration of the last read-back frame's substeps: the simulated time it
+    /// advanced over the substeps it took, 0.0 before any step. The
+    /// explicit CFL bounds how far matter moves in one substep, so this is
+    /// the interval over which a particle's motion stays within about a
+    /// cell, what the surface view's velocity stretch measures motion over
+    /// (`SurfaceReconstructionSource::dt`). The frame `dt` spans many
+    /// substeps and is not that interval.
+    pub fn mean_substep_dt(&self) -> f32 {
+        if self.last_substeps == 0 {
+            return 0.0;
+        }
+        (self.config.dt - self.last_sim_time_dropped).max(0.0) / self.last_substeps as f32
+    }
+
+    /// Simulated time the GPU could not advance in that same frame, because the
+    /// encoded substeps ran out before the frame's time did.
+    pub fn last_sim_time_dropped(&self) -> f32 {
+        self.last_sim_time_dropped
     }
 
     /// Total frames stepped since creation.

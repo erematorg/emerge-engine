@@ -1,54 +1,180 @@
-//! Boundary conditions: the `BoundaryCondition` trait plus 6 real models,
-//! one per file (mirrors the `materials/` one-model-per-file pattern).
+//! Boundary conditions: the `BoundaryCondition` trait plus 5 real models.
+//! The 3 Coulomb-friction variants (plain/grip/ratchet) are a tightly
+//! related family -- grouped under `friction/` (see that module's doc);
+//! `heightmap`/`slip` are each standalone, one file apiece.
 //!
 //! Shared helpers (`apply_coulomb_wall`, `apply_slip_wall_velocity`,
 //! `clamp_position_inside_grid`) and their direct unit tests live here,
-//! since they're genuinely shared math, not any one model's own logic.
+//! since they're shared math, not any one model's own logic.
 
 use glam::Vec2;
 
-use crate::particle::Particles;
+use crate::particle::ParticleUpdateCtx;
 
 mod friction;
-mod grip_friction;
 mod heightmap;
-mod predictive;
-mod ratchet_friction;
+mod kinematic_obstacle;
 mod slip;
 
-pub use friction::FrictionBoundary;
-pub use grip_friction::GripFrictionBoundary;
+pub use friction::{FrictionBoundary, GripFrictionBoundary, RatchetFrictionBoundary};
 pub use heightmap::HeightmapBoundary;
-pub use predictive::PredictiveBoundary;
-pub use ratchet_friction::RatchetFrictionBoundary;
+pub use kinematic_obstacle::KinematicCircleBoundary;
 pub use slip::SlipBoundary;
 
 pub trait BoundaryCondition: Send + Sync + core::fmt::Debug {
-    fn apply_to_grid_velocity(&self, cell_index: usize, grid_res: usize, velocity: &mut Vec2);
+    /// Correct one grid node's velocity, returning the specific kinetic
+    /// energy this correction DISSIPATED as friction (grid velocity-squared
+    /// units; multiply by `dx_meters^2` for J/kg).
+    ///
+    /// Returning it rather than discarding it is what lets the solver
+    /// account for the energy instead of destroying it -- a frictional
+    /// contact that silently removes kinetic energy violates the first law.
+    /// A frictionless boundary returns 0, which is the honest answer and
+    /// also the cheapest.
+    fn apply_to_grid_velocity(
+        &self,
+        cell_index: usize,
+        grid_res: usize,
+        velocity: &mut Vec2,
+    ) -> f32;
     /// Clamp particle position to the valid domain after G2P.
-    /// Not a physical force — last-resort domain enforcement so particles never escape the grid.
+    /// Not a physical force -- last-resort domain enforcement so particles never escape the grid.
     /// Proper no-penetration physics lives in `apply_to_grid_velocity`.
     fn clamp_particle_position(&self, position: Vec2, grid_res: usize) -> Vec2;
-    fn post_g2p_particle(&self, _particles: &mut Particles, _i: usize, _grid_res: usize, _dt: f32) {
+    /// Optional post-G2P per-particle hook (e.g. `GripFrictionBoundary`'s muscle
+    /// grip). Takes a `ParticleUpdateCtx`, not `&mut Particles, i` -- same reason
+    /// as `MaterialModel::update_particle`: only ever touches its own particle's
+    /// fields, so G2P can run every particle's boundary hook in parallel too.
+    fn post_g2p_particle(&self, _ctx: &mut ParticleUpdateCtx, _grid_res: usize, _dt: f32) {}
+
+    /// Whether this boundary has a declared compatible wall discretisation
+    /// for strict WC-MPM liquids. The conservative default is false: a
+    /// post-G2P particle mutation is not automatically a fluid traction or
+    /// no-penetration condition. Implementors must opt in explicitly.
+    fn is_strict_wc_mpm_fluid_compatible(&self) -> bool {
+        false
     }
+
+    /// Local contact normal and penetration overlap for a grain of `radius` at
+    /// `position`, if it touches this boundary's surface. Lets grain-vs-terrain
+    /// contact produce a rolling torque via
+    /// `grain_contact_law::resolve_wall_contact`, as grain-vs-grain contact
+    /// does; without it a grain resting on a boundary cannot start rolling
+    /// from rest (see `heightmap.rs`).
+    ///
+    /// `normal` must point AWAY from the surface (toward free space, where
+    /// the grain is); `overlap = radius - distance_to_surface`. Default:
+    /// `None` (no rolling torque from this boundary), for boundaries such as
+    /// outer box walls that a grain rarely rests on.
+    fn grain_contact(
+        &self,
+        _position: Vec2,
+        _radius: f32,
+        _grid_res: usize,
+    ) -> Option<(Vec2, f32)> {
+        None
+    }
+
+    /// Radius-aware position backstop for a grain, after its velocity
+    /// integration (see `clamp_particle_position` for why a backstop exists:
+    /// last-resort domain enforcement, not physics). The default delegates to
+    /// `clamp_particle_position`, right for a boundary with no grain-specific
+    /// contact logic (e.g. `FrictionBoundary`).
+    ///
+    /// `HeightmapBoundary` overrides it: its generic `clamp_particle_position`
+    /// uses a fixed "+1" vertical clearance and checks straight-down `y`,
+    /// ignoring the grain's radius and the slope. Each boundary owns its
+    /// grain backstop end to end here, rather than the caller layering a
+    /// `grain_contact`-based correction over the generic clamp: `None` from
+    /// `grain_contact` means both "no grain logic" and "not touching", so the
+    /// call site cannot tell the two apart.
+    fn clamp_grain_position(&self, position: Vec2, radius: f32, grid_res: usize) -> Vec2 {
+        let _ = radius;
+        self.clamp_particle_position(position, grid_res)
+    }
+
+    /// Same as `apply_to_grid_velocity`, with an optional per-node
+    /// Material-Induced Boundary Friction coefficient (`Grid::
+    /// node_friction_at_index`, `None` when no friction-reporting particle
+    /// touched this node) available for boundaries that want it -- see
+    /// `MaterialModel::current_friction_coefficient`'s doc for the real
+    /// citation (Blatny & Gaume 2025). Default: ignore `node_friction`
+    /// entirely and delegate to the ordinary method -- safe and backward
+    /// compatible, the same "default no-op" shape `grain_contact`/
+    /// `clamp_grain_position` already use above. Only `FrictionBoundary`
+    /// overrides this; every other boundary keeps this default untouched.
+    fn apply_to_grid_velocity_with_node_friction(
+        &self,
+        cell_index: usize,
+        grid_res: usize,
+        velocity: &mut Vec2,
+        _node_friction: Option<f32>,
+    ) -> f32 {
+        self.apply_to_grid_velocity(cell_index, grid_res, velocity)
+    }
+
+    /// Equal-and-opposite reaction hook: called once per grid cell this
+    /// boundary's `apply_to_grid_velocity[_with_node_friction]` corrected,
+    /// with the mass-weighted impulse the grid lost at that cell (`-mass *
+    /// (v_after - v_before)`). A kinematically driven obstacle gains what the
+    /// grid lost, so it feels the material it pushes. Default: no-op (static
+    /// boundaries such as `SlipBoundary`/`FrictionBoundary` have nothing to
+    /// accumulate into).
+    fn on_grid_correction(&self, _cell_pos: Vec2, _reaction_impulse: Vec2) {}
 }
 
-/// Delegating impl so an `Arc<T>` can be boxed as a `BoundaryCondition` directly —
+/// Delegating impl so an `Arc<T>` can be boxed as a `BoundaryCondition` directly --
 /// lets a caller keep its OWN clone of the `Arc` (e.g. to call
 /// `RatchetFrictionBoundary::set_easy_direction` from a game loop) while the same
 /// underlying instance is also installed on the solver, sharing state instead of
 /// copying it.
 impl<T: BoundaryCondition + ?Sized> BoundaryCondition for std::sync::Arc<T> {
-    fn apply_to_grid_velocity(&self, cell_index: usize, grid_res: usize, velocity: &mut Vec2) {
-        (**self).apply_to_grid_velocity(cell_index, grid_res, velocity);
+    fn apply_to_grid_velocity(
+        &self,
+        cell_index: usize,
+        grid_res: usize,
+        velocity: &mut Vec2,
+    ) -> f32 {
+        (**self).apply_to_grid_velocity(cell_index, grid_res, velocity)
     }
 
     fn clamp_particle_position(&self, position: Vec2, grid_res: usize) -> Vec2 {
         (**self).clamp_particle_position(position, grid_res)
     }
 
-    fn post_g2p_particle(&self, particles: &mut Particles, i: usize, grid_res: usize, dt: f32) {
-        (**self).post_g2p_particle(particles, i, grid_res, dt);
+    fn post_g2p_particle(&self, ctx: &mut ParticleUpdateCtx, grid_res: usize, dt: f32) {
+        (**self).post_g2p_particle(ctx, grid_res, dt);
+    }
+
+    fn is_strict_wc_mpm_fluid_compatible(&self) -> bool {
+        (**self).is_strict_wc_mpm_fluid_compatible()
+    }
+
+    fn grain_contact(&self, position: Vec2, radius: f32, grid_res: usize) -> Option<(Vec2, f32)> {
+        (**self).grain_contact(position, radius, grid_res)
+    }
+
+    fn clamp_grain_position(&self, position: Vec2, radius: f32, grid_res: usize) -> Vec2 {
+        (**self).clamp_grain_position(position, radius, grid_res)
+    }
+
+    fn apply_to_grid_velocity_with_node_friction(
+        &self,
+        cell_index: usize,
+        grid_res: usize,
+        velocity: &mut Vec2,
+        node_friction: Option<f32>,
+    ) -> f32 {
+        (**self).apply_to_grid_velocity_with_node_friction(
+            cell_index,
+            grid_res,
+            velocity,
+            node_friction,
+        )
+    }
+
+    fn on_grid_correction(&self, cell_pos: Vec2, reaction_impulse: Vec2) {
+        (**self).on_grid_correction(cell_pos, reaction_impulse);
     }
 }
 
@@ -57,25 +183,42 @@ impl<T: BoundaryCondition + ?Sized> BoundaryCondition for std::sync::Arc<T> {
 /// `outward_normal`: unit vector pointing away from the wall into the domain.
 /// When the velocity has a component moving INTO the wall (v · outward_normal < 0),
 /// zero the normal component and damp the tangential component by µ × |v_normal|.
-pub(crate) fn apply_coulomb_wall(velocity: &mut Vec2, outward_normal: Vec2, mu: f32) {
+/// Returns the specific kinetic energy this Coulomb contact DISSIPATED,
+/// `0.5 * (|v_t|^2 - |v_t_after|^2)`, in the grid's own velocity-squared
+/// units (multiply by `dx_meters^2` for J/kg).
+///
+/// Only the TANGENTIAL part is reported, and that is deliberate. Sliding
+/// friction doing work against a surface is unambiguously dissipation and
+/// becomes heat, and Coulomb's own law says how much. The normal component
+/// this function also removes is a no-penetration constraint against an
+/// idealised rigid wall; where that energy goes in reality (wall
+/// deformation, sound, heat on both sides) is a modelling choice this
+/// engine does not make, so it is not reported as frictional heat.
+///
+/// Callers that do not care may ignore the value. Recording it is what
+/// lets `energy::thermodynamics::frictional_heating` close the first law
+/// instead of letting the energy vanish.
+pub(crate) fn apply_coulomb_wall(velocity: &mut Vec2, outward_normal: Vec2, mu: f32) -> f32 {
     let v_n_scalar = velocity.dot(outward_normal);
     // Only act when moving into the wall.
     if v_n_scalar >= 0.0 {
-        return;
+        return 0.0;
     }
     let normal_speed = v_n_scalar.abs();
     let v_t = *velocity - v_n_scalar * outward_normal;
     let v_t_len = v_t.length();
     let friction_impulse = mu * normal_speed;
-    // Tangential speed after friction: max(|v_t| − µ|v_n|, 0), direction preserved.
+    // Tangential speed after friction: max(|v_t| - mu|v_n|, 0), direction kept.
+    let v_t_after = (v_t_len - friction_impulse).max(0.0);
     *velocity = if v_t_len > friction_impulse {
-        v_t * ((v_t_len - friction_impulse) / v_t_len)
+        v_t * (v_t_after / v_t_len)
     } else {
         Vec2::ZERO
     };
+    0.5 * (v_t_len * v_t_len - v_t_after * v_t_after)
 }
 
-pub(crate) fn apply_slip_wall_velocity(
+pub(crate) const fn apply_slip_wall_velocity(
     thickness: usize,
     cell_index: usize,
     grid_res: usize,
@@ -84,7 +227,7 @@ pub(crate) fn apply_slip_wall_velocity(
     let hi = grid_res - (thickness + 1);
     let x = cell_index / grid_res;
     let y = cell_index % grid_res;
-    // Only block the inward component — let outward (escape) velocity pass through.
+    // Only block the inward component -- let outward (escape) velocity pass through.
     // Standard MPM slip: no-penetration, free tangential slip.
     if x < thickness {
         velocity.x = velocity.x.max(0.0);
@@ -172,10 +315,8 @@ mod boundary_physics_tests {
         );
     }
 
-    /// Real Coulomb friction law: tangential speed is reduced by EXACTLY
-    /// mu * |v_normal| (not more, not less), direction preserved -- this is the
-    /// actual physical law (friction force proportional to normal force), not
-    /// just "friction slows things down somewhat."
+    /// Coulomb friction: tangential speed drops by exactly mu * |v_normal|,
+    /// direction preserved (friction force proportional to normal force).
     #[test]
     fn coulomb_wall_reduces_tangential_speed_by_exactly_mu_times_normal_speed() {
         let v_n = 4.0_f32; // normal speed into the wall
@@ -193,9 +334,8 @@ mod boundary_physics_tests {
         assert_eq!(v.x, 0.0, "normal component always fully zeroed on impact");
     }
 
-    /// Real Coulomb friction can only decelerate, never reverse direction --
-    /// once tangential speed would go negative, it clamps to exactly zero
-    /// (a particle can't be pushed backward by its own friction).
+    /// Coulomb friction only decelerates: once tangential speed would go
+    /// negative it clamps to exactly zero, never reversing direction.
     #[test]
     fn coulomb_wall_never_reverses_tangential_direction() {
         let mut v = Vec2::new(-10.0, 2.0); // huge normal speed, tiny tangential
@@ -209,7 +349,7 @@ mod boundary_physics_tests {
     }
 
     /// Outward-moving velocity must be completely untouched by Coulomb friction
-    /// too, same as the slip wall -- friction only applies to genuine impacts.
+    /// too, same as the slip wall -- friction only applies to impacts.
     #[test]
     fn coulomb_wall_does_not_touch_outward_velocity() {
         let mut v = Vec2::new(4.0, -2.0); // moving away from the wall

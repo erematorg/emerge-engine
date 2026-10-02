@@ -3,7 +3,7 @@
 //! `UniformElectricField` applies a spatially-constant external E-field to charged particles
 //! via the `Field` substep hook. This is a standalone Lorentz-force (F = qE) implementation --
 //! it does NOT call into `electromagnetics::`, which holds separate, so-far-unwired field-query
-//! and EM-wave math (see that module's own doc for why).
+//! and EM-wave math (see that module's doc for why).
 //!
 //! Distinct from `CoulombField` (`fields::coulomb`), which models discrete point-source
 //! interactions rather than a uniform field. Use `UniformElectricField` for capacitor plates,
@@ -37,7 +37,7 @@ pub struct UniformElectricField {
 }
 
 impl UniformElectricField {
-    pub fn new(field: Vec2, material_charges: HashMap<u32, f32>) -> Self {
+    pub const fn new(field: Vec2, material_charges: HashMap<u32, f32>) -> Self {
         Self {
             field,
             material_charges,
@@ -72,10 +72,8 @@ mod tests {
     use super::*;
     use crate::particle::Particle;
 
-    /// `UniformElectricField` had ZERO test coverage of any kind before this
-    /// (confirmed via a full test-file audit, 2026-07-07). Checks the real,
-    /// analytic physics directly: F = qE, a = F/m -- the Lorentz force with no
-    /// magnetic component, exactly what this field claims to model.
+    /// Checks the analytic physics of `UniformElectricField` directly: F = qE,
+    /// a = F/m, the Lorentz force with no magnetic component.
     fn particle_with(material_id: u32, mass: f32) -> Particles {
         let mut p = Particle::zeroed();
         p.material_id = material_id;
@@ -99,8 +97,8 @@ mod tests {
         assert_eq!(field.acceleration(&particles, 0), Vec2::ZERO);
     }
 
-    /// Real Lorentz force law: a = q*E / m, matched exactly (this is a pure
-    /// analytic formula, not a simulated/approximated quantity).
+    /// Lorentz force law, a = q*E / m, matched exactly (a pure analytic
+    /// formula, not a simulated quantity).
     #[test]
     fn charged_particle_matches_qe_over_m_exactly() {
         let e_field = Vec2::new(10.0, -4.0);

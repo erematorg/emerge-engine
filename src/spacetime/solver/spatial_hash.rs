@@ -8,7 +8,7 @@ use std::collections::HashMap;
 /// (roughly one particle per cell) puts ≈1 particle per bucket.
 ///
 /// Rebuild once per substep after G2P (positions are final for that substep).
-/// Query with `query(center, radius)` — iterates candidate indices; caller does
+/// Query with `query(center, radius)` -- iterates candidate indices; caller does
 /// exact distance filtering.
 pub(crate) struct SpatialHash {
     inv_cell: f32,
@@ -58,7 +58,7 @@ impl SpatialHash {
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn cell_of(&self, p: Vec2) -> (i32, i32) {
         (
             (p.x * self.inv_cell).floor() as i32,

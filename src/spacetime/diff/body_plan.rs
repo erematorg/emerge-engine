@@ -12,14 +12,14 @@ use glam::Vec2;
 /// grid units over a ~1.5-unit-tall body) -- because EVERY group could only
 /// push straight up/down, net horizontal drift could only emerge indirectly
 /// through the sticky floor's timing, which is inherently a pogo motion,
-/// not a step. Cross-checked against EvoGym's real, published, walking
+/// not a step. Cross-checked against EvoGym's published, walking
 /// voxel robots (Bhatia et al. 2021, source in `evogym/utils.py`): their
 /// voxels come in two actuator types, `H_ACT` (horizontal) and `V_ACT`
 /// (vertical) -- real walkers mix both, using vertical actuators for
 /// stance/lift and horizontal actuators for push-off (the actual Newton's-
 /// third-law mechanism real legged locomotion uses: push the ground
 /// backward, the ground pushes the body forward). `signed_active_stress`
-/// already took `fiber_dir` as a parameter, so this is a real fix, not new
+/// already took `fiber_dir` as a parameter, so this is a fix, not new
 /// derivation -- no new adjoint math, just plumbing a per-group value
 /// through where a global constant was hardcoded before.
 pub struct BodyPlan {

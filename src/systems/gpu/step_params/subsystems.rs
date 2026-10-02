@@ -2,28 +2,28 @@
 //! reaction-diffusion, ASFLIP, and material-mass render accumulation. Each
 //! follows the same `enabled`/`disabled()` gate convention -- 0 skips every
 //! pass for that subsystem entirely, zero cost, byte-identical to before the
-//! subsystem existed. Split out of `step_params.rs`, see that module's own doc
+//! subsystem existed. Split out of `step_params.rs`, see that module's doc
 //! comment for the full file map.
 
-/// Grid-based Fourier heat diffusion — GPU mirror of `ThermalDiffusion`/`ThermalConfig`
+/// Grid-based Fourier heat diffusion -- GPU mirror of `ThermalDiffusion`/`ThermalConfig`
 /// (`src/energy/thermodynamics/diffusion.rs`). Implements the same real PDE:
 /// `∂T/∂t = α·∇²T` (Fourier's law) plus Newton cooling `dT/dt = −k_c·(T−ambient)`.
-/// `dt` itself is NOT stored here — the thermal pass reads `step_params.dt` (group 0)
+/// `dt` itself is NOT stored here -- the thermal pass reads `step_params.dt` (group 0)
 /// directly, since substep `dt` is already the single source of truth uploaded there
 /// every substep; duplicating it here would risk the two going out of sync.
 /// `enabled == 0` skips all 4 thermal passes entirely (see `contact_active`'s identical
-/// gate-when-unused pattern) — every scene that never attaches thermal pays nothing.
+/// gate-when-unused pattern) -- every scene that never attaches thermal pays nothing.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuThermalParams {
-    /// Thermal diffusivity α = k / (c_p · dx²), grid-units²/s — see
-    /// `ThermalConfig::alpha_grid`'s own doc for the real derivation/units.
+    /// Thermal diffusivity α = k / (c_p · dx²), grid-units²/s -- see
+    /// `ThermalConfig::alpha_grid`'s doc for the derivation/units.
     pub alpha: f32,
-    /// Ambient/boundary temperature — empty cells and Newton cooling both relax toward this.
+    /// Ambient/boundary temperature -- empty cells and Newton cooling both relax toward this.
     pub ambient: f32,
     /// Newton cooling rate k_c, 1/s. 0.0 = no cooling (adiabatic walls).
     pub cooling_rate: f32,
-    /// 0 = no thermal system attached (default, every existing scene) — skips all 4
+    /// 0 = no thermal system attached (default, every existing scene) -- skips all 4
     /// thermal passes. 1 = attached and active.
     pub enabled: u32,
 }
@@ -41,12 +41,12 @@ impl GpuThermalParams {
 
 const _: () = assert!(core::mem::size_of::<GpuThermalParams>() == 16);
 
-/// Generic reaction-diffusion resource field — GPU mirror of `ScalarDiffusionField`
+/// Generic reaction-diffusion resource field -- GPU mirror of `ScalarDiffusionField`
 /// (`src/energy/thermodynamics/scalar_field.rs`), specialized to the one source term
 /// its own CPU test module uses: logistic growth (Verhulst 1838, `dφ/dt = r·φ·(1−φ/K)`).
 /// Same PDE shape as `GpuThermalParams` (scatter -> normalize -> Laplacian+reaction ->
 /// gather), but its own separate group/buffers and carrier field (`particle.scalar_field`,
-/// not `particle.temperature`) — composes freely with `GpuThermalParams` in the same
+/// not `particle.temperature`) -- composes freely with `GpuThermalParams` in the same
 /// scene since the two no longer share a carrier field.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -89,7 +89,7 @@ const _: () = assert!(core::mem::size_of::<GpuResourceParams>() == 32);
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuAsflipParams {
-    /// Blend factor [0, 1] -- see `SimConfig::asflip_blend`'s own doc for the real
+    /// Blend factor [0, 1] -- see `SimConfig::asflip_blend`'s doc for the real
     /// derivation and the ~0.97 reference value (`nepluno/pyasflip`).
     pub blend: f32,
     /// 0 = ASFLIP disabled (default) -- skips the snapshot write and the fused G2P+
@@ -119,9 +119,9 @@ const _: () = assert!(core::mem::size_of::<GpuAsflipParams>() == 16);
 pub const MAX_RENDER_MATERIAL_SLOTS: u32 = 16;
 
 /// Opt-in per-cell per-material mass accumulator for `ColorMode::GridVolume`'s
-/// material-aware coloring (see `grid_volume.wgsl`'s own doc). 0 = disabled
-/// (default) -- P2G skips the extra atomic scatter entirely, zero cost, byte-
-/// identical to before this existed, same gate convention as `GpuAsflipParams`.
+/// material-aware coloring (see `grid_volume.wgsl`'s doc). 0 = disabled
+/// (default) -- P2G skips the extra atomic scatter entirely, same gate
+/// convention as `GpuAsflipParams`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuMaterialMassParams {
@@ -136,6 +136,24 @@ impl GpuMaterialMassParams {
             _pad: [0; 3],
         }
     }
+}
+
+/// GPU mirror of `fluid_pressure.wgsl`'s own `FluidPressureParams` struct --
+/// field order and types must match exactly (WGSL uniform buffers use the
+/// same std140-style layout rules bytemuck's `Pod` derive already assumes
+/// elsewhere in this file). Real GPU port of the CPU-proven Chorin-style
+/// incompressibility pressure projection, see that shader's module doc.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuFluidPressureParams {
+    /// Reference fluid cell mass: a full cell's rest mass in this material's
+    /// grid units (`rest_density`, cell area 1), set from the CPU side. CPU's
+    /// `pressure.rs` averages `mass_avg` live over active cells; matching
+    /// that on GPU would need a reduction pass. Used only for the free-surface
+    /// classification threshold (`reference_cell_mass * 0.3`, as CPU's
+    /// `mass_avg * 0.3`).
+    pub reference_cell_mass: f32,
+    pub _pad: [f32; 3],
 }
 
 const _: () = assert!(core::mem::size_of::<GpuMaterialMassParams>() == 16);

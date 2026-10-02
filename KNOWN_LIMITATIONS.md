@@ -1,0 +1,655 @@
+# Known Limitations - emerge
+
+This document has two parts.
+
+**Open research questions** track places where emerge's design runs into a
+**genuinely open problem in the published computational-physics or
+numerical-methods literature**: not our own bugs, not untested code paths.
+The bar is the same as for something like the Navier-Stokes
+existence-and-smoothness problem: not "we personally couldn't solve it," but
+"real, named, published sources show the wider field hasn't solved it
+either." Every entry must cite sources that themselves say, or show through
+a multi-year line of publications, that the specific question is still open.
+
+**The gap registry** (at the end) tracks work the engine knows it has not
+done yet: deferred on purpose, left out of the current plan, not audited, or
+found in passing and not fixed. Those gaps are ours to fix, not the field's
+to solve. They are listed here, each with its source, so that none of them
+silently disappears and each can be picked up later with better research.
+
+**Rule for every open research question:**
+1. The open question itself, stated plainly.
+2. Real, dated, named sources, quoting the part where they say or show
+   the question is unresolved. Not just a citation for background.
+3. What we found when we hit this in our own engine (kept short: the real
+   trail, not a full replay of the investigation).
+4. What emerge does because the question is still open.
+5. What would close the entry: a specific new published result, not
+   "someone tries harder."
+
+---
+
+## Open
+
+### 1. (Closed)
+
+The former entry 1, "no general stability rule exists for APIC under fast,
+large motion," turned out to describe two GPU implementation bugs, not an
+open question. See "The GPU water splash disintegrated on impact" under
+Resolved. Numbering is kept so that references to entry 2 stay valid.
+
+---
+
+### 2. No general method reaches real-time speed with true PDE integration across stiff, multi-material scenes
+
+**The question.** Is there one time-integration scheme for the material
+point method that is at once: a direct integration of the real governing
+equations, not a position-based shortcut; correct for very stiff
+materials without needing a prohibitively tiny time step; and general
+across constitutive laws (elastic solids, plastic materials, and
+viscous/pressure-based fluids alike)? A real ten-year line of publications
+answers only part of this each time, and says so.
+
+**Sources, quoted, in order.**
+- Klar, Gast, Pradhana, Fu, Schroeder, Jiang and Teran, *"Drucker-Prager
+  Elastoplasticity for Sand Animation,"* SIGGRAPH 2016 ([doi:10.1145/2897824.2925906](https://doi.org/10.1145/2897824.2925906)): "For most of our
+  examples, explicit is more efficient... For stiff examples, implicit
+  becomes advisable." Their own implicit treatment is "implicit in
+  plasticity... not implicit in hardening or friction," a disclosed
+  partial scope, not a general answer.
+- Fang, Hu, Hu and Jiang, *"A Temporally Adaptive Material Point Method
+  with Regional Time Stepping,"* SCA 2018 ([doi:10.1111/cgf.13524](https://doi.org/10.1111/cgf.13524)), Section 8: "it is not always
+  the preferred choice especially for cases where stiff materials occupy
+  the main portion of a scene... We look forward to exploring mixed
+  implicit-explicit integration schemes (IMEX) with regional time
+  stepping to handle these cases better." The authors name the exact
+  combination that would close their own gap and call it future work.
+  We found no paper since, including theirs, that has done it.
+- Daviet, *"Mixed Material Point Methods for Stiff Elastoplasticity,"*
+  NVIDIA, ACM TOG 45(4), 2026 ([doi:10.1145/3811345](https://doi.org/10.1145/3811345)), the most recent and most general attempt
+  (a separate mixed stress field solved as a convex optimization),
+  states plainly: "the performance advantage of implicit over explicit
+  time integration thus reduces as the grid resolution increases." Not a
+  universal win even in 2026.
+
+**What we found in this engine.** We already have a real, working
+implicit solver for one family of materials (stiff elastic and plastic
+solids sharing a shared stress law). We measured it directly, twice. On
+an already-settled pile it is slower than plain explicit stepping (its
+own solve overhead costs more than the small steps it replaces). On a
+genuinely violent impact, the regime where the literature above says
+implicit should help most, we measured it on a real, cited, stiff sand
+material (Young's modulus 15 MPa, a real published excavation-soil
+figure) at real production scale: reaching convergence needs several
+hundred internal solver iterations per frame, each costing enough on its
+own that the total projects to several seconds per frame, 25 to 30 times
+slower than the explicit stepping it was meant to replace. Not a tuning
+problem: the same investigation ruled out the solver's own numerics
+(compared against an exact direct solve, not just its iterative
+approximation) before concluding the real bottleneck is structural,
+needing a fundamentally different, much larger solver technique to fix,
+not a parameter change. We independently re-confirmed the same stiff
+material demands a near-identical, very large step count in a completely
+different scene mixing it with other materials, so this is not one
+scene's quirk. It does not reach fluids at all either: a fluid's stress
+comes from pressure and a rate-dependent viscosity, a different
+mathematical shape than the solids' stress law this solver was built
+around. We also tested letting calm parts of a fluid scene take bigger
+steps while only the violent part takes small ones (the Fang et al. idea
+above). On our actual water scenes, every part of the fluid body moves at
+a similar speed at the same instant during a fall or a fresh spawn, so
+there is no calm region left to exploit. Confirmed by direct measurement,
+not assumed.
+
+One real, published lever DOES help within this same explicit approach,
+for scenes where a small, disclosed accuracy loss is acceptable. Haeri and
+Skonieczny, *"Three-dimensional granular flow continuum modeling via
+material point method with hyperelastic nonlocal granular fluidity,"*
+Computer Methods in Applied Mechanics and Engineering 394 (2022)
+([doi:10.1016/j.cma.2022.114904](https://doi.org/10.1016/j.cma.2022.114904)), the same
+paper behind our sand's stiffness citation, publish their own softened
+version of that same material (a tenth of a percent of the original
+stiffness), built for exactly this speed reason, reporting their own real,
+measured accuracy cost for it (15.8% mean error on excavation force,
+against -0.5% for the full-strength version) rather than one we estimated.
+Using it in a player-facing demo (not our accuracy-focused sand scenes,
+which keep the full-strength citation) cut that scene's own substep count
+by a real, measured 10 times, confirmed live, not just calculated: frame
+throughput in a fixed real-time window rose about 8.5 times. Still well
+short of real-time, but a genuine, sourced improvement, not a guess.
+
+**What emerge does because this is unresolved.** The opt-in implicit
+solver stays scoped to solids only
+(`src/spacetime/solver/implicit_corotated.rs`). Fluids keep running fully
+explicit, at whatever cost the real physics demands.
+
+**What would close this.** A published method showing true PDE, real-time
+integration across both a stiff elastic solid and a viscous, pressure-based
+fluid in the same violently-loaded scene. The exact combination Fang et
+al. named as future work in 2018, still not shown as of the 2026 Daviet
+paper.
+
+**What it costs today, scene by scene** (measured 2026-09-19 on a Radeon
+610M, AC power). The rule behind all three numbers is the same: an explicit
+step cannot exceed about `dx / c`, where `c = sqrt(E/rho)` is the material's
+own speed of sound. Stiffer material or finer grid, more substeps. Nothing
+in the code changes that; it is the equation.
+
+| scene | sound speed | substeps per frame | measured |
+|---|---|---|---|
+| water (dam break, droplet, vortex) | 1.75 m/s, set by the WCSPH rule `c >= 10*v_max` | 52 | 50-56 fps |
+| sand, jellies | relaxed published stiffness (see above) | low tens | 60 fps |
+| multi-material showcase | sand-dominated | ~264, x4 sim steps per rendered frame | ~10-12 fps |
+| snow | 26.5 m/s (`E = 1.4e5 Pa`, `rho = 200`, Stomakhin 2013, [doi:10.1145/2461912.2461948](https://doi.org/10.1145/2461912.2461948)) | ~880, x4 per rendered frame | 1-2 fps |
+
+Snow is the honest worst case: its real, cited stiffness is fifteen times
+water's effective sound speed here, so it needs roughly fifteen times the
+substeps, and the demo runs four simulation steps per rendered frame on top.
+Making each substep faster does not rescue it: at 3500 substeps per rendered
+frame, even halving the per-substep cost leaves it around 3 fps.
+
+What would actually move these two scenes, in order of honesty:
+- a coarser grid (`dt` scales with `dx`, and the same region needs fewer
+  particles), which costs visual resolution, not correctness;
+- slower playback (fewer simulation steps per rendered frame), which costs
+  apparent speed, not correctness;
+- a published relaxed stiffness for that material, as was already done for
+  sand with its own paper's figure -- only where such a figure exists;
+- the unresolved research above.
+
+Softening a material without a source, or damping the motion to hide the
+instability, is not on this list and is not acceptable here.
+
+---
+
+## Resolved
+
+### The GPU water splash disintegrated on impact
+
+**What was wrong.** Two GPU implementation bugs. On the AMD Vulkan driver
+used for development, reading one element of a matrix held in a local copy
+of a struct (`p.m[1][1]`) returned another column, so the fluid's volume
+change followed shear instead of compression. Separately, the GPU summed
+grid mass and momentum as fixed-point integers, which silently dropped every
+contribution smaller than half a quantum at small time steps.
+
+**What actually fixed it.** Matrices are passed by value to small helper
+functions (`trace2`, `det2`, `frob2_sq`) before being indexed, and the main
+grid accumulates in exact floating point with a compare-and-swap loop. The
+shear-damping workaround this entry used to describe was deleted.
+
+**What remains.** The broader question, a published stability analysis of
+APIC under large and fast deformation, may still be open in the literature,
+but it was not what broke this scene. For the simplest case there is a
+measured bound: an isolated particle stays bounded up to a time step of
+0.80 dx/c_p and diverges at 0.85 (Poisson ratio 0.3), close to the
+single-particle value sqrt((lambda + 2 mu) / (2 (lambda + mu))) = 0.84.
+The other read forms of the driver bug were not tested one by one, and the
+secondary GPU grids still use fixed point.
+
+---
+
+### The water splash used to collapse into a paper-thin layer, then explode
+
+**What was wrong.** Water's pressure formula has a floor: pressure is
+never allowed to go more negative than a fixed value, standing in for the
+real physical limit where a liquid starts to cavitate instead of
+stretching further. That floor was set as a bare number with no
+connection to real units, so at this engine's actual scale it clipped
+almost the entire useful range of the formula into a flat zone with no
+restoring force. Once a region drifted into that flat zone, nothing
+pulled it back, and the whole column would silently collapse to a sliver.
+
+**What actually fixed it.** Converting that floor through the same real
+SI-to-simulation conversion the rest of the pressure formula already used,
+based on the real pressure at which dissolved gas in water starts to
+cavitate. Once the fluid could feel a real pressure gradient again, the
+column stopped collapsing. That larger, healthier pressure response also
+meant the simulation genuinely needed far more, smaller time steps than
+before to stay accurate, and an old fixed cap on how many steps a frame
+could take was silently cutting that short, which is what caused the
+follow-up explosion. Raising the cap to match the real requirement closed
+that second issue.
+
+**Then found again, deeper, this week.** The same floor was still broken
+by default inside the two constructors meant to build this material
+correctly from real SI values in the first place. Anyone using the
+"proper" real-unit constructor, not just the two demo files we had
+already patched by hand, would have silently reintroduced the exact same
+bug. Fixed at the source (`src/matter/materials/liquid/fluid.rs`), so every
+future user of this material gets the correct value automatically. A real
+existing test, built specifically to show this same old flaw next to a
+newer alternative material, stopped showing the flaw once this landed. It
+was updated to check that both materials now behave well, instead of
+checking that one of them still misbehaves.
+
+**Closed:** 2026-09-16 (original fix), 2026-09-17 (fixed at the source).
+
+---
+
+### Water's viscosity was about ten times weaker than intended
+
+**What was wrong.** Water's real-world viscosity (about 0.001 Pa times
+seconds, the textbook figure) was being used directly inside a formula
+that expected a value already converted into this simulation's own
+internal units. Same category of mistake as the pressure floor above,
+just on a different field.
+
+**What actually fixed it.** Routed both the shear and the bulk viscosity
+through the engine's own existing, correct conversion function. Checked
+against the full fluid test suite (all still pass) and separately
+confirmed this fix alone does not solve the GPU splash disintegration
+(resolved separately, above). The real molecular viscosity, even corrected, is far too small on
+its own to explain or calm that particular runaway.
+
+**Closed:** 2026-09-17.
+
+---
+
+## Gap registry
+
+### Deferred by the core implementation plan
+
+- **Pressure projection** (`Grid::project_fluid_incompressibility`, off by
+  default). Four mechanisms were measured. The divergence it corrects is
+  read with empty cells as velocity zero, so a droplet in free fall shows a
+  divergence that is entirely fabricated. The velocity correction divides by
+  the nodal mass at partly filled surface nodes while the solve assumes the
+  average density. The 0.2 relaxation masks an unstable operator: the full
+  correction grows an injected divergence up to 6.2 times on a second pass.
+  Fluid, air and wall are classified by mass thresholds and the domain edge
+  instead of geometry. Consequence: the wall-contact column survives 120
+  frames only with J at the [0.5, 2.0] safety clamp from about frame 20, so
+  the frame rates quoted for it (about 30 to 90 fps on CPU, 188 fps on GPU)
+  measure cost, not a valid run. That column is the `fluid_pressure_projection`
+  example, and it no longer gets that far: it panics on its first frame, a
+  particle reaching about 4e7 cells/s within 16 substeps while the CFL step
+  collapses to about 3e-9. Replayed at commits back to 13 September 2026, it
+  ran two frames at most. The experiments and their toggles live on
+  the fork branch `archive/pressure-rhs-audit-2026-09-21`.
+
+  **The rebuild on the standard formulation is experimental and has not
+  passed its gates yet.** `grid::mac` (feature `experimental`) holds it,
+  apart from the step, which does not call it: a staggered grid, a liquid
+  level set from the particles, solid face weights, a ghost-fluid free
+  surface and a MIC(0) conjugate gradient (Bridson and Muller-Fischer 2007
+  course notes, [doi:10.1145/1281500.1281681](https://doi.org/10.1145/1281500.1281681); Batty, Bertails and Bridson
+  2007, [doi:10.1145/1276377.1276502](https://doi.org/10.1145/1276377.1276502); Zhu and Bridson; `apic2d`
+  as the reference code). Its stop criteria, in `grid/mac/gates.rs`, were
+  committed before its code and allowed two failed runs; both runs failed,
+  so the attempt stopped there. The four gate scenes and the four probes
+  that counted why are ignored tests in that file
+  (`cargo test --features experimental --lib grid::mac::gates -- --ignored
+  --nocapture`).
+
+  | scene | first run | second run |
+  | --- | --- | --- |
+  | column at rest, 0.38, 1, 2.5 g | pass | pass |
+  | droplet in free fall, 0.38, 1, 2.5 g | pass | pass |
+  | dam break | fail | fail |
+  | drop into a pool | fail | fail |
+
+  The column holds hydrostatic pressure within 0.046 cell of head, and the
+  error halves at 0.5 cm cells; the falling droplet keeps zero pressure and
+  J within 1e-5 of 1. Between the runs, two things were fixed, both derived
+  here from the conditions the solve enforces, not taken from a source. The
+  gather is quadratic along each velocity component and linear across it,
+  so the divergence a particle reads is the grid's own: deep in the liquid
+  it went from 1000 to 3000 times the grid's to equal to it, and J there now
+  stays within 2e-4 of 1 over 2 s. And a wall's closed faces hold the mirror
+  image of the flow, so the normal velocity read at a flat wall is zero:
+  crossings fell from 474 to 107 and the pool keeps every particle.
+
+  Still failing, counted by the probes in `grid/mac/gates.rs`:
+
+  - Particles that come near the free surface drift in volume, their mean
+    J between 0.96 and 1.03 over 2 s, because the velocity extrapolated
+    into the air is not divergence free and the gather reads it. The dam break
+    ends 6.7 percent off, the pool 3.4.
+  - The 107 remaining crossings are at the tank's corners, where one
+    wall's mirror is not the image across both, at up to 3.4 m/s.
+
+  Energy never rose in any run. The track goes on: after phase 7, a new
+  bounded attempt with new criteria written first, aimed at these two
+  points. Once the new projection passes, the old one (`grid/pressure.rs`)
+  is removed.
+- **Time convergence and energy lost per substep.** With APIC, a free
+  elastic block keeps 0.69, 0.51 and 0.37 of its energy after the same
+  physical time at 256, 1024 and 4096 steps (the exact answer is 1.0):
+  smaller steps mean more artificial damping. ASFLIP, available through
+  `asflip_blend`, does not fix it: 0.53 at blend 0.5, and at blend 0.97 it
+  creates energy (1.16 at 4096 steps). Candidates: PolyPIC (Fu et al. 2017,
+  [doi:10.1145/3130800.3130878](https://doi.org/10.1145/3130800.3130878)),
+  which lowers the loss per transfer without changing the order, and an
+  energy-momentum consistent implicit MPM (Love and Sulsky 2006, [doi:10.1002/nme.1512](https://doi.org/10.1002/nme.1512)), which
+  conserves energy by construction at the cost of an implicit solve. The
+  energy lost per step will be published next to the CFL safety factor.
+- **3D.** The code is 2D throughout (about 2,400 `Vec2`, 840 `Mat2` and 250
+  `IVec2` uses, 440 WGSL 2D types, no dimension abstraction). A
+  per-dimension type alias would be the first seam; nothing else is planned.
+
+### Volume a body loses to nothing
+
+`advance_deformation_gradient` applies each substep as
+`F + (exp(dt C) - I) F`, on CPU and GPU alike, with the increment never
+formed as one plus a small number. An f32 near 1 is spaced 1.19e-7 above
+it and 5.96e-8 below it, so an increment written as `1 + small` was
+rounded one way every substep: the plain product `exp(dt C) F` lost
+determinant steadily, and the first fix, rescaling `F` each substep onto a
+volume ratio carried beside it, fed the same rounding back into the
+shape. Measured on the anchored body of
+`tests/probes/no_compression_drift_horizon.rs` at one substep of 4.37 ms
+(the same substep the adaptive loop picks), mean `J - 1` over the body:
+
+| substeps | tension-only, plain product | tension-only, rescaled | tension-only, now | ordinary elastic, rescaled | ordinary elastic, now |
+| --- | --- | --- | --- | --- | --- |
+| 150 000 | -0.00066 | -0.000042 | +0.000020 | +0.000025 | +0.000031 |
+| 450 000 | -0.00323 | -0.00027 | +0.000015 | +0.000020 | +0.000031 |
+| 900 000 | -0.00709 | -0.0115 | +0.000001 | +0.000011 | +0.000031 |
+
+- **The tension-only body no longer runs away within this horizon.**
+  `max |J - 1|` after 900 000 substeps is 0.0011, where the rescaled form
+  reached 0.131 and the plain product 0.028. What drove the runaway was
+  one-way round-off in the shape of `F`, which a law with no compressive
+  stiffness turns into volume. The physical gap itself is unchanged: a
+  tension-only body still has no restoring force in compression, so a
+  real disturbance there is unresisted. Real cables and membranes are not
+  purely tension-only either (bending stiffness, a small compressive
+  modulus); adding one is the candidate fix, and it is not built
+  (issue #37).
+- **What is left is unbiased, not zero.** Over 900 000 substeps of a
+  prescribed oscillation from a loaded `F` (`tests/probes/f_rounding_horizon.rs`
+  with ROUND_FXX=1.0027 ROUND_FYY=0.9899 ROUND_AMP=0.4 ROUND_DT=2.94e-4),
+  `ln det F` ends +7.9e-5 from the f64 integral and `ln(F_xx / F_yy)`
+  +6.3e-5, about what an unbiased walk of f32 roundings reaches in that
+  many steps; the rescaled form held the volume to -1.2e-7 but put -5.6e-3
+  into the shape. Storing `F - I` in place of `F` would make each rounding
+  relative to the strain rather than to 1; that changes the particle
+  layout on both paths and is not built.
+- **A sand test lost its premise.**
+  `pradhana_effect_across_repeated_separate_impact_episodes` asserted that
+  its uncorrected baseline gains volume across repeated impact episodes.
+  That gain was round-off: the baseline read -2.19e-8 with the rescaled
+  form and reads +1.91e-8 now, so the sign the test needs is round-off
+  either way and it stays ignored under that reason. Guarding the
+  Pradhana correction needs a scene where the volume gain it corrects is
+  physical.
+
+### Solids throw their friction heat away
+
+Only `BinghamFluidMaterial` and `NewtonianFluidMaterial` declare a
+specific heat. Every solid and plastic law returns the trait's default,
+so the work their yielding and friction dissipate raises nothing's
+temperature: sand shearing, metal yielding and rock fracturing are all
+adiabatic in the wrong direction, losing the energy instead of keeping
+it as heat.
+
+Found in the first pass of the core audit, alongside the spawn contract
+and mu(I)'s Euler integration. Both of those are now fixed and this one
+is not: it belongs to no phase of the plan, which is why it is written
+here rather than left in a note. It is the cross-domain energy question,
+not a one-line fix: a law that heats itself needs somewhere for that
+heat to go, which is the thermal coupling this engine has for fluids and
+not for solids.
+
+### A fluid's cavitation pressure is only half derived
+
+The Tait law these fluids use is a gauge law, zero at rest density, so a
+particle above rest volume asks for a negative pressure. That request is
+clamped at `MaterialParams::pressure_floor`, and a floor of 0.0 deletes it:
+expansion meets no restoring force while compression meets the full one, so
+any symmetric noise in the divergence ratchets volume upward forever. This is
+what made bodies visibly swell and drift apart the longer a demo ran.
+
+Measured, fixed and closed for the yield-stress family. Before
+`BinghamProps::cavitation_pressure_pa` existed, EVERY expanded particle in
+every slab was clamped, 105 of 105 at two cells and 657 of 657 at sixteen, and
+the slabs climbed past J = 1.002 while their own weight said they should sit
+below 0.999. With the cavitation pressure its constants derive, about -280 Pa
+from the nucleus term `2*gamma/R`, the same slabs end twenty seconds at 2 ms a
+frame within 1.3e-3 of one and all of them BELOW one (0.99986, 0.99981,
+0.99988, 0.99957, 0.99875 at one, two, four, eight and sixteen cells). That is
+not flat to the fourth decimal, which was the letter of the original criterion:
+the four-cell slab moves from 0.99924 to 0.99988 over that window. What is gone
+is the upward ratchet. On the same sweep window the drift reads +0.0012 against
++0.0444 percent a second at two cells and -0.0157 against +0.0737 at sixteen,
+where the sign has inverted to compaction, and the thickest slab is heading for
+the 0.998 that `rho g h / 2K` predicts for 32 mm of it, which is load. Worst
+`|J - 1|` on that slab: 0.79 to 0.86 at every window measured with no floor,
+0.038 with one.
+
+What is still open:
+
+- Checked, and the other fluid families do NOT have this bug, which is worth
+  recording because an earlier draft of this entry claimed they did.
+  `BoilingMixtureMaterial`, `CavitatingFluidMaterial` and
+  `IsothermalCavitatingFluidMaterial` bound their pressure at `p_sat(T)` by
+  construction through `cavitating_eos`, which IS their tension limit and is
+  sourced. `GranularFluidMaterial` states `pressure_floor: 0.0` deliberately,
+  with its own comment saying so: a cohesionless granular contact carries no
+  tension, and zero is the right answer there.
+- `NewtonianFluidMaterial::from_physical` does still state -100,000 Pa as a
+  bare constant. `2*gamma/R` returns it at a 1.4 micrometre nucleus, so it
+  could come out of the same relation the yield-stress family now uses, at
+  each fluid's own surface tension instead of water's. It does not.
+- The needle-induced-cavitation relation is `P_c = 5E/6 + 2*gamma/R` and only
+  the nucleus term is used. The elastic term would deepen the floor and make it
+  depend on the fluid's own stiffness. Leaving it out is the conservative
+  direction and is stated at the call site, but it has not been measured.
+
+- Useful floors run from about -140 Pa, where clamping stops being the
+  dominant effect, to about -2800 Pa. At -10,000 Pa the sixteen-cell slab
+  panics on a timestep it cannot represent, so the floor is bounded from below
+  by stability and not only by physics. That bound is measured on one scene.
+- Within that band, deeper measures better. At twenty seconds, -560 Pa leaves
+  3 of 567 expanded particles clamped on the sixteen-cell slab against 60 of
+  663 at -280, so 0.5 percent against 9 percent, and worst `|J - 1|` of 0.028
+  against 0.038. At -280 the fluid is asking for up to 830 Pa of tension and
+  getting 280 back, which is what those 9 percent are. The shipped value is
+  the one the cited bound gives, not the one that measures best.
+- That bound is itself the weakest link. The 1 mm is where a petrographic
+  manual for HARDENED concrete draws the line between entrained and entrapped
+  voids, not the largest bubble measured in a fresh paste, and entrapped voids
+  above 1 mm exist too and would give a shallower threshold still. The radius
+  is a declared modelling choice standing on a published class boundary. Only
+  the surface tension in `2*gamma/R` is measured on the fluid family itself.
+
+Ruled out by counting, and worth recording because this entry used to name it:
+the free-surface node exclusion in `gather_grid_to_particles`. Instrumented
+over the same sweep, it fired 0 times in 418,714,560 node evaluations (issue
+ #39), because P2G inserts every in-bounds node of a particle's own stencil.
+The invariant it protects is kept as a test,
+`a_rigid_translation_reads_no_velocity_gradient`.
+
+### A yield-stress fluid below its yield rings forever
+
+`BinghamFluidMaterial`'s elastoviscoplastic branch (Saramito 2007,
+[doi:10.1016/j.jnnfm.2007.04.004](https://doi.org/10.1016/j.jnnfm.2007.04.004), as a
+radial return with a Perzyna viscous overstress) is purely elastic below its
+yield stress: the viscosity only acts once the material flows. So a block
+loaded under its yield and released has nothing to take the energy out, and
+it rebounds and rings indefinitely. Seen directly in
+`tests/probes/bingham_cursor_yield.rs`: in zero gravity a 1200 Pa block
+pushed at half its yield and released keeps oscillating, which is what gives
+that row its higher floor, 0.15 mm of apparent change of shape at x0.5
+against 0.006 for the 60 Pa block.
+
+It is also a departure from the model this branch cites. Woodbridge, Fonte
+and Juel ([arXiv 2609.12229](https://arxiv.org/abs/2609.12229), 2026, a yield-stress spreading study built on
+the Saramito family) describe it as: "Below yield, the material behaves as a
+linear viscoelastic solid". The dissipation below yield comes from a solvent
+viscosity acting at all stresses, which this radial-return version keeps
+only inside the plastic flow. A real gel dissipates below yield too. The
+same paper notes that one solvent viscosity cannot match both the flow well
+above yield and the sub-yield response, so the coefficient would have to be
+measured for the sub-yield regime on its own.
+
+Declared (2), not a bug: every column that sits at rest in a scene is
+unaffected, and only a column set vibrating below yield shows it. Closing
+it means a viscous term acting below yield as well, with that coefficient.
+
+### A settled yield-stress deposit's shear jumps between lines of particles
+
+On the slump demo's 60 Pa deposit, the shear over its own yield differs
+between a particle and its neighbours by 0.075 on average, against a spread
+of 0.168 across the whole deposit; the demo's stress view shows it as
+stripes. It is not the gripping floor: 0.070 on a slip floor against 0.074,
+and strongest in the top band, not the bottom one
+(`tests/probes/bingham_deposit_state.rs`, `the_stripes_on_each_floor`).
+Cause not established; no issue yet.
+
+### GPU snow hardens differently at a body's edge
+
+Two measurements, months apart and from opposite directions, that are
+almost certainly the same defect:
+
+- A GPU compaction test found cohesion's differentiation about sixteen
+  times weaker than the CPU's: `jp_cohesive` 0.99793 against
+  `jp_loose` 0.99792, a 6e-6 gap where the CPU reliably shows 1e-4.
+  Correct direction, wrong magnitude
+  (`gpu_snow_compacts_and_cohesion_resists_compaction`, ignored with its
+  trail).
+- The parity matrix leaves snow as its one remaining gap: under uniaxial
+  compression the two paths end 9.8e-2 apart in position and 2.5 in
+  velocity. `tests/probes/snow_gpu_gap.rs` narrows it: both sides run
+  ONE identical substep, after which the hardening and density fields
+  part at the body's EDGE while the middle stays identical to the digit.
+  Worst particle on CPU carries hardening 2.158 at density 0.255, on GPU
+  1.324 at 0.391. The GPU's looser timestep bound (2.34e-3 against
+  1.48e-3, so one substep against two) follows from that state, it does
+  not cause it.
+
+Both point at the same named suspect: the order in which the GPU clamps
+`hardening_scale`/`plastic_volume_ratio` relative to its F update, against
+the order `snow.rs` uses. That comparison is line-by-line reading of
+`snow_plasticity` in WGSL against the CPU law, not a measurement, and it
+is not done. Until it is, these are one entry rather than two.
+
+### The DX12 teardown sometimes kills the process
+
+`tests/gpu_parity.rs` ends about one run in nine with Windows exit code
+0xc0000409 (FAST_FAIL), after the test harness has already printed its
+result. Measured attribution rather than an assumption: 2 aborts in 18
+runs on DX12, 0 in 20 on Vulkan, the matrix printing identical numbers
+on both backends, and the existing 52-test GPU suite never showing it.
+Nothing of this engine's runs at teardown (no `unsafe`, no `Drop` in
+`systems::gpu`), and with `RUST_BACKTRACE=full` and wgpu logging on
+there is no panic, no backtrace and no validation warning, so it is not
+a Rust panic reaching abort. Consequence: the parity matrix stays a
+manual test on real hardware and must not gate CI on DX12.
+
+### A grain stops at a boundary instead of bouncing
+
+A grain that meets a boundary loses its whole normal velocity, whatever
+its restitution. In a grid-coupled step (`grains::coupling`),
+`GrainPopulation::clean_wall_normal_velocity` removes the inbound normal
+velocity of every grain touching a boundary, and
+`resolve_wall_contact_forces` applies only the contact's tangential force
+and moments. The normal force is left out on purpose: applied against the
+grid's position clamp, which keeps resetting the overlap, it refilled
+every step and launched the grain. So in its normal direction a boundary
+is a perfectly inelastic stop; grain-grain contact is not affected. A
+scene that needs a grain to bounce off a wall, such as the
+colliding-blocks count in `tests/grains_pi_collisions.rs`, uses a third
+grain held in place as the wall. A restitution-aware normal response at
+the boundary would close this.
+
+### Not audited yet
+
+Rendering (`systems/render`); rod biology (growth, gravitropism, networks,
+plasticity); diagnostics; the particle store; the grip, ratchet, heightmap
+and kinematic-obstacle boundaries; a law-by-law re-read of the 17
+materials.
+
+Given a lighter pass only (formulas and constants against their sources,
+citations, f32 precision traps; not every code path): radiation and optics,
+electromagnetics and acoustics, orbital mechanics, the information
+measures, and the thermodynamics outside the core audit. It found #51 (the
+granular fluidity's pressure factor is inverted) and #52 (heat diffusion
+loses sub-kelvin increments in f32), and leaves one question: the Cosserat
+field's stability bound does not reduce to seconds in the units it states.
+
+### Found during the core audit, outside the current plan
+
+- Positions and velocities are in cells while physical inputs use
+  `dx_meters`, and `grid_cell_size` is always 1.0; several docs warn about
+  mixing the two. A typed unit split would remove the trap.
+- Force fields add no time-step bound of their own. Harmless for smooth
+  fields, unsafe if a stiff one (short-range Coulomb, stiff confinement) is
+  added.
+- The differentiable solver (`spacetime::diff`) is a second, separate
+  physics (signed muscles, sticky floor, no gradient through the kernel
+  weights' position dependence), so a gait trained there must be re-checked
+  in the runtime solver.
+- The electric potential field relaxes with a fixed number of Jacobi
+  iterations chosen by the caller, with no convergence test.
+- Explicit Euler in the LNN controller is stable only while the time step
+  stays well below the neuron time constants; nothing checks it.
+- `MaterialRegistry::get` maps an unregistered material id to slot 0 with
+  only a debug assertion, so outside debug builds a scene that spawns an
+  unregistered id silently runs the wrong material. Four
+  `implicit_corotated_substep` tests did exactly that until they were fixed.
+- `FrictionBoundary` declares no wall law for strict weakly compressible
+  fluids (`is_strict_wc_mpm_fluid_compatible` keeps its `false` default), so
+  a strict-fluid scene with a friction floor stops on the solver's
+  compatibility assertion. Two `physics_correctness` diagnostics
+  (`diag_phase_transition_under_load_causes_stress_discontinuity`,
+  `diag_repeated_phase_transitions_do_not_cause_cumulative_instability`) are
+  ignored for that reason. Choosing the law is a physics decision: Coulomb
+  friction fits a granular skeleton, a liquid needs no-slip or Navier slip.
+- `nacc_preconsolidates_more_under_deeper_self_weight` (`tests/physics_correctness.rs`)
+  is ignored. Its column is spawned without its self-weight stress and
+  rebounds after release; with no cohesion (beta = 0) every tensile state
+  resets the preconsolidation pressure, so mean alpha ends positive at every
+  depth (shallow 0.132, deep 0.259). The ordering the test expects held only
+  while the cap return over-hardened compaction. It should be rechecked once
+  bodies spawn in equilibrium (the spawn contract in the core plan).
+- Two renderer tests (`render_gpu_produces_visible_particle_pixels_not_just_clear_color`
+  and its CPU control) find no particle pixel in a 64x64 headless render, on
+  real hardware too. The instance buffers hold correct data, so the fault is
+  in the draw pass or in quads about 2 pixels wide at that scale; which one
+  is not known. Both stay ignored with that reason.
+- The Cam-Clay soil model carries four disclosed approximations, all in
+  `src/matter/materials/solid/nacc.rs`:
+  - Its elastic response uses a constant bulk modulus. Real Cam-Clay
+    stiffness is proportional to the pressure (`K = v p / kappa`), so a
+    soil near a free surface is modelled far too stiff elastically.
+  - On the dry side of the yield ellipse (an overconsolidated soil being
+    sheared) the softening is still evaluated at the start of the step,
+    unlike the cap and the wet side. Backward Euler is ill-posed there:
+    strain softening loses uniqueness, and at a real clay's hardening
+    exponent the residual has no root. Measured with the old sinh law, a
+    single sheared step could erase the whole preconsolidation; it needs
+    re-measuring under the exponential law.
+  - The 2D friction slope M comes from sparkl's own dimension-reduced
+    relation `M = 4.619 sin(phi) / (3 - sin(phi))`, not from a measurement
+    in plane strain, so a soil's triaxial friction angle reaches the model
+    through an unverified mapping.
+  - p0 never falls below `kappa * 1e-5`, a numerical floor. For a stiff
+    material that floor is larger than the soil's own overburden, so it acts
+    as a hidden preconsolidation rather than a neutral guard. The frozen
+    block of `examples/cpu/permafrost.rs` sits exactly there: its p0 reads
+    43.3 against the 1.5 it carries, and the own-weight preconsolidation the
+    scene computes (2.35) never applies. That scene's frozen ground not
+    yielding is therefore the clamp holding, not measured frozen-soil
+    memory, and must not be read as frozen soil validated.
+- The engine holds one Cam-Clay parameter set (`NaccMaterial::kaolin`),
+  measured on spestone kaolin at Cambridge and cross-checked against a
+  second, independent kaolin set, which sits 2.4 times away in hardening
+  exponent. Any other soil has to pass its own oedometer numbers through
+  `NaccProps`: presets for soils without measurements were removed rather
+  than kept unsourced, peat included.
+- About a hundred comments point to notes that live outside the repository
+  (working notes from past sessions). They should be rewritten to cite the
+  code, a test or this file, or dropped.
+
+### Coverage the CI no longer provides
+
+- **GPU path.** The GPU suite (`tests/gpu.rs`), the 43 library tests and the
+  11 `tests/solver.rs` tests that need a GPU adapter run only by hand on real
+  hardware, because software adapters give different verdicts. A change that
+  breaks the GPU path is only caught when someone runs them.
+- **Slow long-horizon tests.** Tests that would push a CI shard past 45
+  minutes in the debug profile are ignored in the regular suite and run on
+  demand through `.github/workflows/slow-tests.yml`, in the quick profile,
+  where debug assertions are off.

@@ -5,12 +5,37 @@
 //! `step.rs` per that file's own "highest-risk, done last and alone" doc.
 
 use super::super::step_params::{
-    GpuAsflipParams, GpuFieldEntry, GpuMaterialMassParams, GpuResourceParams, GpuThermalParams,
-    MAX_FORCE_FIELDS,
+    GpuAsflipParams, GpuFieldEntry, GpuFluidPressureParams, GpuMaterialMassParams,
+    GpuResourceParams, GpuThermalParams, MAX_FORCE_FIELDS,
 };
 use super::GpuSimulation;
 
 impl GpuSimulation {
+    /// Sets the reference fluid cell mass for the GPU pressure projection's
+    /// free-surface classification (`fluid_pressure.wgsl`): threshold
+    /// `reference_cell_mass * 0.3`, as CPU's `mass_avg * 0.3`.
+    ///
+    /// CPU measures `mass_avg` live on every call (a reduction over the
+    /// scattered grid, `pressure.rs`'s `self.dirty` average); matching it on
+    /// GPU would need an extra reduction pass. The fluid's rest cell mass,
+    /// known at scene construction, serves the same purpose (telling fluid
+    /// cells from empty or noise cells): it equals the live average in a
+    /// cell fully inside a uniform-density fluid body, and the classification
+    /// only needs the order of magnitude.
+    ///
+    /// This does nothing by itself -- dispatch only happens when
+    /// `SimConfig::fluid_pressure_iterations > 0` (see
+    /// `SubstepGates::fluid_pressure_iterations` in `encode_substep.rs`).
+    /// Call this BEFORE the first `step_frame()` that has iterations > 0.
+    pub fn set_fluid_pressure_reference_mass(&mut self, reference_cell_mass: f32) {
+        let params = GpuFluidPressureParams {
+            reference_cell_mass,
+            _pad: [0.0; 3],
+        };
+        self.buffers
+            .upload_fluid_pressure_params(&self.queue, &params);
+    }
+
     /// Add a non-uniform body force field for the GPU path.
     /// Entries are uploaded and dispatched every substep until cleared.
     /// Panics if `MAX_FORCE_FIELDS` is exceeded.
@@ -35,14 +60,14 @@ impl GpuSimulation {
     /// `mu_easy != mu_resist` -- symmetric friction (the default) makes direction
     /// irrelevant, same "no bias without input" principle as `RatchetFrictionBoundary`.
     ///
-    /// HONEST STATUS (2026-07-16): this API is real and correctly wired -- verified
-    /// reaching `resolve_contact.wgsl`'s `grip_params` uniform. The RESULTING
-    /// directional effect is correctly signed (the "easy" direction genuinely retains
-    /// more speed) but its MAGNITUDE is measurably unstable run to run, unlike CPU's
-    /// `DirectionalContactGrip` which is consistent -- see
-    /// `gpu_directional_grip_is_direction_aware`'s `#[ignore]` reason in `tests/gpu.rs`
-    /// for the real measured numbers and the likely (not confirmed) root cause. Usable
-    /// for real, but don't present it as equivalent to CPU's steering yet.
+    /// KNOWN OPEN ISSUE: this API is correctly wired -- reaches
+    /// `resolve_contact.wgsl`'s `grip_params` uniform, and the resulting
+    /// directional effect is correctly signed (the "easy" direction genuinely
+    /// retains more speed). But its magnitude is measurably unstable run to
+    /// run, unlike CPU's `DirectionalContactGrip` which is consistent -- see
+    /// `gpu_directional_grip_is_direction_aware`'s `#[ignore]` reason in
+    /// `tests/gpu.rs` for measured numbers and the likely (not confirmed)
+    /// root cause. Usable, but not yet equivalent to CPU's steering.
     pub fn set_grip_direction(&mut self, direction: glam::Vec2) {
         self.grip_params.easy_direction = direction.normalize_or_zero();
     }
@@ -61,17 +86,15 @@ impl GpuSimulation {
     }
 
     /// Attach day-night/ambient thermal diffusion -- GPU counterpart to CPU's
-    /// `Simulation::with_thermal`/`thermal_config_mut`. Real PDE (Fourier's law
-    /// `∂T/∂t = α·∇²T` plus Newton cooling), see `GpuThermalParams`' own doc. Enables
+    /// `Simulation::with_thermal`/`thermal_config_mut`. Fourier's law
+    /// `∂T/∂t = α·∇²T` plus Newton cooling, see `GpuThermalParams`. Enables
     /// all 4 thermal passes starting next `step_frame`; call `set_thermal_ambient`
     /// afterward for live day-night oscillation.
     ///
-    /// - `conductivity_w_m_k` / `heat_capacity_j_kg_k` / `density_kg_m3`: real SI
-    ///   material constants (α = k/(ρ·c_p) -- see `ThermalConfig::density`'s own doc
-    ///   for the 2026-07-24 fix: this GPU port had the identical missing-density bug
-    ///   as the CPU path, found+fixed the same day, alpha was 1000x too fast for water)
+    /// - `conductivity_w_m_k` / `heat_capacity_j_kg_k` / `density_kg_m3`: SI
+    ///   material constants, α = k/(ρ·c_p) (see `ThermalConfig::density`)
     /// - `grid_cell_size_m`: physical cell size (pass `SimConfig::dx_meters`, NOT
-    ///   `grid_cell_size` which is always 1.0 -- same trap `ThermalConfig`'s own doc
+    ///   `grid_cell_size` which is always 1.0 -- same trap `ThermalConfig`'s doc
     ///   warns about)
     /// - `ambient`: background temperature; `cooling_rate`: Newton cooling k_c (1/s,
     ///   0.0 = none)
@@ -115,13 +138,10 @@ impl GpuSimulation {
 
     /// Attach resource regrowth -- GPU counterpart to CPU's `ScalarDiffusionField` +
     /// a logistic-growth `source` (Verhulst 1838, `dφ/dt = r·φ·(1−φ/K)`), see
-    /// `GpuResourceParams`' own doc for why this is baked in as the one real source
-    /// term rather than staying generic (WGSL has no function pointers, same
-    /// disclosed trade-off as `SpatialDragField`'s GPU port). State is carried in
-    /// `particle.scalar_field`, NOT `particle.temperature` -- real fix, 2026-07-17:
-    /// this and `attach_thermal_gpu` used to both hijack `temperature` as their
-    /// carrier, meaning the two could never be attached in the same scene together.
-    /// They now use separate fields and compose freely.
+    /// `GpuResourceParams` for why this one source term is built in rather than
+    /// generic (WGSL has no function pointers, as for `SpatialDragField`'s GPU
+    /// port). State lives in `particle.scalar_field`, not `particle.temperature`,
+    /// so it composes with `attach_thermal_gpu` in the same scene.
     ///
     /// - `diffusivity`: spatial spread rate D, grid-units²/s
     /// - `ambient`: value assigned to empty cells (no particle mass)
@@ -155,8 +175,8 @@ impl GpuSimulation {
     ///
     /// On first call with `blend > 0.0`, grows `buffers.asflip_snapshot` from its
     /// placeholder to real `grid_res²` size and rebuilds `resource_bind_group` to
-    /// point at it -- see `GpuBuffers::asflip_snapshot`'s own doc for why this buffer
-    /// is lazily grown instead of always allocated at full size (a real, measured OOM
+    /// point at it -- see `GpuBuffers::asflip_snapshot`'s doc for why this buffer
+    /// is lazily grown instead of always allocated at full size (a measured OOM
     /// regression otherwise). Subsequent calls (e.g. re-tuning `blend`) are cheap --
     /// the buffer is already grown, no reallocation or bind-group rebuild happens again.
     pub fn attach_asflip_gpu(&mut self, blend: f32) {
@@ -176,10 +196,10 @@ impl GpuSimulation {
     }
 
     /// Enable `ColorMode::GridVolume`'s per-cell per-material mass tracking --
-    /// real, opt-in cost (an extra P2G atomic scatter + grid_clear zeroing every
+    /// opt-in cost (an extra P2G atomic scatter + grid_clear zeroing every
     /// substep), off by default. Without this, grid-volume rendering still works
     /// but shades every occupied cell with one material's optics (see
-    /// `grid_volume.wgsl`'s own doc for that honest limitation).
+    /// `grid_volume.wgsl`'s doc for that honest limitation).
     ///
     /// On first call, grows `buffers.material_mass` from its placeholder to real
     /// `grid_res² x MAX_RENDER_MATERIAL_SLOTS` size and rebuilds `contact_bind_group`

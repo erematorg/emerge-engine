@@ -1,7 +1,7 @@
 //! Matter domain: what things are made of.
 //!
-//! `materials` — constitutive models, `MaterialModel` trait, `MaterialRegistry`.
-//! `particle` — the `Particle` struct, the per-particle state every model reads/writes.
+//! `materials` -- constitutive models, `MaterialModel` trait, `MaterialRegistry`.
+//! `particle` -- the `Particle` struct, the per-particle state every model reads/writes.
 //!
 //! Part of the emerge/LP domain taxonomy (matter/forces/energy/information/
 //! spacetime/organism/systems) -- see `project_domain_taxonomy` design notes.

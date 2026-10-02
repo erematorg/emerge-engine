@@ -13,24 +13,34 @@
 
 use glam::Vec2;
 
+use super::cutoff::smooth_cutoff;
 use crate::fields::{FADE_ONSET_RATIO, Field};
 use crate::particle::Particles;
-use crate::solver::cutoff::smooth_cutoff;
+
+/// Earth's surface gravitational acceleration in m/s², the value
+/// `SimConfig::earth` converts to grid units: standard gravity `g_n`,
+/// 9.80665 m/s² exactly (NIST CODATA, physics.nist.gov/cgi-bin/cuu/Value?gn),
+/// rounded to three significant figures, 0.035% high. Kept rounded because
+/// tests compare `earth()` scenes against analytic formulas written with
+/// 9.81; moving to the exact value means updating those together.
+pub const EARTH_GRAVITY_M_S2: f32 = 9.81;
 
 /// Gravitational acceleration from one or more point-mass sources.
 ///
 /// Intended for macro-scale bodies (celestial bodies, large terrain features) that
-/// exert gravity on MPM continuum matter. Does **not** model particle-particle N-body —
+/// exert gravity on MPM continuum matter. Does **not** model particle-particle N-body --
 /// for that, use `NBodyGravityField`.
 pub struct GravityWellField {
     /// Point mass sources: `(position in grid coords, mass in simulation units)`.
     pub sources: Vec<(Vec2, f32)>,
 
-    /// Gravitational constant G in simulation units.
+    /// Gravitational constant G in grid units: positions in cells, masses
+    /// in grid mass (`(rho / reference_density_kg_m3) * cells^2`, as
+    /// `SpawnRegion` spawns them), accelerations in cells/s².
     ///
-    /// There is no universal default — tune to your scale.
-    /// Small grid-scale scenes: ~0.1 simulation units.
-    /// For SI: G = 6.674×10⁻¹¹ N·m²/kg² (only meaningful if grid_cell_size is set to SI).
+    /// The real `G_SI` (6.674×10⁻¹¹ N·m²/kg²) converts through
+    /// `SimConfig::gravitational_constant_from_si`, which needs the scene's
+    /// `SimConfig::slice_thickness_m`.
     pub gravitational_constant: f32,
 
     /// Plummer softening length ε in grid coordinates.
@@ -41,18 +51,22 @@ pub struct GravityWellField {
 
     /// Cutoff radius in grid coordinates. Gravity is zero beyond this distance.
     ///
-    /// Default: `f32::INFINITY` (IRL — no cutoff).
+    /// Default: `f32::INFINITY` (IRL -- no cutoff).
     /// Set to a finite value as a performance approximation for large particle counts.
     pub cutoff: f32,
 
-    /// Force-switch onset — smooth fade starts at this radius (must be ≤ cutoff).
+    /// Force-switch onset -- smooth fade starts at this radius (must be ≤ cutoff).
     /// Only meaningful when cutoff is finite.
     pub switch_on: f32,
 }
 
 impl GravityWellField {
-    /// Full-range gravity — IRL default, no distance cutoff.
-    pub fn new(sources: Vec<(Vec2, f32)>, gravitational_constant: f32, softening: f32) -> Self {
+    /// Full-range gravity -- IRL default, no distance cutoff.
+    pub const fn new(
+        sources: Vec<(Vec2, f32)>,
+        gravitational_constant: f32,
+        softening: f32,
+    ) -> Self {
         Self {
             sources,
             gravitational_constant,
@@ -62,7 +76,7 @@ impl GravityWellField {
         }
     }
 
-    /// Single stationary point mass — IRL default, no cutoff.
+    /// Single stationary point mass -- IRL default, no cutoff.
     pub fn point(position: Vec2, mass: f32, gravitational_constant: f32, softening: f32) -> Self {
         Self::new(vec![(position, mass)], gravitational_constant, softening)
     }

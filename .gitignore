@@ -1,6 +1,7 @@
 # Rust build artifacts
 /target/
 **/target/
+/target-*/
 Cargo.lock
 
 # IDE and editor settings
@@ -55,5 +56,5 @@ val_err.txt
 # Application save files
 save.json
 
-# Claude local files
+# Local tool settings, not part of the project
 .claude/

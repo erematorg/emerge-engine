@@ -3,7 +3,7 @@ use glam::Vec2;
 use crate::fields::Field;
 use crate::particle::Particles;
 
-/// Archimedes buoyancy — lighter particles rise, heavier particles sink.
+/// Archimedes buoyancy -- lighter particles rise, heavier particles sink.
 ///
 /// Applies `Δv = −gravity · (fluid_density / particle.density) · dt` per particle.
 /// The solver already applies gravity (−g) to all particles; this field adds +g·(ρ_fluid/ρ)
@@ -15,24 +15,24 @@ use crate::particle::Particles;
 /// `gravity` should match `SimConfig::gravity` exactly.
 ///
 /// # IRL calibration
-/// For water (ρ₀ = 1000 kg/m³):
-/// - Wood (ρ ≈ 600 kg/m³): floats at ~60% submerged — buoyancy_ratio ≈ 0.67
-/// - Steel (ρ ≈ 7800 kg/m³): sinks — buoyancy_ratio ≈ 0.13
-/// - Ice (ρ ≈ 917 kg/m³): floats at ~8% above surface — buoyancy_ratio ≈ 1.09
+/// For water (ρ₀ = 1000 kg/m³), the ratio `ρ_fluid/ρ` this field applies:
+/// - Wood (ρ ≈ 600 kg/m³): ρ_fluid/ρ ≈ 1.67, floats ~60% submerged
+/// - Steel (ρ ≈ 7800 kg/m³): ρ_fluid/ρ ≈ 0.13, sinks
+/// - Ice (ρ ≈ 917 kg/m³): ρ_fluid/ρ ≈ 1.09, floats ~8% above the surface
 ///
 /// In grid units, set `fluid_density` to match your fluid material's `rest_density`.
 #[derive(Debug, Clone, Copy)]
 pub struct BuoyancyField {
-    /// Reference fluid density — typically the `rest_density` of the surrounding fluid material.
+    /// Reference fluid density -- typically the `rest_density` of the surrounding fluid material.
     pub fluid_density: f32,
-    /// Gravitational direction and magnitude — should match `SimConfig::gravity`.
+    /// Gravitational direction and magnitude -- should match `SimConfig::gravity`.
     pub gravity: Vec2,
     /// Density floor to prevent division by zero for near-vacuum particles.
     pub min_density: f32,
 }
 
 impl BuoyancyField {
-    pub fn new(fluid_density: f32, gravity: Vec2) -> Self {
+    pub const fn new(fluid_density: f32, gravity: Vec2) -> Self {
         Self {
             fluid_density,
             gravity,
@@ -66,7 +66,7 @@ mod tests {
     }
 
     /// Net acceleration (solver gravity + this field) for a particle of density `rho`,
-    /// per the field's own doc comment: g·(ρ_fluid/ρ − 1).
+    /// per the field's doc comment: g·(ρ_fluid/ρ − 1).
     fn net_with_gravity(field: &BuoyancyField, gravity: Vec2, rho: f32) -> Vec2 {
         let soa = particle_with_density(rho);
         gravity + field.acceleration(&soa, 0)

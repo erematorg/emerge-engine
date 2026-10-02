@@ -1,19 +1,15 @@
-//! Real, permanent proof of the tier-1 "autonomous creature" capability:
-//! `Lnn` drives sustained real locomotion with ZERO human input polled
-//! anywhere in the loop -- no keyboard, no per-frame steer decision, just
-//! the controller's own continuous-time oscillator plus the same real
-//! muscle/ratchet mechanism `basic_creature.rs` already uses interactively.
+//! Autonomous creature capability: `Lnn` drives sustained locomotion with no
+//! human input polled anywhere in the loop (no keyboard, no per-frame steer
+//! decision), only the controller's continuous-time oscillator and the
+//! muscle/ratchet mechanism `basic_creature.rs` uses interactively.
 //!
-//! `basic_creature.rs` itself gates muscle activation on `steer != 0.0` --
-//! a deliberate DEMO-level choice (an ungated crawl looked identical to a
-//! fake baked-in "always walks the same way from frame 1" idle state, see
-//! that file's own 2026-07-13 fix), not an engine limitation. `Lnn::step`
-//! has no coupling to any input source by construction (see its own module
-//! doc: "emerge supplies the controller math; it has no opinion on when or
-//! whether it runs") -- this test drives it with a FIXED bias baked in at
-//! construction, then just steps controller + physics every frame, matching
-//! the architecture boundary: emerge proves the CAPABILITY exists, LP
-//! decides autonomously when/whether to invoke it.
+//! `basic_creature.rs` gates muscle activation on `steer != 0.0`, a demo
+//! choice (an ungated crawl looks like a baked-in idle walk), not an engine
+//! limitation. `Lnn::step` has no coupling to any input source (see its
+//! module doc: "emerge supplies the controller math; it has no opinion on
+//! when or whether it runs"): this test gives it a fixed bias at
+//! construction and steps controller + physics every frame. emerge provides
+//! the capability; LP decides when to invoke it.
 extern crate emerge_engine as emerge;
 use emerge::{
     Lnn, NeoHookeanMaterial, RatchetFrictionBoundary, SimConfig, Simulation, SpawnRegion,
@@ -66,7 +62,6 @@ fn make_sim() -> (
         box_size: IVec2::new(36, 4),
         box_center: body_center,
         material_id: MAT_BODY,
-        precompute_initial_volumes: true,
         ..SpawnRegion::for_sim(&config)
     };
     let ratchet = Arc::new(RatchetFrictionBoundary::new(4, 0.1, 0.95, Vec2::X));

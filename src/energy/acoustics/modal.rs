@@ -1,76 +1,58 @@
-//! Modal synthesis — real vibration frequencies and damping derived
-//! directly from a rod's own material properties (`ea`, `ei`, mass,
-//! damping), not from a sample-fitting or calibration pipeline.
+//! Modal synthesis: vibration frequencies and damping from a rod's own
+//! material properties (`ea`, `ei`, mass, damping), with no sample fitting.
 //!
-//! # Why rods, why now
-//! Real procedural sound (no samples, no pre-recorded audio, same "zero
-//! assets" discipline as the rest of emerge/LP) needs per-material
-//! resonant frequencies. The open question blocking this has always been
-//! *where do the parameters come from* — fit against real recorded audio,
-//! or derive from physics the engine already knows? For the rod solver
-//! specifically, that question is already answered: `RodMaterial` already
-//! carries real `ea`/`ei` (axial/bending stiffness) and each `RodPoints`
-//! carries real per-point mass — exactly the inputs a beam's own natural
-//! frequencies are a function of. No new parameters, no calibration step.
+//! # Why rods
+//! Procedural sound without samples needs per-material resonant frequencies,
+//! either fitted to recordings or derived from physics. A rod already
+//! carries what a beam's natural frequencies depend on: `RodMaterial`'s
+//! `ea`/`ei` and the per-point masses in `RodPoints`, so no new parameter or
+//! calibration is needed.
 //!
-//! # Real physics: Euler-Bernoulli cantilever bending modes
-//! Fixed-free (pinned root, free tip) boundary conditions — matching how
-//! every existing rod scene in this engine anchors a rod (grass blade,
-//! branch, root: "pin points 0-1, not just point 0"). The natural
-//! (angular) frequency of bending mode `n` for a uniform beam is:
+//! # Euler-Bernoulli cantilever bending modes
+//! Fixed-free (pinned root, free tip), how the rod scenes anchor a rod (grass
+//! blade, branch, root: "pin points 0-1, not just point 0"). The angular
+//! frequency of bending mode `n` of a uniform beam is:
 //!
 //!   ω_n = (β_n·L)² · sqrt(EI / (μ·L⁴))
 //!
-//! where `μ` is mass per unit length (kg/m), `L` is the rod's real length
-//! (m), and `β_n·L` are the real, tabulated roots of the cantilever's own
-//! characteristic equation `cos(βL)·cosh(βL) = -1` (Blevins, *Formulas for
-//! Natural Frequency and Mode Shape*, 1979, Table 8-1; the same values
-//! appear in Rao, *Mechanical Vibrations*) — independently confirmed via
-//! search, not recalled from memory alone: 1.8751, 4.6941, 7.8548,
-//! 10.9955 for the first four modes; modes beyond that converge to
-//! `(2n-1)·π/2` (Blevins' own asymptotic note).
+//! with `μ` the mass per length (kg/m), `L` the length (m), and `β_n·L` the
+//! roots of the cantilever equation `cos(βL)·cosh(βL) = -1` (Blevins,
+//! *Formulas for Natural Frequency and Mode Shape*, 1979, Table 8-1; also in
+//! Rao, *Mechanical Vibrations*): 1.8751, 4.6941, 7.8548, 10.9955 for the
+//! first four modes, then `(2n-1)·π/2` asymptotically (Blevins).
 //!
-//! # Damping — a disclosed simplification, not measured per-mode data
-//! `RodMaterial::bending_damping` is a single discrete-scale coefficient
-//! (see its own doc comment), not a full two-parameter Rayleigh model —
-//! there is no per-mode damping measurement to draw on. This reduces it to
-//! ONE dimensionless ratio: what fraction of critical damping that
-//! coefficient represents at the rod's own reference discrete scale (mean
-//! segment length, mean point mass — reusing `RodMaterial::critical_damping`'s
-//! own real formula, not a new one), then applies that SAME ratio to every
-//! continuous mode. Assuming a constant modal damping ratio when detailed
-//! per-mode data isn't available is itself standard, real practice
-//! (Blevins 1979 §2) — disclosed here as an approximation, not presented
-//! as measured per-mode data.
+//! # Damping: one ratio for every mode
+//! `RodMaterial::bending_damping` is a single discrete-scale coefficient, not
+//! a two-parameter Rayleigh model, and there is no per-mode damping data. It
+//! is reduced to one ratio, the fraction of critical damping it represents
+//! at the rod's reference discrete scale (mean segment length, mean point
+//! mass, through `RodMaterial::critical_damping`'s formula), applied to every
+//! mode: a constant modal damping ratio, the standard assumption without
+//! per-mode data (Blevins 1979 §2).
 //!
-//! # Scope (honest, not silently expanded)
-//! Bending modes only (no axial/longitudinal modes, no torsion — 2D rods
-//! have no twist DOF at all, matching `spacetime::rod`'s own real
-//! dimensional-fact disclosure). Uniform-beam approximation (constant
-//! `EI`/`μ` along the rod) — a rod with strongly varying per-point mass or
-//! `ei` violates this. Frequencies and damping only: no amplitude/excitation
-//! model and no audio-buffer synthesis here — exciting modes (e.g.
-//! proportional to impact force) and running the actual oscillator/DSP
-//! loop is real, separate work, left to the caller (LP), matching the
-//! engine/game split every other emerge system already follows.
+//! # Scope
+//! Bending modes only (no axial modes; no torsion, 2D rods have no twist).
+//! Uniform beam (constant `EI` and `μ`); a strongly non-uniform rod violates
+//! it. Frequencies and damping only: exciting the modes and synthesising
+//! audio are left to the caller (LP).
 
 use crate::rod::Rod;
 
 /// A single vibrational mode: real frequency (Hz) and dimensionless
 /// damping ratio (0 = undamped, 1 = critically damped). Minimal, real
-/// data for an oscillator-bank synthesizer — not an audio sample.
+/// data for an oscillator-bank synthesizer -- not an audio sample.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AcousticMode {
     pub frequency_hz: f32,
     pub damping_ratio: f32,
 }
 
-/// Real, tabulated roots (β_n·L) of the cantilever (fixed-free)
-/// Euler-Bernoulli characteristic equation `cos(βL)·cosh(βL) = -1`.
+/// Tabulated roots (β_n·L) of the cantilever (fixed-free) Euler-Bernoulli
+/// characteristic equation `cos(βL)·cosh(βL) = -1`.
 /// Blevins 1979, Table 8-1 / Rao, *Mechanical Vibrations*, Table 8.2.
 const CANTILEVER_BETA_L: [f32; 4] = [1.8751, 4.6941, 7.8548, 10.9955];
 
-/// `β_n·L` for mode index `n` (0-based) — tabulated for the first 4 modes,
+/// `β_n·L` for mode index `n` (0-based) -- tabulated for the first 4 modes,
 /// asymptotic `(2n-1)·π/2` beyond that (Blevins 1979's own noted limit).
 fn beta_l(mode_index: usize) -> f32 {
     CANTILEVER_BETA_L
@@ -79,18 +61,17 @@ fn beta_l(mode_index: usize) -> f32 {
         .unwrap_or((2.0 * (mode_index as f32 + 1.0) - 1.0) * std::f32::consts::FRAC_PI_2)
 }
 
-/// Real cantilever bending-mode frequencies/damping for a `Rod`, treated
-/// as a uniform Euler-Bernoulli beam using its own real `ei`/mass/length.
-/// Returns an empty vec for a degenerate rod (fewer than 2 points, zero
-/// length, or zero mass) rather than dividing by zero.
+/// Cantilever bending-mode frequencies and damping for a `Rod`, as a uniform
+/// Euler-Bernoulli beam with its `ei`, mass and length. Empty for a
+/// degenerate rod (fewer than 2 points, zero length or zero mass).
 pub fn cantilever_rod_modes(rod: &Rod, n_modes: usize) -> Vec<AcousticMode> {
     let n = rod.points.len();
     if n < 2 || n_modes == 0 {
         return Vec::new();
     }
 
-    // Real length (m) and mass-per-length (kg/m) from the rod's own state --
-    // rest_edge_length/mass are already real SI (see build_straight_rod).
+    // Length (m) and mass per length (kg/m) from the rod's state:
+    // rest_edge_length and mass are SI (see build_straight_rod).
     let length_m: f32 = rod.points.rest_edge_length.iter().sum();
     let total_mass_kg: f32 = rod.points.mass.iter().sum();
     if length_m <= 0.0 || total_mass_kg <= 0.0 {
@@ -129,11 +110,10 @@ mod tests {
     use crate::rod::{RodMaterial, build_straight_rod};
     use glam::Vec2;
 
-    /// Real, independently-checkable analytical target: a steel ruler,
-    /// 30cm x 3cm x 0.5mm, E=200 GPa, rho=7850 kg/m^3 -- a common textbook
-    /// cantilever example. Real numbers: A=3e-2*5e-4=1.5e-5 m^2,
-    /// I=w*t^3/12=3e-2*(5e-4)^3/12=3.125e-13 m^4, mu=rho*A=0.1178 kg/m.
-    /// f1 = (1.8751^2/(2*pi*L^2)) * sqrt(EI/mu), L=0.3m.
+    /// A steel ruler, 30 cm x 3 cm x 0.5 mm, E = 200 GPa, rho = 7850 kg/m^3 (a
+    /// textbook cantilever): A = 1.5e-5 m^2, I = w*t^3/12 = 3.125e-13 m^4,
+    /// mu = rho*A = 0.1178 kg/m, f1 = (1.8751^2/(2*pi*L^2)) * sqrt(EI/mu) at
+    /// L = 0.3 m.
     #[test]
     fn steel_ruler_fundamental_matches_hand_computed_value() {
         let e = 200.0e9_f32;
@@ -166,7 +146,7 @@ mod tests {
             modes[0].frequency_hz,
             f1_expected
         );
-        // Real sanity checks: frequencies strictly increasing, all positive.
+        // Frequencies strictly increasing and positive.
         for w in modes.windows(2) {
             assert!(
                 w[1].frequency_hz > w[0].frequency_hz,

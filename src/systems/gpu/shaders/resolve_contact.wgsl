@@ -1,15 +1,15 @@
 // Multi-field contact resolution (GPU port). Ports `Grid::resolve_contact`/
-// `fit_contact_normal_lr` (src/spacetime/grid/mod.rs, CPU) to WGSL — Bardenhagen 2001 +
-// Nairn 2020 LR normal fit + velocity-floor Baumgarte stabilization (not the earlier
-// unconditional-additive form, which causes long-horizon energy injection).
+// `fit_contact_normal_lr` (src/spacetime/grid/mod.rs, CPU) to WGSL -- Bardenhagen 2001 +
+// Nairn, Hammerquist and Smith 2020: LR normal fit, and contact only where the bodies
+// approach and their particles' deformed edges touch (no Baumgarte term, issue #49).
 //
 // Point-cloud storage is bucketed per coarse BLOCK, not per exact grid node (per-node
-// sizing scales as `grid_res² × capacity` and OOMs — see `MAX_CONTACT_POINTS_PER_BLOCK`'s
+// sizing scales as `grid_res² × capacity` and OOMs -- see `MAX_CONTACT_POINTS_PER_BLOCK`'s
 // doc in step_params.rs). The fit here (`fit_contact_normal_lr`) gathers a node's
 // candidate points from its own block PLUS its 8 neighbors (`gather_local_points`,
 // mirroring the halo-expansion `particle_sort_compact_main` uses for occupancy) into a
 // small fixed-size LOCAL array, filtered to actual kernel range (`|rel| < 1.5` cells, the
-// 3x3 B-spline stencil reach P2G uses) — only then does the Newton-Raphson iteration run,
+// 3x3 B-spline stencil reach P2G uses) -- only then does the Newton-Raphson iteration run,
 // same as CPU's per-node exact list, just gathered differently underneath.
 //
 // `debug_fit_normal_main` runs the same fit against one whole block's raw points with no
@@ -33,10 +33,14 @@ struct StepParams {
     sleep_threshold:    f32,
     contact_friction:   f32, // repurposes the first of GpuStepParams' 3 pad slots
     grid_cell_size:     f32, // repurposes the second pad slot -- SimConfig::grid_cell_size
-    _pad1:              u32,
+    contact_active:     u32,
+    cfl_coefficient:    f32,
+    material_cfl_coefficient: f32, // the small-nodal-mass bound's fraction, see resolve_cell
+    min_dt:             f32,
+    dt_cap:             f32,
 }
 
-// Field order matches ContactDebugParams (Rust, step_params.rs) exactly — node_pos
+// Field order matches ContactDebugParams (Rust, step_params.rs) exactly -- node_pos
 // first (8-byte alignment), then the two u32s.
 struct ContactDebugParams {
     node_pos:     vec2<f32>,
@@ -44,10 +48,10 @@ struct ContactDebugParams {
     point_count:  u32,
 }
 
-// Directional (setae-style) grip friction — GPU mirror of `DirectionalContactGrip`
+// Directional (setae-style) grip friction -- GPU mirror of `DirectionalContactGrip`
 // (src/spacetime/grid/mod.rs). `mu_easy == mu_resist` (the default, uploaded whenever
 // no directional bias is active) reduces this EXACTLY to plain symmetric Coulomb
-// friction at `contact_friction` — see `resolve_direction_aware` below for why one
+// friction at `contact_friction` -- see `resolve_direction_aware` below for why one
 // code path covers both cases instead of maintaining two.
 struct DirectionalGripParams {
     easy_direction: vec2<f32>,
@@ -58,17 +62,40 @@ struct DirectionalGripParams {
 const MAX_POINTS_PER_BLOCK: u32 = 256u;
 const MAX_LOCAL_POINTS:     u32 = 128u;
 // Dedicated finer contact-point partition (see MAX_CONTACT_POINTS_PER_BLOCK's doc in
-// step_params.rs) — deliberately NOT the same override as this file's OWN
+// step_params.rs) -- deliberately NOT the same override as this file's OWN
 // NUM_BLOCKS_PER_DIM below (that one sizes active_block_ids/active_block_count, the
 // unrelated sparse-MPM-dispatch partition).
 override NUM_CONTACT_BLOCKS_PER_DIM: u32;
 override NUM_BLOCKS_PER_DIM: u32;
 const NUM_BLOCKS: u32 = 256u;
-const BLOCK_THREADS_PER_DIM: u32 = 16u;
-const MIN_MASS_FRACTION: f32 = 1.0e-6;
+// Set at pipeline creation to min(16, cells per block side) -- same sizing as
+// grid_update.wgsl's BLOCK_THREADS_PER_DIM (see its doc); the grid-stride loops below
+// cover larger blocks.
+override BLOCK_THREADS_PER_DIM: u32 = 16u;
+// Division guard on grip/rest node mass, the value of the CPU `resolve_contact`.
+const MIN_NODE_MASS: f32 = 1.0e-6;
 
 @group(0) @binding(1)  var<storage, read_write> grid:                    array<Cell>;
 @group(0) @binding(3)  var<uniform>             step_params:             StepParams;
+
+// This substep's timestep and velocity cap, decided on the GPU at the end of the previous
+// substep -- see `adaptive_cfl.wgsl`. `substep_dt()`/`vel_limit` are the CPU's
+// frame-start values and are NOT authoritative any more (the GPU may only tighten them).
+@group(2) @binding(37) var<storage, read_write> adaptive_dt: array<atomic<u32>, 5>;
+
+// Cached per invocation: this is an atomic storage load, and reading it at every use
+// site cost ~40% of a substep (measured: 0.29 -> 0.41ms per substep on the dam break).
+var<private> substep_dt_cache: f32 = -1.0;
+
+fn substep_dt() -> f32 {
+    if substep_dt_cache < 0.0 {
+        substep_dt_cache = bitcast<f32>(atomicLoad(&adaptive_dt[0]));
+    }
+    return substep_dt_cache;
+}
+
+// Raw per-block particle histogram for THIS substep -- see grid_update.wgsl's binding.
+@group(0) @binding(6)  var<storage, read_write> block_counts:            array<atomic<u32>, NUM_BLOCKS>;
 @group(0) @binding(8)  var<storage, read_write> active_block_ids:        array<u32, NUM_BLOCKS>;
 @group(0) @binding(9)  var<storage, read_write> active_block_count:      atomic<u32>;
 @group(0) @binding(10) var<storage, read_write> active_block_ids_prev:   array<u32, NUM_BLOCKS>;
@@ -82,7 +109,7 @@ const MIN_MASS_FRACTION: f32 = 1.0e-6;
 @group(1) @binding(18) var<storage, read_write> resolved_rest_v:         array<vec2<f32>>;
 @group(1) @binding(19) var<uniform>             grip_params:             DirectionalGripParams;
 
-// Exact port of solve3x3 (src/spacetime/grid/mod.rs) — Cramer's rule for a general 3x3
+// Exact port of solve3x3 (src/spacetime/grid/mod.rs) -- Cramer's rule for a general 3x3
 // linear system. `ok` is written false (leaving `out` untouched) when the system is
 // singular (|det| <= epsilon), matching the Rust version's `Option::None` return.
 //
@@ -97,7 +124,12 @@ const MIN_MASS_FRACTION: f32 = 1.0e-6;
 // than assumed from the algebra alone.
 fn solve3x3(m: mat3x3<f32>, rhs: vec3<f32>, out: ptr<function, vec3<f32>>) -> bool {
     let det = determinant(m);
-    if abs(det) <= 1.1920929e-7 { // f32::EPSILON
+    // Relative to the diagonal product, as CPU's `solve3x3`: an absolute bound
+    // stopped the fit before convergence on separable clouds (issue #49). The
+    // second test is Rust's `!det.is_normal()`: zero, subnormal or not finite.
+    let diagonal = abs(m[0][0] * m[1][1] * m[2][2]);
+    if abs(det) <= 1.1920929e-7 * diagonal // f32::EPSILON
+        || !(abs(det) >= 1.17549435e-38 && abs(det) <= 3.40282347e38) {
         return false;
     }
     var result: vec3<f32>;
@@ -112,12 +144,12 @@ fn solve3x3(m: mat3x3<f32>, rhs: vec3<f32>, out: ptr<function, vec3<f32>>) -> bo
     return true;
 }
 
-// Exact port of fit_contact_normal_lr's core Newton-Raphson NLLS iteration — same
+// Exact port of fit_contact_normal_lr's core Newton-Raphson NLLS iteration -- same
 // numerics, same 15-iteration cap, same penalty, same z-clamp, same sign-consistency
 // check against the actual labels. Operates on a caller-supplied LOCAL point list
 // (`points[0..count)`), decoupling this core math from where the points came from
 // (a single block's raw list for the debug entry point, or a distance-filtered
-// multi-block gather for the real resolve_contact pass below).
+// multi-block gather for the resolve_contact pass below).
 fn fit_normal_from_local_points(points: ptr<function, array<vec4<f32>, 128>>, count: u32, node_pos: vec2<f32>, grid_cell_size: f32) -> vec3<f32> {
     var has_grip = false;
     var has_rest = false;
@@ -190,7 +222,7 @@ fn fit_normal_from_local_points(points: ptr<function, array<vec4<f32>, 128>>, co
         return vec3<f32>(0.0, 0.0, 0.0);
     }
 
-    // Sign-consistency check against the actual labels — see fit_contact_normal_lr's
+    // Sign-consistency check against the actual labels -- see fit_contact_normal_lr's
     // own Rust doc for the full rationale (Newton can converge to a backwards normal).
     var grip_sum = 0.0;
     var grip_n = 0.0;
@@ -230,7 +262,7 @@ fn grip_mass_at(cx: i32, cy: i32, res: u32) -> f32 {
 // Fallback contact normal: Sobel-3x3 gradient of the grip field's own grid mass -- exact
 // port of `grip_mass_gradient_normal` (CPU, src/spacetime/grid/mod.rs). Needed because a
 // falling body's first touch has a shallow, one-sided point cloud where the LR fit often
-// has no answer yet — without this fallback, `resolve_cell` would skip correction
+// has no answer yet -- without this fallback, `resolve_cell` would skip correction
 // outright and let the body free-fall straight through before tunneling deep and only
 // then decelerating. Returns z<=0.0 (matching `fit_normal_from_local_points`'s own "no
 // confident normal" convention) when there's no local gradient either.
@@ -250,7 +282,7 @@ fn grip_mass_gradient_normal(cx: u32, cy: u32, res: u32) -> vec3<f32> {
     return vec3<f32>(n.x, n.y, 1.0);
 }
 
-// Contact-point bucket geometry — uses the DEDICATED NUM_CONTACT_BLOCKS_PER_DIM
+// Contact-point bucket geometry -- uses the DEDICATED NUM_CONTACT_BLOCKS_PER_DIM
 // partition, not this file's own NUM_BLOCKS_PER_DIM (that one is the sparse-MPM
 // active-block partition resolve_contact_main iterates cells within, an unrelated
 // purpose). Must stay byte-for-byte identical to p2g.wgsl's contact_block_index.
@@ -261,13 +293,11 @@ fn block_index_of(cell_x: u32, cell_y: u32, res: u32) -> vec2<u32> {
     return vec2<u32>(bx, by);
 }
 
-// Gathers this node's real contact point cloud: scans its own block plus its 8
-// neighbors (same halo-expansion reasoning as particle_sort_compact_main -- a point
-// near a block boundary can belong to an adjacent block from this node's perspective),
-// filtering to points within actual P2G kernel range (`|rel| < 1.5` cells, the 3x3
-// B-spline stencil reach). Real, disclosed cap: stops at MAX_LOCAL_POINTS (128) even
-// if more real candidates exist -- a bounded-memory tradeoff, not silently wrong (see
-// MAX_LOCAL_POINTS' own reasoning above).
+// Gathers this node's contact point cloud: scans its own block plus its 8 neighbors
+// (same halo reasoning as particle_sort_compact_main: a point near a block boundary can
+// belong to an adjacent block from this node's view), keeping points within the
+// particle-to-node reach below. Stops at MAX_LOCAL_POINTS (128) even if more candidates
+// exist, a bounded-memory tradeoff (see MAX_LOCAL_POINTS above).
 fn gather_local_points(node_pos: vec2<f32>, res: u32, out_points: ptr<function, array<vec4<f32>, 128>>) -> u32 {
     let cell_x = u32(clamp(node_pos.x, 0.0, f32(res - 1u)));
     let cell_y = u32(clamp(node_pos.y, 0.0, f32(res - 1u)));
@@ -287,9 +317,23 @@ fn gather_local_points(node_pos: vec2<f32>, res: u32, out_points: ptr<function, 
             let base = block * MAX_POINTS_PER_BLOCK;
             for (var i: u32 = 0u; i < count; i++) {
                 if n >= MAX_LOCAL_POINTS { return n; }
-                let pt = contact_points[base + i];
+                let slot = base + i;
+                let head = contact_points[2u * slot];
+                // The fit reads position and label; `w` carries the point's
+                // slot so `resolve_cell` can read its edge data back.
+                let pt = vec4<f32>(head.xyz, bitcast<f32>(slot));
                 let rel = pt.xy - node_pos;
-                if abs(rel.x) < 1.5 && abs(rel.y) < 1.5 {
+                // Same reach as CPU (`Grid::add_contact_point`, via
+                // `gather_contact_point_cloud`): a particle is included at every
+                // one of the 3x3 cells `base_cell + {-1,0,1}`, `base_cell =
+                // floor(position)`, so its distance to an included node can
+                // approach (not reach) 2.0 grid units (position at
+                // `base_cell + 0.999`, node at `base_cell - 1`). A `< 1.5` bound
+                // drops points in a spatially consistent pattern on a regular
+                // lattice (e.g. `spacing=0.5`), tilting the fitted contact
+                // normal (mean v_x went negative at friction=0 in
+                // `gpu_multi_field_contact_produces_real_coulomb_slip_and_stick`).
+                if abs(rel.x) < 2.0 && abs(rel.y) < 2.0 {
                     (*out_points)[n] = pt;
                     n++;
                 }
@@ -299,10 +343,10 @@ fn gather_local_points(node_pos: vec2<f32>, res: u32, out_points: ptr<function, 
     return n;
 }
 
-// Debug-only entry point (1 thread) — runs the fit against `gather_local_points`'s
+// Debug-only entry point (1 thread) -- runs the fit against `gather_local_points`'s
 // neighbor-expanded, distance-filtered point cloud around `contact_debug_params.
 // node_pos`, i.e. the EXACT same input `resolve_cell` itself uses. `target_block`/
-// `point_count` are unused (kept for struct layout compatibility only) — a single
+// `point_count` are unused (kept for struct layout compatibility only) -- a single
 // un-expanded block's raw points would not represent what `resolve_cell` actually sees.
 @compute @workgroup_size(1, 1, 1)
 fn debug_fit_normal_main() {
@@ -313,14 +357,6 @@ fn debug_fit_normal_main() {
     contact_debug_output[0] = result.x;
     contact_debug_output[1] = result.y;
     contact_debug_output[2] = result.z;
-}
-
-fn clamp_speed(v: vec2<f32>, vel_limit: f32) -> vec2<f32> {
-    let spd = length(v);
-    if spd > vel_limit {
-        return v * (vel_limit / spd);
-    }
-    return v;
 }
 
 // Exact port of DirectionalContactGrip::resolve (src/spacetime/grid/mod.rs) --
@@ -351,8 +387,8 @@ fn resolve_direction_aware(v_rel: vec2<f32>, n: vec2<f32>) -> vec2<f32> {
     return vec2<f32>(0.0, 0.0);
 }
 
-// Exact port of Grid::resolve_contact (CPU), including the velocity-floor Baumgarte
-// form (see this file's top doc for why, not the unconditional-additive version).
+// Exact port of Grid::resolve_contact (CPU): edge-touch detection, the Coulomb
+// correction against the wall normal `-n`, and the small nodal mass bound.
 // Dispatched the same active-block-bounded way as grid_update_main (one workgroup per
 // block slot, grid-stride loop over the block's real cell range).
 fn resolve_cell(cx: u32, cy: u32, res: u32) {
@@ -367,12 +403,12 @@ fn resolve_cell(cx: u32, cy: u32, res: u32) {
     resolved_grip_v[idx] = total.momentum;
     resolved_rest_v[idx] = total.momentum;
 
-    if grip_mass <= MIN_MASS_FRACTION || rest_mass <= MIN_MASS_FRACTION {
+    if grip_mass <= MIN_NODE_MASS || rest_mass <= MIN_NODE_MASS {
         return;
     }
 
     let v_cm = total.momentum;
-    let v_grip = clamp_speed(grip.momentum / grip_mass + step_params.gravity * step_params.dt, step_params.vel_limit);
+    let v_grip = grip.momentum / grip_mass + step_params.gravity * substep_dt();
 
     let node_pos = vec2<f32>(f32(cx), f32(cy));
     var local_points: array<vec4<f32>, 128>;
@@ -390,49 +426,84 @@ fn resolve_cell(cx: u32, cy: u32, res: u32) {
         // resolve nothing at this node (matches CPU's own "no confident normal"
         // branch: both fields keep their own velocities, total-momentum-consistent).
         resolved_grip_v[idx] = v_grip;
-        resolved_rest_v[idx] = clamp_speed((v_cm * total.mass - v_grip * grip_mass) / rest_mass, step_params.vel_limit);
+        resolved_rest_v[idx] = (v_cm * total.mass - v_grip * grip_mass) / rest_mass;
         return;
     }
 
     // `-` because the raw fit points toward increasing grip-label density; negating
     // matches CPU's "outward: away from grip" convention.
     let n = -fit.xy;
-    var v_rel = v_grip - v_cm;
-    v_rel = resolve_direction_aware(v_rel, n);
+    let v_rel_before = v_grip - v_cm;
+    var v_rel = v_rel_before;
 
-    // Baumgarte position correction (velocity-floor form) --
-    // reuses the SAME local point cloud already gathered for the fit.
-    var max_grip_proj = -3.4e38;
-    var min_rest_proj = 3.4e38;
+    // Contact exists only where the bodies touch (Nairn, Hammerquist and
+    // Smith 2020, eq. 15, 22-25), as CPU's `Grid::resolve_contact`: the
+    // separation between their deformed edges along `n`,
+    // `min_rest(X.n - R_p) - max_grip(X.n + R_p)`, is negative. `R_p` is the
+    // point's undeformed half size over `|F_p^-1 n|` (eq. 25), both written by
+    // `gather_contact_points_main`, read back through the slot in `w`.
+    var max_grip_edge = -3.4e38;
+    var min_rest_edge = 3.4e38;
     for (var i: u32 = 0u; i < n_local; i++) {
         let pt = local_points[i];
+        let slot = bitcast<u32>(pt.w);
+        let half_size = contact_points[2u * slot].w;
+        let inverse_f4 = contact_points[2u * slot + 1u];
+        let inverse_f = mat2x2<f32>(inverse_f4.xy, inverse_f4.zw);
+        let reach = half_size / max(length(inverse_f * n), 1.17549435e-38);
         let proj = dot(pt.xy, n);
         if pt.z > 0.0 {
-            max_grip_proj = max(max_grip_proj, proj);
+            max_grip_edge = max(max_grip_edge, proj + reach);
         } else if pt.z < 0.0 {
-            min_rest_proj = min(min_rest_proj, proj);
+            min_rest_edge = min(min_rest_edge, proj - reach);
         }
     }
-    if max_grip_proj > -3.0e38 && min_rest_proj < 3.0e38 {
-        let gap = min_rest_proj - max_grip_proj;
-        if gap < 0.0 {
-            let correction_rate = 2.0;
-            let max_correction_speed = 0.5 * step_params.grid_cell_size; // matches CPU exactly
-            let correction_speed = min(correction_rate * (-gap), max_correction_speed);
-            let v_n = dot(v_rel, n);
-            let target_vn = -correction_speed;
-            if v_n > target_vn {
-                v_rel += n * (target_vn - v_n);
-            }
-        }
+    let touching = min_rest_edge - max_grip_edge < 0.0;
+
+    // Approaching (eq. 14) is the Coulomb correction's own test. It takes
+    // the wall's outward normal, from the rest body into the grip body: `-n`.
+    if touching {
+        v_rel = resolve_direction_aware(v_rel_before, -n);
     }
 
-    let v_grip_new = clamp_speed(v_cm + v_rel, step_params.vel_limit);
+    // Small nodal mass (Bardenhagen et al. 2001, eq. 17-22), exactly as CPU's
+    // Grid::resolve_contact: the rest field's change is the grip field's times
+    // -grip_mass / rest_mass, so both are scaled together when either would strain
+    // a cell by more than material_cfl_coefficient in one substep. This replaces a
+    // clamp of each field to one cell per substep, which discarded momentum.
+    let grip_change = v_rel - v_rel_before;
+    let rest_change = grip_change * (-grip_mass / rest_mass);
+    let largest_change = max(max(abs(grip_change.x), abs(grip_change.y)),
+                             max(abs(rest_change.x), abs(rest_change.y)));
+    let strain_increment = largest_change * substep_dt() / step_params.grid_cell_size;
+    var v_grip_new = v_cm + v_rel;
+    if strain_increment > step_params.material_cfl_coefficient {
+        v_grip_new = v_grip + grip_change * (step_params.material_cfl_coefficient / strain_increment);
+    }
     let total_momentum = v_cm * total.mass;
-    let v_rest_new = clamp_speed((total_momentum - v_grip_new * grip_mass) / rest_mass, step_params.vel_limit);
+    let v_rest_new = (total_momentum - v_grip_new * grip_mass) / rest_mass;
 
     resolved_grip_v[idx] = v_grip_new;
     resolved_rest_v[idx] = v_rest_new;
+}
+
+// Same occupancy rule as particle_sort_compact_main, which built this substep's
+// active_block_ids from these exact counts.
+fn in_current_active_list(block: u32) -> bool {
+    let bx = i32(block % NUM_BLOCKS_PER_DIM);
+    let by = i32(block / NUM_BLOCKS_PER_DIM);
+    for (var dy: i32 = -1; dy <= 1; dy++) {
+        let ny = by + dy;
+        if ny < 0 || ny >= i32(NUM_BLOCKS_PER_DIM) { continue; }
+        for (var dx: i32 = -1; dx <= 1; dx++) {
+            let nx = bx + dx;
+            if nx < 0 || nx >= i32(NUM_BLOCKS_PER_DIM) { continue; }
+            if atomicLoad(&block_counts[u32(ny) * NUM_BLOCKS_PER_DIM + u32(nx)]) > 0u {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 @compute @workgroup_size(BLOCK_THREADS_PER_DIM, BLOCK_THREADS_PER_DIM, 1)
@@ -440,6 +511,9 @@ fn resolve_contact_main(
     @builtin(workgroup_id) wg_id: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
+    // The frame's time is already fully advanced -- this encoded substep is spare
+    // capacity the CPU could not size exactly in advance (see adaptive_cfl.wgsl).
+    if substep_dt() <= 0.0 { return; }
     var block: u32;
     if wg_id.x < NUM_BLOCKS {
         if wg_id.x >= atomicLoad(&active_block_count) { return; }
@@ -448,10 +522,9 @@ fn resolve_contact_main(
         let slot = wg_id.x - NUM_BLOCKS;
         if slot >= active_block_count_prev { return; }
         block = active_block_ids_prev[slot];
-        let current_count = atomicLoad(&active_block_count);
-        for (var i: u32 = 0u; i < current_count; i++) {
-            if active_block_ids[i] == block { return; }
-        }
+        // Skip blocks also in the current list (its own workgroup handles them) --
+        // O(9) occupancy check, see grid_update.wgsl's `in_current_active_list`.
+        if in_current_active_list(block) { return; }
     }
     let res = step_params.grid_res;
 

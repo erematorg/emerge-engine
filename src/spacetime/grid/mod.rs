@@ -1,10 +1,10 @@
 //! Sparse Eulerian background grid for MLS-MPM P2G/G2P.
 //!
-//! Split by subsystem — the struct partitions into 3 nearly-independent field
+//! Split by subsystem -- the struct partitions into 3 nearly-independent field
 //! groups (`cells`, `contact_cells`, `mixture_cells`, each with its own dirty
 //! list). `contact.rs` and `mixture.rs` each add their own `impl Grid { ... }`
 //! block (ordinary Rust: multiple impl blocks for one type across files) rather
-//! than living inside this one — every method these files define is private to
+//! than living inside this one -- every method these files define is private to
 //! the `grid` module (visible to `grid` and its descendants by Rust's normal
 //! privacy rule), so no visibility widening was needed for `Grid`'s own fields;
 //! only the two per-subsystem cell types (`ContactCell`/`ContactCellMap`,
@@ -12,28 +12,36 @@
 //! struct definition can name their map types.
 
 pub mod kernel;
+#[cfg(feature = "experimental")]
+pub mod mac;
 
 mod contact;
 mod contact_normal;
+mod dct;
 mod directional_grip;
+mod friction;
 mod mixture;
+mod pressure;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hasher};
 
+#[cfg(any(test, feature = "research-diagnostics"))]
+use glam::DVec2;
 use glam::{IVec2, Vec2};
 
 use contact::ContactCellMap;
 pub use directional_grip::DirectionalContactGrip;
+pub(crate) use friction::{FrictionCellMap, accumulate_friction, merge_friction_maps};
 use mixture::MixtureCellMap;
 
 /// FxHash-style hasher for the grid's `u32` flat-index keys.
 ///
-/// `std::collections::HashMap` defaults to SipHash — a cryptographic, DoS-resistant
+/// `std::collections::HashMap` defaults to SipHash -- a cryptographic, DoS-resistant
 /// hash that is deliberately slow. The grid is hashed 9× per particle every substep
 /// (the hottest loop in the solver) on an internal `u32` key with no adversarial input,
 /// so a single-multiply non-cryptographic hash is both correct and far faster.
-/// Constant is the standard FxHash multiplier. Zero dependencies — keeps the
+/// Constant is the standard FxHash multiplier. Zero dependencies -- keeps the
 /// glam + bytemuck-only invariant.
 const FXHASH_K: u64 = 0x51_7c_c1_b7_27_22_0a_95;
 
@@ -45,7 +53,7 @@ pub struct FxU32Hasher {
 impl Hasher for FxU32Hasher {
     #[inline]
     fn write_u32(&mut self, i: u32) {
-        // Grid keys are always exactly one u32 — this is the only path taken in practice.
+        // Grid keys are always exactly one u32 -- this is the only path taken in practice.
         self.hash = (i as u64).wrapping_mul(FXHASH_K);
     }
 
@@ -81,9 +89,9 @@ pub(crate) type CellMap = HashMap<u32, Cell, FxU32BuildHasher>;
 pub type VelocitySnapshot = HashMap<u32, Vec2, FxU32BuildHasher>;
 
 /// Converts a cell position to the flat HashMap key, or `None` if out of domain bounds.
-/// Shared by `Grid::add_mass_momentum` and the parallel P2G scatter in `transfer.rs` — both
+/// Shared by `Grid::add_mass_momentum` and the parallel P2G scatter in `transfer.rs` -- both
 /// must agree on bounds-checking and indexing, so this is the single source of truth.
-pub(crate) fn flat_index(cell_pos: IVec2, resolution: usize) -> Option<u32> {
+pub(crate) const fn flat_index(cell_pos: IVec2, resolution: usize) -> Option<u32> {
     if cell_pos.x < 0 || cell_pos.y < 0 {
         return None;
     }
@@ -95,7 +103,7 @@ pub(crate) fn flat_index(cell_pos: IVec2, resolution: usize) -> Option<u32> {
     Some((x * resolution + y) as u32)
 }
 
-/// One grid cell — `repr(C)` for stable GPU buffer layout.
+/// One grid cell -- `repr(C)` for stable GPU buffer layout.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Cell {
@@ -106,7 +114,7 @@ pub struct Cell {
     pub mass: f32,
 }
 
-/// Sparse grid — HashMap-backed, only touched cells allocated.
+/// Sparse grid -- HashMap-backed, only touched cells allocated.
 ///
 /// `resolution` defines the simulation domain (soft boundary enforcement).
 /// Memory cost is O(active particles × stencil) not O(resolution²).
@@ -122,17 +130,39 @@ pub struct Grid {
     /// Flat indices of cells touched this frame, in insertion order.
     /// Separate from `cells` to enable O(touched) clear without iterating HashMap buckets.
     dirty: Vec<u32>,
-    /// Second velocity field for multi-field contact — see `contact::ContactCell` doc.
+    /// Second velocity field for multi-field contact -- see `contact::ContactCell` doc.
     /// Empty for every scene that never sets `Particle::contact_group`, which is the
     /// critical zero-cost property: `has_contact_activity()` gates the extra work in
     /// P2G/G2P/step so a scene that doesn't use this feature runs unaffected.
     contact_cells: ContactCellMap,
     contact_dirty: Vec<u32>,
-    /// Two-phase mixture coupling field — see `mixture::MixtureCell` doc. Empty for
+    /// Two-phase mixture coupling field -- see `mixture::MixtureCell` doc. Empty for
     /// every scene that never uses `WithMixturePhase`, the same zero-cost property
     /// `contact_cells` already has.
     mixture_cells: MixtureCellMap,
     mixture_dirty: Vec<u32>,
+    /// Material-Induced Boundary Friction (MIBF) field -- see `friction::
+    /// FrictionCell` doc. Empty for every scene with no `current_friction_
+    /// coefficient`-reporting material active, the same zero-cost property
+    /// `contact_cells`/`mixture_cells` already have.
+    friction_cells: FrictionCellMap,
+    friction_dirty: Vec<u32>,
+    /// Grid nodes carrying an essential (Dirichlet) zero-velocity condition
+    /// from `Particle::pinned` support. Kept separately from `Cell` so the
+    /// latter's GPU-stable layout remains unchanged.
+    pinned_nodes: HashSet<u32, FxU32BuildHasher>,
+    /// Specific kinetic energy each node lost to Coulomb friction this
+    /// substep, in the grid's own velocity-squared units.
+    ///
+    /// Without this the energy a frictional contact removes simply vanishes,
+    /// which is a first-law violation the engine used to commit at every
+    /// rubbing wall. Recording it here is what lets
+    /// `energy::thermodynamics::frictional_heating` turn it into a real
+    /// temperature rise on the matter that did the rubbing.
+    ///
+    /// Empty for every frictionless scene -- the same zero-cost property
+    /// `contact_cells`/`mixture_cells`/`friction_cells` already have.
+    friction_heat: HashMap<u32, f32, FxU32BuildHasher>,
 }
 
 impl Grid {
@@ -146,17 +176,32 @@ impl Grid {
             contact_dirty: Vec::new(),
             mixture_cells: MixtureCellMap::default(),
             mixture_dirty: Vec::new(),
+            friction_cells: FrictionCellMap::default(),
+            friction_dirty: Vec::new(),
+            pinned_nodes: HashSet::with_hasher(FxU32BuildHasher),
+            friction_heat: HashMap::with_hasher(FxU32BuildHasher),
         }
     }
 
-    pub fn resolution(&self) -> usize {
+    pub const fn resolution(&self) -> usize {
         self.resolution
     }
 
+    /// Flat index -> cell position. Inverse of `flat_index`. Shared by
+    /// `mixture::pressure` and `pressure` (single-phase fluid projection) --
+    /// both run the identical dirty-cell-iteration Jacobi-Poisson pattern.
+    pub(crate) const fn idx_to_pos(&self, idx: u32) -> IVec2 {
+        let idx = idx as usize;
+        IVec2::new(
+            (idx / self.resolution) as i32,
+            (idx % self.resolution) as i32,
+        )
+    }
+
     /// True if any grip particle touched the grid this substep. Gates the extra
-    /// contact-aware work in P2G/G2P/step — when false (every scene that never sets
+    /// contact-aware work in P2G/G2P/step -- when false (every scene that never sets
     /// `Particle::contact_group`), those paths run their original, unmodified logic.
-    pub fn has_contact_activity(&self) -> bool {
+    pub const fn has_contact_activity(&self) -> bool {
         !self.contact_dirty.is_empty()
     }
 
@@ -172,25 +217,64 @@ impl Grid {
     /// "already in dirty this substep" from "occupied but stale," which can't safely
     /// live on `Cell` itself (`#[repr(C)]`, stable GPU buffer layout) without checking
     /// every GPU-side assumption first.
+    /// `accumulate` (and its two contact/mixture-cell equivalents) only ever pushes an
+    /// index to `dirty` the FIRST time that key becomes `Occupied` -- so `dirty` is always
+    /// exactly the current key set of `cells`, never a subset. That makes a real
+    /// per-key `remove()` loop here (N individual hashes + bucket probes, one per touched
+    /// cell) equivalent to just calling `HashMap::clear()` (one sweep of the backing
+    /// table's control bytes, no hashing at all, capacity kept for reuse -- the exact
+    /// guarantee `std`'s own `clear()` docs make). Same real "remove, don't zero-in-place"
+    /// requirement as this fn's doc above -- `clear()` still empties every entry, it
+    /// just does it without re-deriving the key set `dirty` already gives us for free.
     pub fn clear(&mut self) {
-        for &idx in &self.dirty {
-            self.cells.remove(&idx);
-        }
+        self.cells.clear();
         self.dirty.clear();
-        for &idx in &self.contact_dirty {
-            self.contact_cells.remove(&idx);
-        }
+        self.contact_cells.clear();
         self.contact_dirty.clear();
-        for &idx in &self.mixture_dirty {
-            self.mixture_cells.remove(&idx);
-        }
+        self.mixture_cells.clear();
         self.mixture_dirty.clear();
+        self.friction_cells.clear();
+        self.friction_dirty.clear();
+        self.pinned_nodes.clear();
+        self.friction_heat.clear();
+    }
+
+    /// Record the specific kinetic energy a boundary just dissipated as
+    /// friction at node `cell_index`. Ignores non-positive values, so a
+    /// frictionless correction never allocates.
+    pub(crate) fn add_friction_heat(&mut self, cell_index: usize, specific_energy: f32) {
+        if !specific_energy.is_finite() || specific_energy <= 0.0 {
+            return;
+        }
+        *self.friction_heat.entry(cell_index as u32).or_insert(0.0) += specific_energy;
+    }
+
+    /// True if any node dissipated friction this substep. Gates the heating
+    /// pass entirely -- same zero-cost convention as `has_contact_activity`.
+    pub fn has_friction_heat(&self) -> bool {
+        !self.friction_heat.is_empty()
+    }
+
+    /// Specific energy dissipated as friction at `cell_pos` this substep,
+    /// 0 where nothing rubbed. Grid velocity-squared units; multiply by
+    /// `dx_meters^2` for J/kg.
+    pub fn friction_heat_at(&self, cell_pos: IVec2) -> f32 {
+        flat_index(cell_pos, self.resolution)
+            .and_then(|idx| self.friction_heat.get(&idx).copied())
+            .unwrap_or(0.0)
+    }
+
+    /// Total specific energy dissipated as friction this substep, summed over
+    /// every node. The quantity an energy audit compares against the kinetic
+    /// energy the boundary removed.
+    pub fn total_friction_heat(&self) -> f32 {
+        self.friction_heat.values().sum()
     }
 
     /// True if any mixture-phase particle touched the grid this substep. Gates
-    /// the extra mixture-aware work in P2G/G2P/step — same convention as
+    /// the extra mixture-aware work in P2G/G2P/step -- same convention as
     /// `has_contact_activity`.
-    pub fn has_mixture_activity(&self) -> bool {
+    pub const fn has_mixture_activity(&self) -> bool {
         !self.mixture_dirty.is_empty()
     }
 
@@ -202,8 +286,49 @@ impl Grid {
         self.accumulate(idx, mass, momentum);
     }
 
+    /// Mark one active node as carrying a homogeneous Dirichlet constraint.
+    /// MPM essential boundary conditions belong on grid degrees of freedom:
+    /// merely zeroing a pinned particle after G2P discards its motion but does
+    /// not transmit the anchor reaction to neighbouring material points.
+    pub(crate) fn mark_pinned_node(&mut self, cell_pos: IVec2) {
+        if let Some(idx) = flat_index(cell_pos, self.resolution) {
+            self.pinned_nodes.insert(idx);
+        }
+    }
+
+    /// Enforce the grid velocity prescribed by particle anchors. This must be
+    /// the last operation before G2P (and before a pre-force snapshot when one
+    /// is requested), exactly like geometric Dirichlet boundary conditions.
+    pub(crate) fn apply_pinned_node_constraints(&mut self) {
+        for &idx in &self.pinned_nodes {
+            if let Some(cell) = self.cells.get_mut(&idx) {
+                cell.momentum = Vec2::ZERO;
+            }
+        }
+    }
+
+    /// Merges a thread-local `CellMap` (built by parallel P2G's rayon
+    /// fold/reduce, see `transfer::p2g::scatter_particles_to_grid`) into this
+    /// grid's own cell storage. Reuses `accumulate` so dirty-tracking stays
+    /// correct, exactly as if every entry had gone through `add_mass_momentum`
+    /// one at a time -- just batched into a single serial merge pass after the
+    /// parallel scatter completes. `pub(crate)` since only `transfer.rs` (same
+    /// crate) needs it.
+    ///
+    /// A dense `Vec<Cell>` accumulator measured worse, in two variants (see
+    /// `transfer::p2g::scatter_particles_to_grid`): `CellMap` grows lazily,
+    /// allocating only what a fold chunk touches (a small fraction of
+    /// `resolution^2`), which beats a fixed full-grid allocation whatever the
+    /// chunk count. Re-measure the integrated cost on a scene, not a
+    /// microbenchmark, before trying a dense accumulator again.
+    pub(crate) fn merge_cells(&mut self, local: CellMap) {
+        for (idx, cell) in local {
+            self.accumulate(idx, cell.mass, cell.momentum);
+        }
+    }
+
     /// Accumulate by pre-computed flat index (already bounds-checked by the caller).
-    /// Single hash lookup via entry() — was contains_key + insert + get_mut (3 lookups)
+    /// Single hash lookup via entry() -- was contains_key + insert + get_mut (3 lookups)
     /// in the hottest scatter loop. dirty only grows on first touch of a cell.
     fn accumulate(&mut self, idx: u32, mass: f32, momentum: Vec2) {
         match self.cells.entry(idx) {
@@ -219,7 +344,7 @@ impl Grid {
         }
     }
 
-    /// Grid velocity at `cell_pos` — valid after `update_velocities()`. Zero for OOB/untouched.
+    /// Grid velocity at `cell_pos` -- valid after `update_velocities()`. Zero for OOB/untouched.
     pub fn velocity_at(&self, cell_pos: IVec2) -> Vec2 {
         if cell_pos.x < 0 || cell_pos.y < 0 {
             return Vec2::ZERO;
@@ -232,6 +357,64 @@ impl Grid {
         self.cells
             .get(&((x * self.resolution + y) as u32))
             .map_or(Vec2::ZERO, |c| c.momentum)
+    }
+
+    /// Same as `velocity_at`, but an untouched (never scattered to) cell reads
+    /// `extrapolated_v + gravity * dt`, slip-wall-clamped, instead of zero.
+    ///
+    /// `extrapolated_v`: the velocity to use at an empty node; pass the
+    /// gathering particle's own current velocity.
+    ///
+    /// A G2P stencil can span touched cells (particle mass and momentum,
+    /// already accelerated by `apply_gravity`) and untouched ones, e.g. at a
+    /// sparse free surface. A zero at the untouched cells, or `gravity * dt`
+    /// alone (one substep of gravity, ~0.0056 against a fluid moving at
+    /// 0.3-2.0), puts an artificial jump across the particle's stencil that
+    /// reads as stretching: positive `div(v)`, so `J` grows every substep and
+    /// never self-corrects. In free fall every particle accelerates alike, so
+    /// `div(v)` must be exactly 0; measured on `basic_fluids_gpu.rs` without
+    /// extrapolation, `J` climbed 1.000 -> 1.005 -> 1.022 -> 1.052 -> 1.093 ->
+    /// 1.140 -> 1.185 -> ... up to the 2.0 clamp, before any impact.
+    ///
+    /// Constant (zeroth-order) extrapolation of the fluid velocity into empty
+    /// nodes is the standard treatment (Bridson, "Fluid Simulation for
+    /// Computer Graphics", ch. 5: extrapolate velocity from fluid into air
+    /// before advection/gather). `+ gravity*dt` matches touched cells, which
+    /// `apply_gravity` has already accelerated by that much. A particle in
+    /// free fall then sees a uniform stencil, `div(v) = 0`, and `J` stays 1.
+    /// The GPU does the same (`g2p_gather.inc.wgsl`).
+    ///
+    /// It also encodes the right free-surface boundary condition: zero traction
+    /// (no stress from the empty side), rather than the implicit "the air is a
+    /// wall at rest" that a zero/near-zero fallback asserts.
+    pub fn velocity_at_or_extrapolated(
+        &self,
+        cell_pos: IVec2,
+        extrapolated_v: Vec2,
+        gravity: Vec2,
+        dt: f32,
+        boundary_thickness: usize,
+    ) -> Vec2 {
+        if cell_pos.x < 0 || cell_pos.y < 0 {
+            return Vec2::ZERO;
+        }
+        let x = cell_pos.x as usize;
+        let y = cell_pos.y as usize;
+        if x >= self.resolution || y >= self.resolution {
+            return Vec2::ZERO;
+        }
+        let idx = (x * self.resolution + y) as u32;
+        if let Some(cell) = self.cells.get(&idx) {
+            return cell.momentum;
+        }
+        let mut v = extrapolated_v + gravity * dt;
+        crate::forces::boundary::apply_slip_wall_velocity(
+            boundary_thickness,
+            idx as usize,
+            self.resolution,
+            &mut v,
+        );
+        v
     }
 
     pub fn mass_at(&self, cell_pos: IVec2) -> f32 {
@@ -250,13 +433,14 @@ impl Grid {
 
     /// Normalize momentum → velocity and apply gravity. Operates only on active cells.
     ///
-    /// A thin wrapper over `normalize_velocities` + `apply_gravity` — split so ASFLIP
+    /// A thin wrapper over `normalize_velocities` + `apply_gravity` -- split so ASFLIP
     /// (`SimConfig::asflip_blend`) can snapshot the grid's pre-force velocity in between
     /// the two (see `snapshot_velocities`). Behavior here is unchanged for every existing
     /// caller (`solver::step`, `spacetime::diff`'s `update_velocities_vjp` differentiates
     /// this exact combined formula, so the split must never change its net effect).
     pub fn update_velocities(&mut self, dt: f32, gravity: Vec2) {
         self.normalize_velocities();
+        self.normalize_friction();
         self.apply_gravity(dt, gravity);
     }
 
@@ -286,8 +470,8 @@ impl Grid {
 
     /// Snapshot of every active cell's CURRENT velocity, keyed the same way as `cells`
     /// (flat index → velocity). Used only by ASFLIP (`SimConfig::asflip_blend > 0.0`) to
-    /// capture the grid's velocity right after `normalize_velocities` — i.e. before this
-    /// substep's gravity, boundary conditions, or contact resolution modify it — so G2P
+    /// capture the grid's velocity right after `normalize_velocities` -- i.e. before this
+    /// substep's gravity, boundary conditions, or contact resolution modify it -- so G2P
     /// can later compute the classic FLIP residual `v_p_old - old_v` (Fei et al. 2021).
     /// O(touched cells), not O(grid²): iterates `dirty`, not the full domain. Never called
     /// when ASFLIP is disabled (the default), so this has zero cost for every other scene.
@@ -311,16 +495,16 @@ impl Grid {
     }
 
     /// Cundall (1982/1987) local non-viscous damping -- see `SimConfig::cundall_damping`'s
-    /// own doc for the real citation/rationale. Compares each active cell's CURRENT
+    /// doc for the citation/rationale. Compares each active cell's CURRENT
     /// velocity against `pre_force` (the same pre-gravity/boundary/contact snapshot
     /// ASFLIP already takes -- see `snapshot_velocities`), treating the delta as a real
     /// proxy for the force applied this substep (Δv = F·dt/m at fixed dt/mass), and
     /// damps the component of velocity that delta is driving -- proportional to the
     /// FORCE magnitude, not velocity magnitude (that distinction is the whole point:
     /// ordinary viscous damping scales with speed, this scales with how hard something
-    /// was just pushed). Component-wise, matching the real Cundall formulation exactly
+    /// was just pushed). Component-wise, matching the Cundall formulation exactly
     /// (each DOF independently, not the vector as a whole). Zero contribution wherever
-    /// a component is exactly zero (nothing to oppose) -- real, honest guard, since
+    /// a component is exactly zero (nothing to oppose) -- honest guard, since
     /// `f32::signum(0.0)` returns `1.0`, not `0.0`, and would otherwise inject a spurious
     /// damping force at rest.
     pub fn apply_cundall_damping(&mut self, pre_force: &VelocitySnapshot, coefficient: f32) {
@@ -332,11 +516,20 @@ impl Grid {
                 let before = pre_force.get(&idx).copied().unwrap_or(Vec2::ZERO);
                 let after = cell.momentum;
                 let dv = after - before;
+                // Clamp the damping magnitude to at most `|after|` so the corrected
+                // component can reach zero but never cross it. Uncapped, `damp` can
+                // exceed `after`'s own magnitude whenever this substep's force
+                // transient (`dv`) is large relative to the resulting velocity --
+                // common for several substeps after a violent event even once the
+                // visible motion looks settled. Past that point the correction
+                // overshoots zero and flips sign, injecting energy instead of
+                // removing it. Standard fix for this class of non-viscous
+                // (Cundall 1982/1987) damping formulation.
                 let damp_component = |v: f32, d: f32| -> f32 {
                     if v == 0.0 {
                         0.0
                     } else {
-                        coefficient * d.abs() * v.signum()
+                        (coefficient * d.abs()).min(v.abs()) * v.signum()
                     }
                 };
                 let damp = Vec2::new(damp_component(after.x, dv.x), damp_component(after.y, dv.y));
@@ -361,7 +554,7 @@ impl Grid {
     ///   d_loss_d_mass     = -(d_loss_d_v . momentum) / mass^2
     ///
     /// SCOPED: does not cover boundary-condition application or velocity
-    /// clamping, both applied AFTER this in the real substep -- those are
+    /// clamping, both applied AFTER this in the substep -- those are
     /// piecewise/conditional (zero out or cap components), differentiable
     /// almost everywhere but with real kinks at the boundary, deliberately
     /// deferred as their own future piece, not silently folded in here.
@@ -379,7 +572,48 @@ impl Grid {
         self.dirty.iter().filter_map(move |idx| cells.get(idx))
     }
 
-    /// Iterate active cells (mutable). For CFL clamping.
+    /// Sum of raw P2G momentum before normalization, for the structural-boundary
+    /// impulse ledger; valid only while `Cell::momentum` still stores mass times
+    /// velocity.
+    #[cfg(any(test, feature = "research-diagnostics"))]
+    pub(crate) fn raw_momentum_sum(&self) -> Vec2 {
+        self.active_cells().map(|cell| cell.momentum).sum()
+    }
+
+    /// Deterministic f64 accumulation companion for the structural-boundary
+    /// impulse ledger. Cell storage remains the f32 solver state; this isolates
+    /// global reduction/cancellation error from transfer error without
+    /// changing dynamics.
+    #[cfg(any(test, feature = "research-diagnostics"))]
+    pub(crate) fn raw_momentum_sum_f64(&self) -> DVec2 {
+        (0..self.resolution * self.resolution).fold(DVec2::ZERO, |sum, index| {
+            self.cells
+                .get(&(index as u32))
+                .map_or(sum, |cell| sum + cell.momentum.as_dvec2())
+        })
+    }
+
+    /// Sum `m_i v_i` after grid normalization/force updates, for the
+    /// structural-boundary impulse ledger.
+    #[cfg(any(test, feature = "research-diagnostics"))]
+    pub(crate) fn velocity_field_momentum_sum(&self) -> Vec2 {
+        self.active_cells()
+            .map(|cell| cell.mass * cell.momentum)
+            .sum()
+    }
+
+    /// Deterministic f64 global sum of the f32 nodal state. See
+    /// `raw_momentum_sum_f64`; this is a diagnostic side channel only.
+    #[cfg(any(test, feature = "research-diagnostics"))]
+    pub(crate) fn velocity_field_momentum_sum_f64(&self) -> DVec2 {
+        (0..self.resolution * self.resolution).fold(DVec2::ZERO, |sum, index| {
+            self.cells.get(&(index as u32)).map_or(sum, |cell| {
+                sum + f64::from(cell.mass) * cell.momentum.as_dvec2()
+            })
+        })
+    }
+
+    /// Iterate active cells mutably.
     pub fn active_cells_mut(&mut self) -> impl Iterator<Item = &mut Cell> {
         let (dirty, cells) = (&self.dirty, &mut self.cells);
         // SAFETY: dirty contains unique indices (enforced at insertion), each yielding
@@ -393,18 +627,32 @@ impl Grid {
     }
 
     /// Iterate active cells with flat index: `(flat_idx, &mut Cell)`.
-    /// `flat_idx = x * resolution + y` — same convention used by boundary conditions.
+    /// `flat_idx = x * resolution + y` -- same convention used by boundary conditions.
     pub fn active_cells_with_index_mut(&mut self) -> impl Iterator<Item = (usize, &mut Cell)> {
         let (dirty, cells) = (&self.dirty, &mut self.cells);
         let ptr = cells as *mut CellMap;
         dirty.iter().filter_map(move |&idx| {
-            // SAFETY: same as active_cells_mut — unique indices, no concurrent inserts.
+            // SAFETY: same as active_cells_mut -- unique indices, no concurrent inserts.
             unsafe { (*ptr).get_mut(&idx).map(|cell| (idx as usize, cell)) }
         })
     }
 
+    /// Cell access by flat index, for the structural-boundary impulse ledger.
+    #[cfg(any(test, feature = "research-diagnostics"))]
+    pub(crate) fn cell_at_index_mut(&mut self, index: usize) -> Option<&mut Cell> {
+        self.cells.get_mut(&(index as u32))
+    }
+
+    /// Velocity lookup by flat index, for the structural-boundary impulse ledger.
+    #[cfg(any(test, feature = "research-diagnostics"))]
+    pub(crate) fn velocity_at_index(&self, index: usize) -> Vec2 {
+        self.cells
+            .get(&(index as u32))
+            .map_or(Vec2::ZERO, |cell| cell.momentum)
+    }
+
     /// Number of cells that received mass this frame.
-    pub fn active_cell_count(&self) -> usize {
+    pub const fn active_cell_count(&self) -> usize {
         self.dirty.len()
     }
 }

@@ -10,7 +10,7 @@ use glam::Vec2;
 /// grounding: real crawlers break fore/aft slip symmetry structurally, not by
 /// timing friction to muscle phase). `RatchetFrictionBoundary` only ever resolves
 /// against a fixed, flat world floor (`normal = Vec2::Y` always); this generalizes
-/// the same idea to an ARBITRARY contact normal, since a real multi-field contact
+/// the same idea to an ARBITRARY contact normal, since a multi-field contact
 /// interface (a creature gripping actual terrain particles) can be sloped or
 /// uneven, not just a flat boundary. `easy_direction` is projected onto the local
 /// tangent plane (perpendicular to whatever normal the contact resolver fit that
@@ -20,7 +20,7 @@ use glam::Vec2;
 /// Deliberately generic, not tied to any one creature or body: this attaches to
 /// the grid's contact resolution as a whole (the existing binary grip/rest
 /// split, see `ContactCell` doc), so ANY body that opts particles into
-/// `Particle::contact_group != 0` gets the same real, scalable mechanism for
+/// `Particle::contact_group != 0` gets the same scalable mechanism for
 /// free -- living or non-living, any body plan, matching every other primitive
 /// in this engine (materials, force fields, boundaries) being creature-agnostic.
 ///

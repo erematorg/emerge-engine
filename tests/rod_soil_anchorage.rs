@@ -1,10 +1,8 @@
-//! Real verification (2026-07-22) that a root embedded in sand gets genuine
-//! mechanical anchorage from ordinary granular contact -- NOT a special
-//! "root anchor" mechanism, just the SAME rod<->grid coupling (with this
-//! session's coverage-gap fix) and the SAME Drucker-Prager sand contact
-//! already proven elsewhere in this repo. Real A/B: identical root, identical
-//! lateral push, with sand around it vs bare (empty grid) -- anchorage
-//! should show up as measurably less displacement, not asserted.
+//! A root embedded in sand gets mechanical anchorage from ordinary granular
+//! contact, with no special "root anchor" mechanism: the rod<->grid coupling
+//! and Drucker-Prager sand contact used elsewhere. A/B: identical root and
+//! lateral push, with sand around it vs bare (empty grid); anchorage shows as
+//! measurably less displacement.
 
 extern crate emerge_engine as emerge;
 use emerge::rod::{RodMaterial, build_straight_rod};
@@ -50,7 +48,7 @@ fn pushed_root(with_sand: bool, steps: usize) -> f32 {
     );
     let material = RodMaterial::from_young_modulus_rectangular(3.0e6, 0.06, 0.02, 50.0, 5.0);
     let mut rod = emerge::rod::Rod::new(rod_points, material);
-    // Sustained lateral push near the top -- a real, continuous toppling
+    // Sustained lateral push near the top -- a continuous toppling
     // force (wind-on-a-plant analog), not a one-shot impulse.
     rod.push_center = Some(Vec2::new(24.0, 18.0));
     rod.push_strength = 100.0;
@@ -69,16 +67,14 @@ fn root_embedded_in_sand_resists_lateral_push_more_than_bare_root() {
     let bare_displacement = pushed_root(false, 2000);
     let anchored_displacement = pushed_root(true, 2000);
 
-    // Real negative control: the bare root must actually move a real amount
-    // under this push, confirming the push itself is doing real work (not a
-    // scene where nothing moves regardless).
+    // Negative control: the bare root must move a clear amount under this
+    // push, so the push itself does work.
     assert!(
         bare_displacement > 1.0,
         "bare-root negative control barely moved -- push isn't doing real work: {bare_displacement:.4}"
     );
-    // Real positive proof: the SAME push produces measurably LESS
-    // displacement when the root is embedded in sand -- genuine mechanical
-    // anchorage from granular contact, not asserted.
+    // The same push gives measurably less displacement when the root is
+    // embedded in sand: anchorage from granular contact.
     assert!(
         anchored_displacement < bare_displacement * 0.5,
         "root embedded in sand should resist the push far more than a bare root: \

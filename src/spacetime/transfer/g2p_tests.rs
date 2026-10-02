@@ -1,9 +1,5 @@
-//! G2P test suite for `transfer.rs` -- split out of the original combined
-//! `transfer_tests.rs` (2026-07-19, mirrors `transfer.rs`'s own P2G/G2P
-//! phase split) by pure mechanical line-range extraction, not retyped, to
-//! eliminate transcription risk in adjoint math this precise (every VJP
-//! here is verified against central-difference numerical gradients --
-//! exactly the code where a silent copy error would be hardest to notice).
+//! G2P test suite for `transfer.rs`. Every VJP here is checked against
+//! central-difference numerical gradients.
 
 use super::*;
 
@@ -25,7 +21,7 @@ mod activation_tests {
     }
 
     /// Directional materials (everything except Viscoelastic): active stress follows the fiber
-    /// direction exactly — `activation * coeff` along the fiber axis, zero perpendicular to it.
+    /// direction exactly -- `activation * coeff` along the fiber axis, zero perpendicular to it.
     #[test]
     fn directional_active_stress_follows_fiber_axis() {
         let mut mat = NeoHookeanMaterial::new(100.0, 200.0);
@@ -48,7 +44,7 @@ mod activation_tests {
     }
 
     /// Viscoelastic uses an isotropic active term (matches its Kelvin-Voigt formulation and the
-    /// GPU shader's `model == 9u` special case) — equal on both diagonal axes, regardless of
+    /// GPU shader's `model == 9u` special case) -- equal on both diagonal axes, regardless of
     /// `activation_dir`.
     #[test]
     fn viscoelastic_active_stress_is_isotropic() {
@@ -73,7 +69,7 @@ mod activation_tests {
 
     /// Regression: `ViscoelasticMaterial::kirchhoff_stress` used to add its own isotropic active
     /// term directly AND report a non-zero `activation_scale()`, so the shared P2G path
-    /// (`combined_kirchhoff_stress`) added a second active term on top — silently doubling muscle
+    /// (`combined_kirchhoff_stress`) added a second active term on top -- silently doubling muscle
     /// stress for any Viscoelastic creature body. Pin the total to exactly one contribution.
     #[test]
     fn viscoelastic_active_stress_is_not_double_counted() {
@@ -98,7 +94,7 @@ mod activation_tests {
         let mut mat = NeoHookeanMaterial::new(100.0, 200.0);
         mat.active_stress_coeff = 10.0;
         let mut p = particle_at_rest();
-        p.activation = 0.0; // off — must be a true no-op regardless of coeff
+        p.activation = 0.0; // off -- must be a true no-op regardless of coeff
         p.activation_dir = Vec2::X;
 
         let soa = Particles::from(vec![p]);
@@ -110,10 +106,9 @@ mod activation_tests {
     }
 }
 
-/// Real, checkable validation of the internal pre-stress mechanism added for
-/// turgor-pressure-style support (see `Particle::internal_pressure` and
-/// `MaterialModel::pressure_scale` docs) — not a "looks nicer" check, a direct
-/// verification of the `-P*I` formula `combined_kirchhoff_stress` adds.
+/// Internal pre-stress for turgor-pressure-style support (see
+/// `Particle::internal_pressure` and `MaterialModel::pressure_scale`): checks
+/// the `-P*I` term `combined_kirchhoff_stress` adds.
 #[cfg(test)]
 mod pre_stress_tests {
     use super::combined_kirchhoff_stress;
@@ -131,7 +126,7 @@ mod pre_stress_tests {
         p
     }
 
-    /// `NeoHookeanMaterial` opts into pre-stress (`pressure_scale() == 1.0`) — an
+    /// `NeoHookeanMaterial` opts into pre-stress (`pressure_scale() == 1.0`) -- an
     /// undeformed particle's stress should be exactly `-P*I`, matching the real
     /// "prestressed structure" formula (isotropic hydrostatic pressure term).
     #[test]
@@ -161,7 +156,7 @@ mod pre_stress_tests {
     fn zero_internal_pressure_leaves_stress_unchanged() {
         let mat = NeoHookeanMaterial::new(100.0, 200.0);
         let mut p = particle_at_rest();
-        p.internal_pressure = 0.0; // off — must be a true no-op
+        p.internal_pressure = 0.0; // off -- must be a true no-op
 
         let soa = Particles::from(vec![p]);
         let tau = combined_kirchhoff_stress(&mat, &soa, 0);
@@ -172,7 +167,7 @@ mod pre_stress_tests {
     }
 
     /// A material that does NOT override `pressure_scale()` (default 0.0) must ignore
-    /// `internal_pressure` entirely — real opt-in behavior, not a silent global effect.
+    /// `internal_pressure` entirely -- real opt-in behavior, not a silent global effect.
     /// `DruckerPragerMaterial` (sand) is a real material that never opts in.
     #[test]
     fn material_without_pressure_scale_ignores_internal_pressure() {
@@ -183,7 +178,7 @@ mod pre_stress_tests {
             "test assumption: DruckerPragerMaterial does not opt into pre-stress"
         );
         let mut p = particle_at_rest();
-        p.internal_pressure = 999.0; // deliberately large — should have zero effect
+        p.internal_pressure = 999.0; // deliberately large -- should have zero effect
 
         let soa = Particles::from(vec![p]);
         let tau = combined_kirchhoff_stress(&mat, &soa, 0);
@@ -193,7 +188,7 @@ mod pre_stress_tests {
         );
     }
 
-    /// Pre-stress and activation are independent additive terms — both should apply
+    /// Pre-stress and activation are independent additive terms -- both should apply
     /// simultaneously without either one suppressing the other (real composability,
     /// not an accidental either/or).
     #[test]
@@ -226,7 +221,7 @@ mod g2p_velocity_vjp_tests {
 
     /// Forward formula exactly matching G2P's own `new_v` computation (the
     /// weighted sum over the 3x3 stencil), taking the 9 grid velocities
-    /// directly as an array instead of reading a real `Grid` -- isolates the
+    /// directly as an array instead of reading a `Grid` -- isolates the
     /// weighted-sum math being verified from grid storage/lookup entirely.
     fn gather_velocity(x: Vec2, v_grid: &[[Vec2; 3]; 3]) -> Vec2 {
         let weights = quadratic_weights(x);
@@ -446,7 +441,7 @@ mod g2p_affine_vjp_tests {
 
     /// Forward formula exactly matching G2P's own `new_c`/`velocity_gradient`
     /// computation (the weighted outer-product sum), taking the 9 grid
-    /// velocities directly as an array instead of reading a real `Grid`.
+    /// velocities directly as an array instead of reading a `Grid`.
     fn gather_affine(x: Vec2, v_grid: &[[Vec2; 3]; 3], scale: f32) -> Mat2 {
         let weights = quadratic_weights(x);
         let mut b = Mat2::ZERO;
@@ -546,13 +541,11 @@ mod g2p_affine_vjp_tests {
         }
     }
 
-    /// Real end-to-end check: combines g2p_velocity_vjp and g2p_affine_vjp
-    /// (the two halves of G2P's actual joint computation, gathered from the
-    /// SAME 9 grid velocities in the same pass) and verifies the SUMMED
-    /// gradient matches a finite difference taken through the true combined
-    /// loss L = g_v . new_v + g_c : new_c -- proves the two adjoints compose
-    /// correctly when G2P's real output (both v and C) feeds a real loss,
-    /// not just that each is independently correct in isolation.
+    /// End to end: g2p_velocity_vjp and g2p_affine_vjp (the two halves of
+    /// G2P's joint computation, gathered from the same 9 grid velocities)
+    /// summed match a finite difference through the combined loss
+    /// L = g_v . new_v + g_c : new_c, so the adjoints compose correctly when
+    /// both v and C feed a loss, not only each in isolation.
     #[test]
     fn composes_correctly_with_g2p_velocity_vjp() {
         let x = Vec2::new(18.3, 9.7);
@@ -770,7 +763,7 @@ mod multistep_backprop_tests {
     /// `p2g_position_vjp` handles it, and isn't exercised here since this
     /// proof targets the OTHER remaining gap -- chaining substeps together).
     /// With one particle and fixed position, the 9-cell stencil can be
-    /// tracked as a plain local array instead of a real `Grid`.
+    /// tracked as a plain local array instead of a `Grid`.
     fn substep_forward(
         f_old: Mat2,
         v_old: Vec2,
@@ -813,7 +806,7 @@ mod multistep_backprop_tests {
     /// SUM of both paths -- the standard multivariable chain rule, not
     /// special-cased per path.
     ///
-    /// `p2g_stress_vjp` is reused twice: once with the real `stress_coeff`
+    /// `p2g_stress_vjp` is reused twice: once with the `stress_coeff`
     /// for the stress->F path, once with `mass` standing in for that same
     /// scalar for the `c_old`->grid path -- both are the identical
     /// `weight*scalar*(tensor*cell_dist)` shape `scatter_particles_to_grid`
@@ -941,7 +934,7 @@ mod multistep_backprop_tests {
         });
     }
 
-    /// Scales the two-substep proof above to a real rollout length (5
+    /// Scales the two-substep proof above to a rollout length (5
     /// substeps) via a plain loop over the same `substep_forward` /
     /// `substep_backward` functions -- no new math, just more of it. Proves
     /// the chain doesn't silently degrade (error accumulation, sign flips)

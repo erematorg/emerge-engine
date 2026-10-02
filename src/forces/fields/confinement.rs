@@ -10,7 +10,7 @@ use crate::particle::Particles;
 
 /// Circular confinement: harmonic restoring force for particles outside radius.
 ///
-/// Models a soft container — particles inside feel nothing, particles outside
+/// Models a soft container -- particles inside feel nothing, particles outside
 /// are pulled back toward the surface with force proportional to overshoot.
 ///
 /// ```text
@@ -32,7 +32,7 @@ pub struct RadialConfinementField {
 }
 
 impl RadialConfinementField {
-    pub fn new(center: Vec2, radius: f32, stiffness: f32) -> Self {
+    pub const fn new(center: Vec2, radius: f32, stiffness: f32) -> Self {
         Self {
             center,
             radius,
@@ -69,7 +69,7 @@ pub struct AabbConfinementField {
 }
 
 impl AabbConfinementField {
-    pub fn new(min: Vec2, max: Vec2, stiffness: f32) -> Self {
+    pub const fn new(min: Vec2, max: Vec2, stiffness: f32) -> Self {
         Self {
             min,
             max,
