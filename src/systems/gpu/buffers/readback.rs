@@ -1,5 +1,5 @@
 //! GPU -> CPU readback methods for `GpuBuffers` -- split out of `buffers.rs`
-//! (was ~250 of its ~700 lines), matching that file's own doc comment split
+//! (was ~250 of its ~700 lines), matching that file's doc comment split
 //! between "Upload path" and "Download path". Construction and uploads stay
 //! in `buffers.rs`; every blocking/async readback variant lives here.
 
@@ -8,8 +8,74 @@ use std::mem;
 use super::GpuBuffers;
 use crate::particle::Particle;
 
+/// What the GPU's own time accounting says about the last stepped frame, read
+/// from `adaptive_dt` (see that buffer's slot layout).
+pub struct FrameStats {
+    /// Simulated time the frame's substeps actually advanced.
+    pub executed_time: f32,
+    /// Substeps that actually ran (spare encoded substeps are not counted).
+    pub executed_substeps: u32,
+    /// Frame time left unadvanced when the encoded substeps ran out.
+    pub dropped_time: f32,
+}
+
 impl GpuBuffers {
-    /// Begin an async GPU → CPU readback. Non-blocking — returns a shared flag set when done.
+    /// Copy `adaptive_dt` to its staging buffer and start mapping it. Non-blocking;
+    /// the returned flag is set when the copy is readable. Must follow the frame's
+    /// last substep submission on the same queue.
+    pub fn begin_frame_stats_readback(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> std::sync::Arc<std::sync::Mutex<Option<Result<(), wgpu::BufferAsyncError>>>> {
+        use std::sync::{Arc, Mutex};
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("mpm_frame_stats_copy"),
+        });
+        encoder.copy_buffer_to_buffer(
+            &self.adaptive_dt,
+            0,
+            &self.frame_stats_staging,
+            0,
+            self.adaptive_dt.size(),
+        );
+        queue.submit(std::iter::once(encoder.finish()));
+        let flag: Arc<Mutex<Option<Result<(), wgpu::BufferAsyncError>>>> =
+            Arc::new(Mutex::new(None));
+        let flag_cb = flag.clone();
+        self.frame_stats_staging
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |r| {
+                *flag_cb
+                    .lock()
+                    .expect("emerge: GPU frame stats flag poisoned") = Some(r);
+            });
+        flag
+    }
+
+    /// Read the mapped frame stats and unmap. Call only after the flag from
+    /// `begin_frame_stats_readback` reported `Ok`.
+    pub fn finish_frame_stats_readback(&self) -> FrameStats {
+        let slots: [u32; 8] = {
+            let view = self.frame_stats_staging.slice(..).get_mapped_range();
+            bytemuck::pod_read_unaligned(&view)
+        };
+        self.frame_stats_staging.unmap();
+        FrameStats {
+            executed_time: f32::from_bits(slots[3]),
+            executed_substeps: slots[4],
+            // `[0]` is the dt chosen for a substep that was never encoded, `[1]` what
+            // was still left after it: together, the time this frame did not advance.
+            dropped_time: f32::from_bits(slots[0]) + f32::from_bits(slots[1]),
+        }
+    }
+
+    /// Unmap after a failed frame stats mapping.
+    pub fn abandon_frame_stats_readback(&self) {
+        self.frame_stats_staging.unmap();
+    }
+
+    /// Begin an async GPU → CPU readback. Non-blocking -- returns a shared flag set when done.
     /// Caller polls the flag each frame via `try_lock` + `take`. Staging buffer must be idle.
     pub fn begin_readback(
         &self,
@@ -27,7 +93,7 @@ impl GpuBuffers {
         encoder.copy_buffer_to_buffer(&self.particles, 0, &self.readback_staging, 0, byte_count);
         queue.submit(std::iter::once(encoder.finish()));
 
-        // Kick off async mapping — callback fires when copy is complete and buffer is ready.
+        // Kick off async mapping -- callback fires when copy is complete and buffer is ready.
         let flag: Arc<Mutex<Option<Result<(), wgpu::BufferAsyncError>>>> =
             Arc::new(Mutex::new(None));
         let flag_cb = flag.clone();
@@ -39,12 +105,12 @@ impl GpuBuffers {
         flag
     }
 
-    /// Blocking GPU → CPU readback of specific particle index ranges only — e.g. a
+    /// Blocking GPU → CPU readback of specific particle index ranges only -- e.g. a
     /// handful of live creatures scattered through a much larger terrain/water
     /// buffer, where reading the WHOLE buffer every frame (via `readback_blocking`)
     /// would stall on copying/mapping particles the caller doesn't even need this
     /// frame. All ranges are copied within a SINGLE encoder/submit/poll (batched,
-    /// not one blocking round-trip per range — the per-call CPU↔GPU synchronization
+    /// not one blocking round-trip per range -- the per-call CPU↔GPU synchronization
     /// overhead, not just data volume, is what makes repeated small blocking
     /// readbacks expensive in practice). Returns one `Vec<Particle>` per input
     /// range, same order, each sized `range.len()`.
@@ -98,7 +164,7 @@ impl GpuBuffers {
     }
 
     /// Blocking GPU → CPU readback. Submits copy, waits for GPU idle, maps, returns particles.
-    /// Stalls the CPU until the GPU completes all in-flight work — only call from tests or
+    /// Stalls the CPU until the GPU completes all in-flight work -- only call from tests or
     /// parity-mode helpers, never from the render/game loop.
     pub fn readback_blocking(
         &self,
@@ -124,7 +190,7 @@ impl GpuBuffers {
     }
 
     /// Blocking GPU → CPU readback of an arbitrary u32 storage buffer (e.g.
-    /// `sorted_particle_ids`). Test/verification use only — uses a throwaway staging buffer,
+    /// `sorted_particle_ids`). Test/verification use only -- uses a throwaway staging buffer,
     /// never call from the render/game loop.
     pub fn readback_u32_blocking(
         &self,
@@ -158,7 +224,7 @@ impl GpuBuffers {
 
     /// Test/diagnostic readback of `count` f32 values from any storage buffer with COPY_SRC.
     /// Used to inspect the dense `grid` buffer directly (4 f32 per `Cell`: momentum.x,
-    /// momentum.y, mass, _pad — same field order as the WGSL `Cell` struct in every shader)
+    /// momentum.y, mass, _pad -- same field order as the WGSL `Cell` struct in every shader)
     /// without exposing the crate-private `GpuCell` type outside this module.
     pub fn readback_f32_blocking(
         &self,
@@ -202,17 +268,12 @@ impl GpuBuffers {
     }
 
     /// Release a FAILED readback's mapping without extracting data (there's nothing
-    /// valid to read on `Err`). Real bug this closes (found 2026-07-05, see project
-    /// memory): `map_async`'s callback firing at all -- Ok OR Err -- means wgpu
-    /// considers the buffer mapped; only `finish_readback`/this function's call to
-    /// `unmap()` releases that state. The old code only ever unmapped on the Ok path,
-    /// so a single `Err` (rare on fast hardware, far more likely on a slow/software
-    /// backend where async completion timing differs) left the staging buffer
-    /// permanently mapped -- silently disabling every future readback for the rest of
-    /// the run, then panicking ("Buffer is already mapped") the next time anything
-    /// tried to map it again (reproduced locally forcing a software WARP-style
-    /// adapter; plausibly the same root cause behind emerge issue #10's
-    /// STATUS_STACK_BUFFER_OVERRUN on CI, manifesting differently per-driver).
+    /// valid to read on `Err`). `map_async`'s callback firing at all -- Ok OR Err --
+    /// means wgpu considers the buffer mapped; only `finish_readback`/this
+    /// function's call to `unmap()` releases that state. Skipping unmap on `Err`
+    /// leaves the staging buffer permanently mapped, silently disabling every
+    /// future readback for the rest of the run, then panicking ("Buffer is
+    /// already mapped") the next time anything tries to map it again.
     pub fn abandon_readback(&self) {
         self.readback_staging.unmap();
     }

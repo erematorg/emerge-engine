@@ -2,10 +2,10 @@
 //! the deliberate exception to the IRL-grounding mandate that governs every
 //! other domain here, carved out on purpose, not an oversight.
 //!
-//! `diagnostics` — health monitoring, NDJSON logging, plugin-based stats
+//! `diagnostics` -- health monitoring, NDJSON logging, plugin-based stats
 //! collection: engineering observability, not physics. `gpu`
-//! [feature = "gpu"] — `GpuSimulation` + WGSL compute shaders: backend
-//! plumbing. `render` [feature = "render"] — instanced particle debug draw:
+//! [feature = "gpu"] -- `GpuSimulation` + WGSL compute shaders: backend
+//! plumbing. `render` [feature = "render"] -- instanced particle debug draw:
 //! pipeline setup, not the physics it visualizes.
 //!
 //! Part of the emerge/LP domain taxonomy (matter/forces/energy/information/

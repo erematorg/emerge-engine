@@ -5,7 +5,7 @@
 /// Must match `array<ImpulseEntry, 16>` in `apply_impulses.wgsl`.
 pub const MAX_GPU_IMPULSES: usize = 16;
 
-/// One impulse descriptor — 32 bytes, matches `struct ImpulseEntry` in WGSL.
+/// One impulse descriptor -- 32 bytes, matches `struct ImpulseEntry` in WGSL.
 ///
 /// mode 0 = radial: `v += normalize(p - center) * strength * falloff`
 /// mode 1 = directional: `v += force * falloff`
@@ -22,7 +22,7 @@ pub struct GpuImpulseEntry {
 
 const _: () = assert!(core::mem::size_of::<GpuImpulseEntry>() == 32);
 
-/// Uniform data for the apply_impulses compute pass — 528 bytes.
+/// Uniform data for the apply_impulses compute pass -- 528 bytes.
 /// Matches `struct ImpulseParams` in `apply_impulses.wgsl`.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]

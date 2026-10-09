@@ -176,12 +176,11 @@ pub fn controller_gradient(
     let n = plan.positions.len();
     // Average the drift over the last `loss_window` states instead of
     // reading only the final one: a final-state-only loss rewards ending
-    // far right by ANY means, and gradient descent found the exploit --
-    // ballistic end-of-rollout hops ("goes flying, not walking", observed
-    // live 2026-07-11). Averaging over a window rewards being consistently
-    // far right through sustained ground contact instead. dL/dx for each
-    // windowed state is -1/(n*K); the position-identity chain in
-    // `backward_substep` accumulates them correctly across steps.
+    // far right by any means, and gradient descent finds ballistic
+    // end-of-rollout hops. Averaging over a window rewards being
+    // consistently far right through sustained ground contact. dL/dx for
+    // each windowed state is -1/(n*K); the position-identity chain in
+    // `backward_substep` accumulates them across steps.
     let window = cfg.loss_window.clamp(1, steps);
     let per_state = -1.0 / (n as f32 * window as f32);
     // Bounce penalty: mean squared vertical velocity over the WHOLE rollout
@@ -345,12 +344,12 @@ pub(super) fn backprop_through_time(
 
 /// Gradient of the same locomotion loss as `controller_gradient`, but for a
 /// `FeedbackController`. Same windowed-drift + bounce-penalty objective;
-/// the real difference is the activation gradient chains through
+/// the difference is the activation gradient chains through
 /// `FeedbackController::backward` (feature-extraction + linear + tanh)
 /// instead of the sinusoid's tanh+weights, and that backward ALSO returns
 /// position/velocity gradient contributions (the controller READ this
 /// substep's state to decide its own activation) that must be ADDED onto
-/// `out.x`/`out.v` -- a real, new path the open-loop controller never had
+/// `out.x`/`out.v` -- a new path the open-loop controller never had
 /// (its activation depended only on `t`, never on the body's own state).
 pub fn feedback_controller_gradient(
     plan: &BodyPlan,

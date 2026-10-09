@@ -1,6 +1,7 @@
 //! 2D finite-difference wave equation solver.
 //!
-//! Solves ∂²u/∂t² = c²(∂²u/∂x² + ∂²u/∂y²) using explicit Euler time integration.
+//! Solves ∂²u/∂t² = c²(∂²u/∂x² + ∂²u/∂y²) with the explicit second-order
+//! central scheme in time (leapfrog: u_next = 2u - u_prev + c²dt²∇²u).
 //!
 //! # Applications in LP
 //! - Pressure waves through terrain (seismic, explosions)
@@ -8,9 +9,9 @@
 //! - Electromagnetic wave fields (year 2)
 //!
 //! # Stability
-//! Check `is_stable()` before running — the Courant condition c·dt·√(1/dx² + 1/dy²) ≤ 1
+//! Check `is_stable()` before running -- the Courant condition c·dt·√(1/dx² + 1/dy²) ≤ 1
 //! must hold or the simulation will diverge (Courant, Friedrichs & Lewy 1928,
-//! "Über die partiellen Differenzengleichungen der mathematischen Physik" —
+//! "Über die partiellen Differenzengleichungen der mathematischen Physik" --
 //! the original real derivation of this stability bound for explicit FD wave
 //! schemes, still the standard reference cited for it today).
 //!
@@ -85,7 +86,7 @@ impl WaveEquation2D {
         let cx = self.cx;
         let cy = self.cy;
 
-        // Interior points — cache-blocked for better L1 usage.
+        // Interior points -- cache-blocked for better L1 usage.
         const TILE: usize = 32;
         let rows = self.ny.saturating_sub(2);
         let cols = self.nx.saturating_sub(2);
@@ -110,7 +111,7 @@ impl WaveEquation2D {
             }
         }
 
-        // Dirichlet boundary (u = 0) — already zero from vec! initialisation.
+        // Dirichlet boundary (u = 0) -- already zero from vec! initialisation.
         self.u_previous = std::mem::replace(&mut self.u_current, u_next);
     }
 

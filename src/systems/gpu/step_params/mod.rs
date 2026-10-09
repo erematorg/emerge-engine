@@ -23,7 +23,7 @@
 //!     `GpuAsflipParams`/`GpuMaterialMassParams`
 
 /// Re-export so GPU code reads the same limit as the registry.
-/// Injected into WGSL shaders at pipeline creation — change only in `materials/registry.rs`.
+/// Injected into WGSL shaders at pipeline creation -- change only in `materials/registry.rs`.
 pub use crate::materials::registry::MAX_MATERIAL_SLOTS as MAX_MATERIALS;
 
 mod force_fields;
@@ -42,6 +42,6 @@ pub use spatial_blocks::{
 };
 pub use substep::GpuStepParams;
 pub use subsystems::{
-    GpuAsflipParams, GpuMaterialMassParams, GpuResourceParams, GpuThermalParams,
-    MAX_RENDER_MATERIAL_SLOTS,
+    GpuAsflipParams, GpuFluidPressureParams, GpuMaterialMassParams, GpuResourceParams,
+    GpuThermalParams, MAX_RENDER_MATERIAL_SLOTS,
 };

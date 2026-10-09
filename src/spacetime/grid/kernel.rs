@@ -85,10 +85,9 @@ mod tests {
         }
     }
 
-    /// Real sanity check independent of the analytic formula itself: since
-    /// `axis_weights` always sums to 1 (confirmed above), its derivative
-    /// must always sum to 0 -- a genuine algebraic constraint, not just
-    /// another way of restating the finite-difference check.
+    /// Independent of the analytic formula: `axis_weights` always sums to 1
+    /// (checked above), so its derivative must always sum to 0, an algebraic
+    /// constraint rather than another finite-difference check.
     #[test]
     fn axis_weights_derivative_sums_to_zero() {
         for d in [0.0f32, 0.1, 0.35, -0.2, 0.49, -0.49] {

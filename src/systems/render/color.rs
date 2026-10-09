@@ -1,30 +1,103 @@
 //! CPU-path color computation for `Renderer` -- split out of `mod.rs` (was its
 //! own already-marked "Color helpers (CPU path)" section plus `particle_color`,
 //! together ~110 of the file's ~930 lines). Mirrors `prep_instances.wgsl`'s
-//! ByPhysics branch exactly -- see that shader for the real citations/
+//! ByPhysics branch exactly -- see that shader for the citations/
 //! derivation of each term (Beer-Lambert absorption, single-scattering-albedo
 //! subsurface approximation, Schlick Fresnel specular, blackbody emission).
 
 use glam::Mat2;
 
 use super::{ColorMode, OpticalTable, Renderer};
+use crate::energy::radiation::{
+    blackbody_linear_srgb_locus_fit, blackbody_radiance_w_m2_sr, slab_radiance,
+};
 use crate::particle::Particle;
 
+/// Mirrors `blackbody.inc.wgsl`'s `BLACKBODY_MAX_EXPOSURE`; the two must stay
+/// equal or CPU and GPU emission diverge above the ceiling.
+const BLACKBODY_MAX_EXPOSURE: f32 = 16.0;
+
 impl Renderer {
-    pub(super) fn particle_color(&self, p: &Particle) -> [f32; 4] {
+    /// Thermal emission: Planck's colour (`energy::radiation`) weighted by
+    /// Stefan-Boltzmann's `T^4` exposure. The CPU mirror of
+    /// `blackbody.inc.wgsl`'s `blackbody_emission`, including its exposure
+    /// ceiling, so both paths saturate at the same place.
+    pub(super) fn blackbody_emission(&self, temperature_k: f32) -> [f32; 3] {
+        if !temperature_k.is_finite() || temperature_k <= 0.0 {
+            return [0.0; 3];
+        }
+        let exposure = match self.physical_render_contract {
+            Some(_) => {
+                blackbody_radiance_w_m2_sr(temperature_k) / self.display_white_mean().max(1.0e-12)
+            }
+            None => {
+                let ratio = temperature_k / self.emission_reference_temperature().max(1.0);
+                ratio * ratio * ratio * ratio
+            }
+        }
+        .min(BLACKBODY_MAX_EXPOSURE);
+        blackbody_linear_srgb_locus_fit(temperature_k).map(|channel| channel * exposure)
+    }
+
+    pub(super) fn particle_color(&self, p: &Particle, i: usize) -> [f32; 4] {
         match self.color_mode {
             ColorMode::ByMaterial => material_palette(p.material_id),
             ColorMode::ByVelocity => heat(p.v.length() * self.vel_scale),
             ColorMode::ByVolume => heat(det2(p.deformation_gradient) * 0.5),
             ColorMode::ByPhysics => {
                 // Mirrors prep_instances.wgsl's ByPhysics branch exactly -- see that
-                // shader's comments for the real citations/derivation of each term
+                // shader's comments for the citations/derivation of each term
                 // (Beer-Lambert absorption, single-scattering-albedo subsurface
                 // approximation, Schlick Fresnel specular, blackbody emission).
                 let slot = p.material_id as usize % 16;
                 let sigma = self.sigma_a[slot];
-                let sigma_s = self.sigma_s[slot];
+                // Pore-fluid index-matching darkening (see
+                // `Renderer::set_refractive_index` for the mechanism and
+                // citations), driven by this particle's own `scalar_field`
+                // (moisture, or any other saturating quantity a scene wires
+                // there), not a sand-specific case. `refractive_index[slot]==1.0`
+                // (default) makes `contrast_dry==0`, skipped below, so
+                // materials that never opt in keep their exact color.
+                let sigma_s = {
+                    let base = self.sigma_s[slot];
+                    let n_solid = self.refractive_index[slot];
+                    let contrast_dry = (n_solid - 1.0).abs();
+                    if contrast_dry > 1.0e-4 {
+                        const N_WATER: f32 = 1.33; // Hecht, "Optics" -- standard reference
+                        let saturation = p.scalar_field.clamp(0.0, 1.0);
+                        let n_fluid = 1.0 + saturation * (N_WATER - 1.0);
+                        let contrast_wet = (n_solid - n_fluid).abs();
+                        base * (contrast_wet / contrast_dry).powi(2)
+                    } else {
+                        base
+                    }
+                };
                 let j = det2(p.deformation_gradient).clamp(0.05, 4.0);
+                if let Some(contract) = self.physical_render_contract {
+                    // Full SI radiative transfer, the same law
+                    // `radiative_transfer.inc.wgsl` runs on the GPU. A
+                    // particle carries no surface normal, so Fresnel is
+                    // evaluated at normal incidence (`cos_view = 1`).
+                    let path_m = (1.0 / j) * contract.slice_thickness_m()
+                        / contract.camera_direction().z.abs().max(1.0e-6);
+                    let radiance = slab_radiance(
+                        contract.background_radiance_w_m2_sr(),
+                        contract.incident_radiance_w_m2_sr(),
+                        sigma,
+                        sigma_s,
+                        path_m,
+                        self.specular_r0[slot],
+                        1.0,
+                    );
+                    let display_white = contract.display_white_radiance_w_m2_sr();
+                    let emission = self.blackbody_emission(p.temperature);
+                    return [
+                        (radiance[0] / display_white[0] + emission[0]).clamp(0.0, 1.0),
+                        (radiance[1] / display_white[1] + emission[1]).clamp(0.0, 1.0),
+                        (radiance[2] / display_white[2] + emission[2]).clamp(0.0, 1.0),
+                        1.0,
+                    ];
+                }
                 let od = 1.0 / j;
                 let transmitted = [
                     (-sigma[0] * od).exp(),
@@ -40,28 +113,24 @@ impl Renderer {
                     })
                     .collect();
                 let r0 = self.specular_r0[slot];
-                let t = (p.temperature / 5000.0).clamp(0.0, 1.0);
-                let glow = t * t * 2.0;
-                let [er, eg, eb, _] = heat(0.5 + t * 0.5);
+                let emission = self.blackbody_emission(p.temperature);
                 [
-                    (with_scattering[0] + r0 + er * glow).min(1.0),
-                    (with_scattering[1] + r0 + eg * glow).min(1.0),
-                    (with_scattering[2] + r0 + eb * glow).min(1.0),
+                    (with_scattering[0] + r0 + emission[0]).min(1.0),
+                    (with_scattering[1] + r0 + emission[1]).min(1.0),
+                    (with_scattering[2] + r0 + emission[2]).min(1.0),
                     1.0,
                 ]
             }
             ColorMode::ByThermal => {
-                let t = (p.temperature / 1500.0).clamp(0.0, 1.0);
-                let [r, g, b, _] = heat(t);
-                [
-                    r * (0.1 + t * 0.9),
-                    g * (0.1 + t * 0.9),
-                    b * (0.1 + t * 0.9),
-                    1.0,
-                ]
+                let [r, g, b] = self.blackbody_emission(p.temperature);
+                [r.min(1.0), g.min(1.0), b.min(1.0), 1.0]
             }
             ColorMode::ByActivation => heat(p.activation.clamp(0.0, 1.0) * 0.8),
             ColorMode::ByScalarField => heat(p.scalar_field.clamp(0.0, 1.0)),
+            ColorMode::ByStress => {
+                let sigma_vm = self.stress_field.get(i).copied().unwrap_or(0.0);
+                heat(sigma_vm * self.stress_scale)
+            }
         }
     }
 }
@@ -72,6 +141,7 @@ pub(super) fn write_optical_table(
     sigma_a: &[[f32; 3]; 16],
     sigma_s: &[f32; 16],
     specular_r0: &[f32; 16],
+    holds_shape: &[bool; 16],
 ) {
     let mut table = OpticalTable {
         slots: [[0.0; 4]; 16],
@@ -79,7 +149,8 @@ pub(super) fn write_optical_table(
     };
     for (i, s) in sigma_a.iter().enumerate() {
         table.slots[i] = [s[0], s[1], s[2], sigma_s[i]];
-        table.specular[i] = [specular_r0[i], 0.0, 0.0, 0.0];
+        let shape = if holds_shape[i] { 1.0 } else { 0.0 };
+        table.specular[i] = [specular_r0[i], shape, 0.0, 0.0];
     }
     queue.write_buffer(buf, 0, bytemuck::bytes_of(&table));
 }
@@ -119,5 +190,58 @@ fn material_palette(id: u32) -> [f32; 4] {
         13 => [0.40, 0.70, 0.50, 1.0],
         14 => [0.60, 0.60, 0.60, 1.0],
         _ => [1.00, 1.00, 1.00, 1.0],
+    }
+}
+
+#[cfg(test)]
+mod heat_bands_tests {
+    use super::heat;
+    use crate::diagnostics::HEAT_BANDS;
+
+    /// The name `HEAT_BANDS` documents for a colour: its strongest channel,
+    /// or a mix of two when the second reaches 0.6 of the strongest.
+    fn read(rgb: [f32; 4]) -> char {
+        let mut channels = [(rgb[0], 'r'), (rgb[1], 'g'), (rgb[2], 'b')];
+        channels.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let [(first, a), (second, b), _] = channels;
+        if second >= 0.6 * first {
+            match (a.min(b), a.max(b)) {
+                ('b', 'g') => return ':',
+                ('g', 'r') => return '+',
+                _ => {}
+            }
+        }
+        match a {
+            'b' => '.',
+            'g' => '-',
+            _ => '#',
+        }
+    }
+
+    /// The text map (`diagnostics::scene_map`) draws `heat`'s values with
+    /// `HEAT_BANDS`. Sweep `heat` over its whole range and check every value
+    /// lands in the band its colour reads as, away from the rounding at each
+    /// threshold, so a change to either shows here.
+    #[test]
+    fn heat_bands_read_like_the_heat_colour_map() {
+        let thresholds: Vec<f32> = HEAT_BANDS.iter().skip(1).map(|(t, _)| *t).collect();
+        for step in 0..=1000 {
+            let value = step as f32 / 1000.0;
+            if thresholds.iter().any(|t| (value - t).abs() < 0.005) {
+                continue;
+            }
+            let band = HEAT_BANDS
+                .iter()
+                .rev()
+                .find(|(threshold, _)| value >= *threshold)
+                .map(|(_, c)| *c);
+            assert_eq!(
+                band,
+                Some(read(heat(value))),
+                "heat({value}) = {:?} reads as {:?}, HEAT_BANDS draws {band:?}",
+                heat(value),
+                read(heat(value))
+            );
+        }
     }
 }

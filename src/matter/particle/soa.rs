@@ -16,28 +16,66 @@ use super::Particle;
 ///
 /// # Invariant
 /// All vecs have the same length at all times. Methods panic on out-of-bounds.
+#[derive(Clone)]
 pub struct Particles {
-    // ── Kinematics — hot (read every substep) ────────────────────────────────
+    // ── Kinematics -- hot (read every substep) ────────────────────────────────
     pub x: Vec<Vec2>,
+    /// The part of each position increment, in cells, that the f32 addition
+    /// to `x` rounded away, carried into the next increment (compensated
+    /// summation, `spacetime::integration::advance_position`). Between 16
+    /// and 32 cells the spacing between f32 values is 1.9e-6 cells, so a
+    /// particle whose `v * dt` stays under half of it never moved at all
+    /// (issue #47). SoA only, like `temperature_residual`: the GPU `Particle`
+    /// has no spare bytes. Always under half that spacing, so readers of `x`
+    /// alone lose nothing visible; reset to zero whenever `x` is set or
+    /// clamped from outside the integration.
+    pub position_residual: Vec<Vec2>,
     pub v: Vec<Vec2>,
     pub velocity_gradient: Vec<Mat2>,
     pub deformation_gradient: Vec<Mat2>,
 
-    // ── Volume / mass — hot ───────────────────────────────────────────────────
+    // ── Volume / mass -- hot ───────────────────────────────────────────────────
     pub mass: Vec<f32>,
     pub initial_volume: Vec<f32>,
     pub volume: Vec<f32>,
     pub density: Vec<f32>,
     pub material_id: Vec<u32>,
 
-    // ── Plastic state — warm ──────────────────────────────────────────────────
+    // ── Plastic state -- warm ──────────────────────────────────────────────────
     pub plastic_volume_ratio: Vec<f32>,
     pub hardening_scale: Vec<f32>,
     pub friction_hardening: Vec<f32>,
     pub log_volume_strain: Vec<f32>,
+    /// Signed Pradhana volumetric-plastic-strain correction accumulator
+    /// (Pradhana, co-author of Klar, Gast, Pradhana, Fu, Teran, Jiang & Museth
+    /// 2016 "A Drucker-Prager Elastoplasticity Theory for Sand Simulation";
+    /// mechanism as in Blatny & Gaume 2025, `tmp/matter/src/simulation/
+    /// plasticity.cpp`'s `eps_pl_vol_pradhana`/`use_pradhana`). Tracks how much
+    /// volumetric correction `DruckerPragerMaterial::project`'s tension-cutoff
+    /// branch (the full-expansion return mapping, not the shear-yield cone
+    /// projection that file calls "Case III") has already applied since the
+    /// particle was last elastic, so the next tension-cutoff evaluation
+    /// accounts for it instead of re-adding volume from scratch each time:
+    /// the fix for "volume gain on expansion" (Tampubolon et al. 2017).
+    ///
+    /// SoA only, with no AoS `Particle` counterpart (unlike `log_volume_strain`
+    /// above): the 128-byte GPU-uploadable `Particle` has no spare bytes, and
+    /// this correction is CPU-only, not yet on the GPU (a known CPU/GPU parity
+    /// gap). 0.0 (no correction owed) for every particle that is not
+    /// `DruckerPragerMaterial` with `use_pradhana=true`.
+    pub eps_pl_vol_pradhana: Vec<f32>,
 
-    // ── Extended — cold ───────────────────────────────────────────────────────
+    // ── Extended -- cold ───────────────────────────────────────────────────────
     pub temperature: Vec<f32>,
+    /// The part of each temperature increment, in kelvin, that the f32
+    /// addition to `temperature` rounded away, carried into the next
+    /// increment (see `add_temperature`). Near 300 K the spacing between f32
+    /// values is 3.05e-5 K, so a conduction or cooling step smaller than half
+    /// of it would otherwise be lost every time. SoA only, like
+    /// `eps_pl_vol_pradhana`: the GPU `Particle` has no spare bytes. Always
+    /// smaller than half that spacing, so readers of `temperature` alone lose
+    /// nothing visible.
+    pub temperature_residual: Vec<f32>,
     pub user_tag: Vec<u32>,
     pub activation: Vec<f32>,
     pub activation_dir: Vec<Vec2>,
@@ -51,15 +89,98 @@ pub struct Particles {
     /// Generic internal pre-stress pressure. See `Particle::internal_pressure` doc.
     pub internal_pressure: Vec<f32>,
 
-    // ── Sleep state — not in the hot path ────────────────────────────────────
+    // ── Sleep state -- not in the hot path ────────────────────────────────────
     /// True when sleeping (skipped by P2G/G2P). `pub(crate)`: write only via
     /// `Simulation::wake`/`sleep`, which keep the tail-partition invariant intact.
     pub(crate) sleeping: Vec<bool>,
 }
 
+/// Per-particle mutable view into one particle's warm state, used by
+/// `MaterialModel::update_particle` and `BoundaryCondition::post_g2p_particle`.
+/// Exists so G2P's per-particle plasticity/boundary pass can run in parallel
+/// across particles (rayon) instead of needing `&mut Particles` (the whole
+/// SoA struct) one particle at a time -- every field here is disjoint-borrowed
+/// straight out of `Particles`' own separate `Vec<T>` fields (real struct-of-
+/// arrays, not just in name), so the borrow checker can prove two different
+/// particles' contexts never alias, even built concurrently on different
+/// threads. Covers exactly the fields every material's `update_particle` (and
+/// `GripFrictionBoundary`'s `post_g2p_particle`) actually touches -- verified
+/// by grepping every implementation, not guessed.
+pub struct ParticleUpdateCtx<'a> {
+    pub x: &'a mut Vec2,
+    pub v: &'a mut Vec2,
+    pub velocity_gradient: &'a mut Mat2,
+    pub deformation_gradient: &'a mut Mat2,
+    pub volume: &'a mut f32,
+    pub density: &'a mut f32,
+    pub hardening_scale: &'a mut f32,
+    pub plastic_volume_ratio: &'a mut f32,
+    pub log_volume_strain: &'a mut f32,
+    pub friction_hardening: &'a mut f32,
+    /// See `Particles::eps_pl_vol_pradhana`'s doc.
+    pub eps_pl_vol_pradhana: &'a mut f32,
+    pub mass: f32,
+    pub temperature: f32,
+    pub initial_volume: f32,
+    pub activation: f32,
+    pub activation_dir: Vec2,
+    /// Generic second scalar carrier, read-only here -- see `Particle::scalar_field`
+    /// doc. A material that wants to respond to a coupled `ScalarDiffusionField`
+    /// value (e.g. moisture/saturation) reads this; only the diffusion field itself
+    /// writes it (via P2G/G2P), same "gather, never own" convention `nonlocal_fluidity`
+    /// below already uses. 0.0 (the field's own real rest state) for every scene that
+    /// doesn't wire up such a field.
+    pub scalar_field: f32,
+    /// Gathered granular fluidity `g` from a coupled
+    /// `GranularFluidityField` (see `energy::thermodynamics::granular_fluidity`),
+    /// for this substep only -- transient, never stored on `Particle` itself
+    /// (there is no spare byte for it). 0.0 (the field's own real rest
+    /// state) when no such field is wired up for this scene, or when the
+    /// reading material doesn't opt in -- provably inert in that case, not
+    /// a tuning default.
+    pub nonlocal_fluidity: f32,
+    /// Gathered micro-curvature (kappa = grad(omega_c)) from a coupled
+    /// `CosseratField` (see `energy::thermodynamics::cosserat_field`), for
+    /// this substep only -- transient, never stored on `Particle` itself,
+    /// same convention `nonlocal_fluidity` already uses. `Vec2::ZERO` (the
+    /// field's own real rest state) when no such field is wired up for this
+    /// scene, or when the reading material doesn't opt in -- provably inert
+    /// in that case, not a tuning default.
+    pub cosserat_curvature: Vec2,
+}
+
 impl Particles {
+    /// Builds a `ParticleUpdateCtx` for one particle by index. For single-
+    /// particle/test call sites (needs exclusive `&mut Particles`, so NOT
+    /// usable from inside a parallel loop over sliced fields -- the G2P
+    /// hot path builds these directly from its own already-disjoint parallel
+    /// slices instead of calling this).
+    pub fn update_ctx(&mut self, i: usize) -> ParticleUpdateCtx<'_> {
+        ParticleUpdateCtx {
+            x: &mut self.x[i],
+            v: &mut self.v[i],
+            velocity_gradient: &mut self.velocity_gradient[i],
+            deformation_gradient: &mut self.deformation_gradient[i],
+            volume: &mut self.volume[i],
+            density: &mut self.density[i],
+            hardening_scale: &mut self.hardening_scale[i],
+            plastic_volume_ratio: &mut self.plastic_volume_ratio[i],
+            log_volume_strain: &mut self.log_volume_strain[i],
+            friction_hardening: &mut self.friction_hardening[i],
+            eps_pl_vol_pradhana: &mut self.eps_pl_vol_pradhana[i],
+            mass: self.mass[i],
+            temperature: self.temperature[i],
+            initial_volume: self.initial_volume[i],
+            activation: self.activation[i],
+            activation_dir: self.activation_dir[i],
+            scalar_field: self.scalar_field[i],
+            nonlocal_fluidity: 0.0,
+            cosserat_curvature: Vec2::ZERO,
+        }
+    }
+
     /// Create an empty `Particles` store.
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             x: Vec::new(),
             v: Vec::new(),
@@ -74,7 +195,10 @@ impl Particles {
             hardening_scale: Vec::new(),
             friction_hardening: Vec::new(),
             log_volume_strain: Vec::new(),
+            eps_pl_vol_pradhana: Vec::new(),
             temperature: Vec::new(),
+            temperature_residual: Vec::new(),
+            position_residual: Vec::new(),
             user_tag: Vec::new(),
             activation: Vec::new(),
             activation_dir: Vec::new(),
@@ -103,7 +227,10 @@ impl Particles {
             hardening_scale: Vec::with_capacity(cap),
             friction_hardening: Vec::with_capacity(cap),
             log_volume_strain: Vec::with_capacity(cap),
+            eps_pl_vol_pradhana: Vec::with_capacity(cap),
             temperature: Vec::with_capacity(cap),
+            temperature_residual: Vec::with_capacity(cap),
+            position_residual: Vec::with_capacity(cap),
             user_tag: Vec::with_capacity(cap),
             activation: Vec::with_capacity(cap),
             activation_dir: Vec::with_capacity(cap),
@@ -118,13 +245,13 @@ impl Particles {
 
     /// Number of particles.
     #[inline]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.x.len()
     }
 
     /// True if there are no particles.
     #[inline]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.x.is_empty()
     }
 
@@ -161,6 +288,9 @@ impl Particles {
     /// Write a modified [`Particle`] back to index `i`.
     #[inline]
     pub fn set(&mut self, i: usize, p: Particle) {
+        if self.x[i] != p.x {
+            self.position_residual[i] = Vec2::ZERO;
+        }
         self.x[i] = p.x;
         self.v[i] = p.v;
         self.velocity_gradient[i] = p.velocity_gradient;
@@ -201,7 +331,13 @@ impl Particles {
         self.hardening_scale.push(p.hardening_scale);
         self.friction_hardening.push(p.friction_hardening);
         self.log_volume_strain.push(p.log_volume_strain);
+        // Not part of the AoS `Particle` view (see `eps_pl_vol_pradhana`'s own
+        // doc) -- a freshly-pushed particle always starts owing zero
+        // correction, the physically-correct initial condition.
+        self.eps_pl_vol_pradhana.push(0.0);
         self.temperature.push(p.temperature);
+        self.temperature_residual.push(0.0);
+        self.position_residual.push(Vec2::ZERO);
         self.user_tag.push(p.user_tag);
         self.activation.push(p.activation);
         self.activation_dir.push(p.activation_dir);
@@ -210,7 +346,7 @@ impl Particles {
         self.pinned.push(p.pinned);
         self.scalar_field.push(p.scalar_field);
         self.internal_pressure.push(p.internal_pressure);
-        // Honor the incoming particle's real sleeping state — needed by GpuSimulation's
+        // Honor the incoming particle's real sleeping state -- needed by GpuSimulation's
         // CPU-plasticity readback path (Particles::from(Vec<Particle>)), which converts
         // live GPU particles (sleeping state included) into this SoA. Freshly-spawned
         // particles always have sleeping=0 already, so this is a no-op for that path.
@@ -236,7 +372,10 @@ impl Particles {
         self.hardening_scale.swap(a, b);
         self.friction_hardening.swap(a, b);
         self.log_volume_strain.swap(a, b);
+        self.eps_pl_vol_pradhana.swap(a, b);
         self.temperature.swap(a, b);
+        self.temperature_residual.swap(a, b);
+        self.position_residual.swap(a, b);
         self.user_tag.swap(a, b);
         self.activation.swap(a, b);
         self.activation_dir.swap(a, b);
@@ -250,7 +389,7 @@ impl Particles {
 
     /// Rotate `[start..end]` so that `[mid..end]` precedes `[start..mid]`.
     /// Used by add_body to insert new particles before the sleeping zone.
-    /// Standard 3-reversal algorithm — O(end − start) swaps.
+    /// Standard 3-reversal algorithm -- O(end − start) swaps.
     pub fn rotate_range(&mut self, start: usize, mid: usize, end: usize) {
         if start >= mid || mid >= end {
             return;
@@ -268,6 +407,21 @@ impl Particles {
             self.swap(l, r);
             l += 1;
         }
+    }
+
+    /// Adds `delta` kelvin to particle `i`'s temperature without losing the
+    /// part an f32 addition at that temperature rounds away: that part is
+    /// kept in `temperature_residual` and added with the next increment
+    /// (compensated summation). Use it for every small, repeated heat
+    /// exchange (conduction, cooling); a plain `+=` drops any increment under
+    /// half the f32 spacing at the particle's temperature.
+    #[inline]
+    pub fn add_temperature(&mut self, i: usize, delta: f32) {
+        let increment = delta + self.temperature_residual[i];
+        let before = self.temperature[i];
+        let after = before + increment;
+        self.temperature_residual[i] = increment - (after - before);
+        self.temperature[i] = after;
     }
 
     /// Collect all particles into a `Vec<Particle>` (for GPU upload / diagnostics).
@@ -290,8 +444,12 @@ impl Particles {
             if pred(&p) {
                 if write != read {
                     self.set(write, p);
-                    // sleeping is not part of the AoS Particle view — copy explicitly.
+                    // sleeping, eps_pl_vol_pradhana and the two residuals are
+                    // not part of the AoS Particle view -- copy explicitly.
                     self.sleeping[write] = self.sleeping[read];
+                    self.eps_pl_vol_pradhana[write] = self.eps_pl_vol_pradhana[read];
+                    self.temperature_residual[write] = self.temperature_residual[read];
+                    self.position_residual[write] = self.position_residual[read];
                 }
                 write += 1;
             }
@@ -309,7 +467,10 @@ impl Particles {
         self.hardening_scale.truncate(write);
         self.friction_hardening.truncate(write);
         self.log_volume_strain.truncate(write);
+        self.eps_pl_vol_pradhana.truncate(write);
         self.temperature.truncate(write);
+        self.temperature_residual.truncate(write);
+        self.position_residual.truncate(write);
         self.user_tag.truncate(write);
         self.activation.truncate(write);
         self.activation_dir.truncate(write);
@@ -344,7 +505,7 @@ impl Default for Particles {
 
 /// Lazy iterator over [`Particle`] views from a borrowed [`Particles`] store.
 ///
-/// Constructs each `Particle` on demand from SoA storage — no upfront allocation.
+/// Constructs each `Particle` on demand from SoA storage -- no upfront allocation.
 pub struct ParticlesIter<'a> {
     particles: &'a Particles,
     index: usize,
@@ -369,7 +530,7 @@ impl<'a> Iterator for ParticlesIter<'a> {
 impl ExactSizeIterator for ParticlesIter<'_> {}
 
 impl Particles {
-    pub fn iter(&self) -> ParticlesIter<'_> {
+    pub const fn iter(&self) -> ParticlesIter<'_> {
         ParticlesIter {
             particles: self,
             index: 0,

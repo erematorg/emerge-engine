@@ -1,3 +1,7 @@
+//! `DiagnosticsRegistry`/`evaluate_stability`/`collect_snapshot` suite --
+//! health-check violation detection (empty snapshots, concentrated
+//! particles, mixed-material blending) and basic snapshot correctness.
+
 extern crate emerge_engine as emerge;
 
 use emerge::SimConfig;
@@ -51,12 +55,10 @@ fn collect_and_evaluate_basic_snapshot() {
 
 #[test]
 fn snapshot_reports_kinetic_energy_and_pinned_particle_speed() {
-    // Real, direct check for the two diagnostics fields added 2026-07-19
-    // (see `project_basic_plant_forcing_function_2026-07-19` memory): total
-    // kinetic energy must match the exact sum of 0.5*m*|v|^2, and a pinned
-    // particle's own speed must be surfaced separately -- this is the sanity
-    // signal that catches a broken `Particle::pinned` mechanism directly,
-    // rather than inferring it from a body slowly drifting.
+    // Total kinetic energy must match the exact sum of 0.5*m*|v|^2, and a
+    // pinned particle's speed is reported separately: the signal that catches
+    // a broken `Particle::pinned` directly, rather than inferring it from a
+    // body slowly drifting.
     let config = make_config(8);
 
     let free = Particle {

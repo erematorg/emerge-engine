@@ -1,57 +1,55 @@
 //! Differentiable mini-solver for offline gait training.
 //!
 //! A self-contained, differentiable MLS-MPM forward simulation plus its
-//! hand-derived reverse pass -- the trainer the whole adjoint chain in
-//! `spacetime::transfer` was built toward. Structured to match the canonical
-//! open-loop DiffTaichi `diffmpm.py` walker demo (verified against the real
-//! cloned source, not from memory), because that is the simplest published
-//! setup proven to produce visible trained locomotion:
+//! hand-derived reverse pass, built on the adjoint chain in
+//! `spacetime::transfer`. Structured like DiffTaichi's open-loop
+//! `diffmpm.py` walker demo, the simplest published setup shown to produce
+//! visible trained locomotion:
 //!
 //! - **Time-varying actuation from a sinusoid basis controller** -- the
 //!   trainable parameters are per-muscle-group weights over `n_waves` phase-
-//!   shifted sinusoids plus a bias, squashed with tanh. Constant per-particle
-//!   activation (the first prototype here) can only learn a static squeeze;
-//!   a time-varying signal learns a *gait*.
+//!   shifted sinusoids plus a bias, squashed with tanh. Constant
+//!   per-particle activation can only learn a static squeeze; a time-varying
+//!   signal learns a *gait*.
 //! - **Signed actuation** (`tanh` in (-1,1)): muscles both contract and
-//!   extend, exactly DiffTaichi's convention (`A = [[0,0],[0,1]] * act`, both
-//!   signs). NOTE: the engine's runtime muscle model
-//!   (`transfer::combined_kirchhoff_stress`) is contract-only `[0,1]` -- a
-//!   trained gait transfers to the runtime by remapping, this module does not
-//!   change engine semantics.
-//! - **Gravity + a sticky floor** as the locomotion symmetry-breaker.
-//!   Verified detail from the real `diffmpm.py` source: its friction-cone
-//!   code runs on an already-zeroed velocity, so the canonical walker
-//!   actually trains against a *sticky* floor (grid cells at floor level
-//!   moving downward get zeroed) -- which is exactly what this module
-//!   implements, with the branch decision recorded forward and replayed as a
-//!   fixed linear map backward (same "detach the branch" treatment as the
-//!   kernel-weight kink documented throughout `spacetime::transfer`).
+//!   extend, DiffTaichi's convention (`A = [[0,0],[0,1]] * act`, both
+//!   signs). The engine's runtime muscle model
+//!   (`transfer::combined_kirchhoff_stress`) is contract-only `[0,1]`: a
+//!   trained gait transfers to the runtime by remapping; this module does
+//!   not change engine semantics.
+//! - **Gravity + a sticky floor** as the locomotion symmetry-breaker. In
+//!   `diffmpm.py` the friction-cone code runs on an already-zeroed velocity,
+//!   so the walker trains against a *sticky* floor (grid cells at floor
+//!   level moving downward are zeroed). This module does the same, recording
+//!   the stick/no-stick branch forward and replaying it as a fixed linear
+//!   map backward: a hard `if`, the non-differentiability any differentiable
+//!   contact simulator has to handle somewhere.
 //! - **Actuator groups**: particles share muscle groups (legs), not one
 //!   trainable scalar per particle.
 //!
-//! Every backward formula is either one of the individually finite-difference-
-//! verified adjoints from `spacetime::transfer`/`grid`, or is derived and
-//! FD-verified in this module's own tests. The one deliberate scope limit,
-//! same as everywhere else in the chain: kernel weights use each step's REAL
-//! recorded positions as fixed reference points (the position-dependence of
-//! *which cells* a particle touches is not differentiated -- the standard
-//! detached treatment; ChainQueen's own backward pass makes the same choice
-//! per-step-linearization-wise for branch decisions).
+//! Every backward formula is either one of the finite-difference-verified
+//! adjoints from `spacetime::transfer`/`grid`, or derived and FD-verified in
+//! this module's tests. One scope limit specific to this module:
+//! `spacetime::transfer::p2g_position_vjp` differentiates the kernel
+//! weights' dependence on position (`axis_weights_derivative`, matches
+//! finite difference), but this module's backward pass evaluates each step's
+//! weights at the recorded forward position and does not backprop through
+//! them. ChainQueen (`G2P_backward` in `tmp/ChainQueen/src/backward.cu`
+//! sums `dw()` terms into the position gradient) and DiffTaichi
+//! (`diffmpm.py`'s autodiff backward, no `stop_grad` on `p2g`/`g2p`) both
+//! differentiate through the weights. The omission is a shortcut for a
+//! small, short-horizon offline tool; it causes the ~5-7% gap measured in
+//! `controller_gradient_matches_finite_difference_smooth_regime`.
 //!
 //! Scale/units note: this is a *training tool*, not the runtime solver. It
 //! runs a small body (tens of particles) for a short horizon (~100 substeps)
 //! thousands of times; the trained controller parameters are the output.
 //!
-//! Split into submodules 2026-07-19 (was 1632 lines in one file) by pipeline
-//! phase -- `body_plan`/`config`/`stress` are shared building blocks,
-//! `forward`/`backward` mirror the real solver's own P2G/G2P phase split,
-//! `metrics`/`train` are the outer training-loop layer. Every item that was
-//! `pub` at this module's top level before the split is still re-exported
-//! here at the exact same path, so nothing outside `diff` observes a
-//! difference. `backward.rs` deliberately stayed ONE file rather than
-//! splitting sinusoid/feedback backprop apart: `IncomingGrad`/`OutgoingGrad`/
-//! `SubstepCtx`/`GradSeed` are shared infrastructure both paths lean on, and
-//! separating them would mean duplicating that plumbing for no real gain.
+//! Submodules follow the pipeline: `body_plan`/`config`/`stress` are shared
+//! building blocks, `forward`/`backward` mirror the solver's P2G/G2P split,
+//! `metrics`/`train` are the outer training loop. `backward.rs` stays one
+//! file because sinusoid and feedback backprop share
+//! `IncomingGrad`/`OutgoingGrad`/`SubstepCtx`/`GradSeed`.
 
 use glam::Mat2;
 
@@ -123,6 +121,6 @@ impl DifferentiableMaterial for NeoHookeanMaterial {
 
 // Test suite split into its own file -- was ~900 of this file's ~2530 lines,
 // same pattern as `gpu/solver/device_lost_tests.rs`. Pure mechanical
-// line-range extraction, see that file's own doc comment.
+// line-range extraction, see that file's doc comment.
 #[cfg(test)]
 mod tests;

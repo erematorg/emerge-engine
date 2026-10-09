@@ -1,4 +1,4 @@
-//! `rod::network` branching: the junction point is a genuine shared array index (both
+//! `rod::network` branching: the junction point is a shared array index (both
 //! the trunk's last edge and the branch's first edge reference it), not two synchronized
 //! `Rod`s. Checks internal force consistency at a branch vertex and that a branch
 //! measurably loads the trunk through that shared point.

@@ -1,9 +1,5 @@
-//! P2G test suite for `transfer.rs` -- split out of the original combined
-//! `transfer_tests.rs` (2026-07-19, mirrors `transfer.rs`'s own P2G/G2P
-//! phase split) by pure mechanical line-range extraction, not retyped, to
-//! eliminate transcription risk in adjoint math this precise (every VJP
-//! here is verified against central-difference numerical gradients --
-//! exactly the code where a silent copy error would be hardest to notice).
+//! P2G test suite for `transfer.rs`. Every VJP here is checked against
+//! central-difference numerical gradients.
 
 use super::*;
 
@@ -168,10 +164,10 @@ mod p2g_stress_vjp_tests {
 
     #[test]
     fn chains_correctly_into_neohookean_kirchhoff_stress_vjp() {
-        // Real end-to-end check: P2G's stress gradient feeds NeoHookean's own
-        // F-adjoint, and the composed result still matches a finite-difference
-        // taken all the way from F, through stress, through the P2G scatter --
-        // proves the two pieces compose correctly, not just individually.
+        // End to end: P2G's stress gradient feeds NeoHookean's F-adjoint, and
+        // the composed result matches a finite difference taken from F,
+        // through stress, through the P2G scatter, so the two pieces compose
+        // correctly, not only individually.
         use crate::materials::NeoHookeanMaterial;
         use crate::particle::{Particle, Particles};
 
@@ -256,7 +252,7 @@ mod p2g_position_vjp_tests {
 
     /// Forward function reconstructing scatter_particles_to_grid's EXACT
     /// per-cell formula (mass_contrib, momentum_contrib), taking the
-    /// particle state directly instead of a real Particles/Grid -- isolates
+    /// particle state directly instead of a Particles/Grid -- isolates
     /// the position-dependence being verified from everything else.
     fn contributions(x: Vec2, state: &P2GParticleState) -> ([[Vec2; 3]; 3], [[f32; 3]; 3]) {
         let weights = quadratic_weights(x);
@@ -364,6 +360,437 @@ mod p2g_position_vjp_tests {
             },
             g_momentum,
             g_mass,
+        );
+    }
+}
+
+#[cfg(test)]
+mod spatial_sort_tests {
+    use super::*;
+    use crate::materials::NeoHookeanMaterial;
+    use crate::materials::registry::MaterialRegistry;
+    use crate::particle::{Particle, Particles};
+
+    fn scattered_particles(n: usize, resolution: usize) -> Particles {
+        // Deterministic LCG, as in `sand_repose_angle_gui.rs`/
+        // `tests/grains_repose_angle.rs::SmallRng`: a reproducible layout where
+        // spawn order no longer matches spatial order, the condition
+        // `spatial_sort_order` exists for.
+        struct Rng(u64);
+        impl Rng {
+            fn next_f32(&mut self) -> f32 {
+                self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((self.0 >> 33) as f32) / (u32::MAX as f32)
+            }
+        }
+        let mut rng = Rng(0xC0FF_EE11_u64);
+        let mut particles = Particles::default();
+        for _ in 0..n {
+            let x = Vec2::new(
+                rng.next_f32() * (resolution as f32 - 2.0) + 1.0,
+                rng.next_f32() * (resolution as f32 - 2.0) + 1.0,
+            );
+            particles.push(Particle {
+                x,
+                v: Vec2::new(rng.next_f32() - 0.5, rng.next_f32() - 0.5),
+                velocity_gradient: Mat2::ZERO,
+                deformation_gradient: Mat2::IDENTITY,
+                mass: 1.0,
+                initial_volume: 1.0,
+                volume: 1.0,
+                density: 1.0,
+                material_id: 0,
+                plastic_volume_ratio: 1.0,
+                hardening_scale: 1.0,
+                friction_hardening: 0.0,
+                log_volume_strain: 0.0,
+                temperature: 0.0,
+                scalar_field: 0.0,
+                user_tag: 0,
+                activation: 0.0,
+                activation_dir: Vec2::ZERO,
+                muscle_group_id: 0,
+                contact_group: 0,
+                sleeping: 0,
+                pinned: 0,
+                internal_pressure: 0.0,
+            });
+        }
+        particles
+    }
+
+    #[test]
+    fn spatial_sort_order_is_valid_permutation() {
+        let resolution = 32;
+        let particles = scattered_particles(200, resolution);
+        let order = spatial_sort_order(&particles, particles.len(), resolution);
+        assert_eq!(order.len(), particles.len());
+        let mut seen = vec![false; particles.len()];
+        for &i in &order {
+            assert!(!seen[i], "index {i} appeared more than once in sort order");
+            seen[i] = true;
+        }
+        assert!(
+            seen.iter().all(|&s| s),
+            "sort order did not cover every index 0..{}",
+            particles.len()
+        );
+    }
+
+    #[test]
+    fn spatial_sort_order_groups_nearby_particles() {
+        // The sort must improve locality, not only be a valid permutation:
+        // consecutive entries in the sorted order land in the same or a
+        // neighboring grid cell far more often than in the original (random
+        // spawn) order.
+        let resolution = 32;
+        let particles = scattered_particles(300, resolution);
+        let cell_of = |i: usize| -> IVec2 { particles.x[i].floor().as_ivec2() };
+        let neighbor_frac = |order: &[usize]| -> f32 {
+            let mut adjacent = 0usize;
+            for w in order.windows(2) {
+                let d = (cell_of(w[0]) - cell_of(w[1])).abs();
+                if d.x <= 1 && d.y <= 1 {
+                    adjacent += 1;
+                }
+            }
+            adjacent as f32 / (order.len() - 1) as f32
+        };
+        let identity: Vec<usize> = (0..particles.len()).collect();
+        let sorted = spatial_sort_order(&particles, particles.len(), resolution);
+        let frac_identity = neighbor_frac(&identity);
+        let frac_sorted = neighbor_frac(&sorted);
+        assert!(
+            frac_sorted > frac_identity,
+            "sort did not improve spatial locality: identity={frac_identity:.3} sorted={frac_sorted:.3}"
+        );
+    }
+
+    #[test]
+    fn scatter_sorted_matches_unsorted_mass_and_momentum() {
+        // Tolerance, not exact equality: float summation order changes with
+        // iteration order (see `scatter_particles_to_grid_sorted`). Total
+        // mass and momentum scattered onto the grid must still agree closely
+        // whatever the processing order.
+        let resolution = 24;
+        let particles = scattered_particles(150, resolution);
+        let materials =
+            MaterialRegistry::with_default(Box::new(NeoHookeanMaterial::new(900.0, 700.0)));
+        let active_count = particles.len();
+        let dt = 0.01;
+
+        let mut grid_unsorted = crate::grid::Grid::new(resolution);
+        scatter_particles_to_grid(&particles, &mut grid_unsorted, &materials, dt, active_count);
+
+        let order = spatial_sort_order(&particles, active_count, resolution);
+        let mut grid_sorted = crate::grid::Grid::new(resolution);
+        scatter_particles_to_grid_sorted(
+            &particles,
+            &mut grid_sorted,
+            &materials,
+            dt,
+            active_count,
+            &order,
+        );
+
+        let sum_mass = |g: &crate::grid::Grid| -> f32 { g.active_cells().map(|c| c.mass).sum() };
+        let sum_momentum =
+            |g: &crate::grid::Grid| -> Vec2 { g.active_cells().map(|c| c.momentum).sum() };
+
+        let m_unsorted = sum_mass(&grid_unsorted);
+        let m_sorted = sum_mass(&grid_sorted);
+        assert!(
+            (m_unsorted - m_sorted).abs() < 1.0e-3 * m_unsorted.max(1.0),
+            "total mass diverged: unsorted={m_unsorted} sorted={m_sorted}"
+        );
+
+        let p_unsorted = sum_momentum(&grid_unsorted);
+        let p_sorted = sum_momentum(&grid_sorted);
+        assert!(
+            (p_unsorted - p_sorted).length() < 1.0e-3 * p_unsorted.length().max(1.0),
+            "total momentum diverged: unsorted={p_unsorted:?} sorted={p_sorted:?}"
+        );
+    }
+
+    /// A particle anchor is a grid constraint, so both production P2G paths
+    /// must mark the same quadratic-B-spline support. This also guards the
+    /// lifecycle requirement that `Grid::clear` removes last substep's
+    /// constraint instead of silently pinning a node forever.
+    #[test]
+    fn pinned_support_is_constrained_in_both_p2g_paths_and_cleared_next_step() {
+        let resolution = 24;
+        let mut particles = scattered_particles(2, resolution);
+        particles.x[0] = Vec2::new(7.25, 8.4);
+        particles.v[0] = Vec2::new(3.0, -2.0);
+        particles.pinned[0] = 1;
+        particles.x[1] = Vec2::new(16.25, 16.4);
+        particles.v[1] = Vec2::new(-1.0, 2.0);
+        particles.pinned[1] = 0;
+
+        let materials =
+            MaterialRegistry::with_default(Box::new(NeoHookeanMaterial::new(900.0, 700.0)));
+        let mut ordinary = crate::grid::Grid::new(resolution);
+        scatter_particles_to_grid(&particles, &mut ordinary, &materials, 0.01, particles.len());
+        ordinary.normalize_velocities();
+        ordinary.apply_pinned_node_constraints();
+
+        let order = spatial_sort_order(&particles, particles.len(), resolution);
+        let mut sorted = crate::grid::Grid::new(resolution);
+        scatter_particles_to_grid_sorted(
+            &particles,
+            &mut sorted,
+            &materials,
+            0.01,
+            particles.len(),
+            &order,
+        );
+        sorted.normalize_velocities();
+        sorted.apply_pinned_node_constraints();
+
+        let pinned_weights = quadratic_weights(particles.x[0]);
+        for gx in 0..3 {
+            for gy in 0..3 {
+                let cell = pinned_weights.base_cell + IVec2::new(gx - 1, gy - 1);
+                assert_eq!(
+                    ordinary.velocity_at(cell),
+                    Vec2::ZERO,
+                    "ordinary P2G left {cell:?} free"
+                );
+                assert_eq!(
+                    sorted.velocity_at(cell),
+                    Vec2::ZERO,
+                    "sorted P2G left {cell:?} free"
+                );
+            }
+        }
+
+        let free_weights = quadratic_weights(particles.x[1]);
+        let mut saw_free_motion = false;
+        for gx in 0..3 {
+            for gy in 0..3 {
+                let cell = free_weights.base_cell + IVec2::new(gx - 1, gy - 1);
+                let ordinary_v = ordinary.velocity_at(cell);
+                let sorted_v = sorted.velocity_at(cell);
+                assert!(
+                    (ordinary_v - sorted_v).length() < 1.0e-6,
+                    "P2G paths disagree at free node {cell:?}: ordinary={ordinary_v:?} sorted={sorted_v:?}"
+                );
+                saw_free_motion |= ordinary_v.length() > 0.1;
+            }
+        }
+        assert!(
+            saw_free_motion,
+            "the distant unpinned particle was accidentally frozen"
+        );
+
+        ordinary.clear();
+        let old_pinned_cell = pinned_weights.base_cell;
+        ordinary.add_mass_momentum(old_pinned_cell, 2.0, Vec2::new(4.0, -6.0));
+        ordinary.normalize_velocities();
+        ordinary.apply_pinned_node_constraints();
+        assert_eq!(
+            ordinary.velocity_at(old_pinned_cell),
+            Vec2::new(2.0, -3.0),
+            "Grid::clear must remove stale pinned-node constraints"
+        );
+    }
+}
+
+/// Where a particle's P2G time goes. Each sub-call of the per-particle work
+/// in `scatter_particles_to_grid` is timed alone over every particle of a
+/// 57 600-particle block on one thread, then the whole P2G is timed for
+/// reference. Run it in an optimised profile, a debug build times the
+/// wrong code:
+///
+///   cargo test --profile quick --lib p2g_cost_breakdown -- --ignored --nocapture
+///
+/// Knob: P2G_PROBE_MATERIAL (`elastic`, or `sand` for Drucker-Prager).
+#[cfg(test)]
+mod p2g_cost_breakdown {
+    use super::*;
+    use crate::grid::CellMap;
+    use crate::materials::registry::MaterialRegistry;
+    use crate::{
+        DruckerPragerMaterial, NeoHookeanMaterial, SimConfig, SpawnRegion, build_particles,
+        lame_from_young,
+    };
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    #[test]
+    #[ignore = "timing probe kept for reruns, not part of the CI suite"]
+    fn p2g_cost_breakdown() {
+        const GRID: usize = 256;
+        const REPS: usize = 20;
+        let config = SimConfig::standard(GRID, 0.02, Vec2::new(0.0, -0.3));
+        let spawn = SpawnRegion {
+            spacing: 0.5,
+            box_size: IVec2::new(120, 120),
+            box_center: Vec2::new(128.0, 70.0),
+            material_id: 0,
+            ..SpawnRegion::for_sim(&config)
+        };
+        let particles = Particles::from(build_particles(&config, spawn));
+        let n = particles.len();
+        let sand = std::env::var("P2G_PROBE_MATERIAL").as_deref() == Ok("sand");
+        let (l, u) = lame_from_young(1.0e4, 0.3);
+        let registry = if sand {
+            MaterialRegistry::with_default(Box::new(DruckerPragerMaterial::new(l, u)))
+        } else {
+            MaterialRegistry::with_default(Box::new(NeoHookeanMaterial::new(l, u)))
+        };
+        let dt = config.dt;
+        let per_particle_ns = |f: &mut dyn FnMut()| -> f64 {
+            f();
+            let t0 = Instant::now();
+            for _ in 0..REPS {
+                f();
+            }
+            t0.elapsed().as_secs_f64() * 1e9 / (REPS * n) as f64
+        };
+        let ids = &particles.material_id;
+
+        let kirchhoff = per_particle_ns(&mut || {
+            for (i, &id) in ids.iter().enumerate() {
+                black_box(registry.kirchhoff_stress(id, &particles, i));
+            }
+        });
+        let get = per_particle_ns(&mut || {
+            for &id in ids {
+                black_box(registry.get(id));
+            }
+        });
+        let passive: Vec<Mat2> = (0..n)
+            .map(|i| registry.kirchhoff_stress(ids[i], &particles, i))
+            .collect();
+        let combined = per_particle_ns(&mut || {
+            for (i, (&id, &tau)) in ids.iter().zip(&passive).enumerate() {
+                let material = registry.get(id);
+                black_box(combined_kirchhoff_stress_from(tau, material, &particles, i));
+            }
+        });
+        let stress_volume = per_particle_ns(&mut || {
+            for (i, &id) in ids.iter().enumerate() {
+                black_box(registry.stress_volume(id, &particles, i));
+            }
+        });
+        let owns_volume = per_particle_ns(&mut || {
+            for &id in ids {
+                black_box(registry.owns_deformation_volume_state(id));
+            }
+        });
+        let weights = per_particle_ns(&mut || {
+            for &x in &particles.x {
+                black_box(quadratic_weights(x));
+            }
+        });
+        // The nine nodes' APIC and stress momentum, with stress and weights
+        // already in hand, into an indexed array.
+        let mut dense = vec![(0.0f32, Vec2::ZERO); GRID * GRID];
+        let node_math = per_particle_ns(&mut || {
+            for (i, &stress) in passive.iter().enumerate() {
+                let x = particles.x[i];
+                let w = quadratic_weights(x);
+                let stress_coeff = -1.0e-3;
+                for gx in 0..3 {
+                    for gy in 0..3 {
+                        let weight = w.wx[gx] * w.wy[gy];
+                        let cell = w.base_cell + IVec2::new(gx as i32 - 1, gy as i32 - 1);
+                        let d = cell.as_vec2() - x + Vec2::splat(0.5);
+                        let m = particles.mass[i];
+                        let momentum = weight
+                            * (m * (particles.v[i] + particles.velocity_gradient[i] * d)
+                                + stress_coeff * (stress * d));
+                        let node = &mut dense[cell.x as usize * GRID + cell.y as usize];
+                        node.0 += weight * m;
+                        node.1 += momentum;
+                    }
+                }
+            }
+        });
+        // The same momentum factored per particle: m (v + C d) + s (S d) is
+        // A + B d with A = m v and B = m C + s S, and d steps by whole cells
+        // between nodes, so each node adds B's columns instead of two
+        // matrix-vector products.
+        let mut dense_f = vec![(0.0f32, Vec2::ZERO); GRID * GRID];
+        let node_math_factored = per_particle_ns(&mut || {
+            for (i, &stress) in passive.iter().enumerate() {
+                let x = particles.x[i];
+                let w = quadratic_weights(x);
+                let stress_coeff = -1.0e-3;
+                let m = particles.mass[i];
+                let a = m * particles.v[i];
+                let b = particles.velocity_gradient[i] * m + stress * stress_coeff;
+                let d0 = w.base_cell.as_vec2() - x + Vec2::splat(0.5);
+                let at_base = a + b * d0;
+                for gx in 0..3 {
+                    for gy in 0..3 {
+                        let weight = w.wx[gx] * w.wy[gy];
+                        let cell = w.base_cell + IVec2::new(gx as i32 - 1, gy as i32 - 1);
+                        let momentum = weight
+                            * (at_base
+                                + (gx as f32 - 1.0) * b.x_axis
+                                + (gy as f32 - 1.0) * b.y_axis);
+                        let node = &mut dense_f[cell.x as usize * GRID + cell.y as usize];
+                        node.0 += weight * m;
+                        node.1 += momentum;
+                    }
+                }
+            }
+        });
+        // The same nine adds into the map type P2G's fold uses.
+        let map_adds = per_particle_ns(&mut || {
+            let mut acc = CellMap::default();
+            for i in 0..n {
+                let w = quadratic_weights(particles.x[i]);
+                for gx in 0..3 {
+                    for gy in 0..3 {
+                        let cell = w.base_cell + IVec2::new(gx as i32 - 1, gy as i32 - 1);
+                        let idx = (cell.x as usize * GRID + cell.y as usize) as u32;
+                        let entry = acc.entry(idx).or_default();
+                        entry.mass += w.wx[gx] * w.wy[gy];
+                    }
+                }
+            }
+            black_box(acc);
+        });
+        let mut grid = Grid::new(GRID);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let full_one_thread = per_particle_ns(&mut || {
+            pool.install(|| {
+                grid.clear();
+                super::super::scatter_particles_to_grid(&particles, &mut grid, &registry, dt, n);
+            });
+        });
+        let full_all_threads = per_particle_ns(&mut || {
+            grid.clear();
+            super::super::scatter_particles_to_grid(&particles, &mut grid, &registry, dt, n);
+        });
+
+        println!(
+            "{n} particles, {}, ns per particle:",
+            if sand {
+                "Drucker-Prager sand"
+            } else {
+                "NeoHookean"
+            }
+        );
+        println!("  kirchhoff_stress (enum dispatch)   {kirchhoff:7.1}");
+        println!("  registry.get (trait object)        {get:7.1}");
+        println!("  combined_kirchhoff_stress_from     {combined:7.1}");
+        println!("  stress_volume                      {stress_volume:7.1}");
+        println!("  owns_deformation_volume_state      {owns_volume:7.1}");
+        println!("  quadratic_weights                  {weights:7.1}");
+        println!("  9-node APIC + stress math, array   {node_math:7.1}");
+        println!("  same, factored per particle        {node_math_factored:7.1}");
+        println!("  9 adds into a CellMap              {map_adds:7.1}");
+        println!("  whole P2G, 1 thread                {full_one_thread:7.1}");
+        println!(
+            "  whole P2G, {} threads               {full_all_threads:7.1}",
+            rayon::current_num_threads()
         );
     }
 }
