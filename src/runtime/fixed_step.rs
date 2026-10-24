@@ -13,7 +13,7 @@ pub struct FixedStepController {
 }
 
 impl FixedStepController {
-    /// Standard interactive stepper — `hz` solver steps per real second, capped at 64/frame.
+    /// Standard interactive stepper -- `hz` solver steps per real second, capped at 64/frame.
     ///
     /// Equivalent to `FixedStepController::new(FixedStepConfig { dt, simulation_speed: hz * dt,
     /// max_substeps_per_frame: 64, max_frame_delta: 1.0 / 15.0 })`.
@@ -52,14 +52,24 @@ impl FixedStepController {
         self.config.simulation_speed = speed;
     }
 
-    pub fn dt(&self) -> f32 {
+    pub const fn dt(&self) -> f32 {
         self.config.dt
     }
-    pub fn simulation_speed(&self) -> f32 {
+    /// The leftover fractional step: how far elapsed time has advanced past
+    /// the last completed physics step, as a `[0,1)` fraction of one `dt`. A
+    /// renderer can interpolate between the previous and current physics
+    /// state (`x_render = lerp(x_prev, x_now, alpha)`, the "Fix Your
+    /// Timestep" pattern, Gaffer 2004) so on-screen motion stays smooth when
+    /// the achievable step cadence varies frame to frame. Changes no physics
+    /// value.
+    pub fn interpolation_alpha(&self) -> f32 {
+        (self.accumulator / self.config.dt).clamp(0.0, 1.0)
+    }
+    pub const fn simulation_speed(&self) -> f32 {
         self.config.simulation_speed
     }
-    /// Reset the time accumulator — call on save-load or pause-resume to prevent stutter.
-    pub fn reset(&mut self) {
+    /// Reset the time accumulator -- call on save-load or pause-resume to prevent stutter.
+    pub const fn reset(&mut self) {
         self.accumulator = 0.0;
     }
 
@@ -71,5 +81,46 @@ impl FixedStepController {
         let steps = raw_steps.min(self.config.max_substeps_per_frame);
         self.accumulator -= steps as f32 * self.config.dt;
         steps
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interpolation_alpha_tracks_leftover_fraction() {
+        let mut stepper = FixedStepController::new(FixedStepConfig {
+            dt: 0.1,
+            simulation_speed: 1.0, // 1 real second = 1 simulated second
+            max_substeps_per_frame: 64,
+            max_frame_delta: 1.0,
+        });
+        // Half a dt's worth of real time -- no step taken yet (raw_steps=0),
+        // so the whole 0.05s should sit in the accumulator as alpha=0.5.
+        assert_eq!(stepper.steps_for_frame(0.05), 0);
+        assert!((stepper.interpolation_alpha() - 0.5).abs() < 1e-6);
+
+        // Another 0.05s completes exactly one dt -- one step taken, leftover
+        // fraction drops back to (near) zero.
+        assert_eq!(stepper.steps_for_frame(0.05), 1);
+        assert!(stepper.interpolation_alpha() < 1e-5);
+    }
+
+    #[test]
+    fn interpolation_alpha_stays_in_zero_one_range_even_capped() {
+        let mut stepper = FixedStepController::new(FixedStepConfig {
+            dt: 0.01,
+            simulation_speed: 1.0,
+            max_substeps_per_frame: 2, // deliberately tiny cap
+            max_frame_delta: 1.0,
+        });
+        // Elapsed time far beyond what the cap allows: the accumulator keeps
+        // the unconsumed backlog (see `steps_for_frame`), so alpha stays
+        // clamped to [0,1) rather than reporting a multi-step overrun.
+        let steps = stepper.steps_for_frame(1.0);
+        assert_eq!(steps, 2);
+        let alpha = stepper.interpolation_alpha();
+        assert!((0.0..=1.0).contains(&alpha), "alpha={alpha} out of range");
     }
 }

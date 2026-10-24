@@ -7,13 +7,34 @@ use super::body_plan::BodyPlan;
 
 // ── Config / controller / state ───────────────────────────────────────────────
 
+#[derive(Debug)]
 pub struct DiffConfig {
+    /// Uniform per-particle mass for this mini-sim -- a free constant, same
+    /// disclosed-simplification convention as `stress_coeff` below (this
+    /// whole module trades real, SI-calibrated physics for a small,
+    /// stylized, backprop-friendly training environment, per
+    /// `spacetime::diff`'s module doc). 1.0 keeps every derived
+    /// quantity in the same simple unit scale the rest of this
+    /// free-parameter config already uses.
     pub mass: f32,
     /// P2G stress premultiplier: `-V0 * KERNEL_D_INVERSE * dt` in the real
     /// solver; a free constant here.
     pub stress_coeff: f32,
+    /// Fixed substep size for this mini-sim's own explicit integration --
+    /// NOT CFL-derived (unlike the solver's adaptive substep logic,
+    /// `spacetime::solver::cfl`): this differentiable stepper trades real
+    /// adaptive stability for a constant, backprop-friendly step count per
+    /// rollout. 0.01 is an empirically-stable free choice across
+    /// `BodyPlan`'s creature scales, not derived from a stability bound.
     pub dt: f32,
     pub kernel_d_inverse: f32,
+    /// Same ROLE as `SimConfig::apic_blend` (PIC/FLIP interpolation), but a
+    /// FREE constant here, not a derived one: `SimConfig::apic_blend`'s own
+    /// doc grounds its value in a strict WC-MPM continuity-equation
+    /// requirement for real fluid materials -- this mini-sim's own material
+    /// model has no such continuity constraint, so there is nothing to
+    /// derive it from. `1.0` (pure APIC, no FLIP blending) matches this
+    /// whole struct's disclosed "stylized training environment" status.
     pub apic_blend: f32,
     /// Downward gravitational acceleration (grid units / s^2).
     pub gravity: f32,
@@ -32,20 +53,15 @@ pub struct DiffConfig {
     /// ending far right by any means -- including ballistic hops; a window
     /// rewards sustained progress. See `controller_gradient`.
     pub loss_window: usize,
-    /// Coefficient penalizing mean squared vertical velocity across the
-    /// WHOLE rollout, added to the training loss. Real root cause found
-    /// live 2026-07-11: `loss_window` alone rewards "consistently far right
-    /// through sustained contact" but does not PENALIZE vertical motion
-    /// itself -- if a ballistic hop still covers more ground per unit loss
-    /// than a grounded gait, gradient descent takes the hop regardless of
-    /// how the actuators are arranged (confirmed: adding horizontal
-    /// push-off muscles alone, see `BodyPlan::biped`, improved vy/vx from
-    /// 1.76 to 1.46-1.58 but left contact fraction at ~0.22-0.23 once
-    /// actuation was strong enough to move any real distance). Direct
-    /// penalty on vertical velocity is the standard fix in published
-    /// legged-locomotion reward functions (torso-height/vertical-velocity
-    /// penalties are near-universal there) -- 0.0 disables it (backward
-    /// compatible default).
+    /// Coefficient penalizing mean squared vertical velocity across the whole
+    /// rollout, added to the training loss. `loss_window` alone rewards
+    /// "consistently far right through sustained contact" but does not
+    /// penalize vertical motion, so if a ballistic hop covers more ground per
+    /// unit loss than a grounded gait, gradient descent takes the hop however
+    /// the actuators are arranged (horizontal push-off muscles alone, see
+    /// `BodyPlan::biped`, moved vy/vx from 1.76 to 1.46-1.58 but left the
+    /// contact fraction at ~0.22-0.23). A vertical-velocity penalty is common
+    /// in published legged-locomotion reward functions. 0.0 disables it.
     pub bounce_penalty: f32,
     /// Coefficient penalizing mean squared activation across the whole
     /// rollout and all groups -- the "torque cost" half of standard
@@ -78,7 +94,7 @@ impl Default for DiffConfig {
 
 /// Open-loop sinusoid-basis controller (DiffTaichi `compute_actuation`):
 /// `act[t, g] = tanh( sum_j w[g,j] * sin(omega * t * dt + 2*pi*j/n_waves) + b[g] )`.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct SinusoidController {
     /// Row-major `[group][wave]`.
     pub weights: Vec<f32>,
@@ -89,20 +105,15 @@ pub struct SinusoidController {
     /// reuses group `s`'s weights/bias (a mirrored, not independent, muscle)
     /// instead of having its own free parameters. `None` = free/trainable.
     ///
-    /// Real technique, found live 2026-07-11 after a diagnosed failure: a
-    /// trained biped with fully independent left/right controllers found a
-    /// ONE-LEGGED HOP (one leg permanently retracted, the other doing all
-    /// the work) -- nothing in a pure drift/bounce/effort loss requires the
-    /// two legs to alternate, and that degenerate solution is simpler for
-    /// gradient descent to find than genuine alternation. Cross-checked
-    /// against EvoSoro's real, published soft-robot evolution source
-    /// (`evosoro/networks.py`, `enforce_symmetry()`): it mirrors left/right
-    /// genome parameters structurally so an asymmetric solution can't even
-    /// be represented, rather than hoping a loss term discourages it.
-    /// Combined here with `phase_offset` (standard CPG anti-phase coupling
-    /// for ALTERNATING, not synchronized, gaits): mirroring alone would make
-    /// both legs move identically in phase (a two-legged synchronized hop,
-    /// not a walk); the phase offset is what turns that into alternation.
+    /// With fully independent left/right controllers, a trained biped found a
+    /// one-legged hop (one leg retracted, the other doing all the work):
+    /// nothing in a drift/bounce/effort loss requires the legs to alternate,
+    /// and that solution is easier for gradient descent to find. EvoSoro's
+    /// soft-robot evolution code (`evosoro/networks.py`, `enforce_symmetry()`)
+    /// mirrors left/right genome parameters so an asymmetric solution cannot
+    /// be represented. Combined with `phase_offset` (CPG anti-phase coupling):
+    /// mirroring alone moves both legs in phase (a synchronized hop); the
+    /// phase offset turns that into alternation.
     pub mirror_of: Vec<Option<usize>>,
     /// Extra phase (radians) added to group `g`'s sinusoid argument.
     pub phase_offset: Vec<f32>,
@@ -117,15 +128,12 @@ impl SinusoidController {
         Self::seeded_with(n_groups, n_waves, 0)
     }
 
-    /// Same as `seeded`, but with an explicit `seed` -- every call to
-    /// `seeded` (no seed argument) used the SAME index-only hash for the
-    /// entire session, meaning every hyperparameter sweep started from the
-    /// literal same initial weights every time. Non-convex training
-    /// standardly needs multiple random restarts, not just hyperparameter
-    /// search over a single fixed starting point -- real gap, found late
-    /// 2026-07-11 after several sweeps converged to different DEGENERATE
-    /// solutions (frozen, one-legged hop, monotonic tilt) without ever
-    /// trying a different basin of attraction.
+    /// Same as `seeded`, but with an explicit `seed`. `seeded` uses one
+    /// index-only hash, so every call starts from the same initial weights;
+    /// non-convex training needs several random restarts, not only a
+    /// hyperparameter search from one starting point (sweeps from a single
+    /// start converged to different degenerate solutions: frozen, one-legged
+    /// hop, monotonic tilt).
     pub fn seeded_with(n_groups: usize, n_waves: usize, seed: u32) -> Self {
         let rand = |i: usize| -> f32 {
             let x = (i as u32)
@@ -185,7 +193,7 @@ impl SinusoidController {
 }
 
 /// Closed-loop state-feedback controller -- ChainQueen's real `walker_2d.py`
-/// design (verified against the real source, `demos/walker_2d.py`): each
+/// design (verified against the source, `demos/walker_2d.py`): each
 /// muscle group's mean position (relative to the body's own centroid, for
 /// translation invariance) and mean velocity feed ONE shared linear layer +
 /// tanh, producing all groups' activations together (so one group's muscle
@@ -201,7 +209,7 @@ impl SinusoidController {
 ///
 /// Per-group feature layout: `[rel_x, rel_y, vel_x, vel_y]`, concatenated
 /// group-major -- `feature_len() = n_groups * 4`.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct FeedbackController {
     /// Row-major `[output_group][input_feature]`.
     pub weights: Vec<f32>,
@@ -210,7 +218,7 @@ pub struct FeedbackController {
 }
 
 impl FeedbackController {
-    pub fn feature_len(n_groups: usize) -> usize {
+    pub const fn feature_len(n_groups: usize) -> usize {
         n_groups * 4
     }
 
@@ -364,7 +372,7 @@ impl FeedbackController {
 }
 
 /// Per-particle dynamic state of the mini-sim.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct DiffState {
     pub x: Vec<Vec2>,
     pub v: Vec<Vec2>,
@@ -390,6 +398,7 @@ impl DiffState {
 
 /// What one forward substep records for its backward pass: the sticky-floor
 /// branch decisions (everything else is recomputed from the stored states).
+#[derive(Debug)]
 pub struct StepRecord {
     pub(super) stuck: BTreeSet<(i32, i32)>,
 }

@@ -1,22 +1,22 @@
-// Day-night/ambient thermal diffusion — GPU port of ThermalDiffusion
+// Day-night/ambient thermal diffusion -- GPU port of ThermalDiffusion
 // (src/energy/thermodynamics/diffusion.rs). Same real PDE: Fourier's law
 // ∂T/∂t = α·∇²T, plus Newton cooling dT/dt = −k_c·(T−ambient). Dense
 // grid_res² dispatch every substep, no active-block optimization (matches
-// CPU's own unconditional-dense-grid behavior — real, bounded scope).
+// CPU's own unconditional-dense-grid behavior -- bounded scope).
 //
 // 4 passes, mirroring CPU's ThermalDiffusion::apply stages exactly, each a
 // separate dispatch because the Laplacian pass needs every cell's NORMALIZED
-// temperature to be settled before it reads any neighbor — a genuine global
+// temperature to be settled before it reads any neighbor -- a global
 // barrier, not something a single fused pass can satisfy:
-//   1. thermal_clear_main      — zero thermal_mass + thermal_work
-//   2. thermal_p2g_main        — one thread per particle, scatter mass-
+//   1. thermal_clear_main      -- zero thermal_mass + thermal_work
+//   2. thermal_p2g_main        -- one thread per particle, scatter mass-
 //                                 weighted temperature (fixed-point atomics,
 //                                 same convention as p2g.wgsl)
-//   3. thermal_normalize_laplacian_main — one thread per cell: normalize
+//   3. thermal_normalize_laplacian_main -- one thread per cell: normalize
 //                                 (thermal_temp_old = work/mass, or ambient
 //                                 if empty), 5-point Laplacian FD into
 //                                 thermal_work, Newton cooling folded in
-//   4. thermal_g2p_main        — one thread per particle, gather Δparticle
+//   4. thermal_g2p_main        -- one thread per particle, gather Δparticle
 //                                 temperature = (T_new − T_old) at this
 //                                 particle's position
 
@@ -55,9 +55,9 @@ struct StepParams {
     boundary_thickness: u32,
     vel_limit:          f32,
     sleep_threshold:    f32,
-    _pad0:              u32,
-    _pad1:              u32,
-    _pad2:              u32,
+    contact_friction:              f32,
+    grid_cell_size:              f32,
+    contact_active:              u32,
 }
 
 struct ThermalParams {
@@ -65,6 +65,12 @@ struct ThermalParams {
     ambient:      f32,
     cooling_rate: f32,
     enabled:      u32,
+    // Seconds one pass advances: the frame's dt over the passes `step_frame` runs.
+    // The thermal passes run once per frame, after the mechanics substeps.
+    dt:           f32,
+    _pad0:        u32,
+    _pad1:        u32,
+    _pad2:        u32,
 }
 
 const BSPLINE_INNER_LIMIT:  f32 = 0.5;
@@ -73,7 +79,7 @@ const BSPLINE_CENTER_COEFF: f32 = 0.75;
 const BSPLINE_OUTER_SCALE:  f32 = 0.5;
 const CELL_CENTER_OFFSET:   f32 = 0.5;
 // Same fixed-point atomic convention as p2g.wgsl's MASS_ATOMIC_SCALE/MOM_ATOMIC_SCALE
-// (duplicated per-shader-file, WGSL has no cross-file includes — same precedent).
+// (duplicated per-shader-file, WGSL has no cross-file includes -- same precedent).
 const THERMAL_ATOMIC_SCALE: f32 = 100000.0;
 
 @group(0) @binding(0) var<storage, read_write> particles:   array<Particle>;
@@ -142,28 +148,34 @@ fn thermal_p2g_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 }
 
+// Normalize: thermal_temp_old[i] = T_old (mass-weighted average, or ambient where the
+// cell has no particle mass). A dispatch of its own: the Laplacian below reads four
+// neighbours, two of them in other workgroups, and `storageBarrier` orders memory only
+// within a workgroup, so normalizing and differencing in one dispatch read neighbours
+// that had not been written yet.
 @compute @workgroup_size(64, 1, 1)
-fn thermal_normalize_laplacian_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn thermal_normalize_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if thermal_params.enabled == 0u { return; }
     let res = step_params.grid_res;
-    let n = res * res;
     let i = gid.x;
-    if i >= n { return; }
-
-    // Normalize: thermal_temp_old[i] = T_old (mass-weighted average, or ambient if
-    // this cell has no particle mass). thermal_work still holds the raw P2G scatter
-    // at this point -- read via atomicLoad since it's declared atomic<i32>, then
-    // immediately overwritten below with the post-Laplacian T_new.
+    if i >= res * res { return; }
     let mass_i = f32(atomicLoad(&thermal_mass[i])) / THERMAL_ATOMIC_SCALE;
     let raw_i = f32(atomicLoad(&thermal_work[i])) / THERMAL_ATOMIC_SCALE;
+    thermal_temp_old[i] = select(thermal_params.ambient, raw_i / mass_i, mass_i > 1e-10);
+}
+
+// 5-point Laplacian FD on the normalized field (column-major idx = cy*res+cx, matching
+// thermal_p2g_main's own scatter convention above), off-grid neighbours read as
+// ambient (Dirichlet), then Newton cooling. thermal_work receives T_new.
+@compute @workgroup_size(64, 1, 1)
+fn thermal_laplacian_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if thermal_params.enabled == 0u { return; }
+    let res = step_params.grid_res;
+    let i = gid.x;
+    if i >= res * res { return; }
     let ambient = thermal_params.ambient;
-    let t_old_i = select(ambient, raw_i / mass_i, mass_i > 1e-10);
-    thermal_temp_old[i] = t_old_i;
-
-    storageBarrier();
-
-    // 5-point Laplacian FD (column-major idx = cy*res+cx, matching thermal_p2g_main's
-    // own scatter convention above). Off-grid neighbors treated as ambient (Dirichlet).
+    let dt = thermal_params.dt;
+    let t_old_i = thermal_temp_old[i];
     let cx = i32(i % res);
     let cy = i32(i / res);
     let t_xm = select(ambient, thermal_temp_old[u32(cy) * res + u32(cx - 1)], cx > 0);
@@ -171,11 +183,12 @@ fn thermal_normalize_laplacian_main(@builtin(global_invocation_id) gid: vec3<u32
     let t_ym = select(ambient, thermal_temp_old[u32(cy - 1) * res + u32(cx)], cy > 0);
     let t_yp = select(ambient, thermal_temp_old[u32(cy + 1) * res + u32(cx)], cy + 1 < i32(res));
     let laplacian = t_xm + t_xp + t_ym + t_yp - 4.0 * t_old_i;
-    var t_new = t_old_i + thermal_params.alpha * step_params.dt * laplacian;
+    var t_new = t_old_i + thermal_params.alpha * dt * laplacian;
 
-    // Newton cooling: T_new += -k_c*dt*(T-ambient), folded into the same pass.
-    let decay = thermal_params.cooling_rate * step_params.dt;
-    t_new += decay * (ambient - t_new);
+    // Newton cooling, dT/dt = -k_c (T - ambient), by its exact solution over the pass
+    // as CPU's ThermalDiffusion does: the explicit `1 - k_c dt` form loses accuracy
+    // once passes are a frame long.
+    t_new = ambient + (t_new - ambient) * exp(-thermal_params.cooling_rate * dt);
 
     atomicStore(&thermal_work[i], i32(round(t_new * THERMAL_ATOMIC_SCALE)));
 }

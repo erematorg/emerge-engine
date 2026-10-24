@@ -13,7 +13,7 @@ use crate::{grid::Grid, particle::Particles};
 
 use super::SimSnapshot;
 
-/// Particle-only snapshot — no grid required. Used by `GpuSimulation::diagnostics_snapshot`.
+/// Particle-only snapshot -- no grid required. Used by `GpuSimulation::diagnostics_snapshot`.
 /// Grid-side fields (mass error, momentum error, grid speed, active cells) are left at zero.
 pub fn collect_snapshot_particles_only(
     frame_index: u64,
@@ -36,8 +36,8 @@ pub fn collect_snapshot_particles_only(
         avg_elastic_hardening: 1.0,
         ..Default::default()
     };
-    let min_bound = config.boundary_thickness.saturating_sub(1) as f32;
-    let max_bound = config.grid_res.saturating_sub(config.boundary_thickness) as f32;
+    let (min_bound, max_bound) =
+        crate::boundary::position_clamp_bounds(config.boundary_thickness, config.grid_res);
     let mut jp_sum = 0.0f32;
     let mut h_sum = 0.0f32;
 
@@ -153,8 +153,8 @@ pub fn collect_snapshot(
     let mut h_sum = 0.0f32;
     let mut material_cells = HashMap::<usize, MaterialCellState>::new();
 
-    let min_bound = config.boundary_thickness.saturating_sub(1) as f32;
-    let max_bound = config.grid_res.saturating_sub(config.boundary_thickness) as f32;
+    let (min_bound, max_bound) =
+        crate::boundary::position_clamp_bounds(config.boundary_thickness, config.grid_res);
 
     for i in particles.indices() {
         let mass = particles.mass[i];

@@ -1,33 +1,24 @@
-// ASFLIP (GPU port, Fei, Guo, Wu, Huang, Gao 2021, "Revisiting Integration in the
-// Material Point Method: A Scheme for Easier Separation and Less Dissipation") --
-// fused G2P + particles_update, dispatched INSTEAD OF the ordinary g2p+particles_update
-// pair for a substep, ONLY when SimConfig::asflip_blend > 0.0 (see SubstepGates::
-// asflip_active in encode_substep.rs). Ordinary scenes (asflip disabled, the default)
-// never touch this file at all -- zero cost, zero behavior change.
+// ASFLIP (Fei, Guo, Wu, Huang, Gao 2021, "Revisiting Integration in the Material
+// Point Method: A Scheme for Easier Separation and Less Dissipation") -- fused G2P +
+// particles_update, dispatched instead of the ordinary g2p+particles_update pair for
+// a substep only when SimConfig::asflip_blend > 0.0 (see SubstepGates::asflip_active
+// in encode_substep.rs). Scenes with ASFLIP disabled (the default) never run it.
 //
-// WHY FUSED (not two separate ASFLIP-aware passes mirroring g2p/particles_update's own
-// split): ASFLIP's position correction is adaptive -- it applies while two bodies are
-// SEPARATING (gamma=1) but not while COMPRESSING (gamma=0), see CPU's
-// `gather_grid_to_particles` in transfer.rs for the reference formula this ports. That
-// means the STORED velocity (v_store, always gets the ASFLIP kick) and the POSITION
-// velocity (v_position, only gets the kick while separating) can genuinely differ. CPU
-// computes both in one function and uses them locally. GPU's existing architecture
-// splits velocity-gather (g2p.wgsl) from F-update/position (particles_update.wgsl) into
-// two separate dispatches for a real, different reason (Gao et al. 2018 sorted-access
-// cache locality) -- meaning v_position would need to survive from the first dispatch
-// to the second. `Particle` has exactly one spare u32 (4 bytes) left; a second stored
-// Vec2 needs 8. Rather than grow the 128-byte struct (real risk: this exact struct had
-// a confirmed, still-not-fully-understood GPU corruption bug from a MUCH smaller
-// mid-struct field insertion earlier this project -- see Particle::scalar_field's own
-// doc), this fused kernel keeps v_store/v_position as pure local variables that never
-// need to leave one thread's registers, at the cost of one new pipeline variant.
+// Why fused: ASFLIP's position correction is adaptive, applied while two bodies
+// separate (gamma=1) but not while they compress (gamma=0); see CPU's
+// `gather_grid_to_particles` in transfer.rs for the formula this ports. The stored
+// velocity (v_store, always kicked) and the position velocity (v_position, kicked only
+// while separating) can differ. CPU computes both in one function. The GPU splits
+// velocity gather (g2p.wgsl) from F-update/position (particles_update.wgsl) for sorted-
+// access cache locality (Gao et al. 2018), so v_position would have to survive between
+// the two dispatches, and `Particle` has no spare bytes left in its 128-byte layout.
+// This kernel keeps v_store/v_position as thread-local variables, at the cost of one
+// more pipeline variant.
 //
-// REAL, DISCLOSED MAINTENANCE COST: WGSL has no module/include system, so this file
-// duplicates particles_update.wgsl's plasticity math (svd2 and all 6 material-model
-// return-mapping functions) verbatim rather than sharing it. If that file's plasticity
-// logic ever changes, THIS file needs the identical change applied by hand -- there is
-// no compiler enforcement keeping them in sync. Flagged honestly, not hidden; a real
-// WGSL-side module system would remove this risk but doesn't exist in this toolchain.
+// Maintenance cost: WGSL has no module/include system, so this file duplicates
+// particles_update.wgsl's plasticity math (svd2 and all 6 material-model return-mapping
+// functions) verbatim. A change to that file's plasticity logic must be applied here by
+// hand; nothing enforces it.
 
 struct Particle {
     x:                    vec2<f32>,
@@ -86,6 +77,14 @@ struct MaterialParams {
     bulk_viscosity:          f32,
     surface_tension_coeff:   f32,
     cohesion_coeff:              f32,
+    // See Rust MaterialParams. Not consumed here (ASFLIP is mutually
+    // exclusive with strict-fluid mode, see step.rs's
+    // assert_strict_fluid_mode_is_supported); kept for byte-layout parity
+    // with the other MaterialParams mirrors sharing the uniform buffer.
+    owns_deformation_volume_state: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 struct StepParams {
@@ -97,8 +96,8 @@ struct StepParams {
     boundary_thickness: u32,
     vel_limit:          f32,
     sleep_threshold:    f32,
-    _pad0:              u32,
-    _pad1:              u32,
+    contact_friction:              f32,
+    grid_cell_size:              f32,
     contact_active:     u32,
 }
 
@@ -124,6 +123,27 @@ const CELL_CENTER_OFFSET:   f32 = 0.5;
 @group(0) @binding(1) var<storage, read_write> grid:                 array<Cell>;
 @group(0) @binding(2) var<uniform>              materials:            array<MaterialParams, MAX_MATERIALS>;
 @group(0) @binding(3) var<uniform>              step_params:          StepParams;
+
+// This substep's timestep and velocity cap, decided on the GPU at the end of the previous
+// substep -- see `adaptive_cfl.wgsl`. `substep_dt()`/`vel_limit` are the CPU's
+// frame-start values and are NOT authoritative any more (the GPU may only tighten them).
+@group(2) @binding(37) var<storage, read_write> adaptive_dt: array<atomic<u32>, 5>;
+
+// Cached per invocation: this is an atomic storage load, and reading it at every use
+// site cost ~40% of a substep (measured: 0.29 -> 0.41ms per substep on the dam break).
+var<private> substep_dt_cache: f32 = -1.0;
+
+fn substep_dt() -> f32 {
+    if substep_dt_cache < 0.0 {
+        substep_dt_cache = bitcast<f32>(atomicLoad(&adaptive_dt[0]));
+    }
+    return substep_dt_cache;
+}
+
+fn substep_vel_limit(dt: f32) -> f32 {
+    return step_params.grid_cell_size / max(dt, 1.0e-12);
+}
+
 @group(0) @binding(5) var<storage, read_write> sorted_particle_ids:  array<u32>;
 // Multi-field contact (GPU port) -- resolved velocities from resolve_contact_main, same
 // fallback-to-total-velocity convention g2p.wgsl already relies on.
@@ -138,6 +158,27 @@ fn bspline_w(d: f32) -> f32 {
     if a < BSPLINE_INNER_LIMIT { return BSPLINE_CENTER_COEFF - a * a; }
     if a < BSPLINE_OUTER_LIMIT { let t = BSPLINE_OUTER_LIMIT - a; return BSPLINE_OUTER_SCALE * t * t; }
     return 0.0;
+}
+
+// Free-surface velocity extrapolation for an UNTOUCHED grid node -- see
+// `g2p.wgsl`'s own copy of this function for the full doc (same core-solver
+// fix, this file's own separate fused G2P+particles_update pass).
+fn extrapolated_boundary_velocity(
+    particle_v: vec2<f32>,
+    cx: i32,
+    cy: i32,
+    res: i32,
+    gravity: vec2<f32>,
+    dt: f32,
+    boundary_thickness: u32,
+) -> vec2<f32> {
+    var v = particle_v + gravity * dt;
+    let bt = i32(boundary_thickness);
+    if cx < bt          && v.x < 0.0 { v.x = 0.0; }
+    if cx >= res - bt   && v.x > 0.0 { v.x = 0.0; }
+    if cy < bt          && v.y < 0.0 { v.y = 0.0; }
+    if cy >= res - bt   && v.y > 0.0 { v.y = 0.0; }
+    return v;
 }
 
 // ── 2D SVD (verbatim copy of particles_update.wgsl's own -- see this file's top doc
@@ -200,8 +241,8 @@ fn snow_plasticity(f_trial: mat2x2<f32>, jp_in: f32, mat: MaterialParams) -> Sno
 
 fn dp_alpha(q: f32, mat: MaterialParams) -> f32 {
     let phi = mat.dp_h0 + (mat.dp_h1 * q - mat.dp_h3) * exp(-mat.dp_h2 * q);
-    let s   = sin(phi);
-    return sqrt(2.0 / 3.0) * (2.0 * s) / max(3.0 - s, NUM_FLOOR_TIGHT);
+    // The 2D Mohr-Coulomb match, sin(phi) / sqrt(2) (see sand.rs `alpha`).
+    return sin(phi) * 0.70710678;
 }
 
 struct DpReturn { sigma: vec2<f32>, dq: f32, log_vol_delta: f32 }
@@ -213,7 +254,11 @@ fn dp_plasticity(sigma_in: vec2<f32>, log_volume_strain: f32, q: f32, mat: Mater
     let dev   = eps - vec2<f32>(tr * 0.5);
     let dn    = length(dev);
 
-    if dn < NUM_FLOOR_TIGHT || tr > 0.0 {
+    // Tension cutoff: expansion goes to the cone's tip. A zero deviator under
+    // compression stays elastic (Klar et al. 2016 sec. 7.1 test Case I before
+    // Case II; see sand.rs `project`) and is only sent to the tip below, once
+    // gamma has found it outside the cone.
+    if tr > 0.0 {
         let prev_det = sigma.x * sigma.y;
         return DpReturn(vec2<f32>(1.0), dn, log(max(prev_det, NUM_FLOOR_TIGHT * NUM_FLOOR_TIGHT)));
     }
@@ -225,6 +270,10 @@ fn dp_plasticity(sigma_in: vec2<f32>, log_volume_strain: f32, q: f32, mat: Mater
 
     if gamma <= 0.0 {
         return DpReturn(sigma, 0.0, 0.0);
+    }
+    if dn < NUM_FLOOR_TIGHT {
+        let prev_det = sigma.x * sigma.y;
+        return DpReturn(vec2<f32>(1.0), 0.0, log(max(prev_det, NUM_FLOOR_TIGHT * NUM_FLOOR_TIGHT)));
     }
 
     let h_eps     = eps - gamma * (dev / dn);
@@ -348,9 +397,72 @@ fn det2(m: mat2x2<f32>) -> f32 {
     return m[0][0] * m[1][1] - m[0][1] * m[1][0];
 }
 
+// Squared Frobenius norm, matrix taken BY VALUE -- same reason as `trace2`
+// (particles_update.wgsl): indexing a column straight out of a mat2x2 member
+// of a function-local struct copy lost the column index on the AMD Vulkan
+// target, so `p.velocity_gradient[1]` silently re-read column 0 and this
+// NaN guard never saw column 1.
+fn frob2_sq(m: mat2x2<f32>) -> f32 {
+    return dot(m[0], m[0]) + dot(m[1], m[1]);
+}
+
+// exp(A) - I, matching CPU `deformation_increment_exp_minus_identity`: see
+// its doc for why the increment is never formed as one plus a small number
+// (a loaded body's F straddles 1, where f32 steps differ above and below,
+// and `1 + small` then rounds one way every substep), and
+// `INCREMENT_SERIES_LIMIT`'s for why the series runs to |delta^2| < 1: the
+// accuracy WGSL requires of sinh, sin and exp (W3C WGSL, section 15.7.4
+// Floating Point Accuracy) can lose a substep's small argument entirely.
+// Keep this duplicate bit-identical to particles_update.wgsl: these are two
+// separate production G2P/update paths, not shared textual includes.
+fn deformation_increment_exp_minus_identity(a: mat2x2<f32>) -> mat2x2<f32> {
+    let identity = mat2x2<f32>(vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 1.0));
+    let half_trace = 0.5 * (a[0][0] + a[1][1]);
+    let half_difference = 0.5 * (a[0][0] - a[1][1]);
+    let delta_sq = half_difference * half_difference + a[1][0] * a[0][1];
+    // cosh(sqrt(x)) - 1 and sinh(sqrt(x))/sqrt(x), cos/sin of sqrt(-x) for x < 0.
+    var even_minus_one = 0.0;
+    var odd_factor = 0.0;
+    if abs(delta_sq) < 1.0 {
+        let x = delta_sq;
+        even_minus_one = x * (1.0 / 2.0
+            + x * (1.0 / 24.0 + x * (1.0 / 720.0 + x * (1.0 / 40320.0 + x / 3628800.0))));
+        odd_factor = 1.0 + x * (1.0 / 6.0
+            + x * (1.0 / 120.0 + x * (1.0 / 5040.0 + x * (1.0 / 362880.0 + x / 39916800.0))));
+    } else if delta_sq > 0.0 {
+        let delta = sqrt(delta_sq);
+        let half = sinh(0.5 * delta);
+        even_minus_one = 2.0 * half * half;
+        odd_factor = sinh(delta) / delta;
+    } else {
+        let omega = sqrt(-delta_sq);
+        let half = sin(0.5 * omega);
+        even_minus_one = -2.0 * half * half;
+        odd_factor = sin(omega) / omega;
+    }
+    // e^h - 1 for h = tr(A) / 2. WGSL's exp may be 3 + 2|x| ULP off a result
+    // near 1, so below |h| < 0.5 this is the Taylor series to h^8 (first
+    // omitted term under 1.1e-8 of h); the CPU calls f32::exp_m1.
+    var scale_minus_one = 0.0;
+    if abs(half_trace) < 0.5 {
+        let h = half_trace;
+        scale_minus_one = h * (1.0 + h * (1.0 / 2.0 + h * (1.0 / 6.0 + h * (1.0 / 24.0
+            + h * (1.0 / 120.0 + h * (1.0 / 720.0 + h * (1.0 / 5040.0 + h / 40320.0)))))));
+    } else {
+        scale_minus_one = exp(half_trace) - 1.0;
+    }
+    // exp(A) - I = (e + s (1 + e)) I + (1 + s) odd (A - h I).
+    let traceless = a - half_trace * identity;
+    return (even_minus_one + scale_minus_one * (1.0 + even_minus_one)) * identity
+        + ((1.0 + scale_minus_one) * odd_factor) * traceless;
+}
+
 // Workgroup size MUST match WG_PARTICLES (= 64) in src/gpu/mod.rs, same as g2p/particles_update.
 @compute @workgroup_size(64, 1, 1)
 fn g2p_asflip_fused_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    // The frame's time is already fully advanced -- this encoded substep is spare
+    // capacity the CPU could not size exactly in advance (see adaptive_cfl.wgsl).
+    if substep_dt() <= 0.0 { return; }
     if gid.x >= step_params.particle_count { return; }
     // Sorted access -- matches particles_update.wgsl's own convention (cache-coherent
     // for this shader's own particle-memory access pattern); no correctness dependence
@@ -394,29 +506,59 @@ fn g2p_asflip_fused_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     } else {
         let is_grip = p.contact_group != 0u;
         let contact_active = step_params.contact_active != 0u;
+        // Same rule as g2p_gather.inc.wgsl: a node below NUM_FLOOR mass is
+        // left out of B, a wall (out-of-bounds) cell counts.
+        var included_di = array<bool, 3>(false, false, false);
+        var included_dj = array<bool, 3>(false, false, false);
 
         for (var di: i32 = -1; di <= 1; di++) {
             for (var dj: i32 = -1; dj <= 1; dj++) {
                 let cx = base.x + di;
                 let cy = base.y + dj;
-                if cx < 0 || cy < 0 || cx >= i32(res) || cy >= i32(res) { continue; }
+                if cx < 0 || cy < 0 || cx >= i32(res) || cy >= i32(res) {
+                    included_di[di + 1] = true;
+                    included_dj[dj + 1] = true;
+                    continue;
+                }
 
                 let cell_dist = vec2<f32>(f32(cx), f32(cy)) + vec2<f32>(CELL_CENTER_OFFSET) - p.x;
                 let w = bspline_w(cell_dist.x) * bspline_w(cell_dist.y);
 
                 let node_idx = u32(cy) * res + u32(cx);
                 let cell   = grid[node_idx];
-                let cell_v = select(
+                let touched_v = select(
                     cell.momentum,
                     select(resolved_rest_v[node_idx], resolved_grip_v[node_idx], is_grip),
                     contact_active,
                 );
+                // Free-surface velocity extrapolation for untouched nodes --
+                // see `extrapolated_boundary_velocity`'s doc.
+                let extrap_v = extrapolated_boundary_velocity(
+                    p.v, cx, cy, i32(res), step_params.gravity, substep_dt(),
+                    step_params.boundary_thickness,
+                );
+                let is_touched = cell.mass > NUM_FLOOR;
+                let cell_v = select(extrap_v, touched_v, is_touched);
+
+                // An extrapolated node contributes to new_v but not to the
+                // affine gradient; plain (non-contact) path only.
+                let excluded_from_gradient = !is_touched && !contact_active;
 
                 new_v       += w * cell_v;
-                b_col0      += w * cell_v * cell_dist.x;
-                b_col1      += w * cell_v * cell_dist.y;
+                if !excluded_from_gradient {
+                    included_di[di + 1] = true;
+                    included_dj[dj + 1] = true;
+                    b_col0 += w * cell_v * cell_dist.x;
+                    b_col1 += w * cell_v * cell_dist.y;
+                }
                 new_density += w * cell.mass;
             }
+        }
+        if (i32(included_di[0]) + i32(included_di[1]) + i32(included_di[2])) < 2 {
+            b_col0 = vec2<f32>(0.0);
+        }
+        if (i32(included_dj[0]) + i32(included_dj[1]) + i32(included_dj[2])) < 2 {
+            b_col1 = vec2<f32>(0.0);
         }
     }
 
@@ -453,8 +595,8 @@ fn g2p_asflip_fused_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // v_store when ASFLIP disabled, since v_store==v_position==new_v then). NaN-safe
     // select, same defensive pattern g2p_main's own (pre-ASFLIP) clamp already used.
     let spd = length(v_store);
-    if !(spd <= step_params.vel_limit) {
-        let inv = step_params.vel_limit / spd;
+    if !(spd <= substep_vel_limit(substep_dt())) {
+        let inv = substep_vel_limit(substep_dt()) / spd;
         let scale = select(inv, 0.0, !(inv > 0.0));
         v_store *= scale;
         v_position *= scale;
@@ -481,7 +623,7 @@ fn g2p_asflip_fused_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // and using `v_position` (not `p.v`) for the position line. ─────────────────────────
 
     let mat = materials[p.material_id];
-    let dt  = step_params.dt;
+    let dt  = substep_dt();
     let bt  = f32(step_params.boundary_thickness);
     let identity = mat2x2<f32>(vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 1.0));
 
@@ -491,8 +633,7 @@ fn g2p_asflip_fused_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if !(p.x.x >= 0.0 && p.x.x < fres) { p.x.x = half; }
     if !(p.x.y >= 0.0 && p.x.y < fres) { p.x.y = half; }
     if !(dot(p.v, p.v) >= 0.0) { p.v = vec2<f32>(0.0); }
-    let cg = dot(p.velocity_gradient[0], p.velocity_gradient[0])
-           + dot(p.velocity_gradient[1], p.velocity_gradient[1]);
+    let cg = frob2_sq(p.velocity_gradient);
     if !(cg >= 0.0) { p.velocity_gradient = mat2x2<f32>(); }
     if !(det2(p.deformation_gradient) > 0.0) { p.deformation_gradient = identity; }
     if !(p.plastic_volume_ratio > 0.0)         { p.plastic_volume_ratio = 1.0; }
@@ -500,7 +641,18 @@ fn g2p_asflip_fused_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if !(abs(p.friction_hardening) < 3.4e+38)  { p.friction_hardening = 0.0; }
     if !(abs(p.log_volume_strain)  < 3.4e+38)  { p.log_volume_strain  = 0.0; }
 
-    var new_F = (identity + dt * p.velocity_gradient) * p.deformation_gradient;
+    // F_new = F + (exp(dt C) - I) F  (C = velocity_gradient written by the g2p pass),
+    // never (I + dt C) F or exp(dt C) F: the increment stays a small number added to F
+    // (see `deformation_increment_exp_minus_identity` above).
+    // NeoHookean (2)/Corotated (3)/Snow (4)/Drucker-Prager (5)/Von Mises (6)/Rankine (7)/
+    // SandMuI (8)/Viscoelastic (9)/GranularFluid (11) use the exact kinematic increment;
+    // plastic models were migrated one family at a time with marginal-yield and CPU/GPU
+    // checks. Every other model keeps the linear increment dt C.
+    var f_step = dt * p.velocity_gradient;
+    if mat.model == 2u || mat.model == 3u || mat.model == 4u || mat.model == 5u || mat.model == 6u || mat.model == 7u || mat.model == 8u || mat.model == 9u || mat.model == 11u {
+        f_step = deformation_increment_exp_minus_identity(dt * p.velocity_gradient);
+    }
+    var new_F = p.deformation_gradient + f_step * p.deformation_gradient;
 
     if mat.model == 4u && mat.compression_limit > 0.0 {
         let sr = snow_plasticity(new_F, p.plastic_volume_ratio, mat);
@@ -511,6 +663,14 @@ fn g2p_asflip_fused_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let svd    = svd2(new_F);
         let dp_res = dp_plasticity(svd.s, p.log_volume_strain, p.friction_hardening, mat);
         var dp_sigma = abs(dp_res.sigma);
+        // Floor each axis individually before the product-based rescale below --
+        // same real bug (and same fix) as CPU `DruckerPragerMaterial`'s own
+        // `MIN_AXIS` guard (see that code's doc): under a hard enough
+        // impact one singular value can collapse to exactly (or within float
+        // noise of) zero on its own axis, and a rescale that multiplies BOTH
+        // axes by the same scalar can never recover an axis already at zero
+        // (0 * any finite scalar is still 0).
+        dp_sigma = max(dp_sigma, vec2<f32>(1e-3));
         let dp_j = dp_sigma.x * dp_sigma.y;
         if dp_j < mat.volume_ratio_min {
             dp_sigma *= sqrt(mat.volume_ratio_min / max(dp_j, NUM_FLOOR_TIGHT));
@@ -547,12 +707,6 @@ fn g2p_asflip_fused_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         J_fluid = clamp(J_fluid, FLUID_J_MIN, fluid_j_max);
         let sqrtJ = sqrt(J_fluid);
         new_F = mat2x2<f32>(vec2<f32>(sqrtJ, 0.0), vec2<f32>(0.0, sqrtJ));
-
-        if mat.dp_h0 > 0.0 {
-            let damp = 1.0 - clamp(mat.dp_h0 * dt, 0.0, 0.5);
-            p.v *= damp;
-            v_position *= damp;
-        }
     }
 
     let J_trial = det2(new_F);
@@ -578,14 +732,10 @@ fn g2p_asflip_fused_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    // Light damping for plasticity models -- applied to BOTH v_store (p.v, persists for
-    // next g2p gather) and v_position (this substep's own position advance), same
-    // damping ratio, keeping ASFLIP's two velocities mutually consistent with how the
-    // single-velocity (non-ASFLIP) path already behaves under this damping.
-    if mat.model != 0u && mat.model != 1u && mat.model != 2u && mat.model != 3u && mat.model != 9u {
-        p.v *= 0.999;
-        v_position *= 0.999;
-    }
+    // No velocity damping here either, for the same measured reason as the
+    // fused pass's twin in `particles_update.wgsl`: see that file. This
+    // site damped BOTH of ASFLIP's velocities, so it cost the same in the
+    // position advance as in the stored velocity.
 
     // Position: x = x + v_position * dt -- v_position, NOT p.v, is ASFLIP's real point:
     // while separating (gamma=1) this equals p.v exactly; while compressing (gamma=0)
@@ -594,8 +744,13 @@ fn g2p_asflip_fused_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // framing). Identical to p.v*dt when ASFLIP disabled or gamma=1.
     var new_x = p.x + v_position * dt;
 
-    let lo = max(0.0, bt - 1.0);
-    let hi = f32(res) - bt;
+    // Mirrors CPU's `position_clamp_bounds`: one cell past each wall plane
+    // on every side, and the quadratic stencil kept inside the grid
+    // (x >= 1, x < res - 1; the largest f32 below res - 1 is one bit under
+    // it, positive floats being ordered like their bits).
+    let room = max(0.0, bt - 1.0);
+    let lo = max(room, 1.0);
+    let hi = min(f32(res) - room, bitcast<f32>(bitcast<u32>(f32(res) - 1.0) - 1u));
     new_x  = clamp(new_x, vec2<f32>(lo), vec2<f32>(hi));
 
     particles[p_idx].x                    = new_x;

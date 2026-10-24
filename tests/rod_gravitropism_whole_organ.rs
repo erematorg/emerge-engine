@@ -1,30 +1,23 @@
 //! `rod::gravitropism::GravitropismMode::WholeOrgan` (Bastien, Bohr, Moulia,
-//! Douady 2013, PNAS 110(2):755-760) and the companion sleep-freeze fix
-//! (`Rod::is_correcting_gravitropically`) it depends on to mean anything at
-//! all -- a rod that falls asleep mid-correction would never finish, no
-//! matter how correct the underlying formula is.
+//! Douady 2013, PNAS 110(2):755-760) and the sleep freeze
+//! (`Rod::is_correcting_gravitropically`) it depends on: a rod that falls
+//! asleep mid-correction never finishes, however correct the formula.
 //!
-//! # A real, disclosed scope boundary found while building this (2026-07-27)
-//! `WholeOrgan` recovers a pushed organ's true shape ONLY when that shape is
-//! mechanically STABLE (below its own Euler/Greenhill self-weight buckling
-//! height -- see `Rod::buckling_warning`). Tested directly: the exact same
-//! push/release/correct sequence on blade A (safely under its own critical
-//! height) converges cleanly to true vertical and stays there permanently;
-//! on blade B (deliberately built OVER its own critical height, the real
-//! demonstration case) it instead settles into a sustained, non-decaying
-//! oscillation, regardless of gravitropism's gain (tested across a 500x
-//! range) or whether the correction is per-vertex or a single global-chord
-//! signal (tested both). This is NOT a bug: past its own critical height,
-//! "straight" is a genuine UNSTABLE equilibrium for that organ's real EA/EI/
-//! mass -- no curvature-target correction, however designed, can hold a
-//! structure at an unstable equilibrium, the same way no amount of
-//! "trying to balance" keeps a pencil upright on its tip. Real biology
-//! solves genuine structural buckling with a DIFFERENT mechanism entirely
-//! (secondary growth / thigmomorphogenesis -- literally growing a stiffer,
-//! thicker stem), not gravitropism. See
+//! # Scope boundary
+//! `WholeOrgan` recovers a pushed organ's shape only when that shape is
+//! mechanically stable (below its Euler/Greenhill self-weight buckling
+//! height, see `Rod::buckling_warning`). The same push/release/correct
+//! sequence converges to vertical and stays there on blade A (under its
+//! critical height), but on blade B (built over it) settles into a sustained,
+//! non-decaying oscillation whatever the gain (tested across a 500x range) and
+//! whether the correction is per-vertex or a single global-chord signal. Not a
+//! bug: past its critical height, straight is an unstable equilibrium for the
+//! organ's EA/EI/mass, and no curvature-target correction can hold a structure
+//! at an unstable equilibrium, as no amount of balancing keeps a pencil on its
+//! tip. Plants handle buckling with another mechanism, secondary growth
+//! (thigmomorphogenesis: growing a stiffer, thicker stem), not gravitropism.
 //! `whole_organ_gravitropism_cannot_rescue_genuine_structural_buckling`
-//! below for the disclosed, tested boundary rather than a silently
-//! unhandled case.
+//! below tests the boundary.
 
 extern crate emerge_engine as emerge;
 use emerge::rod::{Gravitropism, GravitropismMode, Rod, RodMaterial, build_straight_rod};
@@ -85,7 +78,7 @@ fn make_sim(young_modulus: f32, tilt_rad: f32, gravitropism: Option<Gravitropism
     solver
 }
 
-/// Same real, sustained hover-push contract `rod_blade_of_grass_gui.rs`
+/// Same sustained hover-push contract `rod_blade_of_grass_gui.rs`
 /// itself uses (persistent forcing every substep, not a one-shot impulse) --
 /// hard enough to knock either blade into a large, real deviation.
 fn push_hard(solver: &mut Simulation) {
@@ -109,7 +102,7 @@ fn tip_x_offset(solver: &Simulation) -> f32 {
 
 #[test]
 fn gravitropism_keeps_correcting_after_the_rod_would_otherwise_have_slept() {
-    // A rod that starts genuinely misaligned (45 degrees off its GSA=0
+    // A rod that starts misaligned (45 degrees off its GSA=0
     // target) but with near-zero initial velocity -- the elastic system has
     // nothing to mechanically settle, so any wake-time here is coming ONLY
     // from gravitropism's own ongoing correction, isolating the fix from
@@ -150,7 +143,7 @@ fn gravitropism_keeps_correcting_after_the_rod_would_otherwise_have_slept() {
          ROD_SLEEP_SETTLE_MAX_SECONDS elapsed"
     );
 
-    // Keep stepping until gravitropism genuinely converges -- must
+    // Keep stepping until gravitropism converges -- must
     // eventually sleep once it does (bounds the fix the other direction:
     // this isn't a rod that can NEVER sleep).
     let mut slept = false;
@@ -173,11 +166,11 @@ fn gravitropism_keeps_correcting_after_the_rod_would_otherwise_have_slept() {
 fn whole_organ_gravitropism_recovers_a_grown_crooked_blade_while_tip_only_plateaus() {
     // Blade A -- E=1e7, confirmed SAFELY under its own Greenhill critical
     // height, so "straight" really is a mechanically stable shape here
-    // (unlike blade B -- see this file's own module doc). Built ALREADY
+    // (unlike blade B -- see this file's module doc). Built ALREADY
     // leaning 30 degrees off vertical -- NOT a momentary push (a
     // mechanically stable blade's own passive elasticity recovers a
     // momentary push on its own, confirmed empirically, so that can't show
-    // gravitropism's real, distinct value). This is the actually-real case
+    // gravitropism's distinct value). This is the actually-real case
     // gravitropism exists for: an organ whose GROWN rest shape itself needs
     // active correction (the same real scenario as the root's own 45-degree
     // start), not a transient nudge elastic springback already handles.
@@ -206,7 +199,7 @@ fn whole_organ_gravitropism_recovers_a_grown_crooked_blade_while_tip_only_platea
         "a 30-degree lean must be a real, meaningful deviation to recover from, got {baseline_offset}"
     );
 
-    // Real, generous horizon -- gravitropism is a slow, real biological
+    // Generous horizon -- gravitropism is a slow, real biological
     // process, not an instant snap.
     const HORIZON_STEPS: usize = 15_000; // 300 simulated seconds
     for _ in 0..HORIZON_STEPS {
@@ -214,7 +207,7 @@ fn whole_organ_gravitropism_recovers_a_grown_crooked_blade_while_tip_only_platea
         tip_only.step();
         whole_organ.step();
     }
-    // No gravitropism at all: a real tilt introduces a genuine bending
+    // No gravitropism at all: a tilt introduces a bending
     // moment from self-weight (absent for a perfectly vertical column,
     // where self-weight is purely axial) -- real additional elastic SAG is
     // expected and fine, this only checks passive elasticity has no reason
@@ -248,7 +241,7 @@ fn whole_organ_gravitropism_cannot_rescue_genuine_structural_buckling() {
     // Blade B -- E=5e6, deliberately built OVER its own Greenhill critical
     // height (confirmed via `Rod::buckling_warning`). This is a REAL,
     // disclosed negative control, not a silently-passing edge case: no
-    // curvature-target correction can hold an organ at a genuinely unstable
+    // curvature-target correction can hold an organ at a unstable
     // equilibrium, so this must NOT converge to true vertical, no matter how
     // long it runs. If this test ever starts passing as "recovered," that's
     // a sign something about blade B's own parameters drifted below its
@@ -268,7 +261,7 @@ fn whole_organ_gravitropism_cannot_rescue_genuine_structural_buckling() {
     push_hard(&mut whole_organ);
 
     // Run well past one full real oscillation period (empirically ~90-100s)
-    // and sample near the end -- a genuinely converged organ would show
+    // and sample near the end -- a converged organ would show
     // every sample small; a sustained oscillation shows at least one large.
     const HORIZON_STEPS: usize = 15_000; // 300 simulated seconds
     let mut max_late_offset = 0.0_f32;

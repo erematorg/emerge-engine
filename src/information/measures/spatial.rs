@@ -1,6 +1,6 @@
 /// O(N) information-theoretic estimators for MPM particle systems.
 ///
-/// All functions take `&Particles` (SoA — the CPU solver's canonical form, same as
+/// All functions take `&Particles` (SoA -- the CPU solver's canonical form, same as
 /// `diagnostics::per_material_stats`) and do a single pass. No distance matrix, no k-NN.
 /// Safe to call every frame.
 use crate::materials::registry::MAX_MATERIAL_SLOTS;
@@ -24,7 +24,7 @@ fn shannon_bits(counts: &[u32]) -> f32 {
         .sum()
 }
 
-/// Spatial entropy — how evenly particles are spread across the grid.
+/// Spatial entropy -- how evenly particles are spread across the grid.
 ///
 /// H = 0  → all particles in one cell (maximum clustering).
 /// H = log₂(grid²) → perfectly uniform (maximum disorder).
@@ -44,7 +44,7 @@ pub fn spatial_entropy(particles: &Particles, grid_res: usize) -> f32 {
     shannon_bits(&counts)
 }
 
-/// Kinetic entropy — disorder in the velocity-magnitude distribution.
+/// Kinetic entropy -- disorder in the velocity-magnitude distribution.
 ///
 /// Bins |v| into `bins` buckets between 0 and v_max.
 /// H = 0 → all particles at same speed (coherent motion).
@@ -70,7 +70,7 @@ pub fn kinetic_entropy(particles: &Particles, bins: usize) -> f32 {
     shannon_bits(&counts)
 }
 
-/// Phase entropy — diversity of material types across the particle set.
+/// Phase entropy -- diversity of material types across the particle set.
 ///
 /// H = 0 → all particles same material (pure phase).
 /// H = log₂(num_materials) → materials equally distributed.
@@ -88,7 +88,7 @@ pub fn phase_entropy(particles: &Particles) -> f32 {
 
 /// Local mutual information between two material phases over a set of particles.
 ///
-/// `indices` is the particle set to analyse — typically
+/// `indices` is the particle set to analyse -- typically
 /// `solver.particles_near(center, radius).collect()`. Measures how much the presence
 /// of `mat_a` predicts `mat_b` within that set (2×2 joint histogram). O(|indices|).
 ///

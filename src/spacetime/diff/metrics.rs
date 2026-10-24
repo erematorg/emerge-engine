@@ -31,6 +31,7 @@ pub fn drift_feedback(
 /// Gait-quality metrics for judging whether a trained controller WALKS
 /// rather than hurls itself -- the difference a drift number alone can't
 /// see (observed live: a final-state-drift-trained gait "goes flying").
+#[derive(Debug)]
 pub struct GaitMetrics {
     /// Final-state mean-x drift (what `drift` reports).
     pub final_drift: f32,

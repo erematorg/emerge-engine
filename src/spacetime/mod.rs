@@ -1,11 +1,11 @@
 //! Spacetime domain: the arena.
 //!
-//! `grid` — `Grid`/`Cell`, the Eulerian background grid + quadratic B-spline
-//! kernel. `solver` — `Simulation`, `SimConfig`, `SpawnRegion`: orchestrates
-//! the whole substep loop over that grid. `transfer` — P2G/G2P transfer
-//! kernels, the actual particle-grid-particle bridge each substep. `diff` —
+//! `grid` -- `Grid`/`Cell`, the Eulerian background grid + quadratic B-spline
+//! kernel. `solver` -- `Simulation`, `SimConfig`, `SpawnRegion`: orchestrates
+//! the whole substep loop over that grid. `transfer` -- P2G/G2P transfer
+//! kernels, the actual particle-grid-particle bridge each substep. `diff` --
 //! differentiable mini-solver for offline gait training, built on the
-//! hand-derived adjoints in `transfer`/`grid`. `rod` — a genuine 1D discrete
+//! hand-derived adjoints in `transfer`/`grid`. `rod` -- a genuine 1D discrete
 //! elastic rod sub-solver for slender bodies, a second real dimensional
 //! reduction of continuum elasticity (sibling to `diff`: narrower, self-
 //! contained, real physics), coupled to the same shared `Grid` ordinary MPM
@@ -18,8 +18,13 @@
 //! and every LP equivalent keeps resolving unchanged -- this move only
 //! changes where the files physically live, not any public API.
 
+pub(crate) mod artificial_viscosity;
 pub mod diff;
+pub mod grains;
 pub mod grid;
+pub(crate) mod integration;
+pub mod return_mapping;
 pub mod rod;
 pub mod solver;
+pub mod total_lagrangian;
 pub mod transfer;

@@ -4,11 +4,11 @@
 // InstanceData feeds the render_particles vertex shader as per-instance attributes.
 //
 // Color modes (RenderConfig::mode):
-//   0 = ByMaterial — material_id % 16 → fixed palette
-//   1 = ByVelocity — |v| * vel_scale → blue→red heat map
-//   2 = ByVolume   — det(F) → blue (compressed) / white (rest) / red (expanded)
+//   0 = ByMaterial -- material_id % 16 → fixed palette
+//   1 = ByVelocity -- |v| * vel_scale → blue→red heat map
+//   2 = ByVolume   -- det(F) → blue (compressed) / white (rest) / red (expanded)
 //
-// Particle struct layout (128 bytes) must match src/matter/particle.rs exactly —
+// Particle struct layout (128 bytes) must match src/matter/particle.rs exactly --
 // any field/padding drift here silently misaligns every WGSL array index past 0.
 
 struct Particle {
@@ -37,7 +37,7 @@ struct Particle {
     internal_pressure:    f32,
 }
 
-// InstanceData layout (48 bytes) — must match MpmRenderer's VertexBufferLayout:
+// InstanceData layout (48 bytes) -- must match MpmRenderer's VertexBufferLayout:
 //   deform_col0: vec2<f32> @ offset  0
 //   deform_col1: vec2<f32> @ offset  8
 //   position:    vec2<f32> @ offset 16
@@ -55,7 +55,10 @@ struct RenderConfig {
     mode:           u32,
     particle_count: u32,
     vel_scale:      f32,
-    _pad:                 u32,
+    // Render-time position blend factor, "Fix Your Timestep" (Gaffer 2004) --
+    // see the Rust-side `RenderConfig::interp_alpha` doc for the real
+    // "sudden acceleration" symptom this closes.
+    interp_alpha:   f32,
 }
 
 // Per-material optical absorption: σ_a [r, g, b, σ_s] × 16 slots.
@@ -63,23 +66,43 @@ struct RenderConfig {
 // High σ_a = strong absorption = dark / hue-shifted toward complementary color.
 // .w = σ_s, reduced scattering coefficient (single scalar -- real tissue scattering
 // is far less wavelength-dependent than absorption in the visible range, Jacques
-// 2013 -- used for a real, bounded single-scattering-albedo subsurface approximation,
+// 2013 -- used for a bounded single-scattering-albedo subsurface approximation,
 // not a full BSSRDF/diffusion simulation).
 //
 // specular[i].x = R0, Fresnel base reflectance (Schlick 1994 approximation) for
 // material slot i. This renderer has no surface-normal estimation (particle
 // instances, not a reconstructed/raytraced surface), so this is a constant
 // near-normal-incidence reflectance, not a view-angle-dependent Fresnel term --
-// a real, cited, but honestly bounded simplification.
+// a cited, but honestly bounded simplification.
 struct OpticalTable {
     slots: array<vec4<f32>, 16>,
     specular: array<vec4<f32>, 16>,
+}
+
+// Shared validated SI contract. `spatial.z == 0` means the caller has not
+// supplied physical scale yet and this path is still in legacy mode.
+struct PhysicalRenderParams {
+    spatial: vec4<f32>,
+    incident_radiance: vec4<f32>,
+    background_radiance: vec4<f32>,
+    display_white_radiance: vec4<f32>,
+    camera_direction: vec4<f32>,
+    light_direction: vec4<f32>,
+    // x = thermal-emission exposure anchor in kelvin, 0 = unset. See
+    // `Renderer::set_emission_reference_temperature`. y/z/w reserved.
+    emission: vec4<f32>,
 }
 
 @group(0) @binding(0) var<storage, read>       particles: array<Particle>;
 @group(0) @binding(1) var<storage, read_write> instances: array<InstanceData>;
 @group(0) @binding(2) var<uniform>             config:    RenderConfig;
 @group(0) @binding(3) var<uniform>             optics:    OpticalTable;
+@group(0) @binding(4) var<uniform>             physical:  PhysicalRenderParams;
+// Pre-step position snapshot from `snapshot_positions.wgsl`, taken once per
+// render-frame's physics-step batch (mirrors the CPU `prev_x` convention in
+// `basic_fluids.rs`). Blended against the current `p.x` by `config.interp_alpha`
+// below -- zero-readback, GPU-resident the whole way, no `sync_particles_blocking`.
+@group(0) @binding(5) var<storage, read>       prev_positions: array<vec2<f32>>;
 
 // ── Color helpers ─────────────────────────────────────────────────────────────
 
@@ -155,36 +178,70 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let transmitted = exp(-sigma_a * optical_depth);
         //
         // Subsurface scattering (single-scattering albedo approximation, real but
-        // bounded -- see OpticalTable's own doc). Real single-scattering albedo:
+        // bounded -- see OpticalTable's doc). Real single-scattering albedo:
         //   a = σ_s / (σ_s + σ_a)
         // Light lost to absorption alone would just leave the medium dark; real
         // scattering tissue instead looks brighter/softer than pure absorption
         // predicts, because scattered photons re-emerge diffusely rather than
         // being lost. Blend transmitted color toward a soft, desaturated glow
-        // by the real albedo fraction, weighted by how deep light had to travel.
+        // by the albedo fraction, weighted by how deep light had to travel.
         let albedo = sigma_s / max(sigma_s + sigma_a, vec3(1e-4));
         let scatter_glow = vec3(1.0, 0.95, 0.9) * (1.0 - exp(-sigma_s * optical_depth));
         let with_scattering = mix(transmitted, scatter_glow, clamp(albedo, vec3(0.0), vec3(1.0)));
         //
         // Specular: constant near-normal Fresnel reflectance (Schlick 1994), real
-        // but bounded -- see OpticalTable's own doc for why this isn't view-angle
+        // but bounded -- see OpticalTable's doc for why this isn't view-angle
         // dependent. Adds a small additive highlight, real magnitude (water R0~0.02).
         let r0 = optics.specular[slot].x;
         let with_specular = with_scattering + vec3(r0);
         //
-        // Thermal emission: blackbody additive glow above ~300 K.
-        //   Normalized to 5000 K (solar surface) — biological temps near zero.
-        let t_norm = clamp(p.temperature / 5000.0, 0.0, 1.0);
-        let emission = heat(0.5 + t_norm * 0.5).rgb * (t_norm * t_norm) * 2.0;
+        // Thermal emission: real blackbody, Planck's colour weighted by
+        // Stefan-Boltzmann's T^4 -- see `blackbody.inc.wgsl`, and
+        // `energy::radiation` for the physics it mirrors. Additive, because
+        // an emitter's own light adds to whatever it transmits.
+        let emission = blackbody_emission(
+            p.temperature,
+            physical.spatial.z,
+            physical.display_white_radiance.rgb,
+            physical.emission.x,
+        );
         //
-        color = vec4(clamp(with_specular + emission, vec3(0.0), vec3(1.0)), 1.0);
+        if physical.spatial.z > 0.5 {
+            // SI radiative transfer: absorption, single scattering and
+            // Fresnel together (`radiative_transfer.inc.wgsl`). A particle
+            // has no surface normal, so reflection is evaluated at normal
+            // incidence (the limitation `OpticalTable`'s doc states), with
+            // the Fresnel R0 rather than a flat added term.
+            let view_length_m = physical.spatial.y / max(abs(physical.camera_direction.z), 1.0e-6);
+            let path_m = (1.0 / j) * view_length_m;
+            let radiance = slab_radiance(
+                physical.background_radiance.rgb,
+                physical.incident_radiance.rgb,
+                sigma_a,
+                sigma_s,
+                path_m,
+                r0,
+                1.0,
+            );
+            let display_radiance = radiance / physical.display_white_radiance.rgb;
+            color = vec4(clamp(display_radiance + emission, vec3(0.0), vec3(1.0)), 1.0);
+        } else {
+            color = vec4(clamp(with_specular + emission, vec3(0.0), vec3(1.0)), 1.0);
+        }
     } else if config.mode == 4u {
-        // ByThermal: blackbody emission only. Cold → black, warm → orange, hot → white.
-        let t_norm = clamp(p.temperature / 1500.0, 0.0, 1.0);
-        color = vec4(heat(t_norm).rgb * (0.1 + t_norm * 0.9), 1.0);
+        // ByThermal: emission alone, nothing else. Cold is black, an ember is
+        // deep red, a flame orange, incandescence white, hotter still blue --
+        // the Planckian sequence, not a colour ramp.
+        let thermal = blackbody_emission(
+            p.temperature,
+            physical.spatial.z,
+            physical.display_white_radiance.rgb,
+            physical.emission.x,
+        );
+        color = vec4(clamp(thermal, vec3(0.0), vec3(1.0)), 1.0);
     } else if config.mode == 6u {
         // ByScalarField: generic second carrier (resource/grass level, pheromone,
-        // nutrients -- see Particle::scalar_field's own doc). Unlike temperature,
+        // nutrients -- see Particle::scalar_field's doc). Unlike temperature,
         // this field has no universal physical scale, so no normalization divisor --
         // callers own fields in roughly [0,1] (matches GpuResourceParams' own
         // logistic carrying-capacity convention).
@@ -195,10 +252,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         color = heat(clamp(p.activation, 0.0, 1.0) * 0.8);
     }
 
+    // mix(prev, current, alpha): alpha=1.0 (no snapshot taken yet, or the
+    // caller passed the "unblended" default) reduces to p.x exactly.
+    let render_pos = mix(prev_positions[id], p.x, config.interp_alpha);
+
     instances[id] = InstanceData(
-        f[0],        // deform_col0 — F's x-axis
-        f[1],        // deform_col1 — F's y-axis
-        p.x,         // position in grid coords
+        f[0],        // deform_col0 -- F's x-axis
+        f[1],        // deform_col1 -- F's y-axis
+        render_pos,  // interpolated position in grid coords
         vec2(0.0),   // _pad
         color,
     );

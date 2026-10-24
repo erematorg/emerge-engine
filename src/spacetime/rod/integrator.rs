@@ -1,13 +1,14 @@
-//! Standalone rod time integration — no grid, no `Simulation` (Phase 0/1).
+//! Standalone rod time integration -- no grid, no `Simulation` (Phase 0/1).
 //! Phase 2's grid-coupled path reuses `forces::compute_internal_forces`
 //! directly (see `coupling.rs`) rather than this integrator.
 
 use glam::Vec2;
 
 use super::{RodMaterial, RodPoints, RodRestState, compute_internal_forces};
+use crate::spacetime::integration::advance_position;
 
 /// One explicit (symplectic Euler) rod substep. Pinned points held at
-/// `v=0`/position fixed — identical semantics to `Particle::pinned`'s own
+/// `v=0`/position fixed -- identical semantics to `Particle::pinned`'s own
 /// G2P handling (forces v=0 instead of gathering, position left completely
 /// untouched, mass/forces still computed normally so the anchor is real).
 pub fn step_rod(
@@ -57,41 +58,61 @@ pub fn step_rod(
         if rod.pinned[i] != 0 {
             continue;
         }
-        rod.x[i] += rod.v[i] * dt;
+        advance_position(
+            &mut rod.x[i],
+            &mut rod.position_compensation[i],
+            rod.v[i] * dt,
+        );
     }
 }
 
-/// CFL-safe `dt` bound for the rod's own explicit integrator, covering BOTH
-/// stiffness (axial + bending natural frequencies, `dt < 2/omega`) AND
-/// damping (axial + bending dashpots, `dt < 2*m/c` — its own, independent
-/// explicit-Euler stability limit) — the rod's own direct analog of
-/// `materials::utils::elastic_wave_dt` PLUS `ViscoelasticMaterial::
-/// timestep_bound`'s separate `viscous_dt` term. No `dx_meters` parameter
-/// needed — `mass`/`rest_edge_length` are already real SI (kg/meters), so
-/// every bound here comes out in real seconds directly.
+/// Longest step the rod's own explicit integrator (`step_rod`: symplectic
+/// Euler, damping from the step's starting velocity) stays stable at, per
+/// point, then the smallest; `fraction` of it is returned. The fraction is
+/// `SimConfig::material_cfl_coefficient`'s definition.
 ///
-/// Computed per-point rather than per-edge/vertex: an interior point is
-/// coupled to 2 axial edges AND up to 3 overlapping bending vertices
-/// simultaneously, so this sums every stiffness/damping term touching each
-/// point — a real Gershgorin circle row-sum bound (for `x''=-M^-1 K x`, the
-/// spectral radius of `M^-1 K` is bounded by `max_i(sum_j |K_ij|)/m_i`, the
-/// standard way to localize eigenvalues without a full eigendecomposition)
-/// — then takes the min across points. Endpoints see fewer coupled terms
-/// and correctly get a larger safe dt than an interior point.
-/// Point `i`'s own `(omega_sq, damping_rate)` Gershgorin row-sum, shared by
-/// `rod_cfl_dt` and `apply_mass_scaling_for_target_dt` so both work from the
-/// exact same real stiffness/damping aggregation -- not two hand-kept-in-
-/// sync copies of the same math.
-fn point_stability_terms(rod: &RodPoints, material: &RodMaterial, i: usize) -> (f32, f32) {
+/// Derived from the scheme. A mode `x'' = -omega^2 x - b x'` stepped this
+/// way is stable exactly while `dt <= 4 / (b + sqrt(b^2 + 4 omega^2))`
+/// (the Jury conditions on its 2x2 update; `2 / omega` without damping).
+/// `omega^2` and `b` are bounded by Gershgorin row sums of the linearised
+/// stiffness and damping over the point's mass (`point_stability_sums`).
+///
+/// It replaces a per-point sum that counted each edge's axial stiffness once
+/// and each bending vertex once with weight one, 2 and 16/3 times too little,
+/// with an empirical 0.4 in front: a cantilever at 1 cm cells under real
+/// gravity blew up at step 32 at that step (`tests/subsystem_time_steps.rs`,
+/// `probe_cantilever_coupling_cut`).
+pub fn rod_cfl_dt(rod: &RodPoints, material: &RodMaterial, fraction: f32) -> f32 {
+    let mut min_dt = f32::INFINITY;
+    for i in 0..rod.len() {
+        if rod.pinned[i] != 0 {
+            continue;
+        }
+        let m = rod.mass[i].max(1.0e-9);
+        let (k, c) = point_stability_sums(rod, material, i);
+        let (omega_sq, b) = (k / m, c / m);
+        if omega_sq > 0.0 || b > 0.0 {
+            min_dt = min_dt.min(4.0 / (b + (b * b + 4.0 * omega_sq).sqrt()));
+        }
+    }
+    fraction * min_dt
+}
+
+/// Point `i`'s Gershgorin row sums of the linearised stiffness `K` (N/m) and
+/// damping `C` (N s/m), about the straight rest state, shared by
+/// `rod_cfl_dt` and `apply_mass_scaling_for_target_dt`.
+///
+/// Axial: each edge is a spring `EA / l0` and a dashpot `c_a` along it, a
+/// 2x2 block `[[1, -1], [-1, 1]]`, so each adjacent edge adds twice its
+/// value to the row. Bending (`forces::compute_internal_forces`): vertex
+/// `k` stores `EI / (2 L_v) kappa^2`, and for a straight rod
+/// `kappa = (w2 - w1) / l_n - (w1 - w0) / l_p` in the lateral displacements,
+/// so its gradient is `g = (1/l_p, -(1/l_p + 1/l_n), 1/l_n)`, its stiffness
+/// `(EI / L_v) g g^T` and its damping `c_b g g^T`; point `i` at position `j`
+/// in the vertex adds `|g_j| * sum|g|` times each. An interior point on
+/// equal edges gets `4 EA / l0` and `16 EI / l0^3`.
+fn point_stability_sums(rod: &RodPoints, material: &RodMaterial, i: usize) -> (f32, f32) {
     let n = rod.len();
-    let m = rod.mass[i].max(1.0e-9);
-    let mut omega_sq = 0.0f32;
-    let mut damping_rate = 0.0f32;
-    // Per-vertex stiffness with a uniform-material fallback -- same
-    // convention `forces::compute_internal_forces` uses, needed so this
-    // CFL bound stays correct (and doesn't panic on an empty slice) for
-    // both a uniform rod (built via `Rod::new`, `rod.ea`/`ei` empty until
-    // filled) and a genuinely non-uniform one.
     let ea_at = |k: usize| {
         if rod.ea.is_empty() {
             material.ea
@@ -106,96 +127,189 @@ fn point_stability_terms(rod: &RodPoints, material: &RodMaterial, i: usize) -> (
             rod.ei[k]
         }
     };
-
-    if i > 0 {
-        let l0 = rod.rest_edge_length[i - 1].max(1.0e-9);
-        omega_sq += ea_at(i - 1) / (m * l0);
-        damping_rate += material.axial_damping;
+    let (mut k_sum, mut c_sum) = (0.0f32, 0.0f32);
+    for edge in [i.checked_sub(1), (i + 1 < n).then_some(i)]
+        .into_iter()
+        .flatten()
+    {
+        let l0 = rod.rest_edge_length[edge].max(1.0e-9);
+        k_sum += 2.0 * ea_at(edge) / l0;
+        c_sum += 2.0 * material.axial_damping;
     }
-    if i + 1 < n {
-        let l0 = rod.rest_edge_length[i].max(1.0e-9);
-        omega_sq += ea_at(i) / (m * l0);
-        damping_rate += material.axial_damping;
-    }
-
-    if material.ei > 0.0 || material.bending_damping > 0.0 {
-        for k in [i.checked_sub(2), i.checked_sub(1), Some(i)]
-            .into_iter()
-            .flatten()
-        {
-            if k + 2 >= n {
-                continue;
-            }
-            let l0_prev = rod.rest_edge_length[k].max(1.0e-9);
-            let l0_next = rod.rest_edge_length[k + 1].max(1.0e-9);
-            let voronoi_length = 0.5 * (l0_prev + l0_next);
-            let ei_k = ei_at(k);
-            if ei_k > 0.0 {
-                omega_sq += ei_k / (m * voronoi_length.powi(3));
-            }
-            if material.bending_damping > 0.0 {
-                damping_rate += material.bending_damping / voronoi_length.powi(2);
-            }
+    for vertex in [i.checked_sub(2), i.checked_sub(1), Some(i)]
+        .into_iter()
+        .flatten()
+    {
+        if vertex + 2 >= n {
+            continue;
         }
+        let l_p = rod.rest_edge_length[vertex].max(1.0e-9);
+        let l_n = rod.rest_edge_length[vertex + 1].max(1.0e-9);
+        let voronoi_length = 0.5 * (l_p + l_n);
+        let g = [1.0 / l_p, 1.0 / l_p + 1.0 / l_n, 1.0 / l_n];
+        let row = g[i - vertex] * (g[0] + g[1] + g[2]);
+        k_sum += ei_at(vertex) / voronoi_length * row;
+        c_sum += material.bending_damping * row;
     }
-
-    (omega_sq, damping_rate)
+    (k_sum, c_sum)
 }
 
-pub fn rod_cfl_dt(rod: &RodPoints, material: &RodMaterial, safety: f32) -> f32 {
-    let n = rod.len();
-    let mut min_dt = f32::INFINITY;
-
-    for i in 0..n {
-        let m = rod.mass[i].max(1.0e-9);
-        let (omega_sq, damping_rate) = point_stability_terms(rod, material, i);
-
-        if omega_sq > f32::EPSILON {
-            min_dt = min_dt.min(safety * 2.0 / omega_sq.sqrt());
-        }
-        if damping_rate > f32::EPSILON {
-            min_dt = min_dt.min(safety * 2.0 * m / damping_rate);
-        }
-    }
-
-    min_dt
-}
-
-/// Real, general mass scaling (Gershgorin CFL row-sum, same math `rod_cfl_dt`
-/// already uses -- see `point_stability_terms`) -- a standard, established
-/// explicit-FEM stability technique (selective/target mass scaling, e.g.
-/// LS-DYNA's own `*CONTROL_TIMESTEP` mass-scaling option): raise a point's
-/// OWN inertia just enough that its stiffness-driven CFL bound alone
-/// reaches `target_dt`, rather than tuning per-scene multipliers by hand.
-/// Real, disclosed tradeoff: this genuinely makes the point heavier (it
-/// changes real dynamics -- gravity/wind/push response, not just a CFL-
-/// check fudge), so it should only raise mass, never lower it, and should
-/// be applied deliberately (an opt-in call), not silently baked into
-/// construction. Generalizes to ANY rod/material combination -- not tuned
-/// to one scene's own stiffness, the formula derives the exact minimum
-/// mass increase needed from each point's own real stiffness terms.
+/// Mass scaling (a standard explicit-dynamics technique, e.g. LS-DYNA's own
+/// `*CONTROL_TIMESTEP` option): raise a point's own inertia just enough
+/// that `rod_cfl_dt` reaches `target_dt` at `fraction`. Only ever raises
+/// mass, and changes real dynamics (gravity, wind, push response), so it is
+/// an opt-in call, never applied silently.
 ///
-/// Does NOT touch the damping-rate CFL term (unaffected by mass scaling in
-/// the same way -- `dt < 2*m/damping_rate` already grows linearly with the
-/// same added mass, so raising mass to fix the STIFFNESS term also loosens
-/// the damping term for free, not fought against).
+/// From `rod_cfl_dt`: with `tau = target_dt / fraction`, `omega^2 = K / m`
+/// and `b = C / m`, `4 / (b + sqrt(b^2 + 4 omega^2)) >= tau` exactly when
+/// `m >= (K tau^2 + 2 C tau) / 4`.
 pub fn apply_mass_scaling_for_target_dt(
     rod: &mut RodPoints,
     material: &RodMaterial,
-    safety: f32,
+    fraction: f32,
     target_dt: f32,
 ) {
-    let n = rod.len();
-    for i in 0..n {
-        let (omega_sq, _damping_rate) = point_stability_terms(rod, material, i);
-        if omega_sq <= f32::EPSILON {
+    let tau = target_dt / fraction;
+    for i in 0..rod.len() {
+        if rod.pinned[i] != 0 {
             continue;
         }
-        let m_old = rod.mass[i].max(1.0e-9);
-        // omega_sq_old = stiffness_sum / m_old, so stiffness_sum = omega_sq_old * m_old.
-        // Solve m_new from: target_dt = safety * 2 / sqrt(stiffness_sum / m_new).
-        let stiffness_sum = omega_sq * m_old;
-        let m_required = stiffness_sum * (target_dt / (2.0 * safety)).powi(2);
-        rod.mass[i] = m_old.max(m_required);
+        let (k, c) = point_stability_sums(rod, material, i);
+        let m_required = (k * tau * tau + 2.0 * c * tau) / 4.0;
+        rod.mass[i] = rod.mass[i].max(m_required);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use glam::Vec2;
+
+    use super::{rod_cfl_dt, step_rod};
+    use crate::rod::{
+        RodForceParams, RodImplicitStepParams, RodMaterial, RodPoints, YBranchSpec, advance_rod,
+        build_straight_rod, build_y_branch, step_network, step_rod_implicit,
+    };
+
+    /// Half the spacing of f32 values around 40, where these tests sit.
+    fn half_ulp_at_40() -> f32 {
+        0.5 * (40.0f32.next_up() - 40.0)
+    }
+
+    /// A straight three-point rod near x = y = 40 cells at rest length,
+    /// translating as a whole at `speed` cells/s: no internal force acts,
+    /// so every stepper must carry it `speed * seconds`.
+    fn translating_rod(speed: f32) -> (RodPoints, RodMaterial) {
+        let dx = 0.01;
+        let mut rod = build_straight_rod(Vec2::new(40.0, 40.0), Vec2::new(42.0, 40.0), 3, 0.1, dx);
+        rod.v.iter_mut().for_each(|v| *v = Vec2::new(0.0, speed));
+        let (axial, bending) = RodMaterial::critical_damping(dx, 0.1 * dx, 1000.0, 0.5);
+        (rod, RodMaterial::new(1000.0, 0.5, axial, bending))
+    }
+
+    /// Each point's increment is `speed * h`; the tests pick `speed` so that
+    /// it is well under half an ulp, and check the rod still covers the
+    /// distance.
+    fn assert_covered(rod: &RodPoints, start_y: f32, distance: f32, stepper: &str) {
+        for (i, x) in rod.x.iter().enumerate() {
+            let moved = x.y - start_y;
+            assert!(
+                (moved - distance).abs() < 0.01 * distance,
+                "{stepper}: point {i} moved {moved:e}, expected {distance:e}"
+            );
+        }
+    }
+
+    #[test]
+    fn step_rod_keeps_motion_below_half_an_ulp() {
+        let speed = 1.0e-3;
+        let (mut rod, material) = translating_rod(speed);
+        let h = rod_cfl_dt(&rod, &material, 0.5);
+        assert!(speed * h < 0.1 * half_ulp_at_40(), "premise: h {h:e}");
+        let steps = (1.0 / h).ceil() as usize;
+        for _ in 0..steps {
+            step_rod(&mut rod, &material, Vec2::ZERO, Vec2::ZERO, 0.0, 0.01, h);
+        }
+        assert_covered(&rod, 40.0, speed * h * steps as f32, "step_rod");
+    }
+
+    #[test]
+    fn advance_rod_keeps_motion_below_half_an_ulp() {
+        let speed = 1.0e-3;
+        let (mut rod, material) = translating_rod(speed);
+        let h = rod_cfl_dt(&rod, &material, 0.5);
+        assert!(speed * h < 0.1 * half_ulp_at_40(), "premise: h {h:e}");
+        let frame = 0.01;
+        let external = vec![Vec2::ZERO; rod.len()];
+        for _ in 0..100 {
+            let params = RodForceParams {
+                wind_velocity: Vec2::ZERO,
+                wind_drag_coeff: 0.0,
+                push_center: None,
+                push_strength: 0.0,
+                push_radius: 0.0,
+                dx_meters: 0.01,
+                dt: frame,
+                stability_fraction: 0.5,
+            };
+            advance_rod(&mut rod, &material, params, &external);
+        }
+        assert_covered(&rod, 40.0, speed * frame * 100.0, "advance_rod");
+    }
+
+    #[test]
+    fn step_rod_implicit_keeps_motion_below_half_an_ulp() {
+        let speed = 1.0e-3;
+        let (mut rod, material) = translating_rod(speed);
+        let h = 1.0e-4;
+        assert!(speed * h < 0.1 * half_ulp_at_40(), "premise: h {h:e}");
+        for _ in 0..10_000 {
+            let params = RodImplicitStepParams {
+                gravity: Vec2::ZERO,
+                wind_velocity: Vec2::ZERO,
+                wind_drag_coeff: 0.0,
+                push_center: None,
+                push_strength: 0.0,
+                push_radius: 0.0,
+                dx_meters: 0.01,
+                dt: h,
+            };
+            step_rod_implicit(&mut rod, &material, params);
+        }
+        assert_covered(&rod, 40.0, speed * h * 10_000.0, "step_rod_implicit");
+    }
+
+    #[test]
+    fn step_network_keeps_motion_below_half_an_ulp() {
+        let speed = 1.0e-3;
+        let mut net = build_y_branch(YBranchSpec {
+            trunk_start: Vec2::new(40.0, 40.0),
+            junction: Vec2::new(40.0, 42.0),
+            branch_end: Vec2::new(42.0, 43.0),
+            n_trunk_points: 3,
+            n_branch_points: 3,
+            linear_density_kg_per_m: 0.1,
+            dx_meters: 0.01,
+            // No stiffness: nothing but the translation acts.
+            ea: 0.0,
+            ei: 0.0,
+            axial_damping: 0.0,
+            bending_damping: 0.0,
+        });
+        net.pinned.iter_mut().for_each(|p| *p = 0);
+        net.v.iter_mut().for_each(|v| *v = Vec2::new(speed, 0.0));
+        let start: Vec<Vec2> = net.x.clone();
+        let h = 1.0e-4;
+        assert!(speed * h < 0.1 * half_ulp_at_40(), "premise: h {h:e}");
+        for _ in 0..10_000 {
+            step_network(&mut net, Vec2::ZERO, 0.01, h);
+        }
+        let distance = speed * h * 10_000.0;
+        for (i, (x, x0)) in net.x.iter().zip(&start).enumerate() {
+            let moved = x.x - x0.x;
+            assert!(
+                (moved - distance).abs() < 0.01 * distance,
+                "step_network: point {i} moved {moved:e}, expected {distance:e}"
+            );
+        }
     }
 }

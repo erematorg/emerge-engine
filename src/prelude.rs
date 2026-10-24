@@ -9,17 +9,21 @@
 //! diagnostics, and runtime. Does not include experimental or GPU-backend types.
 
 pub use crate::{
-    AabbConfinementField,
     ActivationStatsPlugin,
-    // Materials — all twelve (*Material types only)
+    // Materials -- all seventeen (*Material types only)
     BinghamFluidMaterial,
+    BinghamProps,
     // Queries + density field export
     BodyState,
+    BoilingMixtureMaterial,
     // Boundary conditions
     BoundaryCondition,
     BrittleProps,
     BuoyancyField,
-    ChemotaxisField,
+    CavitatingFluidMaterial,
+    // Chemical-gradient sensing (Keller-Segel drift velocity)
+    ChemotaxisSensor,
+    CoriolisField,
     CorotatedMaterial,
     CoulombField,
     DiagnosticsFrame,
@@ -43,13 +47,16 @@ pub use crate::{
     FrictionBoundary,
     FromSI,
     GranularFluidMaterial,
+    GranularProps,
     GravityWellField,
-    // Directional/phase-gated grip boundaries (shipped with the ratchet
-    // locomotion work) -- were missing from the prelude despite its own doc
-    // claiming full boundary-condition coverage; fixed 2026-07-08.
-    GripFrictionBoundary,
     HeightmapBoundary,
 
+    IdealGasMaterial,
+    IsothermalCavitatingFluidMaterial,
+    // Kinematically driven moving obstacle (not a rigid body), with two-way
+    // momentum exchange; see its doc.
+    KinematicCircleBoundary,
+    LiquidWaterMaterial,
     // Creature locomotion controller
     Lnn,
     MaterialCountPlugin,
@@ -70,9 +77,7 @@ pub use crate::{
     Particles,
 
     PlasticityModel,
-    PredictiveBoundary,
     Pressurized,
-    RadialConfinementField,
     RankineMaterial,
     RatchetFrictionBoundary,
     RollingPlugin,
@@ -89,6 +94,7 @@ pub use crate::{
     SpawnShape,
     StabilityStatus,
     StabilityThresholds,
+    StaticBoxBoundary,
     StepTiming,
     StomakhinMaterial,
     // Thermodynamics
@@ -96,11 +102,13 @@ pub use crate::{
     ThermalDiffusion,
     ThermalStatsPlugin,
     UniformElectricField,
+    UniformMagneticField,
 
     Viscoelastic,
     ViscoelasticMaterial,
     VonMisesMaterial,
     WithLatentHeat,
+    WithLatentHeatTable,
     WithPreStress,
     // Particle construction helpers
     build_particles,
@@ -108,10 +116,7 @@ pub use crate::{
     collect_snapshot_particles_only,
     evaluate_stability,
     gravity_to_grid,
-
-    lame_from_si,
     lame_from_young,
-    log_frame,
     log_frame_full,
     log_frame_gpu,
     per_material_stats,
@@ -119,5 +124,5 @@ pub use crate::{
     rankine_damage_estimate,
 };
 
-// Math types — re-exported so consumers don't need a separate glam dependency.
+// Math types -- re-exported so consumers don't need a separate glam dependency.
 pub use glam::{IVec2, Mat2, Vec2};

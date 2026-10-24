@@ -1,66 +1,63 @@
-//! Real implicit (backward Euler) time integration for a discrete elastic
-//! rod — the actual fix for the CFL-driven substep ceiling explicit
-//! integration hits for a stiff rod (see `mod.rs`'s own doc and
-//! `integrator::rod_cfl_dt`). Standard, established numerical method for
-//! stiff ODEs (Baraff & Witkin 1998, "Large Steps in Cloth Simulation";
-//! DisMech, a real published fully-implicit discrete-elastic-rod simulator,
-//! confirms this is the standard approach for exactly this rod
-//! formulation) -- genuinely solving the SAME Newtonian equations of motion
-//! `compute_internal_forces` already does, just with an implicit numerical
-//! integration scheme instead of explicit symplectic Euler. NOT a
-//! constraint-based method (PBD/XPBD) -- those reformulate the problem as
-//! geometric constraint projection, a different mathematical object from
-//! the real force-based PDE this engine is built on, and were explicitly
-//! rejected for that reason.
+//! Implicit (backward Euler) time integration for a discrete elastic rod,
+//! which removes the CFL substep ceiling explicit integration hits for a
+//! stiff rod (see `mod.rs` and `integrator::rod_cfl_dt`). The standard
+//! method for stiff ODEs (Baraff & Witkin 1998, "Large Steps in Cloth
+//! Simulation"; DisMech, a published fully-implicit discrete-elastic-rod
+//! simulator, uses it for this rod formulation). It solves the same
+//! Newtonian equations of motion as `compute_internal_forces`, with an
+//! implicit scheme instead of explicit symplectic Euler. Not a
+//! constraint-based method (PBD/XPBD), which reformulates the problem as
+//! geometric constraint projection rather than the force-based PDE this
+//! engine uses.
 //!
 //! # Method
 //! Backward Euler: `v_{n+1} = v_n + dt*a(x_{n+1}, v_{n+1})`,
 //! `x_{n+1} = x_n + dt*v_{n+1}`. Linearizing `F` around the current state
-//! (standard Newton/quasi-Newton treatment) with `x_{n+1} = x_n + dt*v_{n+1}`
-//! gives the real, standard linear system:
+//! (Newton/quasi-Newton) with `x_{n+1} = x_n + dt*v_{n+1}` gives
 //! `(M - dt*C - dt^2*K) * dv = dt * F(x_n, v_n)`
-//! where `K = dF/dx`, `C = dF/dv` (system Jacobians), solved once per real
-//! step for `dv = v_{n+1} - v_n`.
+//! with `K = dF/dx`, `C = dF/dv` (system Jacobians), solved once per step
+//! for `dv = v_{n+1} - v_n`.
 //!
-//! # Real, disclosed simplification: finite-difference Jacobians
-//! `K`/`C` are computed via central finite differences of the ALREADY
-//! real, already-tested `compute_internal_forces` (perturb each of the 2N
-//! position/velocity DOFs, re-evaluate real forces) rather than hand-
-//! derived analytic second derivatives of the discrete curvature formula
-//! (`discrete_curvature_gradient` is itself a real analytic first
-//! derivative; a fully analytic K would need ITS OWN derivative, a real,
-//! error-prone undertaking to hand-derive correctly under time pressure).
-//! This is a standard, legitimate numerical-methods technique -- many real
-//! implicit ODE solvers (e.g. SciPy's implicit integrators) default to
-//! finite-difference Jacobians precisely when analytic ones are impractical
-//! -- both converge to the exact same linearized system, just computed
-//! differently; this does not change the underlying physics model, only
-//! how its derivative is numerically estimated. Real, disclosed cost:
-//! O(N^2) per implicit step (2N perturbations x O(N) force evaluation),
-//! negligible next to the substep-count reduction this unlocks.
+//! # Analytic Jacobians, one term approximate
+//! `K`/`C` are assembled analytically, not finite-differenced (see
+//! `implicit_solver_cost_profile` for the measured cost difference). Axial
+//! (stretch + Kelvin-Voigt damping) uses the exact damped-spring Jacobian
+//! (Baraff & Witkin 1998; `forces::axial_force_and_jacobian`). Bending
+//! uses `forces::bending_jacobian_gauss_newton`: exact for `dF/dv`
+//! (bending damping is linear in velocity), a Gauss-Newton
+//! (material-stiffness-only) approximation for `dF/dx`, since the Hessian
+//! of this engine's 2D `discrete_curvature` has no derived closed form yet.
+//! That function's doc lists what is dropped and why the result is
+//! positive-semi-definite.
 //!
-//! # Real, disclosed simplification: dense solve, not banded
-//! The true Jacobian has bandwidth ~2 (a pentadiagonal-like structure --
-//! stretch couples i to i+/-1, bending couples i to i+/-2 through each
-//! vertex's own 3-point coupling), but this uses a general dense Gaussian
-//! elimination with partial pivoting instead of a specialized banded
-//! solver. For a rod's real point counts (tens, not thousands), O(N^3)
-//! dense solve is a real, correct, negligible cost -- optimizing to exploit
-//! the band structure is real future work if profiling ever shows this
-//! matters, not attempted here (YAGNI).
+//! # Dense solve, not banded
+//! The Jacobian has bandwidth ~2 (stretch couples i to i+/-1, bending couples
+//! i to i+/-2 through each vertex's 3-point stencil), but the solve is a
+//! dense Gaussian elimination with partial pivoting. For tens of points the
+//! O(N^3) cost is negligible; a banded solver would only matter if
+//! profiling showed it.
 
 use glam::Vec2;
 
 use super::coupling::push_acceleration;
-use super::forces::{axial_force_and_jacobian, compute_bending_forces_only};
+use super::forces::{
+    axial_force_and_jacobian, bending_jacobian_gauss_newton, discrete_curvature_gradient,
+};
 use super::{RodMaterial, RodPoints, RodRestState, compute_internal_forces};
+use crate::spacetime::integration::advance_position;
 
 /// Solve `A x = b` via Gaussian elimination with partial pivoting.
 /// `a` is row-major `n*n`, destroyed in the process. Returns `None` if `A`
-/// is numerically singular (no pivot found above a real tolerance) --
+/// is numerically singular (no pivot found above a tolerance) --
 /// callers should fall back to an explicit substep in that case, same
-/// spirit as any real implicit solver needing a graceful degradation path.
-fn solve_dense(mut a: Vec<f32>, mut b: Vec<f32>, n: usize) -> Option<Vec<f32>> {
+/// spirit as any implicit solver needing a graceful degradation path.
+///
+/// `pub(crate)`: also reused by `spacetime::grains::implicit` for the exact
+/// same real reason it exists here (a small, general dense Newton solve for
+/// a stiff mass-spring-damper system) -- not duplicating a correctness-
+/// critical elimination routine for a second stiff-spring solver in the
+/// same codebase.
+pub(crate) fn solve_dense(mut a: Vec<f32>, mut b: Vec<f32>, n: usize) -> Option<Vec<f32>> {
     debug_assert_eq!(a.len(), n * n);
     debug_assert_eq!(b.len(), n);
 
@@ -117,7 +114,7 @@ fn solve_dense(mut a: Vec<f32>, mut b: Vec<f32>, n: usize) -> Option<Vec<f32>> {
 /// standard reduction to only the FREE degrees of freedom, not a special
 /// case bolted on afterward.
 ///
-/// Grouped step parameters for `step_rod_implicit` — everything except the
+/// Grouped step parameters for `step_rod_implicit` -- everything except the
 /// rod/material being stepped (one struct instead of an 8-argument tail).
 #[derive(Debug, Clone, Copy)]
 pub struct RodImplicitStepParams {
@@ -131,10 +128,8 @@ pub struct RodImplicitStepParams {
     pub dt: f32,
 }
 
-/// Real fallback: if the assembled system is singular (degenerate
-/// geometry, e.g. a fully-collapsed rod), falls back to one explicit
-/// substep rather than silently producing nonsense -- a real, disclosed
-/// safety net, not hidden.
+/// If the assembled system is singular (degenerate geometry, e.g. a fully
+/// collapsed rod), falls back to one explicit substep.
 pub fn step_rod_implicit(
     rod: &mut RodPoints,
     material: &RodMaterial,
@@ -162,8 +157,6 @@ pub fn step_rod_implicit(
     }
     let ndof = nf * 2;
 
-    let h = 1.0e-4_f32; // central-difference step, real SI (meters, m/s)
-
     let f0 = compute_internal_forces(
         &rod.x,
         &rod.v,
@@ -182,111 +175,94 @@ pub fn step_rod_implicit(
     // still matter -- they're baked into f0 -- but its OWN position/velocity
     // are never perturbed or solved for, since it can't move).
     //
-    // Hybrid assembly (real, measured motivation -- `implicit_solver_cost_
-    // profile`, this module's own `#[ignore]`d perf test): profiling found
-    // the finite-difference Jacobian sweep costs 14-18x `solve_dense`'s own
-    // O(ndof^3) elimination at every point count tested (20-200), so THIS
-    // sweep, not the linear solve, was the real bottleneck. The axial
-    // (stretch + Kelvin-Voigt damping) term has a real, standard, closed-
-    // form damped-spring Jacobian (Baraff & Witkin 1998; see
-    // `forces::axial_force_and_jacobian`'s own doc) -- assembled directly
-    // below, no perturbation needed. The bending (discrete curvature) term
-    // has no such closed form available for this engine's own 2D-reduced
-    // curvature law (would need its Hessian, a real, separate, harder
-    // derivation -- disclosed future work, not attempted here), so it stays
-    // finite-differenced, via `compute_bending_forces_only` instead of the
-    // full function (so this sweep no longer redoes axial work the
-    // analytic pass below already covers).
+    // Assembled analytically: `implicit_solver_cost_profile` (this module's
+    // `#[ignore]`d perf test) measured a finite-difference Jacobian sweep at
+    // 14-18x `solve_dense`'s O(ndof^3) elimination for 20-200 points. Axial
+    // uses the closed-form damped-spring Jacobian (Baraff & Witkin 1998, see
+    // `forces::axial_force_and_jacobian`); bending uses
+    // `forces::bending_jacobian_gauss_newton`, exact for the velocity term
+    // and Gauss-Newton for the position term (see that function's doc).
     let mut k_mat = vec![0.0f32; ndof * ndof];
     let mut c_mat = vec![0.0f32; ndof * ndof];
 
+    // `point_to_free_col[p] = Some(free-index)` for a free point, `None`
+    // for pinned -- shared by both the bending and axial analytic blocks
+    // below. A vertex/edge touching a pinned point still contributes to the
+    // OTHER, free point(s)' own row/col; the pinned point's own row/col
+    // simply doesn't exist in this system.
+    let mut point_to_free_col = vec![None; n];
     for (col, &pi) in free.iter().enumerate() {
-        for axis in 0..2 {
-            // ∂F_bending/∂x_{pi,axis} via central difference on position.
-            let mut x_plus = rod.x.clone();
-            let mut x_minus = rod.x.clone();
-            if axis == 0 {
-                x_plus[pi].x += h;
-                x_minus[pi].x -= h;
-            } else {
-                x_plus[pi].y += h;
-                x_minus[pi].y -= h;
-            }
-            let f_plus = compute_bending_forces_only(
-                &x_plus,
-                &rod.v,
-                &rod.rest_edge_length,
-                &rod.rest_curvature,
-                &rod.ei,
-                material,
-                dx_meters,
-            );
-            let f_minus = compute_bending_forces_only(
-                &x_minus,
-                &rod.v,
-                &rod.rest_edge_length,
-                &rod.rest_curvature,
-                &rod.ei,
-                material,
-                dx_meters,
-            );
-            for (row, &pj) in free.iter().enumerate() {
-                let dfx = (f_plus[pj].x - f_minus[pj].x) / (2.0 * h);
-                let dfy = (f_plus[pj].y - f_minus[pj].y) / (2.0 * h);
-                k_mat[(row * 2) * ndof + (col * 2 + axis)] = -dfx;
-                k_mat[(row * 2 + 1) * ndof + (col * 2 + axis)] = -dfy;
-            }
+        point_to_free_col[pi] = Some(col);
+    }
 
-            // ∂F_bending/∂v_{pi,axis} via central difference on velocity.
-            let mut v_plus = rod.v.clone();
-            let mut v_minus = rod.v.clone();
-            if axis == 0 {
-                v_plus[pi].x += h;
-                v_minus[pi].x -= h;
-            } else {
-                v_plus[pi].y += h;
-                v_minus[pi].y -= h;
-            }
-            let f_plus = compute_bending_forces_only(
-                &rod.x,
-                &v_plus,
-                &rod.rest_edge_length,
-                &rod.rest_curvature,
-                &rod.ei,
-                material,
-                dx_meters,
+    // Analytic bending (discrete curvature) contribution.
+    let ei_at = |i: usize| {
+        if rod.ei.is_empty() {
+            material.ei
+        } else {
+            rod.ei[i]
+        }
+    };
+    if n >= 3 {
+        for i in 1..n - 1 {
+            let (p0, p1, p2) = (
+                rod.x[i - 1] * dx_meters,
+                rod.x[i] * dx_meters,
+                rod.x[i + 1] * dx_meters,
             );
-            let f_minus = compute_bending_forces_only(
-                &rod.x,
-                &v_minus,
-                &rod.rest_edge_length,
-                &rod.rest_curvature,
-                &rod.ei,
-                material,
-                dx_meters,
-            );
-            for (row, &pj) in free.iter().enumerate() {
-                let dfx = (f_plus[pj].x - f_minus[pj].x) / (2.0 * h);
-                let dfy = (f_plus[pj].y - f_minus[pj].y) / (2.0 * h);
-                c_mat[(row * 2) * ndof + (col * 2 + axis)] = -dfx;
-                c_mat[(row * 2 + 1) * ndof + (col * 2 + axis)] = -dfy;
+            let grad = discrete_curvature_gradient(p0, p1, p2);
+            let l0_prev = rod.rest_edge_length[i - 1].max(1.0e-9);
+            let l0_next = rod.rest_edge_length[i].max(1.0e-9);
+            let voronoi_length = 0.5 * (l0_prev + l0_next);
+            let stiffness = ei_at(i - 1) / voronoi_length;
+            let (k_blocks, c_blocks) =
+                bending_jacobian_gauss_newton(grad, stiffness, material.bending_damping);
+
+            let vertex_points = [i - 1, i, i + 1];
+            for (a, &pa) in vertex_points.iter().enumerate() {
+                let Some(row) = point_to_free_col[pa] else {
+                    continue;
+                };
+                for (b, &pb) in vertex_points.iter().enumerate() {
+                    let Some(col) = point_to_free_col[pb] else {
+                        continue;
+                    };
+                    // `bending_jacobian_gauss_newton` returns dF/dp, dF/dv
+                    // w.r.t. real-meter position/velocity (`grad` itself came
+                    // from meter-scaled points); `x`/`v` here are grid-cell
+                    // units, so each needs exactly ONE `dx_meters` chain
+                    // factor (`p[b] = x_grid[b]*dx_meters`, one direct linear
+                    // map per point -- same single-factor chain the axial
+                    // block below uses for its own reduced edge variable).
+                    let k_block = k_blocks[a][b] * dx_meters;
+                    let c_block = c_blocks[a][b] * dx_meters;
+                    for r in 0..2 {
+                        for c in 0..2 {
+                            let k_val = if c == 0 {
+                                k_block.x_axis
+                            } else {
+                                k_block.y_axis
+                            };
+                            let c_val = if c == 0 {
+                                c_block.x_axis
+                            } else {
+                                c_block.y_axis
+                            };
+                            let k_component = if r == 0 { k_val.x } else { k_val.y };
+                            let c_component = if r == 0 { c_val.x } else { c_val.y };
+                            k_mat[(row * 2 + r) * ndof + (col * 2 + c)] -= k_component;
+                            c_mat[(row * 2 + r) * ndof + (col * 2 + c)] -= c_component;
+                        }
+                    }
+                }
             }
         }
     }
 
     // Analytic axial (stretch + damping) contribution -- ADDED (not
-    // assigned) to whatever the bending FD sweep above already wrote,
-    // since an interior point's own diagonal block gets real contributions
-    // from BOTH its adjacent edges AND the bending terms touching it.
-    // `point_to_free_col[p] = Some(free-index)` for a free point, `None`
-    // for pinned -- an edge with a pinned point on one end still
-    // contributes to the OTHER end's free row/col (the pinned point's own
-    // row/col simply doesn't exist in this system, same as the bending
-    // sweep already handles via `free.iter().enumerate()`).
-    let mut point_to_free_col = vec![None; n];
-    for (col, &pi) in free.iter().enumerate() {
-        point_to_free_col[pi] = Some(col);
-    }
+    // assigned) to whatever the bending block above already wrote, since an
+    // interior point's own diagonal block gets real contributions from BOTH
+    // its adjacent edges AND the bending vertices touching it.
     let ea_at = |i: usize| {
         if rod.ea.is_empty() {
             material.ea
@@ -347,7 +323,7 @@ pub fn step_rod_implicit(
     // -- gives `[M + dt*C + dt^2*K] * dv = dt*F_n - dt^2*K*v_n`. Getting the
     // sign wrong on the left-hand matrix, or dropping the `-dt^2*K*v_n` term on
     // the right, turns this into an amplifying (unstable) system instead of a
-    // damping one — an incorrectly-signed version blows up with alternating
+    // damping one -- an incorrectly-signed version blows up with alternating
     // sign and exponentially growing magnitude within tens of steps on even a
     // single damped spring.
     let mut a_mat = vec![0.0f32; ndof * ndof];
@@ -358,15 +334,11 @@ pub fn step_rod_implicit(
         a_mat[(row * 2) * ndof + (row * 2)] += m;
         a_mat[(row * 2 + 1) * ndof + (row * 2 + 1)] += m;
 
-        // Real, disclosed simplification: gravity/wind/push are treated as
-        // ordinary EXTERNAL forces on the right-hand side (like gravity
-        // already was), not folded into the implicit K/C solve -- only the
-        // rod's OWN internal elastic/damping forces are stiff enough to
-        // need implicit treatment; wind drag and push are comparatively
-        // soft, real forces, safe to treat this way (same real convention
-        // `apply_rod_internal_and_wind_forces` already uses for the
-        // explicit path, converted to real Newtons via the same
-        // `mass*dx_meters` factor internal forces already use).
+        // Gravity, wind and push are external forces on the right-hand side,
+        // not part of the implicit K/C solve: only the rod's internal
+        // elastic/damping forces are stiff enough to need implicit treatment.
+        // Same convention as the explicit `advance_rod`, converted to newtons
+        // with the `mass*dx_meters` factor the internal forces use.
         let a_wind = wind_drag_coeff * (wind_velocity - rod.v[pi]);
         let a_push = push_acceleration(rod.x[pi], push_center, push_strength, push_radius);
         let f_total = f0[pi] + (gravity + a_wind + a_push) * m * dx_meters;
@@ -390,9 +362,8 @@ pub fn step_rod_implicit(
     let dv = match solve_dense(a_mat, b_vec, ndof) {
         Some(dv) => dv,
         None => {
-            // Real, disclosed fallback: singular system (degenerate
-            // geometry) -- one explicit substep instead of silently
-            // producing garbage.
+            // Singular system (degenerate geometry): one explicit substep
+            // instead.
             for (i, &pi) in free.iter().enumerate() {
                 let _ = i;
                 let a = (f0[pi] + gravity * rod.mass[pi].max(1.0e-9) * dx_meters)
@@ -400,7 +371,11 @@ pub fn step_rod_implicit(
                 rod.v[pi] += a * dt;
             }
             for &pi in &free {
-                rod.x[pi] += rod.v[pi] * dt;
+                advance_position(
+                    &mut rod.x[pi],
+                    &mut rod.position_compensation[pi],
+                    rod.v[pi] * dt,
+                );
             }
             return;
         }
@@ -411,7 +386,11 @@ pub fn step_rod_implicit(
         rod.v[pi].y += dv[row * 2 + 1];
     }
     for &pi in &free {
-        rod.x[pi] += rod.v[pi] * dt;
+        advance_position(
+            &mut rod.x[pi],
+            &mut rod.position_compensation[pi],
+            rod.v[pi] * dt,
+        );
     }
 }
 
@@ -420,53 +399,28 @@ mod tests {
     use super::*;
     use crate::rod::build_straight_rod;
 
-    /// Real, disclosed perf diagnostic (not correctness) -- measures
-    /// `step_rod_implicit`'s real total cost at several point counts,
-    /// end-to-end (assembly + solve together; see the real, permanent
-    /// finding below for the phase split). Run manually:
+    /// Perf diagnostic (not correctness) -- measures `step_rod_implicit`'s
+    /// total cost at several point counts, end-to-end (assembly + solve
+    /// together). Run manually:
     /// `cargo test --lib implicit_solver_cost_profile --all-features --
     /// --ignored --nocapture`.
     ///
-    /// # Real measured finding (2026-07-27)
-    /// Original split-timing version (hand-duplicated assembly loop, since
-    /// removed after it was caught silently measuring stale OLD logic post-
-    /// refactor -- see the in-body comment) found `solve_dense`'s O(ndof^3)
-    /// elimination was NOT the bottleneck: assembly (finite-difference
-    /// Jacobian construction) dominated by 14-18x at every n from 20-200.
-    /// That ruled out a banded solver as the real fix. The actual fix
-    /// implemented: an analytic (Baraff & Witkin 1998 damped-spring)
-    /// Jacobian for the AXIAL term, hybridized with FD ONLY for bending
-    /// (`compute_bending_forces_only`/`axial_force_and_jacobian`, see
-    /// `forces.rs`) -- bending's own analytic Jacobian needs a Hessian of
-    /// `discrete_curvature` with no ready citation, explicitly deferred as
-    /// separate, harder future work, NOT attempted here.
-    ///
-    /// Real before/after total-step-time measurement (this exact test,
-    /// same machine, same run):
-    /// ```text
-    /// n=20   old=435us   new=193us   (-56%)
-    /// n=50   old=1913us  new=1480us  (-23%)
-    /// n=100  old=7903us  new=5710us  (-28%)
-    /// n=200  old=32381us new=23055us (-29%)
-    /// ```
-    /// A real, meaningful, but PARTIAL win -- axial was a genuine minority
-    /// share of assembly cost, not most of it; bending's FD sweep still
-    /// dominates the remaining total. Whether the bending Hessian is worth
-    /// a dedicated follow-up session should weigh against THIS real
-    /// residual, not the original (now-closed) 14-18x gap.
+    /// Both axial (Baraff & Witkin 1998 damped-spring) and bending
+    /// (`forces::bending_jacobian_gauss_newton`) terms use analytic
+    /// Jacobians -- bending's is exact for the velocity term but a
+    /// Gauss-Newton (material-stiffness-only) approximation for the
+    /// position term, since the true Hessian of `discrete_curvature` has no
+    /// derived closed form here (see that function's doc for what's
+    /// dropped and why). Accuracy is still covered by `tests/accuracy.rs`'s
+    /// `cantilever_tip_deflection_matches_euler_bernoulli` and
+    /// `cantilever_deflection_error_shrinks_with_resolution`.
     #[test]
     #[ignore = "perf diagnostic (not correctness) -- measures total implicit-step cost at several point counts; run manually when investigating implicit-rod scaling, not routine CI"]
     fn implicit_solver_cost_profile() {
-        // Real, disclosed correction (2026-07-27): an earlier version of
-        // this test hand-duplicated the assembly loop to split its timing
-        // from `solve_dense`'s -- after the hybrid analytic-axial/FD-
-        // bending change below landed, that duplicate was STILL the OLD
-        // full-FD logic, silently measuring nothing about the real change.
-        // Real lesson: call the ACTUAL function under test, don't
-        // re-implement it a second time just to get a number. This now
-        // times the REAL `step_rod_implicit` end-to-end (assembly + solve
-        // together) -- a less granular but honest number, not a duplicated
-        // and silently-stale one.
+        // Time the actual `step_rod_implicit` end-to-end (assembly + solve
+        // together) -- don't re-implement the assembly loop separately just
+        // to get a number, or the timing can silently drift from the real
+        // code under test.
         for &n_points in &[20usize, 50, 100, 200] {
             let dx_meters = 0.01;
             let height_m = 0.10;
@@ -535,7 +489,7 @@ mod tests {
         // discrete solution should match the same qualitative real decay a
         // continuous critically-damped oscillator has -- checked here via
         // energy monotonically decreasing and reaching nea-zero, not
-        // exploding, the real correctness bar for an implicit integrator.
+        // exploding, the correctness bar for an implicit integrator.
         let dx_meters = 1.0;
         let mut rod =
             build_straight_rod(Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0), 2, 1.0, dx_meters);

@@ -26,22 +26,24 @@ impl GpuSimulation {
     }
 
     /// Physics snapshot from the CPU particle mirror (one frame behind GPU when strided).
-    /// Grid-side fields (mass error, momentum error, active cells) are zero — GPU grid is
+    /// Grid-side fields (mass error, momentum error, active cells) are zero -- GPU grid is
     /// not readable on CPU. All particle-side fields are exact.
     pub fn diagnostics_snapshot(&self) -> crate::diagnostics::SimSnapshot {
-        crate::diagnostics::collect_snapshot_particles_only(
+        let mut snapshot = crate::diagnostics::collect_snapshot_particles_only(
             self.frame_index,
             &self.particles,
             &self.config,
             self.last_sub_dt,
             self.last_substeps,
-        )
+        );
+        snapshot.sim_time_dropped = self.last_sim_time_dropped;
+        snapshot
     }
 
     /// Iterate over (index, &Particle) pairs within `radius` grid-cells of `center`.
-    /// Reads the internal CPU particle mirror — one frame behind GPU when strided.
+    /// Reads the internal CPU particle mirror -- one frame behind GPU when strided.
     /// O(candidates) via the internal spatial hash, not O(N) -- see `spatial_hash`
-    /// field's own doc for why this matters at real scale (many creatures/queries
+    /// field's doc for why this matters at real scale (many creatures/queries
     /// per frame against a large terrain+water buffer).
     pub fn particles_near(
         &self,
@@ -131,12 +133,16 @@ impl GpuSimulation {
     }
 
     /// Aggregate state for all particles of the given material.
-    pub fn material_state(&self, material_id: u32) -> crate::solver::query::BodyState {
-        crate::solver::query::body_state_of_slice(&self.particles, material_id)
+    pub fn material_state(&self, material_id: u32) -> crate::solver::body_state::BodyState {
+        crate::solver::body_state::body_state_of_slice(&self.particles, material_id)
     }
 
     /// Aggregate state for all particles within `radius` grid-cells of `center`.
-    pub fn region_state(&self, center: glam::Vec2, radius: f32) -> crate::solver::query::BodyState {
-        crate::solver::query::region_body_state_of_slice(&self.particles, center, radius)
+    pub fn region_state(
+        &self,
+        center: glam::Vec2,
+        radius: f32,
+    ) -> crate::solver::body_state::BodyState {
+        crate::solver::body_state::region_body_state_of_slice(&self.particles, center, radius)
     }
 }

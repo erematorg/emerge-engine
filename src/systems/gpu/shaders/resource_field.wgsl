@@ -1,19 +1,17 @@
-// Resource regrowth — GPU port of ScalarDiffusionField's real logistic-growth source
-// (src/energy/thermodynamics/scalar_field.rs). Same real PDE shape as thermal.wgsl
+// Resource regrowth -- GPU port of ScalarDiffusionField's logistic-growth source
+// (src/energy/thermodynamics/scalar_field.rs). Same PDE shape as thermal.wgsl
 // (scatter -> normalize -> Laplacian+reaction -> gather), but the reaction term is
 // logistic growth (Verhulst 1838, dφ/dt = r·φ·(1−φ/K)) instead of Newton cooling.
-// Own separate buffers/group from thermal -- carries state in particle.scalar_field,
-// NOT particle.temperature (real fix, 2026-07-17: both fields used to hijack
-// temperature as their carrier, meaning two already-shipped GPU features literally
-// could not run in the same scene together -- see Particle::scalar_field's own doc).
+// Own buffers and group, separate from thermal; state lives in particle.scalar_field,
+// not particle.temperature, so both can run in one scene (see Particle::scalar_field).
 //
 // 4 passes, same reasoning as thermal.wgsl for why they're separate dispatches (the
-// Laplacian pass needs every cell's normalized φ settled first, a genuine global
+// Laplacian pass needs every cell's normalized φ settled first, a global
 // barrier):
-//   1. resource_clear_main               — zero resource_mass + resource_work
-//   2. resource_p2g_main                 — scatter mass-weighted φ (particle.scalar_field)
-//   3. resource_normalize_laplacian_main — normalize, 5-point Laplacian, logistic growth
-//   4. resource_g2p_main                 — gather Δφ back to particles
+//   1. resource_clear_main               -- zero resource_mass + resource_work
+//   2. resource_p2g_main                 -- scatter mass-weighted φ (particle.scalar_field)
+//   3. resource_normalize_laplacian_main -- normalize, 5-point Laplacian, logistic growth
+//   4. resource_g2p_main                 -- gather Δφ back to particles
 
 struct Particle {
     x:                    vec2<f32>,
@@ -50,9 +48,9 @@ struct StepParams {
     boundary_thickness: u32,
     vel_limit:          f32,
     sleep_threshold:    f32,
-    _pad0:              u32,
-    _pad1:              u32,
-    _pad2:              u32,
+    contact_friction:              f32,
+    grid_cell_size:              f32,
+    contact_active:              u32,
 }
 
 struct ResourceParams {
@@ -61,6 +59,10 @@ struct ResourceParams {
     resource_r:  f32,
     resource_k:  f32,
     enabled:     u32,
+    // Seconds one pass advances; the field runs once per frame, see thermal.wgsl.
+    dt:          f32,
+    _pad0:       u32,
+    _pad1:       u32,
 }
 
 const BSPLINE_INNER_LIMIT:  f32 = 0.5;
@@ -136,22 +138,27 @@ fn resource_p2g_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 }
 
+// Normalize in its own dispatch, for the cross-workgroup reason given in thermal.wgsl.
 @compute @workgroup_size(64, 1, 1)
-fn resource_normalize_laplacian_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn resource_normalize_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if resource_params.enabled == 0u { return; }
     let res = step_params.grid_res;
-    let n = res * res;
     let i = gid.x;
-    if i >= n { return; }
-
+    if i >= res * res { return; }
     let mass_i = f32(atomicLoad(&resource_mass[i])) / RESOURCE_ATOMIC_SCALE;
     let raw_i = f32(atomicLoad(&resource_work[i])) / RESOURCE_ATOMIC_SCALE;
+    resource_phi_old[i] = select(resource_params.ambient, raw_i / mass_i, mass_i > 1e-10);
+}
+
+@compute @workgroup_size(64, 1, 1)
+fn resource_laplacian_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if resource_params.enabled == 0u { return; }
+    let res = step_params.grid_res;
+    let i = gid.x;
+    if i >= res * res { return; }
     let ambient = resource_params.ambient;
-    let phi_old_i = select(ambient, raw_i / mass_i, mass_i > 1e-10);
-    resource_phi_old[i] = phi_old_i;
-
-    storageBarrier();
-
+    let dt = resource_params.dt;
+    let phi_old_i = resource_phi_old[i];
     let cx = i32(i % res);
     let cy = i32(i / res);
     let p_xm = select(ambient, resource_phi_old[u32(cy) * res + u32(cx - 1)], cx > 0);
@@ -159,12 +166,15 @@ fn resource_normalize_laplacian_main(@builtin(global_invocation_id) gid: vec3<u3
     let p_ym = select(ambient, resource_phi_old[u32(cy - 1) * res + u32(cx)], cy > 0);
     let p_yp = select(ambient, resource_phi_old[u32(cy + 1) * res + u32(cx)], cy + 1 < i32(res));
     let laplacian = p_xm + p_xp + p_ym + p_yp - 4.0 * phi_old_i;
-    var phi_new = phi_old_i + resource_params.diffusivity * step_params.dt * laplacian;
+    var phi_new = phi_old_i + resource_params.diffusivity * dt * laplacian;
 
-    // Real logistic growth: dφ/dt = r·φ·(1−φ/K) (Verhulst 1838).
+    // Logistic growth, dφ/dt = r·φ·(1−φ/K) (Verhulst 1838), by its exact solution
+    // over the pass, φ K e^{r dt} / (K + φ (e^{r dt} − 1)), as Newton cooling is in
+    // thermal.wgsl: the explicit `φ + r φ (1 − φ/K) dt` lost 1.3 % on the logistic
+    // test once passes became a frame long.
     let k = max(resource_params.resource_k, 1e-6);
-    let growth = resource_params.resource_r * phi_new * (1.0 - phi_new / k);
-    phi_new += growth * step_params.dt;
+    let e = exp(resource_params.resource_r * dt);
+    phi_new = phi_new * k * e / (k + phi_new * (e - 1.0));
 
     atomicStore(&resource_work[i], i32(round(phi_new * RESOURCE_ATOMIC_SCALE)));
 }

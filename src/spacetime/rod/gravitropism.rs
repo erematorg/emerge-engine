@@ -1,69 +1,47 @@
-//! Real gravitropism — curvature relaxation toward a per-organ gravitropic
+//! Gravitropism: curvature relaxation toward a per-organ gravitropic
 //! set-point angle (GSA), with proprioceptive (self-straightening) damping.
-//! Dynamics FORM: Porat, Rivière, Meroz 2024, "A quantitative model for
+//! Dynamics: Porat, Rivière & Meroz 2024, "A quantitative model for
 //! spatio-temporal dynamics of root gravitropism," Journal of Experimental
 //! Botany 75(2):620, eq. 2: `r*edot0*Dkappa/Dt = -beta*sin(theta_tip -
-//! theta_g) - gamma*r*kappa`, itself built on Bastien et al.'s ACE
-//! (Angle-Curvature-Elongation) root model. Target angle: Digby & Firn 1995,
+//! theta_g) - gamma*r*kappa`, built on Bastien et al.'s ACE
+//! (Angle-Curvature-Elongation) model. Target angle: Digby & Firn 1995,
 //! "The gravitropic set-point angle (GSA): the identification of an
 //! important developmentally controlled variable governing plant
-//! architecture," Plant, Cell & Environment 18(12):1434 -- real, established
-//! plant-biology concept: an organ's actively-maintained angle from gravity
-//! is characteristic of the organ, NOT always zero. Convention (matches the
-//! paper): 0 = aligned WITH gravity (a main root, positive gravitropism),
-//! pi = aligned AGAINST gravity (a main shoot, negative gravitropism),
-//! anything between = a plagiotropic lateral branch/root genuinely
-//! maintaining that non-vertical angle as its own real target, not merely
-//! decaying toward vertical. `target_angle_rad`'s default of 0.0 is exactly
-//! the prior (root-only, always-fully-aligned) behavior -- zero change for
-//! any existing caller.
+//! architecture," Plant, Cell & Environment 18(12):1434: an organ's
+//! maintained angle from gravity is characteristic of the organ, not always
+//! zero. Convention (the paper's): 0 = with gravity (a main root), pi =
+//! against it (a main shoot), in between a plagiotropic lateral organ holding
+//! that angle as its target. `target_angle_rad` defaults to 0.0.
 //!
-//! Real, cited equation FORM (a genuine damped-relaxation law: curvature
-//! grows to reduce the local angular deviation from the organ's OWN target
-//! angle, damped by a real proprioceptive self-straightening term that
-//! prevents runaway curling) — not invented. The rate constants below
-//! (`sensitivity`, `straightening`) are disclosed as illustrative, chosen
-//! for a visibly real, stable response, NOT yet calibrated to either paper's
-//! own fitted parameters — a real, open follow-up, not hidden. Applied to
-//! THIS engine's own dimensionless discrete-curvature convention (see
-//! `forces::discrete_curvature`'s own doc), not either paper's literal
-//! 1/length units.
+//! The law's form is cited (curvature grows to reduce the deviation from the
+//! organ's target, damped by self-straightening so it cannot curl up); the
+//! rates `sensitivity` and `straightening` are illustrative, chosen for a
+//! stable visible response, not fitted to either paper. Applied to this
+//! engine's dimensionless discrete curvature (see
+//! `forces::discrete_curvature`), not the papers' 1/length.
 //!
-//! # `GravitropismMode`: which vertices actually evolve
-//! Bastien, Bohr, Moulia, Douady 2013, "Unifying model of shoot gravitropism
-//! reveals proprioception as a central feature of posture control in
-//! plants," PNAS 110(2):755-760, formulates the SAME kind of law as a FIELD
-//! along the organ's whole arc length `s`, not a single tip point:
-//! `dC(s,t)/dt = -beta*sin(A(s,t)) - gamma*C(s,t)`. Two real, distinct,
-//! cited regimes this engine now supports, chosen per-organ via
-//! `GravitropismMode`:
-//! - `TipOnly` (default): only the bending vertex nearest the tip evolves —
-//!   correct for an actively ELONGATING organ's growth zone (Porat 2024's
-//!   own scope; real roots only actively bend within that zone, mature
-//!   tissue further back does not keep re-curving). Exactly the original,
-//!   pre-2026-07-27 behavior.
-//! - `WholeOrgan`: every interior bending vertex evolves independently,
-//!   each sensing its OWN local edge direction — correct for a MATURE,
-//!   non-elongating organ's whole-body posture control (Bastien 2013's own
-//!   scope). One shared `sensitivity`/`straightening` pair applied at every
-//!   vertex is a faithful match to Bastien's own base model (constant beta,
-//!   gamma along the organ), not a new simplification layered on top of it.
-//!   Needed because nudging only the tip vertex cannot undo a shape already
-//!   stored across every OTHER vertex of a mature organ (confirmed
-//!   2026-07-27: a buckled blade of grass recovered only ~10% of its offset
-//!   under `TipOnly` before plateauing — the other ~17 vertices' own
-//!   rest_curvature never moved).
+//! # `GravitropismMode`: which vertices evolve
+//! Bastien, Bohr, Moulia & Douady 2013, "Unifying model of shoot
+//! gravitropism reveals proprioception as a central feature of posture
+//! control in plants," PNAS 110(2):755-760, write the same law as a field
+//! along the arc length `s`: `dC(s,t)/dt = -beta*sin(A(s,t)) - gamma*C(s,t)`.
+//! Two regimes, chosen per organ:
+//! - `TipOnly` (default): only the bending vertex nearest the tip evolves,
+//!   the growth zone of an elongating organ (Porat 2024's scope; mature
+//!   tissue further back does not re-curve).
+//! - `WholeOrgan`: every interior vertex evolves, each sensing its own edge
+//!   direction, the posture control of a mature organ (Bastien 2013's scope,
+//!   with his constant beta and gamma along the organ). Nudging the tip alone
+//!   cannot undo a shape stored along the whole organ: a buckled grass blade
+//!   recovered ~10% of its offset under `TipOnly`, the other ~17 vertices'
+//!   rest curvature never moving.
 //!
-//! # Phototropism reuses the SAME core, a different sensed signal
-//! `Phototropism`/`apply_phototropism` (below) call the exact same
-//! per-vertex damped-relaxation core as gravitropism -- Cholodny & Went's
-//! auxin-asymmetry mechanism for light-seeking bending and the
-//! statolith/gravitropism mechanism both resolve to the same curvature-
-//! relaxation ODE form in Bastien et al.'s own general framework; only the
-//! sensed directional signal differs (a light direction instead of
-//! gravity). `GravitropismMode`'s `TipOnly`/`WholeOrgan` distinction is
-//! itself generic to any such tropism, not gravity-specific, so it's
-//! reused as-is rather than duplicated under a new name.
+//! # Phototropism reuses the same core with another signal
+//! `Phototropism`/`apply_phototropism` call the same per-vertex relaxation:
+//! Cholodny & Went's auxin asymmetry (light-seeking bending) and the
+//! statolith mechanism both reduce to this curvature-relaxation form in
+//! Bastien et al.'s framework; only the sensed direction differs.
+//! `GravitropismMode` applies to any such tropism.
 
 use glam::Vec2;
 
@@ -71,15 +49,15 @@ use super::RodPoints;
 use super::growth::{GrowthResistance, sample_mass_density};
 use crate::grid::Grid;
 
-/// Which vertices `apply_gravitropism` actually evolves — see the module
-/// doc's own "`GravitropismMode`" section for the real, cited distinction.
+/// Which vertices `apply_gravitropism` actually evolves -- see the module
+/// doc's own "`GravitropismMode`" section for the cited distinction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GravitropismMode {
-    /// Growth-zone-localized (Porat, Rivière, Meroz 2024) — an actively
+    /// Growth-zone-localized (Porat, Rivière, Meroz 2024) -- an actively
     /// elongating organ (a root). Default: exactly the original behavior.
     #[default]
     TipOnly,
-    /// Whole-organ posture control (Bastien, Bohr, Moulia, Douady 2013) — a
+    /// Whole-organ posture control (Bastien, Bohr, Moulia, Douady 2013) -- a
     /// mature, non-elongating organ that needs to recover its whole shape,
     /// not just reorient its growing tip.
     WholeOrgan,
@@ -100,18 +78,13 @@ pub struct Gravitropism {
     /// plagiotropic organ actively holding that non-vertical angle. Default
     /// (via `new()`) is 0.0, matching the prior root-only behavior exactly.
     pub target_angle_rad: f32,
-    /// Which vertices evolve — see `GravitropismMode`'s own doc. Default
-    /// `TipOnly`, matching the prior (pre-2026-07-27) behavior exactly.
+    /// Which vertices evolve (see `GravitropismMode`). Default `TipOnly`.
     pub mode: GravitropismMode,
-    /// Real turgor-vs-soil-resistance gate, reusing `GrowthResistance`
-    /// unchanged: gravitropic curling is itself mediated by real differential
-    /// cell elongation
-    /// (Bastien et al.'s ACE model), so the same force balance that halts
-    /// ordinary elongation growth under high mechanical resistance
-    /// legitimately gates this too. `None` (default) = ungated, exactly the
-    /// prior behavior -- zero cost, zero change for anything that doesn't
-    /// opt in (and correctly a no-op for any rod with no grid contact to
-    /// sense in the first place, e.g. a free-standing stem).
+    /// Turgor-versus-soil-resistance gate, `GrowthResistance` unchanged:
+    /// gravitropic curling is differential cell elongation (Bastien et al.'s
+    /// ACE model), so the balance that halts elongation under high resistance
+    /// gates it too. `None` (default) = ungated; a no-op for a rod with no grid
+    /// contact (a free-standing stem).
     pub resistance: Option<GrowthResistance>,
 }
 
@@ -126,49 +99,45 @@ impl Gravitropism {
         }
     }
 
-    pub fn with_resistance(mut self, resistance: GrowthResistance) -> Self {
+    pub const fn with_resistance(mut self, resistance: GrowthResistance) -> Self {
         self.resistance = Some(resistance);
         self
     }
 
-    /// Set this organ's `target_angle_rad` -- see that field's own doc.
-    pub fn with_gsa(mut self, target_angle_rad: f32) -> Self {
+    /// Set this organ's `target_angle_rad` -- see that field's doc.
+    pub const fn with_gsa(mut self, target_angle_rad: f32) -> Self {
         self.target_angle_rad = target_angle_rad;
         self
     }
 
-    /// Choose which vertices evolve -- see `GravitropismMode`'s own doc.
-    pub fn with_mode(mut self, mode: GravitropismMode) -> Self {
+    /// Choose which vertices evolve -- see `GravitropismMode`'s doc.
+    pub const fn with_mode(mut self, mode: GravitropismMode) -> Self {
         self.mode = mode;
         self
     }
 }
 
-/// Real light-seeking curvature response (Cholodny & Went auxin-asymmetry
-/// theory) -- see the module doc's own "Phototropism reuses the SAME core"
-/// section for why this shares `apply_tropism` with `Gravitropism` rather
-/// than duplicating it. The sensed direction (`SimConfig::light_dir`) is a
-/// FIXED, externally-set vector, not a real solar/orbital model -- see
-/// `SimConfig::light_dir`'s own doc for that explicit scope boundary.
-/// Same field shape as `Gravitropism` (same underlying ODE, different
-/// signal), same disclosed-illustrative status for `sensitivity`/
-/// `straightening`.
+/// Light-seeking curvature response (Cholodny & Went auxin asymmetry),
+/// sharing `apply_tropism` with `Gravitropism` (see the module doc). The
+/// sensed direction (`SimConfig::light_dir`) is a fixed vector set from
+/// outside, not a solar model (see `SimConfig::light_dir`). Same fields as
+/// `Gravitropism`, same illustrative `sensitivity`/`straightening`.
 #[derive(Debug, Clone, Copy)]
 pub struct Phototropism {
-    /// See `Gravitropism::sensitivity`'s own doc -- same law, light signal.
+    /// See `Gravitropism::sensitivity`'s doc -- same law, light signal.
     pub sensitivity: f32,
-    /// See `Gravitropism::straightening`'s own doc.
+    /// See `Gravitropism::straightening`'s doc.
     pub straightening: f32,
     /// This organ's target angle from the sensed light direction. 0.0 =
     /// grow directly toward the light (the common phototropic case); PI =
-    /// away from it (negative phototropism, rare but real, e.g. some root
+    /// away from it (negative phototropism, rare but e.g. some root
     /// behavior); anything between = a fixed lean relative to the light
     /// source. Default (via `new()`) is 0.0.
     pub target_angle_rad: f32,
-    /// See `GravitropismMode`'s own doc -- reused as-is (generic to any
+    /// See `GravitropismMode`'s doc -- reused as-is (generic to any
     /// tropism, not gravity-specific in meaning).
     pub mode: GravitropismMode,
-    /// See `Gravitropism::resistance`'s own doc.
+    /// See `Gravitropism::resistance`'s doc.
     pub resistance: Option<GrowthResistance>,
 }
 
@@ -183,41 +152,38 @@ impl Phototropism {
         }
     }
 
-    pub fn with_resistance(mut self, resistance: GrowthResistance) -> Self {
+    pub const fn with_resistance(mut self, resistance: GrowthResistance) -> Self {
         self.resistance = Some(resistance);
         self
     }
 
     /// Set this organ's own target angle from the sensed light direction --
-    /// see `target_angle_rad`'s own doc.
-    pub fn with_target_angle(mut self, target_angle_rad: f32) -> Self {
+    /// see `target_angle_rad`'s doc.
+    pub const fn with_target_angle(mut self, target_angle_rad: f32) -> Self {
         self.target_angle_rad = target_angle_rad;
         self
     }
 
-    /// Choose which vertices evolve -- see `GravitropismMode`'s own doc.
-    pub fn with_mode(mut self, mode: GravitropismMode) -> Self {
+    /// Choose which vertices evolve -- see `GravitropismMode`'s doc.
+    pub const fn with_mode(mut self, mode: GravitropismMode) -> Self {
         self.mode = mode;
         self
     }
 }
 
-/// Real, illustrative convergence bound on `|d(kappa)/dt|` (curvature-units
-/// per second) for `tropism_still_correcting` -- same disclosure spirit as
-/// `sensitivity`/`straightening`: not calibrated to a specific species,
-/// chosen small enough to catch genuine ongoing correction, loose enough
-/// that float noise / a real multi-tropism compromise equilibrium can
-/// still cross it and let the rod sleep. Real units check: at the default
-/// `sensitivity` scale (~0.01-0.05) and a near-equilibrium `sin_deviation`
-/// well under 1, `dkappa` naturally lands well under this bound once truly
-/// settled.
+/// Convergence bound on `|d(kappa)/dt|` (curvature units per second) for
+/// `tropism_still_correcting`, illustrative like `sensitivity`/
+/// `straightening`: small enough to catch ongoing correction, loose enough
+/// that float noise or a multi-tropism compromise lets the rod sleep. At the
+/// default `sensitivity` (~0.01-0.05) and a small `sin_deviation`, a settled
+/// `dkappa` falls well under it.
 const CONVERGED_DKAPPA_PER_SECOND: f32 = 0.002;
 
 /// Rotate `gravity_dir` (already a unit vector) by `target_angle_rad` to get
 /// the organ's real target direction (its GSA, Digby & Firn 1995) --
 /// `target_angle_rad=0.0` leaves it equal to `gravity_dir` (root-like);
 /// `PI` flips it to point straight against gravity (a shoot seeking true
-/// vertical up); anything between is a genuinely maintained plagiotropic
+/// vertical up); anything between is a maintained plagiotropic
 /// lean. Constant across every vertex for one call, matching Bastien
 /// 2013's own model (the target/beta/gamma are not functions of arc-length
 /// `s`; only the sensed local angle `A(s,t)` is).
@@ -232,7 +198,7 @@ fn target_direction(gravity_dir: Vec2, target_angle_rad: f32) -> Vec2 {
 /// Which `rest_curvature` indices `mode` governs, for a rod of `n` points
 /// (`rest_curvature` has `n-2` entries). Matches `forces.rs`'s own vertex
 /// convention: vertex `j` sits between points `j`, `j+1`, `j+2`.
-fn vertex_range(mode: GravitropismMode, n: usize) -> std::ops::Range<usize> {
+const fn vertex_range(mode: GravitropismMode, n: usize) -> std::ops::Range<usize> {
     match mode {
         GravitropismMode::TipOnly => (n - 3)..(n - 2),
         GravitropismMode::WholeOrgan => 0..(n - 2),
@@ -250,12 +216,10 @@ fn local_edge_direction(rod: &RodPoints, vertex: usize) -> Option<Vec2> {
     if len < 1.0e-9 { None } else { Some(edge / len) }
 }
 
-/// Real turgor-vs-soil-resistance gate (see `Gravitropism::resistance`'s own
-/// doc), sampled at `sample_pos` -- the ORIGINAL shipped code samples at
-/// `rod.x[n-1]` for its one tip vertex, which is exactly `x[vertex+2]` when
-/// `vertex=n-3`; every caller here passes `rod.x[vertex+2]` for exactly that
-/// reason, so `WholeOrgan` reproduces `TipOnly`'s own sampling choice at the
-/// tip vertex bit-for-bit rather than silently changing it.
+/// Turgor-versus-soil-resistance gate (see `Gravitropism::resistance`)
+/// sampled at `sample_pos`. Callers pass `rod.x[vertex+2]`, which at the tip
+/// vertex (`vertex = n-3`) is `rod.x[n-1]`, the point `TipOnly` samples, so
+/// `WholeOrgan` matches it there bit for bit.
 fn resistance_gate(resistance: Option<GrowthResistance>, grid: &Grid, sample_pos: Vec2) -> f32 {
     match resistance {
         Some(r) => {
@@ -281,13 +245,10 @@ struct TropismLaw<'a> {
     grid: &'a Grid,
 }
 
-/// Real per-vertex `d(kappa)/dt` under this damped-relaxation law (Porat
-/// 2024/Bastien 2013's shared equation FORM), WITHOUT applying it --
-/// shared by `evolve_vertex_curvature` (which does apply it) and
-/// `tropism_still_correcting` (which uses its magnitude as the real
-/// convergence signal -- see that function's own doc for why this, not a
-/// sin-deviation-from-one-target check, is the correct thing to test).
-/// `None` for a degenerate (near-zero-length) edge.
+/// Per-vertex `d(kappa)/dt` under the relaxation law (Porat 2024 / Bastien
+/// 2013), without applying it: shared by `evolve_vertex_curvature` (which
+/// applies it) and `tropism_still_correcting` (which uses its magnitude as
+/// the convergence signal). `None` for a near-zero-length edge.
 fn vertex_dkappa(
     rod: &RodPoints,
     vertex: usize,
@@ -321,12 +282,10 @@ fn evolve_vertex_curvature(
     rod.rest_curvature[vertex] += dkappa * dt;
 }
 
-/// Real, shared entry point for ANY tropism sharing this damped-relaxation
-/// law (gravitropism, phototropism -- see module doc) -- `direction` is
-/// the sensed environmental vector (gravity or light), NOT yet normalized
-/// or GSA-rotated; this does both, then evolves every vertex `mode`
-/// governs. No-op if `direction` is ~zero (nothing to sense) or the rod is
-/// too short to have any interior bending vertex.
+/// Shared entry point for any tropism under this law (gravitropism,
+/// phototropism): `direction` is the sensed vector (gravity or light),
+/// normalized and GSA-rotated here, then every vertex `mode` governs evolves.
+/// No-op for a near-zero `direction` or a rod too short to bend.
 fn apply_tropism(
     rod: &mut RodPoints,
     mode: GravitropismMode,
@@ -351,29 +310,15 @@ fn apply_tropism(
     }
 }
 
-/// Shared convergence check for any tropism using `apply_tropism` -- see
-/// `still_correcting`'s own doc (the gravitropism-specific wrapper below).
+/// Shared convergence check for any tropism using `apply_tropism` (see the
+/// gravitropism wrapper `still_correcting` below).
 ///
-/// **Real fix (2026-07-28, user-reported "never falls asleep"):** the
-/// original version checked `|sin_deviation from THIS tropism's OWN
-/// target|` -- correct for a rod with only ONE active tropism, but wrong
-/// the moment a rod has gravitropism AND phototropism attached with
-/// genuinely DIFFERENT targets (gravitropism seeking vertical, phototropism
-/// seeking an angled light source): the rod settles at a real COMPROMISE
-/// angle satisfying neither target exactly, so each tropism's own
-/// deviation-from-ITS-target stays permanently nonzero even once the rod
-/// has genuinely, physically stopped changing -- confirmed directly
-/// (headless test, both the original 0.05/0.03 rates AND a slower 0.015/
-/// 0.01 tuning never converged within 60s of simulated settle time).
-///
-/// The real, correct convergence signal is whether the correction is
-/// STILL ACTIVELY CHANGING `rest_curvature` (`|d(kappa)/dt|`, via the
-/// shared `vertex_dkappa`), not whether ONE tropism's own target has been
-/// reached -- this is the true equilibrium condition (a real, physical
-/// steady state, whether single-target or a multi-tropism compromise),
-/// and reduces to the exact same behavior as before for the
-/// single-tropism case (at equilibrium, `sin_deviation` and `dkappa` reach
-/// zero together there too).
+/// Tests whether the correction is still changing `rest_curvature`
+/// (`|d(kappa)/dt|`, from `vertex_dkappa`), not whether one tropism reached
+/// its own target: with gravitropism and phototropism pulling to different
+/// targets the rod settles at a compromise that satisfies neither, and the
+/// per-target deviation never reached zero (no sleep within 60 s at either
+/// rate set tried). With one tropism the two conditions coincide.
 fn tropism_still_correcting(
     rod: &RodPoints,
     mode: GravitropismMode,
@@ -406,13 +351,13 @@ fn tropism_still_correcting(
 /// Without the `resistance` gate, a rod embedded in soil evolves
 /// `rest_curvature` toward its own target-angle alignment regardless of
 /// whether it can actually rotate that far, which can drive unbounded
-/// velocity growth — the same class of failure `growth.rs`'s own
+/// velocity growth -- the same class of failure `growth.rs`'s own
 /// `GrowthResistance` was built to prevent for elongation, extended here to
-/// curvature (see `Gravitropism::resistance`'s own doc).
+/// curvature (see `Gravitropism::resistance`'s doc).
 ///
 /// Evolves `rest_curvature` toward `gravitropism`'s own real gravitropic
 /// set-point angle (GSA, Digby & Firn 1995) at whichever vertices its
-/// `mode` governs (see `GravitropismMode`'s own doc) -- NOT always fully
+/// `mode` governs (see `GravitropismMode`'s doc) -- NOT always fully
 /// vertical: `target_angle_rad=0.0` recovers the exact original root-only
 /// behavior, but any other angle lets an organ actively hold a genuinely
 /// non-vertical "true" shape (a plagiotropic lateral branch, or a shoot
@@ -446,9 +391,9 @@ pub fn apply_gravitropism(
 /// True iff any vertex `gravitropism.mode` governs still has a real,
 /// meaningful angular deviation from its own target direction -- used to
 /// keep a rod awake (see `Rod::is_correcting_gravitropically`) until its
-/// active correction has genuinely converged, not just until the passive
+/// active correction has converged, not just until the passive
 /// elastic settle finishes. `CONVERGED_SIN_DEVIATION` is illustrative (see
-/// its own doc), same disclosure as `sensitivity`/`straightening`.
+/// its doc), same disclosure as `sensitivity`/`straightening`.
 pub(super) fn still_correcting(
     rod: &RodPoints,
     gravitropism: &Gravitropism,
@@ -497,7 +442,7 @@ pub fn apply_phototropism(
     );
 }
 
-/// See `still_correcting`'s own doc -- the phototropism analog, used by
+/// See `still_correcting`'s doc -- the phototropism analog, used by
 /// `Rod::is_correcting_phototropically`.
 pub(super) fn still_correcting_phototropically(
     rod: &RodPoints,
@@ -530,7 +475,7 @@ mod gsa_tests {
     fn horizontal_tip_rod() -> RodPoints {
         let mut points = build_straight_rod(Vec2::new(0.0, 5.0), Vec2::new(0.0, 4.0), 4, 0.01, 1.0);
         // Bend just the tip edge to point sideways (+x) instead of continuing
-        // straight down, giving a real, nonzero angle to correct from any target.
+        // straight down, giving a nonzero angle to correct from any target.
         points.x[3] = points.x[2] + Vec2::new(1.0, 0.0);
         points
     }
@@ -538,7 +483,7 @@ mod gsa_tests {
     #[test]
     fn default_gsa_reproduces_original_align_with_gravity_behavior() {
         // GSA=0.0 (the default) must curl the tip TOWARD gravity_dir, exactly
-        // the original (pre-GSA) root-only behavior -- a real regression
+        // the original (pre-GSA) root-only behavior -- a regression
         // guard, not just a smoke test.
         let mut rod = horizontal_tip_rod();
         let gravitropism = Gravitropism::new(1.0, 0.0);
@@ -565,7 +510,7 @@ mod gsa_tests {
         // exactly at a pole would give a degenerate zero sin(deviation) for
         // BOTH cases (antiparallel is as much an equilibrium as parallel for
         // a pure sin-of-angle law -- correct physics, but not a useful test
-        // case), so this uses a genuinely off-pole tip instead.
+        // case), so this uses a off-pole tip instead.
         let grid = Grid::new(8);
         let gravity = Vec2::new(0.0, -1.0);
 
@@ -598,7 +543,7 @@ mod gsa_tests {
         // A tip already sitting AT its own non-vertical set-point angle
         // (here, 90 degrees -- horizontal) should see zero correction, same
         // as a root at GSA=0 sitting straight down -- proving a plagiotropic
-        // angle is a genuine target the organ actively holds, not merely an
+        // angle is a target the organ actively holds, not merely an
         // intermediate stop on the way to 0 or PI.
         let mut rod = horizontal_tip_rod();
         let grid = Grid::new(8);
@@ -622,10 +567,10 @@ mod whole_organ_tests {
     use crate::rod::build_straight_rod;
 
     /// A 6-point rod uniformly tilted off-vertical -- every edge shares the
-    /// SAME real, nonzero deviation from "straight down" (still genuinely
+    /// SAME nonzero deviation from "straight down" (still genuinely
     /// zero actual curvature, but gravitropism only cares about local edge
     /// direction vs. target, not actual curvature), so every one of its 4
-    /// interior vertices has a real correction to make under any mode.
+    /// interior vertices has a correction to make under any mode.
     fn uniformly_tilted_rod() -> RodPoints {
         let mut points = build_straight_rod(Vec2::new(0.0, 6.0), Vec2::new(0.0, 0.0), 6, 0.01, 1.0);
         for (i, p) in points.x.iter_mut().enumerate() {
@@ -677,7 +622,7 @@ mod whole_organ_tests {
     fn whole_organ_mode_matches_tip_only_at_the_tip_vertex() {
         // Same starting rod/params, only `mode` differs. Per-vertex updates
         // are independent (each reads/writes its own rest_curvature slot,
-        // see `evolve_vertex_curvature`'s own doc), so the tip vertex's own
+        // see `evolve_vertex_curvature`'s doc), so the tip vertex's own
         // result must be identical either way -- proving WholeOrgan is a
         // faithful superset of TipOnly's formula, not a different one.
         let grid = Grid::new(16);
@@ -700,11 +645,9 @@ mod whole_organ_tests {
 
     #[test]
     fn resistance_gate_is_sampled_per_vertex_not_only_at_the_tip() {
-        // Real mass concentrated ONLY near the vertex-0 sample point,
-        // simulating dense soil near the base but none further up along the
-        // organ -- proves the resistance gate is genuinely evaluated at
-        // EACH vertex's own position under WholeOrgan, not just once at the
-        // tip (which is what the pre-generalization code always sampled).
+        // Mass only near the vertex-0 sample point (dense soil at the base,
+        // none higher up): under WholeOrgan the gate is evaluated at each
+        // vertex's own position, not once at the tip.
         let rod_template = uniformly_tilted_rod();
         let mut grid = Grid::new(16);
         let base_sample_cell = rod_template.x[2].round().as_ivec2(); // vertex 0 samples x[0+2]
@@ -751,7 +694,7 @@ mod phototropism_tests {
 
     /// The real point of Phase 3: `apply_phototropism` and `apply_gravitropism`
     /// must produce BIT-IDENTICAL results when given the same direction
-    /// vector and equivalent parameters -- proof this is genuine shared
+    /// vector and equivalent parameters -- proof this is shared
     /// code (`apply_tropism`), not two separately-written, coincidentally-
     /// similar implementations that could silently drift apart later.
     fn same_sensitivity_params(

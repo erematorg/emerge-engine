@@ -56,7 +56,7 @@ pub fn forward_substep(
     let mut vel_map: BTreeMap<(i32, i32), Vec2> = BTreeMap::new();
     let mut stuck = BTreeSet::new();
     for (&cell, &mass_c) in mass_map.iter() {
-        // Zero-weight guard, same as the real `Grid::update_velocities`.
+        // Zero-weight guard, same as the `Grid::update_velocities`.
         if mass_c <= 0.0 {
             continue;
         }

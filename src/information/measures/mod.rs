@@ -1,4 +1,4 @@
-/// Information-theoretic measures for particle systems — all O(N), real-time safe.
+/// Information-theoretic measures for particle systems -- all O(N), real-time safe.
 ///
 /// All estimators use the MPM grid or a single pass over particles.
 /// No pairwise distance matrix. No O(N²).

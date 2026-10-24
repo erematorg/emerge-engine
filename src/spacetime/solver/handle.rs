@@ -1,6 +1,6 @@
 //! Typed handles for materials and particle groups.
 
-use crate::solver::query::BodyState;
+use crate::solver::body_state::BodyState;
 
 /// Typed handle for a registered material.
 ///
@@ -11,7 +11,7 @@ pub struct MaterialHandle(pub u32);
 
 impl MaterialHandle {
     #[inline]
-    pub fn id(self) -> u32 {
+    pub const fn id(self) -> u32 {
         self.0
     }
 }
@@ -38,11 +38,11 @@ impl std::fmt::Display for MaterialHandle {
 
 /// A stable handle to a group of particles, identified by `user_tag`.
 ///
-/// Physical indices change whenever particles sleep or wake — the tag is the
+/// Physical indices change whenever particles sleep or wake -- the tag is the
 /// only stable identity. All operations delegate to `Simulation`'s tag-based API,
 /// which uses `tag_index` for O(group_size) access.
 ///
-/// # Example — LP creature management
+/// # Example -- LP creature management
 /// ```rust,no_run
 /// # extern crate emerge_engine as emerge;
 /// # use emerge::solver::Simulation;
@@ -57,23 +57,23 @@ impl std::fmt::Display for MaterialHandle {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ParticleGroup {
     pub tag: u32,
-    /// Optional debug label — shown in diagnostics.
+    /// Optional debug label -- shown in diagnostics.
     pub label: Option<&'static str>,
 }
 
 impl ParticleGroup {
-    pub fn new(tag: u32) -> Self {
+    pub const fn new(tag: u32) -> Self {
         Self { tag, label: None }
     }
 
-    pub fn named(tag: u32, label: &'static str) -> Self {
+    pub const fn named(tag: u32, label: &'static str) -> Self {
         Self {
             tag,
             label: Some(label),
         }
     }
 
-    pub fn tag(self) -> u32 {
+    pub const fn tag(self) -> u32 {
         self.tag
     }
 }
@@ -93,8 +93,8 @@ impl std::fmt::Display for ParticleGroup {
     }
 }
 
-/// Aggregate BodyState for a tag — delegates to Simulation::group_state.
+/// Aggregate BodyState for a tag -- delegates to Simulation::group_state.
 /// Kept here for callers that hold a ParticleGroup and want a one-liner.
-pub fn group_state_of(_group: ParticleGroup, state: BodyState) -> BodyState {
+pub const fn group_state_of(_group: ParticleGroup, state: BodyState) -> BodyState {
     state
 }

@@ -1,59 +1,40 @@
 use super::GpuSimulation;
 
 impl GpuSimulation {
-    /// Real, honest report of why this instance's device was lost, if it ever
-    /// was — `None` in ordinary operation. Automatically wired for `new()`
-    /// instances; `with_device()` instances need one explicit call to
-    /// `enable_device_lost_detection()` first (see that method's doc for why
-    /// it isn't automatic there). Once set, `step_frame` and the blocking sync
-    /// methods become safe no-ops instead of panicking on a dead device —
-    /// callers that care should poll this rather than assume silence means
-    /// healthy.
+    /// Why this instance's device was lost, if it was; `None` in ordinary
+    /// operation. Wired automatically for `new()` instances; `with_device()`
+    /// instances need one call to `enable_device_lost_detection()` first (see
+    /// that method for why). Once set, `step_frame` and the blocking sync
+    /// methods are no-ops instead of panicking on a dead device; poll this
+    /// rather than assume silence means healthy.
     pub fn device_lost_reason(&self) -> Option<String> {
         self.device_lost.lock().ok().and_then(|g| g.clone())
     }
 
-    /// Opt in to real device-lost detection (the confirmed real cause of
-    /// emerge issue #10 — a genuine `Out of Memory` device loss under
-    /// sustained load on slow/software GPU backends; see project memory
-    /// `gpu_readback_error_path_bug_issue10`). Called automatically by `new()`
-    /// (which owns its device exclusively, so it's always safe there). NOT
-    /// automatic for `with_device()` (shared-device use, e.g. a renderer on the
-    /// same device as this sim) because a wgpu device can only have ONE
-    /// lost-callback (and, as of 2026-07-08, only one uncaptured-error handler
-    /// too — same `Option<Arc<dyn Handler>>` single-slot storage internally,
-    /// confirmed by reading wgpu-27.0.1's `ErrorSinkRaw`) — auto-registering
-    /// here could silently overwrite a caller's own handler. Call this
-    /// explicitly after `with_device()` if you (like LP) don't have your own
-    /// device-lost handling and want emerge's; don't call it if you've already
-    /// registered your own callback/handler on this device — the second
-    /// registration wins and the first is silently lost (this is wgpu's own
-    /// behavior, not something this method can prevent).
+    /// Opt in to device-lost detection (issue #10's cause: an `Out of Memory`
+    /// device loss under sustained load on slow or software GPU backends).
+    /// Called automatically by `new()`, which owns its device. Not automatic
+    /// for `with_device()` (a shared device, e.g. with a renderer): a wgpu
+    /// device holds one lost-callback and one uncaptured-error handler
+    /// (single-slot storage, wgpu-27.0.1's `ErrorSinkRaw`), so registering
+    /// here could silently replace the caller's. Call this after
+    /// `with_device()` if you (like LP) have no device-lost handling of your
+    /// own; if you have registered your own callback or handler, don't, since
+    /// the second registration replaces the first (wgpu's behavior).
     ///
-    /// ALSO installs an uncaptured-error handler (2026-07-08). wgpu's default
-    /// behavior for ANY uncaptured error is an unconditional panic
-    /// (`panic!("wgpu error: {err}")`, confirmed by reading wgpu-27.0.1's
-    /// `default_error_handler`) — this handler replaces that default and
-    /// **never panics**, regardless of what the error says. That "never" is
-    /// load-bearing, not a simplification: an earlier version of this handler
-    /// tried to be more precise — classify errors naming a destroyed/lost
-    /// resource as an inferred device loss (no panic), but still panic for
-    /// anything else so a genuine, unrelated validation bug wouldn't be
-    /// silently swallowed. That version was reproduced crashing LOCALLY
-    /// (forcing the D3D12 WARP adapter — the same backend windows-latest CI
-    /// uses — instead of waiting on another CI round-trip) with the full
-    /// backtrace showing the panic originated from THIS handler's own `panic!`
-    /// call, invoked synchronously from inside `wgpu_core::Queue::submit`'s
-    /// internal error path — and unwinding a panic from there is what produced
-    /// `STATUS_STACK_BUFFER_OVERRUN`, not the error itself. In other words:
-    /// panicking from ANY code reachable from this callback is unsafe on this
-    /// backend, independent of whether the message looks like a device-loss
-    /// artifact or a real bug — so the "still panic for real bugs" branch was
-    /// itself the crash, not a safety net. The fix: never panic here, full
-    /// stop. Every uncaptured error sets `device_lost` (so `is_device_lost()`'s
-    /// existing no-op guards take over) and is `eprintln!`'d in full so it's
-    /// still visible for debugging — just never re-thrown as a Rust panic from
-    /// inside this specific callback context.
+    /// Also installs an uncaptured-error handler. wgpu's default for any
+    /// uncaptured error is an unconditional panic (`panic!("wgpu error:
+    /// {err}")`, wgpu-27.0.1's `default_error_handler`); this handler replaces
+    /// it and never panics, whatever the error.
+    ///
+    /// "Never" matters: a handler that treated errors naming a destroyed or
+    /// lost resource as device loss but still panicked on anything else
+    /// crashed with `STATUS_STACK_BUFFER_OVERRUN` on the D3D12 WARP backend
+    /// (the one windows-latest CI uses), because unwinding a panic from inside
+    /// `wgpu_core::Queue::submit`'s error path is unsafe there. Do not add a
+    /// "still panic for real bugs" branch. Every uncaptured error sets
+    /// `device_lost` (so `is_device_lost()`'s no-op guards take over) and is
+    /// printed in full with `eprintln!`.
     pub fn enable_device_lost_detection(&self) {
         let flag = self.device_lost.clone();
         self.device

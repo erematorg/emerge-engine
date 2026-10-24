@@ -1,6 +1,6 @@
 //! `rod::gravitropism`'s `Phototropism`/`apply_phototropism`: Cholodny & Went
 //! auxin-asymmetry theory, sharing the SAME curvature-relaxation core as
-//! gravitropism (see that module's own doc). Proves the tip rotates toward a
+//! gravitropism (see that module's doc). Proves the tip rotates toward a
 //! sensed light direction through the full mechanical pipeline (grid
 //! coupling, elastic bending, damping, ordinary gravity sag), isolated via
 //! A/B (phototropism on vs off) exactly like `tests/rod_gravitropism.rs`'s

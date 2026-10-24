@@ -21,16 +21,16 @@ use std::collections::HashMap;
 
 use glam::Vec2;
 
-use crate::fields::{FADE_ONSET_RATIO, Field};
+use crate::fields::Field;
 use crate::particle::Particles;
-use crate::solver::cutoff::smooth_cutoff;
 
 /// Electrostatic acceleration from external point charges, affecting particles by material.
+#[derive(Debug)]
 pub struct CoulombField {
     /// External charged point sources: `(position in grid coords, charge in sim units)`.
     ///
     /// Positive charge is proton-like. Negative is electron-like.
-    /// These are macro-scale emitters/electrodes — not individual MPM particles.
+    /// These are macro-scale emitters/electrodes -- not individual MPM particles.
     pub sources: Vec<(Vec2, f32)>,
 
     /// Per-material charge value. `material_id → charge`.
@@ -39,32 +39,22 @@ pub struct CoulombField {
     /// Unregistered material_ids are neutral (charge = 0.0, not affected).
     pub material_charges: HashMap<u32, f32>,
 
-    /// Coulomb constant k in simulation units.
-    ///
-    /// IRL: k = 8.987×10⁹ N·m²/C² in vacuum.
-    /// For grid-scale simulations: tune to balance EM forces relative to gravity (e.g. 1.0–100.0).
+    /// Coulomb constant k in the scene's own units (charge, force and length
+    /// as the caller defines them). In SI, `k = 8.987e9 N m^2/C^2` in vacuum
+    /// (`electromagnetics::COULOMB_CONSTANT`). A conversion from SI to grid
+    /// units, as `SimConfig::gravitational_constant_from_si` gives for G, is
+    /// open: charges carry no unit of their own yet.
     pub coulomb_constant: f32,
 
-    /// Plummer softening length ε in grid coordinates.
-    ///
-    /// Prevents singularity as charged particle approaches source.
-    /// Rule of thumb: 0.5–1.0 grid cells.
+    /// Plummer softening length ε in grid coordinates: a regularization of the
+    /// point-charge singularity, a value the caller chooses (see
+    /// `GravityWellField::softening`).
     pub softening: f32,
-
-    /// Cutoff radius in grid coordinates.
-    ///
-    /// Default: `f32::INFINITY` (IRL — Coulomb force has infinite range).
-    /// Set to a finite value as a performance approximation for large particle counts.
-    pub cutoff: f32,
-
-    /// Force-switch onset for smooth fade (must be ≤ cutoff).
-    /// Only meaningful when cutoff is finite.
-    pub switch_on: f32,
 }
 
 impl CoulombField {
-    /// Full-range Coulomb field — IRL default, no distance cutoff.
-    pub fn new(
+    /// Full-range Coulomb field: the electrostatic force has no range limit.
+    pub const fn new(
         sources: Vec<(Vec2, f32)>,
         material_charges: HashMap<u32, f32>,
         coulomb_constant: f32,
@@ -75,17 +65,7 @@ impl CoulombField {
             material_charges,
             coulomb_constant,
             softening,
-            cutoff: f32::INFINITY,
-            switch_on: f32::INFINITY,
         }
-    }
-
-    /// Performance approximation: clamp Coulomb force to zero beyond `cutoff` grid-cells.
-    /// Smooth fade begins at 0.85 × cutoff.
-    pub fn with_cutoff(mut self, cutoff: f32) -> Self {
-        self.cutoff = cutoff;
-        self.switch_on = FADE_ONSET_RATIO * cutoff;
-        self
     }
 }
 
@@ -110,7 +90,7 @@ impl Field for CoulombField {
             let r2 = r_vec.length_squared();
             let r = r2.sqrt();
 
-            if r >= self.cutoff || r < f32::EPSILON {
+            if r < f32::EPSILON {
                 continue;
             }
 
@@ -124,9 +104,8 @@ impl Field for CoulombField {
                 continue;
             }
 
-            let switch = smooth_cutoff(r, self.switch_on, self.cutoff);
             // Force → acceleration: divide by particle mass
-            acc += r_vec * (force_scale * switch * inv_mass);
+            acc += r_vec * (force_scale * inv_mass);
         }
 
         acc

@@ -1,0 +1,717 @@
+extern crate emerge_engine as emerge;
+
+#[path = "../gui_common/coords.rs"]
+mod gui_common;
+
+/// Soil-horizon layering -- the O/A/B/C genetic horizon sequence (Jenny 1941,
+/// "Factors of Soil Formation"; USDA-NRCS Soil Survey Manual horizon nomenclature),
+/// each horizon an existing material of this engine:
+///
+///   O (organic litter/humus)      -> DruckerPragerMaterial::low_friction
+///                                     (closest existing loose/low-cohesion preset)
+///   A (mineral+organic topsoil)   -> GranularFluidMaterial::saturated_loam
+///                                     ("loam" is the A-horizon texture class)
+///   B (clay-illuviated subsoil)   -> NaccMaterial::kaolin (Cam-Clay, the clay
+///                                     accumulation zone)
+///   C (weathered parent material) -> DruckerPragerMaterial::dilatant (denser,
+///                                     closer to intact rock than A/O)
+///
+/// `saturated_loam` settles cleanly at this file's `young_modulus=1200` under gravity
+/// (with the loam preset's `eos_power`; the water value 7 on a 40%-compressible preset
+/// made it unstable, see `GranularFluidMaterial::saturated_loam`).
+///
+/// Bulk-density ratios relative to water=1.0 (set through `mass_override`), composed
+/// from several soil-science figures rather than one horizon table: organic/peaty soils <0.5 g/cm^3, loam ~1.2-1.5 g/cm^3, clay
+/// ~1.0-1.4 g/cm^3 (B-horizon clay is denser than surface clay of the same texture,
+/// from illuviation and compaction, which is what sets B apart from A), compact or
+/// glacial-till C-horizons 1.76-1.95 g/cm^3. Representative picks within or near each
+/// range; soil depth and density vary hugely with climate and parent material
+/// (Jenny's thesis).
+/// Layer thickness ratios (O thin, C thickest) follow pedology's qualitative
+/// ordering; exact depths vary by soil type and location, so these are representative
+/// proportions, not a literal profile.
+///
+/// Horizon colors are representative pedology descriptions (dark organic O, brown A,
+/// reddish-orange B from iron-oxide illuviation, pale weathered C), not Munsell
+/// soil-color-chart values.
+///
+/// Interaction: LMB pushes soil aside, revealing the cross-section of layers as you
+/// excavate.
+///
+///   cargo run --example soil_horizons --features "render"
+use egui_wgpu::ScreenDescriptor;
+use emerge::render::{ColorMode, Renderer};
+use emerge::{
+    DruckerPragerMaterial, GranularFluidMaterial, NaccMaterial, SimConfig, Simulation,
+    SlipBoundary, SpawnRegion,
+};
+use glam::{IVec2, Vec2};
+use std::sync::Arc;
+use winit::application::ApplicationHandler;
+use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::window::{Window, WindowId};
+
+const GRID: usize = 64;
+/// Simulated time per rendered frame. The CFL condition of these four
+/// materials asks for about 49 substeps per 0.1 of simulated time, whatever
+/// the cursor does, so the old 0.1 per frame could not fit its 16-substep
+/// budget and the solver stopped on the first frame. Measured headless
+/// (`soil_horizons_cost_probe`, release):
+///
+/// ```text
+///   0.1   per frame   48.4 substeps   239 ms    4 fps
+///   0.02  per frame   10.0 substeps    35 ms   29 fps
+///   0.01  per frame    5.0 substeps    21 ms   49 fps (45 under the strongest press)
+/// ```
+///
+/// 0.01 leaves the budget three times the need. Materials are unchanged; the
+/// scene plays slower instead.
+const DT: f32 = 0.01;
+const SPACING: f32 = 0.5;
+const GRAVITY_MAGNITUDE: f32 = 0.3;
+
+const O_ID: u32 = 0;
+const A_ID: u32 = 1;
+const B_ID: u32 = 2;
+const C_ID: u32 = 3;
+
+// Bulk-density ratios vs water=1.0 (USDA-NRCS Soil Survey Manual typical ranges,
+// representative midpoints -- see module doc).
+const O_DENSITY_RATIO: f32 = 0.2;
+const A_DENSITY_RATIO: f32 = 1.2;
+const B_DENSITY_RATIO: f32 = 1.5;
+const C_DENSITY_RATIO: f32 = 1.8; // within the verified 1.76-1.95 glacial-till C-horizon range
+
+// Column geometry: bottom of C horizon sits just above the floor boundary; total
+// soil column depth is split across horizons using the uncontroversial
+// qualitative ordering (O thin, C thickest) -- see module doc for the caveat on
+// exact proportions.
+const COLUMN_HALF_WIDTH: i32 = 24;
+const SOIL_BOTTOM: f32 = 2.0;
+const O_THICKNESS: f32 = 2.0;
+const A_THICKNESS: f32 = 8.0;
+const B_THICKNESS: f32 = 14.0;
+const C_THICKNESS: f32 = 16.0;
+
+/// Mean stress a layer already carries from everything above it, in grid
+/// units: the weight per cell of each layer above plus half of its own,
+/// times gravity, turned into a mean stress with Jaky's earth-pressure
+/// coefficient at rest, `K0 = 1 - sin(phi')`, so `p = sigma_v (1 + K0)/2`
+/// in plane strain. A soil in place has carried this for a long time, so
+/// its clay starts preconsolidated under it instead of as fresh slurry.
+const CLAY_FRICTION_ANGLE_SIN: f32 = 0.436; // kaolin, 25.9 degrees
+
+const DIG_RADIUS: f32 = 4.0;
+/// Velocity change per unit of simulated time, applied as `DIG_RATE * DT`
+/// each frame so digging does not depend on the frame time.
+const DIG_RATE: f32 = 100.0;
+
+// Footstep-force probe: hold F at the cursor to press straight down, like a creature's
+// foot loading the ground. PRESS_RADIUS approximates a footprint's contact patch
+// relative to this column's scale.
+const PRESS_RADIUS: f32 = 3.0;
+const PRESS_FORCE_STEP: f32 = 5.0;
+const PRESS_FORCE_MIN: f32 = 5.0;
+const PRESS_FORCE_MAX: f32 = 200.0;
+
+struct App {
+    window: Option<Arc<Window>>,
+    state: Option<State>,
+}
+
+struct Diagnostics {
+    max_speed: f32,
+    non_finite: usize,
+    o_count: usize,
+    a_count: usize,
+    b_count: usize,
+    c_count: usize,
+}
+
+struct State {
+    surface: wgpu::Surface<'static>,
+    surface_config: wgpu::SurfaceConfiguration,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    sim: Simulation,
+    renderer: Renderer,
+    egui_ctx: egui::Context,
+    egui_state: egui_winit::State,
+    egui_renderer: egui_wgpu::Renderer,
+    cursor_pos: [f32; 2],
+    lmb: bool,
+    rmb: bool,
+    pressing: bool,
+    press_force: f32,
+    // Sag/absorption measurement: the surface height at the press column when pressing
+    // starts and the lowest height reached while held, so after release it reports how
+    // far the ground sagged under load and how much of that stayed (plastic) or
+    // recovered (elastic).
+    press_baseline_height: Option<f32>,
+    press_min_height: f32,
+    was_pressing: bool,
+    frame: u64,
+    fps_timer: std::time::Instant,
+    fps_frames: u64,
+    last_fps: f32,
+}
+
+fn make_sim() -> Simulation {
+    let config = SimConfig {
+        max_substeps_per_step: 16,
+        // Deliberately weak, NOT real IRL gravity (real g_grid ~= 981 via
+        // SimConfig::earth) -- tuned down for a calmer, more legible demo at this
+        // grid scale, same disclosed convention `basic_showcase.rs`/`fire_spread.rs`
+        // already use.
+        gravity: Vec2::new(0.0, -GRAVITY_MAGNITUDE),
+        ..SimConfig::earth(GRID, 0.01, DT)
+    };
+
+    // Stiffness at twice the first values for all four horizons, from a CFL/substep
+    // headroom sweep at dt=0.1/max_substeps_per_step=16: every horizon stays at 50-63%
+    // of its substep budget at this E during quiescent settling, leaving room for
+    // dig/press spikes. The ceiling is higher (O safe to 16x, C to 4x, B to ~4x). The
+    // ordering between horizons (O softest .. C stiffest) is kept. The A horizon's
+    // headroom was not re-measured at this E, only its isolated settling.
+    // O: loose organic litter -- closest existing preset, see module doc.
+    let o_horizon = DruckerPragerMaterial::low_friction(600.0, 0.3);
+    // A: loamy topsoil -- real name-match, now fixed and settling cleanly (see
+    // module doc's A-horizon note).
+    let a_horizon = GranularFluidMaterial::saturated_loam(1200.0, 0.3);
+    // B: clay-illuviated subsoil -- Non-Associated Cam-Clay, real wet-clay regime.
+    let mut b_horizon = NaccMaterial::kaolin(1800.0, 0.3);
+    // Areal density is a spawn's own particle mass over its cell area, and
+    // the B horizon lies under O and A plus half of itself.
+    let areal = |ratio: f32| ratio / (SPACING * SPACING);
+    let sigma_v = GRAVITY_MAGNITUDE
+        * (areal(O_DENSITY_RATIO) * O_THICKNESS
+            + areal(A_DENSITY_RATIO) * A_THICKNESS
+            + areal(B_DENSITY_RATIO) * B_THICKNESS * 0.5);
+    b_horizon.initial_preconsolidation = sigma_v * (2.0 - CLAY_FRICTION_ANGLE_SIN) * 0.5;
+    // C: weathered parent material -- denser, closer to intact rock.
+    let c_horizon = DruckerPragerMaterial::dilatant(2400.0, 0.3);
+
+    let mut solver = Simulation::empty(config)
+        .with_material(O_ID, Box::new(o_horizon))
+        .with_material(A_ID, Box::new(a_horizon))
+        .with_material(B_ID, Box::new(b_horizon))
+        .with_material(C_ID, Box::new(c_horizon))
+        .with_boundary(Box::new(SlipBoundary::new(config.boundary_thickness)));
+
+    let center_x = GRID as f32 * 0.5;
+    let horizons = [
+        (C_ID, C_THICKNESS, C_DENSITY_RATIO, SOIL_BOTTOM),
+        (
+            B_ID,
+            B_THICKNESS,
+            B_DENSITY_RATIO,
+            SOIL_BOTTOM + C_THICKNESS,
+        ),
+        (
+            A_ID,
+            A_THICKNESS,
+            A_DENSITY_RATIO,
+            SOIL_BOTTOM + C_THICKNESS + B_THICKNESS,
+        ),
+        (
+            O_ID,
+            O_THICKNESS,
+            O_DENSITY_RATIO,
+            SOIL_BOTTOM + C_THICKNESS + B_THICKNESS + A_THICKNESS,
+        ),
+    ];
+
+    for &(material_id, thickness, density_ratio, y_bottom) in &horizons {
+        // box_size is in world/grid units directly (same units as box_center), NOT
+        // a particle/cell count to be divided by spacing -- spacing only controls
+        // how densely particles pack WITHIN that world-space extent.
+        let spawn = SpawnRegion {
+            spacing: SPACING,
+            box_size: IVec2::new(COLUMN_HALF_WIDTH * 2, thickness.round().max(1.0) as i32),
+            box_center: Vec2::new(center_x, y_bottom + thickness * 0.5),
+            material_id,
+            mass_override: Some(density_ratio),
+            ..SpawnRegion::for_sim(&config)
+        };
+        let _ = solver.add_body(spawn);
+    }
+
+    solver
+}
+
+impl State {
+    async fn new(window: Arc<Window>) -> Self {
+        let size = window.inner_size();
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let surface = instance.create_surface(window.clone()).unwrap();
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+            })
+            .await
+            .expect("no GPU adapter");
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                required_limits: adapter.limits(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let caps = surface.get_capabilities(&adapter);
+        let fmt = caps
+            .formats
+            .iter()
+            .find(|f| f.is_srgb())
+            .copied()
+            .unwrap_or(caps.formats[0]);
+        let sc = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: fmt,
+            width: size.width,
+            height: size.height,
+            present_mode: wgpu::PresentMode::AutoVsync,
+            desired_maximum_frame_latency: 2,
+            alpha_mode: caps.alpha_modes[0],
+            view_formats: vec![],
+        };
+        surface.configure(&device, &sc);
+        let sim = make_sim();
+        let mut renderer = Renderer::new(&device, sim.particles().len(), fmt);
+        renderer.set_camera(&queue, GRID as u32, size.width, size.height, 0.6, true);
+        renderer.set_color_mode(ColorMode::ByPhysics);
+        // Optical params are Beer-Lambert absorption coefficients, not direct RGB:
+        // color = exp(-sigma_a), so sigma_a = -ln(target) for a target color.
+        // Targets are representative real pedology description, see module doc.
+        renderer.set_optical_params(&queue, O_ID as usize, [1.386, 1.715, 2.120]); // dark organic
+        renderer.set_optical_params(&queue, A_ID as usize, [0.799, 1.139, 1.609]); // brown loam
+        renderer.set_optical_params(&queue, B_ID as usize, [0.511, 1.139, 1.897]); // reddish clay
+        renderer.set_optical_params(&queue, C_ID as usize, [0.431, 0.511, 0.693]); // pale weathered rock
+
+        let egui_ctx = egui::Context::default();
+        let egui_state = egui_winit::State::new(
+            egui_ctx.clone(),
+            egui_ctx.viewport_id(),
+            window.as_ref(),
+            None,
+            None,
+            None,
+        );
+        let egui_renderer = egui_wgpu::Renderer::new(
+            &device,
+            fmt,
+            egui_wgpu::RendererOptions {
+                msaa_samples: 1,
+                ..Default::default()
+            },
+        );
+
+        let particles = sim.particles();
+        let count_of = |id: u32| {
+            particles
+                .indices()
+                .filter(|&i| particles.material_id[i] == id)
+                .count()
+        };
+        println!(
+            "soil_horizons: O={} A={} B={} C={} particles  |  LMB dig  F press  R reset  Q quit",
+            count_of(O_ID),
+            count_of(A_ID),
+            count_of(B_ID),
+            count_of(C_ID),
+        );
+
+        println!(
+            "  hold F to press down at cursor (footstep force probe)  \
+             [ / ] adjust press force (start {PRESS_FORCE_MIN:.0})"
+        );
+
+        Self {
+            surface,
+            surface_config: sc,
+            device,
+            queue,
+            sim,
+            renderer,
+            egui_ctx,
+            egui_state,
+            egui_renderer,
+            cursor_pos: [0.0; 2],
+            lmb: false,
+            rmb: false,
+            pressing: false,
+            press_force: PRESS_FORCE_MIN,
+            press_baseline_height: None,
+            press_min_height: f32::INFINITY,
+            was_pressing: false,
+            frame: 0,
+            fps_timer: std::time::Instant::now(),
+            fps_frames: 0,
+            last_fps: 0.0,
+        }
+    }
+
+    /// Surface-height probe: highest y among particles within `PRESS_RADIUS` of
+    /// `x_center`, the local ground height at that column, so sag is measured against
+    /// the current surface.
+    fn surface_height_near(&self, x_center: f32) -> f32 {
+        self.sim
+            .particles()
+            .iter()
+            .filter(|p| (p.x.x - x_center).abs() <= PRESS_RADIUS)
+            .map(|p| p.x.y)
+            .fold(f32::NEG_INFINITY, f32::max)
+    }
+
+    fn resize(&mut self, w: u32, h: u32) {
+        if w == 0 || h == 0 {
+            return;
+        }
+        self.surface_config.width = w;
+        self.surface_config.height = h;
+        self.surface.configure(&self.device, &self.surface_config);
+        self.renderer
+            .set_camera(&self.queue, GRID as u32, w, h, 0.6, true);
+    }
+
+    fn cursor_grid(&self) -> Vec2 {
+        gui_common::cursor_to_grid(
+            self.cursor_pos,
+            self.surface_config.width,
+            self.surface_config.height,
+            GRID,
+        )
+    }
+
+    /// Per-frame health snapshot, shared by the periodic console print and the egui
+    /// panel so the two stay in sync.
+    fn diagnostics(&self) -> Diagnostics {
+        let particles = self.sim.particles();
+        let max_speed = particles
+            .iter()
+            .map(|p| p.v.length())
+            .fold(0.0f32, f32::max);
+        let non_finite = particles
+            .iter()
+            .filter(|p| !p.x.is_finite() || !p.v.is_finite())
+            .count();
+        let count_of = |id: u32| {
+            particles
+                .indices()
+                .filter(|&i| particles.material_id[i] == id)
+                .count()
+        };
+        Diagnostics {
+            max_speed,
+            non_finite,
+            o_count: count_of(O_ID),
+            a_count: count_of(A_ID),
+            b_count: count_of(B_ID),
+            c_count: count_of(C_ID),
+        }
+    }
+
+    fn update_and_render(&mut self, window: &Window) {
+        if self.lmb || self.rmb {
+            let mag = if self.lmb {
+                DIG_RATE * DT
+            } else {
+                -DIG_RATE * DT
+            };
+            self.sim
+                .apply_radial_impulse(self.cursor_grid(), DIG_RADIUS, mag);
+        }
+
+        let press_x = self.cursor_grid().x;
+        if self.pressing {
+            if self.press_baseline_height.is_none() {
+                let h = self.surface_height_near(press_x);
+                self.press_baseline_height = Some(h);
+                self.press_min_height = h;
+                println!(
+                    "press start: force={:.0} baseline_height={h:.2}",
+                    self.press_force
+                );
+            }
+            self.sim.apply_impulse(
+                self.cursor_grid(),
+                PRESS_RADIUS,
+                Vec2::new(0.0, -self.press_force * DT),
+            );
+            let h = self.surface_height_near(press_x);
+            self.press_min_height = self.press_min_height.min(h);
+        }
+        // Sag/absorption report, printed once as the foot lifts: the settled height
+        // after release against both the original baseline and the deepest point
+        // under load, so "how much recovered" and "how much stayed sunk" are both
+        // measured.
+        if self.was_pressing && !self.pressing {
+            if let Some(baseline) = self.press_baseline_height {
+                let recovered = self.surface_height_near(press_x);
+                let max_sag = baseline - self.press_min_height;
+                let permanent_sag = baseline - recovered;
+                let absorbed_fraction = if max_sag > 1.0e-6 {
+                    (permanent_sag / max_sag).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                println!(
+                    "press end: force={:.0} max_sag={max_sag:.2} permanent_sag={permanent_sag:.2} \
+                     absorbed_fraction={absorbed_fraction:.2} (0=fully elastic rebound, 1=fully absorbed/plastic)",
+                    self.press_force
+                );
+            }
+            self.press_baseline_height = None;
+            self.press_min_height = f32::INFINITY;
+        }
+        self.was_pressing = self.pressing;
+
+        self.sim.step();
+        self.frame += 1;
+        self.fps_frames += 1;
+        if self.fps_timer.elapsed().as_secs_f32() >= 2.0 {
+            self.last_fps = self.fps_frames as f32 / self.fps_timer.elapsed().as_secs_f32();
+            let d = self.diagnostics();
+            println!(
+                "frame={} fps={:.0} max_speed={:.3} non_finite={} \
+                 (should stay small/bounded for a settling soil column -- large/nonzero = explosion)",
+                self.frame, self.last_fps, d.max_speed, d.non_finite
+            );
+            self.fps_timer = std::time::Instant::now();
+            self.fps_frames = 0;
+        }
+        let output = match self.surface.get_current_texture() {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        self.renderer
+            .render(&self.device, &self.queue, self.sim.particles(), &view, true);
+
+        // --- egui panel ---
+        let d = self.diagnostics();
+        let raw_input = self.egui_state.take_egui_input(window);
+        let mut press_force = self.press_force;
+        let mut reset_clicked = false;
+
+        let full_output = self.egui_ctx.run(raw_input, |ctx| {
+            egui::Window::new("Soil Horizons")
+                .default_pos([10.0, 10.0])
+                .default_width(280.0)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label(format!("fps={:.0}  frame={}", self.last_fps, self.frame));
+                    ui.label(format!(
+                        "O={} A={} B={} C={} particles",
+                        d.o_count, d.a_count, d.b_count, d.c_count
+                    ));
+                    ui.separator();
+                    ui.label(format!(
+                        "max_speed={:.3}  non_finite={}",
+                        d.max_speed, d.non_finite
+                    ));
+                    ui.separator();
+                    ui.add(
+                        egui::Slider::new(&mut press_force, PRESS_FORCE_MIN..=PRESS_FORCE_MAX)
+                            .text("press force ([ / ])"),
+                    );
+                    ui.label("LMB dig  RMB fill  F press (footstep probe)  R reset  Q quit");
+                    if ui.button("Reset").clicked() {
+                        reset_clicked = true;
+                    }
+                });
+        });
+
+        self.press_force = press_force;
+        if reset_clicked {
+            self.sim = make_sim();
+            self.frame = 0;
+            println!("reset");
+        }
+
+        self.egui_state
+            .handle_platform_output(window, full_output.platform_output);
+        let tris = self
+            .egui_ctx
+            .tessellate(full_output.shapes, full_output.pixels_per_point);
+        let sd = ScreenDescriptor {
+            size_in_pixels: [self.surface_config.width, self.surface_config.height],
+            pixels_per_point: full_output.pixels_per_point,
+        };
+        for (id, delta) in &full_output.textures_delta.set {
+            self.egui_renderer
+                .update_texture(&self.device, &self.queue, *id, delta);
+        }
+        let cmd = {
+            let mut enc = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            self.egui_renderer
+                .update_buffers(&self.device, &self.queue, &mut enc, &tris, &sd);
+            let mut rp = enc
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    ..Default::default()
+                })
+                .forget_lifetime();
+            self.egui_renderer.render(&mut rp, &tris, &sd);
+            drop(rp);
+            enc.finish()
+        };
+        self.queue.submit(std::iter::once(cmd));
+        for id in &full_output.textures_delta.free {
+            self.egui_renderer.free_texture(id);
+        }
+        output.present();
+    }
+}
+
+impl ApplicationHandler for App {
+    fn resumed(&mut self, el: &ActiveEventLoop) {
+        let w = Arc::new(
+            el.create_window(
+                winit::window::WindowAttributes::default()
+                    .with_title("emerge -- Soil Horizons [O/A/B/C layering]")
+                    .with_inner_size(winit::dpi::LogicalSize::new(640u32, 640u32)),
+            )
+            .unwrap(),
+        );
+        self.state = Some(pollster::block_on(State::new(w.clone())));
+        self.window = Some(w);
+    }
+
+    fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        let Some(s) = self.state.as_mut() else {
+            return;
+        };
+        if let Some(w) = &self.window {
+            let resp = s.egui_state.on_window_event(w, &event);
+            if resp.consumed {
+                return;
+            }
+        }
+        match event {
+            WindowEvent::CloseRequested => el.exit(),
+            WindowEvent::CursorMoved { position, .. } => {
+                s.cursor_pos = [position.x as f32, position.y as f32];
+            }
+            WindowEvent::MouseInput { state, button, .. } => match button {
+                MouseButton::Left => s.lmb = state == ElementState::Pressed,
+                MouseButton::Right => s.rmb = state == ElementState::Pressed,
+                _ => {}
+            },
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(key),
+                        state,
+                        ..
+                    },
+                ..
+            } => {
+                let pressed = state == ElementState::Pressed;
+                match key {
+                    KeyCode::KeyF => s.pressing = pressed,
+                    _ if !pressed => {}
+                    KeyCode::Escape | KeyCode::KeyQ => el.exit(),
+                    KeyCode::KeyR => {
+                        s.sim = make_sim();
+                        s.frame = 0;
+                        println!("reset");
+                    }
+                    KeyCode::BracketRight => {
+                        s.press_force = (s.press_force + PRESS_FORCE_STEP).min(PRESS_FORCE_MAX);
+                        println!("press_force={:.0}", s.press_force);
+                    }
+                    KeyCode::BracketLeft => {
+                        s.press_force = (s.press_force - PRESS_FORCE_STEP).max(PRESS_FORCE_MIN);
+                        println!("press_force={:.0}", s.press_force);
+                    }
+                    _ => {}
+                }
+            }
+            WindowEvent::Resized(sz) => s.resize(sz.width, sz.height),
+            WindowEvent::RedrawRequested => {
+                if let Some(w) = &self.window {
+                    let w = w.clone();
+                    s.update_and_render(&w);
+                    w.request_redraw();
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn main() {
+    let el = EventLoop::new().unwrap();
+    el.set_control_flow(ControlFlow::Poll);
+    let mut app = App {
+        window: None,
+        state: None,
+    };
+    el.run_app(&mut app).unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every particle's material must match the horizon its y-position falls in (O
+    /// topmost, then A, B, C bottommost), and every horizon must be non-empty.
+    #[test]
+    fn particles_are_assigned_to_the_correct_horizon_by_depth() {
+        let sim = make_sim();
+        let particles = sim.particles();
+        assert!(particles.len() > 0, "soil column must not be empty");
+
+        let c_top = SOIL_BOTTOM + C_THICKNESS;
+        let b_top = c_top + B_THICKNESS;
+        let a_top = b_top + A_THICKNESS;
+        let material_at = |y: f32| -> u32 {
+            if y > a_top {
+                O_ID
+            } else if y > b_top {
+                A_ID
+            } else if y > c_top {
+                B_ID
+            } else {
+                C_ID
+            }
+        };
+
+        let mut counts = [0usize; 4];
+        for i in particles.indices() {
+            let y = particles.x[i].y;
+            let id = particles.material_id[i];
+            counts[id as usize] += 1;
+            // Adjacent horizons are spawned as separate abutting boxes, so a
+            // particle can legitimately land exactly on a shared boundary line --
+            // accept either horizon on the two sides of that line, not just one.
+            let eps = 1.0e-3;
+            let candidates = [material_at(y - eps), material_at(y + eps)];
+            assert!(
+                candidates.contains(&id),
+                "particle at y={y:.2} has material_id={id} but its depth allows \
+                 only {candidates:?} (c_top={c_top:.1} b_top={b_top:.1} a_top={a_top:.1})"
+            );
+        }
+
+        for (id, count) in counts.iter().enumerate() {
+            assert!(*count > 0, "horizon material_id={id} has zero particles");
+        }
+    }
+}

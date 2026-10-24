@@ -6,7 +6,7 @@ labels: enhancement, physics
 
 **What real material or phenomenon does this model**
 
-**Source paper or reference** (required — emerge only adds sourced models)
+**Source paper or reference** (required -- emerge only adds sourced models)
 
 **Which existing model is closest and why it falls short**
 
